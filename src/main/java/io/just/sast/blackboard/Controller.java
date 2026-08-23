@@ -2,17 +2,20 @@ package io.just.sast.blackboard;
 
 import io.just.sast.util.JustLogger;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 黑板控制器：串行三阶段调度。
- * ANALYSIS（SCAN_START）产出分析 → COMPOSITION（SCAN_ANALYZED）组装多级链
- * → CALIBRATION（SCAN_COMPLETE）校准全部链。
- * 只做调度不做评分决策；init/onEvent 异常按知识源隔离（含 Error），不中断全扫。
+ * 黑板控制器：三阶段调度（init 串行 → 阶段屏障）。
+ * - ANALYSIS：并行派发（四知识源契约自足：只读冻结图、同步写黑板、不读彼此产物），join 屏障
+ * - COMPOSITION / CALIBRATION：按 priority 升序串行（跨源数据依赖：composer 消费 object-graph
+ *   重根链、pruner 消费 validator 裁决）
+ * init/onEvent 异常按知识源隔离（含 Error），不中断全扫。
  */
 public final class Controller {
 
@@ -28,32 +31,73 @@ public final class Controller {
     }
 
     public void run() {
-        Map<Phase, Map<EventType, Set<KnowledgeSource>>> subsByPhase = new EnumMap<>(Phase.class);
-        for (KnowledgeSource ks : sources) {
+        // priority 升序（稳定）：同阶段执行序显式化
+        List<KnowledgeSource> ordered = new ArrayList<>(sources);
+        ordered.sort(Comparator.comparingInt(KnowledgeSource::priority));
+        Map<Phase, Map<EventType, List<KnowledgeSource>>> subsByPhase = new EnumMap<>(Phase.class);
+        for (KnowledgeSource ks : ordered) {
             try {
                 ks.init(blackboard);
             } catch (Throwable e) {
                 JustLogger.error("知识源 {} 初始化失败（已隔离）: {}", ks.id(), e.toString());
             }
-            Map<EventType, Set<KnowledgeSource>> subs =
+            Map<EventType, List<KnowledgeSource>> subs =
                     subsByPhase.computeIfAbsent(ks.phase(), p -> new EnumMap<>(EventType.class));
             for (EventType type : ks.interests()) {
-                subs.computeIfAbsent(type, t -> new java.util.LinkedHashSet<>()).add(ks);
+                subs.computeIfAbsent(type, t -> new ArrayList<>(1)).add(ks);
             }
         }
         int dispatched = 0;
+        // ANALYSIS 并行：每个知识源一个任务（自足契约），异常隔离，join 屏障后清空残余事件
         blackboard.publish(Event.of(EventType.SCAN_START, -1, null));
-        dispatched += drain(subsByPhase.getOrDefault(Phase.ANALYSIS, Map.of()));
+        dispatched += dispatchParallel(subsByPhase.getOrDefault(Phase.ANALYSIS, Map.of()));
+        // COMPOSITION / CALIBRATION 串行（priority 序，跨源数据依赖）
         blackboard.publish(Event.of(EventType.SCAN_ANALYZED, -1, null));
         dispatched += drain(subsByPhase.getOrDefault(Phase.COMPOSITION, Map.of()));
         blackboard.publish(Event.of(EventType.SCAN_COMPLETE, -1, null));
         dispatched += drain(subsByPhase.getOrDefault(Phase.CALIBRATION, Map.of()));
-        JustLogger.info("黑板分析完成：分发事件 {} 次，sink {} 个，entry {} 个，链 {} 条",
-                dispatched, blackboard.sinkCount(), blackboard.entryCount(), blackboard.chains().size());
+        JustLogger.info("黑板分析完成：分发事件 {} 次，链 {} 条（校准拒绝 {} 条）",
+                dispatched, blackboard.chains().size(), blackboard.calibrationCount());
     }
 
-    /** 排空事件队列，按阶段订阅表分发。 */
-    private int drain(Map<EventType, Set<KnowledgeSource>> subs) {
+    /** ANALYSIS 并行派发：各知识源（去重）并发响应阶段起始事件一次，join 后丢弃队列残余（无订阅者的 CHAIN_FOUND）。 */
+    private int dispatchParallel(Map<EventType, List<KnowledgeSource>> subs) {
+        java.util.Set<KnowledgeSource> started = new java.util.LinkedHashSet<>();
+        for (List<KnowledgeSource> ksList : subs.values()) {
+            started.addAll(ksList);
+        }
+        if (started.isEmpty()) {
+            blackboard.clearEvents();
+            return 0;
+        }
+        CountDownLatch done = new CountDownLatch(started.size());
+        AtomicInteger dispatched = new AtomicInteger();
+        for (KnowledgeSource ks : started) {
+            new Thread(() -> {
+                try {
+                    ks.onEvent(blackboard, Event.of(EventType.SCAN_START, -1, null));
+                    dispatched.incrementAndGet();
+                } catch (Throwable t) {
+                    JustLogger.error("知识源 {} ANALYSIS 并行执行失败（已隔离）: {}", ks.id(), t.toString());
+                    if (JustLogger.isDebug()) {
+                        t.printStackTrace();
+                    }
+                } finally {
+                    done.countDown();
+                }
+            }, "just-ks-" + ks.id()).start();
+        }
+        try {
+            done.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        blackboard.clearEvents(); // CHAIN_FOUND 无订阅者；阶段屏障语义 = 串行 drain 的排空
+        return dispatched.get();
+    }
+
+    /** 排空事件队列，按阶段订阅表分发（订阅序 = priority 序）。 */
+    private int drain(Map<EventType, List<KnowledgeSource>> subs) {
         int dispatched = 0;
         while (blackboard.hasEvents()) {
             if (dispatched >= MAX_DISPATCH) {
@@ -65,7 +109,7 @@ public final class Controller {
             if (event == null) {
                 break;
             }
-            Set<KnowledgeSource> interested = subs.get(event.type());
+            List<KnowledgeSource> interested = subs.get(event.type());
             if (interested == null) {
                 continue;
             }

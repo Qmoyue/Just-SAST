@@ -1,15 +1,11 @@
 package io.just.sast.knowledge.calibrate;
 
-import io.just.sast.analysis.taint.OriginSupport;
-import io.just.sast.analysis.taint.ValueOrigin;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
-import io.just.sast.cpg.graph.Edge;
-import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.InsnFact;
@@ -17,44 +13,22 @@ import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.util.JustLogger;
 
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * SafeConfig 抑制知识源（CALIBRATION 阶段，借鉴 CodeQL SafeXStreamConfig/SafeKryoConfig）。
- * 当框架入口实例被安全配置（白名单/注册要求/安全模式）后，该入口产生的链全部抑制——
- * 纯降噪，不影响检出率（安全配置的实例不构成攻击面）。
+ * SafeConfig 抑制知识源（CALIBRATION 阶段，借鉴 CodeQL SafeXStreamConfig/SafeKryoConfig/SafeObjectMapperConfig）。
+ * 数据驱动：安全配置清单来自 source 规则的 safe-config 声明块（YAML），引擎零硬编码。
  *
- * 检测方式：找"同一方法体内"先调用安全配置方法再调用框架入口的序列——
- * 配置与反序列化在同一作用域时，该入口点视为安全。
+ * 检测语义：同一方法体内**先**调用安全配置（白名单/注册要求/安全模式）**再**调用该框架入口
+ * （按指令偏移序校验——先反序列化后配置的代码不抑制）时，该入口产生的链全部抑制——
+ * 纯降噪，安全配置后的入口不构成攻击面。
+ * 启发式限制：不追踪实参值（如 setRegistrationRequired(false) 无法区分），保守用于降噪。
  */
 public final class SafeConfigKnowledgeSource implements KnowledgeSource {
-
-    /** 安全配置方法（框架实例配置为安全模式） */
-    private record SafeConfigCall(String ownerPrefix, Set<String> methodNames) {}
-
-    private static final Set<SafeConfigCall> SAFE_CONFIGS = Set.of(
-            // XStream：配置白名单/权限
-            new SafeConfigCall("com/thoughtworks/xstream/XStream", Set.of(
-                    "addPermission", "denyPermission", "clearPermissions", "setMode")),
-            // Kryo：要求注册（白名单模式）
-            new SafeConfigCall("com/esotericsoftware/kryo/Kryo", Set.of(
-                    "setRegistrationRequired")),
-            // SnakeYAML 2.x：SafeConstructor
-            new SafeConfigCall("org/yaml/snakeyaml/constructor/SafeConstructor", Set.of(
-                    "<init>")),
-            // Jackson：禁用 default typing
-            new SafeConfigCall("com/fasterxml/jackson/databind/ObjectMapper", Set.of(
-                    "deactivateDefaultTyping", "setPolymorphicTypeValidator")));
-
-    /** 反序列化框架入口（须与 source 规则的 owner 匹配） */
-    private static final Set<String> DESER_OWNERS = Set.of(
-            "com/thoughtworks/xstream/XStream",
-            "com/esotericsoftware/kryo/Kryo",
-            "org/yaml/snakeyaml/Yaml",
-            "com/alibaba/fastjson/JSON",
-            "com/alibaba/fastjson2/JSON",
-            "com/fasterxml/jackson/databind/ObjectMapper");
 
     private Blackboard bb;
 
@@ -74,6 +48,11 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
     }
 
     @Override
+    public int priority() {
+        return 300;
+    }
+
+    @Override
     public void init(Blackboard blackboard) {
         this.bb = blackboard;
     }
@@ -83,30 +62,36 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
         if (event.type() != EventType.SCAN_COMPLETE) {
             return;
         }
-        // 找安全配置的方法（这些方法体内的框架入口调用视为安全）
-        Set<String> safeMethodKeys = findSafeConfiguredMethods();
-        if (safeMethodKeys.isEmpty()) {
+        // 只处理带 safe-config 声明的 source 规则
+        List<io.just.sast.config.Rule.SourceRule> guarded = bb.rules().sources().stream()
+                .filter(src -> src.safeConfig() != null)
+                .toList();
+        if (guarded.isEmpty()) {
             return;
         }
-        // 拒绝入口在这些方法内的链
+        // 找安全配置先于入口调用的方法（owner#name，与链的 entry 归属同口径）
+        Set<String> safeEntryKeys = findSafeConfiguredEntries(guarded);
+        if (safeEntryKeys.isEmpty()) {
+            return;
+        }
         int rejected = 0;
         for (Chain chain : bb.chains()) {
             if (bb.calibrationOf(chain.key()) != null) {
                 continue; // 已被前面校验拒绝
             }
             String entryKey = chain.entryClass() + "#" + chain.entryMethod();
-            if (safeMethodKeys.contains(entryKey)) {
+            if (safeEntryKeys.contains(entryKey)) {
                 bb.calibrateChain(chain.key(), "safe-config");
                 rejected++;
             }
         }
         if (rejected > 0) {
-            JustLogger.info("SafeConfig 抑制：{} 条链（入口方法含安全配置）", rejected);
+            JustLogger.info("SafeConfig 抑制：{} 条链（入口方法内安全配置先于框架调用）", rejected);
         }
     }
 
-    /** 找"方法体内同时有安全配置调用和反序列化入口调用"的方法。 */
-    private Set<String> findSafeConfiguredMethods() {
+    /** 方法体内存在"安全配置调用早于（偏移更小）该规则框架入口调用"的 owner#name 集合。 */
+    private Set<String> findSafeConfiguredEntries(List<io.just.sast.config.Rule.SourceRule> guarded) {
         Set<String> result = new HashSet<>();
         var support = bb.originSupport();
         for (Node method : bb.graph().nodesOfType(NodeType.METHOD)) {
@@ -115,8 +100,8 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
             if (info == null) {
                 continue;
             }
-            boolean hasSafeConfig = false;
-            boolean hasDeserEntry = false;
+            // 每条规则记最早的安全配置偏移与最早的入口调用偏移
+            Map<io.just.sast.config.Rule.SourceRule, int[]> offsets = new HashMap<>();
             for (InsnFact insn : info.instructions()) {
                 if (!insn.op().isInvoke() || insn.operands().isEmpty()) {
                     continue;
@@ -124,40 +109,27 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
                 if (!(insn.operands().get(0) instanceof MethodRef ref)) {
                     continue;
                 }
-                if (isSafeConfigCall(ref.owner(), ref.name())) {
-                    hasSafeConfig = true;
-                }
-                if (isDeserEntryCall(ref.owner(), ref.name())) {
-                    hasDeserEntry = true;
+                for (io.just.sast.config.Rule.SourceRule src : guarded) {
+                    int[] pair = offsets.computeIfAbsent(src, k -> new int[] {Integer.MAX_VALUE, Integer.MAX_VALUE});
+                    if (isSafeConfigCall(src.safeConfig(), ref.owner(), ref.name())) {
+                        pair[0] = Math.min(pair[0], insn.offset());
+                    }
+                    if (src.call().matches(ref.owner(), ref.name(), ref.descriptor())) {
+                        pair[1] = Math.min(pair[1], insn.offset());
+                    }
                 }
             }
-            if (hasSafeConfig && hasDeserEntry) {
-                result.add(io.just.sast.analysis.taint.OriginSupport.methodKeyOf(
-                        info.owner(), info.name(), info.descriptor()));
+            for (int[] pair : offsets.values()) {
+                if (pair[0] < pair[1]) { // 配置先于入口
+                    result.add(info.owner() + "#" + info.name());
+                    break;
+                }
             }
         }
         return result;
     }
 
-    private static boolean isSafeConfigCall(String owner, String name) {
-        for (SafeConfigCall sc : SAFE_CONFIGS) {
-            if (owner.startsWith(sc.ownerPrefix()) && sc.methodNames().contains(name)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean isDeserEntryCall(String owner, String name) {
-        for (String deserOwner : DESER_OWNERS) {
-            if (owner.startsWith(deserOwner)) {
-                return switch (name) {
-                    case "fromXML", "readObject", "readClassAndObject", "load", "loadAs",
-                         "parseObject", "parse", "readValue" -> true;
-                    default -> false;
-                };
-            }
-        }
-        return false;
+    private static boolean isSafeConfigCall(io.just.sast.config.Rule.SafeConfigDecl safe, String owner, String name) {
+        return owner.startsWith(safe.owner().pattern()) && safe.methods().contains(name);
     }
 }

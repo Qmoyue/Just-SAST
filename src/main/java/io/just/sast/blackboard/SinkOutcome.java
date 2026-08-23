@@ -1,6 +1,6 @@
 package io.just.sast.blackboard;
 
-/** KS2 对某个 sink 的分析裁决（KS2 纠错 KS1 的机器可读记录）。 */
+/** backward-taint 对某个 sink 的分析裁决（机器可读记录，报告层产出 sinks.csv）。 */
 public record SinkOutcome(
         String ruleId, String category,
         String sinkOwner, String sinkMethod,

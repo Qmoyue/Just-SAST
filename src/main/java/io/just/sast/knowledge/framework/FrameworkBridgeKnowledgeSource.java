@@ -9,7 +9,6 @@ import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.config.Rule;
-import io.just.sast.config.RuleEngine;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Node;
@@ -22,17 +21,20 @@ import io.just.sast.util.JustLogger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * 统一框架桥接引擎（ANALYSIS 阶段，自足，合并原 KS12/KS13/KS14）。
+ * 统一框架桥接引擎（ANALYSIS 阶段，自足）。
  * 从 YAML source 规则读取框架清单（bridge=deserialize 的反序列化入口 + bridge=serialize 的序列化入口），
  * 以包前缀剪枝 BFS 桥接到反射 sink（Method.invoke / Constructor.newInstance / Class.forName）。
  *
  * 引擎只做一件事：框架入口 → 框架包内 BFS → 反射 sink 的管线桥接。
  * 哪些框架、哪些方法、哪个方向——全部由规则声明，引擎零硬编码。
+ * entry_kind 按桥方向标注（deserialize/serialize）；BFS 中间跳保留在链上（框架内部管线可审计）。
  */
 public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
 
@@ -53,6 +55,11 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
     }
 
     @Override
+    public int priority() {
+        return 400;
+    }
+
+    @Override
     public void init(Blackboard blackboard) {
         this.bb = blackboard;
         this.support = blackboard.originSupport();
@@ -68,10 +75,8 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
             return;
         }
         int chains = 0;
+        outer:
         for (Node method : bb.graph().nodesOfType(NodeType.METHOD)) {
-            if (chains >= MAX_CHAINS) {
-                break;
-            }
             MethodInfo info = support.methodOf(method.strProp("owner"),
                     method.strProp("name"), method.strProp("desc"));
             if (info == null) {
@@ -85,14 +90,8 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                 if (!(insn.operands().get(0) instanceof MethodRef ref)) {
                     continue;
                 }
-                // 匹配 source 规则（规则驱动，非硬编码）
-                Rule.SourceRule matched = null;
-                for (Rule.SourceRule src : sources) {
-                    if (src.call().matches(ref.owner(), ref.name(), ref.descriptor())) {
-                        matched = src;
-                        break;
-                    }
-                }
+                Rule.SourceRule matched = bb.ruleEngine()
+                        .matchingSource(ref.owner(), ref.name(), ref.descriptor()).orElse(null);
                 if (matched == null) {
                     continue;
                 }
@@ -101,27 +100,33 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                     continue;
                 }
                 Node fwCall = bb.graph().node(callId);
-                // 管线 BFS（包前缀剪枝）到反射 sink
-                Node sinkCall = findReflectiveSink(fwCall, ref.owner());
-                if (sinkCall == null) {
+                // 管线 BFS（包前缀剪枝）到反射 sink，保留完整调用点路径
+                List<Node> path = findReflectiveSinkPath(fwCall, ref.owner());
+                if (path == null) {
                     continue;
                 }
-                var sinkRule = RuleEngine.matchingSink(bb.rules(), bb.hierarchy(), sinkCall);
+                Node sinkCall = path.get(path.size() - 1);
+                var sinkRule = bb.ruleEngine().matchingSink(sinkCall);
                 if (sinkRule.isEmpty()) {
                     continue;
                 }
-                Chain chain = assemble(info, fwCall, sinkCall, sinkRule.get(), matched);
+                Chain chain = assemble(info, path, sinkCall, sinkRule.get(), matched);
                 if (chain != null && bb.addChain(chain)) {
                     chains++;
+                    if (chains >= MAX_CHAINS) {
+                        JustLogger.warn("框架桥接：达到链数上限 {}，剩余入口未处理", MAX_CHAINS);
+                        break outer;
+                    }
                 }
             }
         }
         JustLogger.info("框架桥接[规则驱动]：产链 {} 条", chains);
     }
 
-    /** 包前缀剪枝 BFS：从框架入口沿同包方法到反射 sink。 */
-    private Node findReflectiveSink(Node fwCall, String fwOwner) {
+    /** 包前缀剪枝 BFS：框架入口沿同包方法到反射 sink，返回入口→…→sink 的调用点路径。 */
+    private List<Node> findReflectiveSinkPath(Node fwCall, String fwOwner) {
         String fwPrefix = packagePrefix(fwOwner, 3);
+        Map<Node, Node> parent = new HashMap<>();
         Deque<Node> work = new ArrayDeque<>();
         Set<Long> visited = new HashSet<>();
         work.add(fwCall);
@@ -139,34 +144,53 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                     String owner = callee.strProp("owner");
                     String name = callee.strProp("name");
                     if (isReflectiveSink(owner, name)) {
-                        return call;
+                        return buildPath(parent, call, fwCall);
                     }
-                    boolean inFramework = owner.startsWith(fwPrefix);
-                    if (!inFramework) {
+                    if (!owner.startsWith(fwPrefix)) {
                         continue;
                     }
-                    String key = OriginSupport.methodKeyOf(owner, name, callee.strProp("desc"));
-                    MethodInfo info = support.methodOf(owner, name, callee.strProp("desc"));
-                    if (info == null) {
-                        continue;
-                    }
-                    for (InsnFact insn : info.instructions()) {
-                        if (!insn.op().isInvoke()) {
-                            continue;
-                        }
-                        Long callId = support.callId(key, insn.offset());
-                        if (callId != null) {
-                            Node nextCall = bb.graph().node(callId);
-                            if (visited.add(nextCall.id())) {
-                                work.add(nextCall);
-                            }
-                        }
-                    }
+                    expandBody(parent, visited, work, owner, name, callee.strProp("desc"), call);
                 }
             }
             depth++;
         }
         return null;
+    }
+
+    /** 把 callee 方法体内的调用点入队（父记录为当前调用点）。 */
+    private void expandBody(Map<Node, Node> parent, Set<Long> visited, Deque<Node> work,
+                            String owner, String name, String desc, Node via) {
+        MethodInfo info = support.methodOf(owner, name, desc);
+        if (info == null) {
+            return;
+        }
+        String key = OriginSupport.methodKeyOf(owner, name, desc);
+        for (InsnFact insn : info.instructions()) {
+            if (!insn.op().isInvoke()) {
+                continue;
+            }
+            Long callId = support.callId(key, insn.offset());
+            if (callId != null) {
+                Node nextCall = bb.graph().node(callId);
+                if (visited.add(nextCall.id())) {
+                    parent.put(nextCall, via);
+                    work.add(nextCall);
+                }
+            }
+        }
+    }
+
+    /** 沿 parent 回溯构造路径 [fwCall, …, sinkCaller]。 */
+    private static List<Node> buildPath(Map<Node, Node> parent, Node sinkCaller, Node fwCall) {
+        List<Node> path = new ArrayList<>();
+        for (Node cur = sinkCaller; cur != null; cur = parent.get(cur)) {
+            path.add(cur);
+            if (cur.id() == fwCall.id()) {
+                break;
+            }
+        }
+        java.util.Collections.reverse(path);
+        return path;
     }
 
     private static boolean isReflectiveSink(String owner, String name) {
@@ -175,24 +199,35 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                 || ("java/lang/Class".equals(owner) && ("forName".equals(name) || "newInstance".equals(name)));
     }
 
-    private Chain assemble(MethodInfo entryMethod, Node fwCall, Node sinkCall,
+    /** 组装链（sink-first）：sink 自跳 + 管线中间跳（保留框架内部路径）+ 入口自跳。 */
+    private Chain assemble(MethodInfo entryMethod, List<Node> path, Node sinkCall,
                            Rule.SinkRule rule, Rule.SourceRule source) {
         MethodInfo sinkEnclosing = support.enclosingMethod(sinkCall);
         if (sinkEnclosing == null) {
             return null;
         }
+        String bridge = source.bridge() != null ? source.bridge() : "deserialize";
         List<ChainHop> hops = new ArrayList<>();
         hops.add(new ChainHop(sinkEnclosing.owner(), sinkEnclosing.name(),
-                sinkEnclosing.owner(), sinkEnclosing.name(),
-                HopKind.DIRECT_CALL, null, source.bridge(), sinkEnclosing.descriptor(), null));
-        hops.add(new ChainHop(entryMethod.owner(), entryMethod.name(),
-                fwCall.strProp("owner"), fwCall.strProp("name"),
-                HopKind.DIRECT_CALL, null, source.bridge(), fwCall.strProp("desc"), null));
+                sinkCall.strProp("owner"), sinkCall.strProp("name"),
+                HopKind.DIRECT_CALL, null, bridge, sinkCall.strProp("desc"), null));
+        // 中间跳：路径上相邻调用点 (c_i → c_{i+1})，c_{i+1} 位于 c_i 的目标方法体内；sink-first 反向排列
+        for (int i = path.size() - 1; i > 0; i--) {
+            Node inner = path.get(i);
+            Node outer = path.get(i - 1);
+            MethodInfo innerMethod = support.enclosingMethod(inner);
+            if (innerMethod == null) {
+                continue;
+            }
+            hops.add(new ChainHop(innerMethod.owner(), innerMethod.name(),
+                    outer.strProp("owner"), outer.strProp("name"),
+                    HopKind.DIRECT_CALL, null, bridge, outer.strProp("desc"), null));
+        }
         hops.add(new ChainHop(entryMethod.owner(), entryMethod.name(),
                 entryMethod.owner(), entryMethod.name(),
-                HopKind.ENTRY, null, "deserialization", "", null));
+                HopKind.ENTRY, null, bridge, entryMethod.descriptor(), null));
         return new Chain(rule.id(), rule.category(), rule.severity(),
-                entryMethod.owner(), entryMethod.name(), "deserialization",
+                entryMethod.owner(), entryMethod.name(), bridge,
                 sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0);
     }
 

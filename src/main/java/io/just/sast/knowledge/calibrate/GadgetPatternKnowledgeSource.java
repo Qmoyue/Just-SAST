@@ -7,59 +7,60 @@ import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
-import io.just.sast.chain.ConfidenceScorer;
 import io.just.sast.util.JustLogger;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * 已知 gadget 模式识别（CALIBRATION 阶段，借鉴 JDD 可利用性验证 + marshalsec 链分类）。
- * 当链路径同时包含已知 gadget 家族的关键类组合时，提升证据分并标注模式名。
+ * 已知 gadget 模式识别（CALIBRATION 阶段，借鉴 marshalsec 链分类 + JDD 可利用性验证）。
+ * 链路径**覆盖某模式全部关键类**（集合包含判定）时写链级注释（黑板 chainNotes），
+ * 报告层输出 findings.patterns 列并给证据分 +2/模式。
  * 不产链不拒链——纯排序增强，帮分析者一眼识别"这是 CC1 型链"。
  */
 public final class GadgetPatternKnowledgeSource implements KnowledgeSource {
 
-    /** 已知 gadget 模式：名称 + 必须同时出现的类前缀集合 + 证据加分。 */
-    private record Pattern(String name, Set<String> requiredClasses, int bonus) {}
+    /** 已知 gadget 模式：名称 + 必须全部出现的类前缀集合。 */
+    private record Pattern(String name, Set<String> requiredClasses) {}
 
     private static final List<Pattern> PATTERNS = List.of(
             new Pattern("CC1", Set.of(
                     "org/apache/commons/collections/functors/InvokerTransformer",
-                    "org/apache/commons/collections/functors/ChainedTransformer"), 3),
+                    "org/apache/commons/collections/functors/ChainedTransformer")),
             new Pattern("CC2", Set.of(
                     "org/apache/commons/collections/functors/InvokerTransformer",
-                    "org/apache/commons/collections/comparators/TransformingComparator"), 3),
+                    "org/apache/commons/collections/comparators/TransformingComparator")),
             new Pattern("CC3", Set.of(
                     "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
-                    "org/apache/commons/collections/functors/InstantiateTransformer"), 3),
+                    "org/apache/commons/collections/functors/InstantiateTransformer")),
             new Pattern("CC5", Set.of(
-                    "javax/management/BadAttributeValueExpReader",
+                    "javax/management/BadAttributeValueExpException",
                     "org/apache/commons/collections/keyvalue/TiedMapEntry",
-                    "org/apache/commons/collections/map/LazyMap"), 3),
+                    "org/apache/commons/collections/map/LazyMap")),
             new Pattern("CC6", Set.of(
                     "org/apache/commons/collections/keyvalue/TiedMapEntry",
-                    "org/apache/commons/collections/map/LazyMap"), 2),
+                    "org/apache/commons/collections/map/LazyMap")),
             new Pattern("CC7", Set.of(
                     "java/util/Hashtable",
-                    "org/apache/commons/collections/map/LazyMap"), 2),
+                    "org/apache/commons/collections/map/LazyMap")),
             new Pattern("Spring1", Set.of(
                     "org/springframework/core/SerializableTypeWrapper$MethodInvokeTypeProvider",
-                    "org/springframework/aop/framework/AdvisedSupport"), 3),
+                    "org/springframework/aop/framework/AdvisedSupport")),
             new Pattern("Rome", Set.of(
                     "com/sun/syndication/feed/impl/EqualsBean",
-                    "com/sun/syndication/feed/impl/ToStringBean"), 3),
+                    "com/sun/syndication/feed/impl/ToStringBean")),
             new Pattern("Jdk7u21", Set.of(
                     "sun/reflect/annotation/AnnotationInvocationHandler",
-                    "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"), 2),
+                    "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl")),
             new Pattern("CB1", Set.of(
                     "org/apache/commons/beanutils/BeanComparator",
-                    "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"), 3),
+                    "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl")),
             new Pattern("SignedObject二次反序列化", Set.of(
                     "java/security/SignedObject",
-                    "com/sun/syndication/feed/impl/EqualsBean"), 3));
+                    "com/sun/syndication/feed/impl/EqualsBean")));
 
     private Blackboard bb;
 
@@ -76,6 +77,11 @@ public final class GadgetPatternKnowledgeSource implements KnowledgeSource {
     @Override
     public Phase phase() {
         return Phase.CALIBRATION;
+    }
+
+    @Override
+    public int priority() {
+        return 400;
     }
 
     @Override
@@ -96,8 +102,7 @@ public final class GadgetPatternKnowledgeSource implements KnowledgeSource {
             String matched = matchPattern(chain);
             if (matched != null) {
                 patternCounts.merge(matched, 1, Integer::sum);
-                // 标注在 evidence 列（通过 qualityNote 附着）
-                bb.qualityNote(-1, "gadget-pattern:" + matched);
+                bb.chainNote(chain.key(), "pattern:" + matched);
             }
         }
         if (!patternCounts.isEmpty()) {
@@ -108,19 +113,18 @@ public final class GadgetPatternKnowledgeSource implements KnowledgeSource {
         }
     }
 
-    /** 链路径是否同时包含某模式的全部关键类。 */
+    /** 链路径是否覆盖某模式的全部关键类（每个必需类都有一条路径类以之为前缀）。 */
     private String matchPattern(Chain chain) {
-        // 收集链路径上出现的所有类
-        Set<String> pathClasses = new java.util.HashSet<>();
+        Set<String> pathClasses = new HashSet<>();
         pathClasses.add(chain.entryClass());
         for (ChainHop hop : chain.hops()) {
             pathClasses.add(hop.fromOwner());
             pathClasses.add(hop.toOwner());
         }
         for (Pattern pattern : PATTERNS) {
-            if (pathClasses.stream().mapToLong(c ->
-                    pattern.requiredClasses().stream().filter(c::startsWith).count())
-                    .sum() >= pattern.requiredClasses().size()) {
+            boolean allPresent = pattern.requiredClasses().stream()
+                    .allMatch(required -> pathClasses.stream().anyMatch(c -> c.startsWith(required)));
+            if (allPresent) {
                 return pattern.name();
             }
         }

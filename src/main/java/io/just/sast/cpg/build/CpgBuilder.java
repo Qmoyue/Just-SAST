@@ -1,9 +1,8 @@
 package io.just.sast.cpg.build;
 
 import io.just.sast.cpg.graph.Graph;
-import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
-import io.just.sast.frontend.asm.LoadResult;
+import io.just.sast.model.LoadResult;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.FieldRef;
 import io.just.sast.model.InsnFact;

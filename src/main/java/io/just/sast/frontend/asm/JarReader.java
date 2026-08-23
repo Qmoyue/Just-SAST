@@ -92,6 +92,7 @@ public final class JarReader {
         }
     }
 
+    /** 嵌套 jar 内继续递归：lib 内的 class + 更深层的 jar（jar-in-jar-in-lib，至 MAX_NESTING 层）。 */
     private void readNestedJar(byte[] bytes, List<ClassBytes> out, String origin, int depth) throws IOException {
         try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(bytes))) {
             ZipEntry entry;
@@ -106,6 +107,8 @@ public final class JarReader {
                 }
                 if (path.endsWith(".class")) {
                     out.add(new ClassBytes(stripClassPrefix(path), IoUtil.readAll(zip), origin + "!" + path));
+                } else if (path.endsWith(".jar") && depth < MAX_NESTING) {
+                    readNestedJar(IoUtil.readAll(zip), out, origin + "!" + path, depth + 1);
                 }
             }
         }

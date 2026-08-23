@@ -1,4 +1,4 @@
-package io.just.sast.frontend.asm;
+package io.just.sast.model;
 
 import io.just.sast.model.ClassInfo;
 

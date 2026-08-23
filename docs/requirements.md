@@ -2,56 +2,55 @@
 
 ## 1. 概述
 
-Just 是轻量 Java SAST 工具：对闭源 JAR/WAR 做反序列化 gadget 链挖掘。
-覆盖原生 ObjectInputStream + Kryo/SnakeYAML/XStream/Hessian/Fastjson/Gson/Jackson 等替代框架。
+轻量 Java SAST：对 JAR/WAR 挖掘反序列化 gadget 链。覆盖原生 OIS + 12 替代框架。
 
-交付形态：单个 CLI JAR（shade），CSV 三表输出，`--jdk-home` 支持目标 JDK 精确匹配。
+交付：单 CLI JAR，六格式输出，`--jdk-home` 精确匹配。
 
 ## 2. 功能需求
 
-| 编号 | 需求 | 说明 |
-|---|---|---|
-| FR1 | 输入解析 | JAR/WAR/class 目录 + `--deps`；fat jar（BOOT-INF）与 WAR（WEB-INF）嵌套 jar 递归解析；单类损坏不中断 |
-| FR2 | 字节码事实 | ASM 解析为自研 model（ClassInfo/InsnFact/Op），model 不依赖 ASM |
-| FR3 | CPG | METHOD/CALL 两类节点；INVOKES/DISPATCHES/LAMBDA 边（**传递子类型闭包**分发）；SPECIAL 边用 resolveMethod 后真实声明类；构建后冻结 |
-| FR4 | 类层次 | Serializable/Externalizable 传递闭包；JDK 懒加载（jrtfs / --jdk-home rt.jar）；懒加载后缓存失效 |
-| FR5 | 调用图 | CHA 虚调用（传递子类型）；lambda 解析；反射/代理不建边、由前向精扫按需展开 |
-| FR6 | 反向污点 | sink 参数反向回溯；OIS 读/入口 this/proxy args/receiver 返回值/passthrough/字段写入者/数组元素；paramOrdinal 统一槽→序数；双向剪枝；接口反向分发 |
-| FR7 | 前向对象污点 | magic entry/OIS 种子 → 对象污点事实不动点；粗扫+精扫（接口展开/代理串联/反射解析/可达剪枝） |
-| FR8 | OIS 回调 | 自定义 resolveClass/resolveProxyClass 重写建模：回调参数驱动的 sink 产链；机制路径 BFS；流来源剪除 |
-| FR9 | 框架桥接 | YAML source 规则驱动（零硬编码）：serialize 方向（toString→getter 反射）+ deserialize 方向（load→构造器/setter 反射） |
-| FR10 | 对象图扩散 | 类 E 非 transient 字段可容纳 F → F 的回调入口链重根到 E |
-| FR11 | 语义链组装 | INVOKE/TRIGGER/TEMPLATE 三种语义桥接组装多级链 |
-| FR12 | 链校验 | PASM 可行性 + 类型流（final 来源精确）+ 序列化可行性（字段类型闭包） |
-| FR13 | 链剪枝 | 触发上下文（hashCode/toString 须有可达触发者）+ 机制去重（同机制尾按入口家族留代表） |
-| FR14 | SafeConfig | 同方法内安全配置（XStream 白名单/Kryo 注册等）→ 入口链抑制 |
-| FR15 | 已知模式 | CC1-7/Spring1/Rome/CB1/Jdk7u21/SignedObject 等模式识别与加分 |
-| FR16 | 规则系统 | 4 种类型（sink/magic-entry/source/model），改 YAML 零代码；owner 层次命中；`~` 锚定正则 |
-| FR17 | CSV 输出 | findings.csv（置信度降序+变体计数）+ edges.csv（每跳明细）+ sinks.csv（裁决）；RFC 4180；UTF-8 BOM |
-| FR18 | CLI | `--jar`（必填）/ `--deps` / `--output` / `--rules` / `--fast` / `--stats` / `--jdk-home`；退出码 0/2/3 |
-| FR19 | JDK 版本 | class 文件 major version 提取；目标与运行时 JDK 差异 WARN；--jdk-home 读 rt.jar 或 jrt-fs |
-| FR20 | 容器透传 | model 规则声明式污点透传（Map.put/get、List.add/get、String.valueOf 等） |
+| 编号 | 需求 |
+|---|---|
+| FR1 | 输入：JAR/WAR/目录 + `--deps`；嵌套 jar 递归（深度 4） |
+| FR2 | ASM 解析为自研 model（不依赖 ASM 传播到分析层） |
+| FR3 | CPG：CHA 调用图 + 可见性剪枝 + 构建后冻结 |
+| FR4 | 类层次：Serializable 判定 + 懒加载 + 增量缓存失效 |
+| FR5 | 调用图：传递子类型分发 + 反射跳边 + JavaBean 跳 + DISPATCH_CAP 闭包展开 |
+| FR6 | 反向污点：sink 回溯 + 入口距离调度 + 段级记忆化 + per-sink 并行 |
+| FR7 | 前向污点：粗扫+精扫单引擎 + MODEL 规则消费 + origin-guided 精度 |
+| FR8 | OIS 回调：resolveClass/resolveProxyClass + readUnshared 双起跳 |
+| FR9 | 框架桥接：12 marshaller + safe-config 偏移序抑制 |
+| FR10 | 对象图扩散：字段类型含数组 + readResolve 重根 |
+| FR11 | 片段合成：chain-fragment 规则（后缀匹配） |
+| FR12 | 语义链组装：INVOKE/TRIGGER/TEMPLATE/DESER 四桥 |
+| FR13 | 链校验：PASM + 类型流（非 final 参与）+ 序列化 + 约束图矛盾 + catch 可达性守卫 |
+| FR14 | 链剪枝：触发上下文 + 深链结构门 + 软预算机制去重 |
+| FR15 | 模式识别：集合包含判定 + patterns 列 + 证据加分 |
+| FR16 | 动态验证：反射构造可行性 + 子进程链级验证（对象图构造、入口类去重 ≤2、sink 特异性三级判定） |
+| FR17 | 规则系统：5 种类型改 YAML 零代码 |
+| FR18 | 输出：CSV 四表（流式写出）+ SARIF + JSON/HTML/Markdown；CONFIRMED 链置顶 |
+| FR19 | CLI：scan + diff 子命令；退出码 0/2/3 |
+| FR20 | JDK 版本：major version 提取；--jdk-home Java 8/9+ 真挂载 |
+| FR21 | 并行：ANALYSIS 并行派发 + backward 16 worker + 精扫 parallelStream |
+| FR22 | 阶段内 priority 显式排序 |
 
-## 3. 非功能需求
+## 3. 非功能
 
 | 编号 | 需求 |
 |---|---|
-| NFR1 | 运行时依赖仅 3 类：ASM、picocli、SnakeYAML |
-| NFR2 | 启动快：JVM 启动后 <1s 进入扫描 |
-| NFR3 | ASM 仅在 frontend 层；知识源互不直接调用；分层单向依赖 |
-| NFR4 | 知识源可扩展：实现 KnowledgeSource + ServiceLoader 注册即可 |
-| NFR5 | 内存可控：4GB 堆内完成 <1 万类扫描 |
-| NFR6 | **普适性红线**：不得针对 benchmark 特判；优化必须是通用语义修复 |
-| NFR7 | 回归验收：手动 CLI 扫描逐语料校准锚点链 |
+| NFR1 | 运行时依赖仅 ASM/picocli/SnakeYAML |
+| NFR2 | 内存可控：4GB 堆 <1 万类 |
+| NFR3 | ASM 仅 frontend；知识源互不直接调用 |
+| NFR4 | ServiceLoader 注册可扩展 |
+| NFR5 | worker 自适应核数（≤16） |
+| NFR6 | 不得 benchmark 特判 |
+| NFR7 | 双层回归：`mvn test` + Gleipner evaluator |
 
-## 4. 验收标准
+## 4. 验收
 
-| 里程碑 | 验收 |
+| 项 | 标准 |
 |---|---|
-| 构建期 | CPG 传递子类型分发 + SPECIAL 边解析正确；WAR/fat jar 全量解析 |
-| 反向污点 | 已知链检出（demo Dog.hashCode→invoke / Unictf toString→invoke / quote BeanMap CC 链） |
-| 前向污点 | magic entry 种子传播 + 精化选项生效 |
-| 框架桥接 | Kryo/SnakeYAML/jackson 入口桥接到反射 sink |
-| 链组装 | 多级链可组装（babychain Kryo→Rome→TemplatesImpl） |
-| 校准 | 假链不报；SafeConfig 抑制生效；已知模式标注 |
-| 全量回归 | 8 语料（demo×2/Unictf/quote/babychain/babyjava/n1cat/javamix）锚点全过 |
+| Gleipner | 链覆盖 TP ≥100, FP ≤25（当前 106/22） |
+| 语料 | 9 语料锚点全过（demo/demo2/Unictf/java-quote/Remo/warmup/javamix/n1cat/qiao） |
+| 测试 | 50+ 全绿 |
+| 耗时 | demo2 <60s（当前 ~50s） |
+| 大语料 | 4 万+ 类语料默认堆可完成（javamix 42260 类验证通过） |

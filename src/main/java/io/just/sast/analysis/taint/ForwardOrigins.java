@@ -66,7 +66,7 @@ public final class ForwardOrigins {
     private static final Slot UNKNOWN_SLOT = new Slot(Set.of(new ValueOrigin.Unknown()), false);
 
     private final Map<String, Long> callIdByKey;
-    private final Map<String, Result> cache = new HashMap<>();
+    private final Map<String, Result> cache = new java.util.concurrent.ConcurrentHashMap<>();
 
     public ForwardOrigins(Map<String, Long> callIdByKey) {
         this.callIdByKey = callIdByKey;

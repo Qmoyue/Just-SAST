@@ -19,14 +19,16 @@ import java.util.Set;
  * 语义链组装（COMPOSITION 阶段）。
  * 将不同引擎产出的完整链通过**语义桥接**组装成多级完整攻击路径。
  *
- * 三种桥接（均为语义级，非调用图相邻）：
+ * 四种桥接（均为语义级，非调用图相邻）：
  * 1. INVOKE 桥：前段链 sink = Method.invoke → 可调用后段链 entry 的任意公共方法
  * 2. TRIGGER 桥：前段链路径含 HashMap/HashSet/Hashtable → 反序列化时调 key.hashCode/toString → 触发后段
  * 3. TEMPLATE 桥：前段链路径含 TemplatesImpl → 后段 entry 触发 getOutputProperties/newTransformer
+ * 4. DESER 桥：前段 sink 为二次反序列化（DESERIALIZE 类别，SignedObject.getObject /
+ *    SerializationUtils.deserialize 等）→ 前段产物字节流再被反序列化，触发后段机制入口
  *
- * 与已删除的 chain-compose 的区别：不在调用图上找相邻方法（结构级），而是验证
- * 前段 sink 能否**语义上**触发后段 entry（Method.invoke 可调任意公共方法、
- * HashMap 反序列化调 hashCode、TemplatesImpl 的 getter 加载字节码）。
+ * 不在调用图上找相邻方法（结构级），而是验证前段 sink 能否**语义上**触发后段 entry
+ * （Method.invoke 可调任意公共方法、HashMap 反序列化调 hashCode、TemplatesImpl 的 getter
+ * 加载字节码、SignedObject 模式的嵌套反序列化）。
  */
 public final class ChainComposerKnowledgeSource implements KnowledgeSource {
 
@@ -34,7 +36,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     private static final int MAX_HOPS = 16;
 
     /** 桥接类型。 */
-    enum Bridge { INVOKE, TRIGGER, TEMPLATE }
+    enum Bridge { INVOKE, TRIGGER, TEMPLATE, DESER }
 
     private Blackboard bb;
 
@@ -51,6 +53,11 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     @Override
     public Phase phase() {
         return Phase.COMPOSITION;
+    }
+
+    @Override
+    public int priority() {
+        return 200;
     }
 
     @Override
@@ -114,6 +121,11 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (onPath(front, "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl")
                 && isTemplateTrigger(backEntry)) {
             return Bridge.TEMPLATE;
+        }
+
+        // 4. DESER 桥：前段 sink 是二次反序列化 → 其产物字节流再被反序列化，触发后段机制入口
+        if ("DESERIALIZE".equals(front.category()) && isPublicEntry(backKind)) {
+            return Bridge.DESER;
         }
 
         return null;

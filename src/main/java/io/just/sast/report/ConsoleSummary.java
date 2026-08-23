@@ -6,7 +6,7 @@ import io.just.sast.util.JustLogger;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** 控制台摘要（stderr）：扫描统计 + KS2 对 KS1 的逐规则过滤率。 */
+/** 控制台摘要（stderr）：扫描统计 + 反向引擎的逐规则过滤率。 */
 public final class ConsoleSummary {
 
     private ConsoleSummary() {}

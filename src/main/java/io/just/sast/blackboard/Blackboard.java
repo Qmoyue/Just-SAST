@@ -2,6 +2,7 @@ package io.just.sast.blackboard;
 
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.analysis.taint.OriginSupport;
+import io.just.sast.config.RuleEngine;
 import io.just.sast.config.RuleSet;
 import io.just.sast.cpg.build.FieldWriterIndex;
 import io.just.sast.cpg.graph.Graph;
@@ -16,32 +17,32 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 黑板 = CPG 图 + 标记 + 链产物 + 事件队列。
+ * 黑板 = CPG 图 + 链产物 + 校准记录 + 链注释 + 事件队列。
  * 知识源通过本对象读写共享状态，互不直接调用。
- * KS1（标记）与 KS2（裁决）交叉并行、独立写黑板：KS2 不依赖 KS1 的输出触发，
- * 二者产物在 sinkRecords() 中合并——KS2 的裁决校准 KS1 的标记。
+ * 共享支撑（originSupport/ruleEngine）随黑板分发一次构建，全知识源复用。
+ * 单线程契约：控制器串行调度，本类不加锁。
  */
 public final class Blackboard {
-
-    /** KS1 标记 + KS2 裁决合并后的 sink 视图（校准结果）。 */
-    public record SinkRecord(SinkMark mark, SinkOutcome outcome) {}
 
     private final Graph graph;
     private final ClassHierarchy hierarchy;
     private final FieldWriterIndex fieldWriters;
     private final RuleSet rules;
     private final int maxDepth;
-    /** 共享分析支撑：调用点索引 + 方法解析缓存 + origin 分析缓存（KS2/KS4/KS5 复用同一份）。 */
+    /** 共享分析支撑：调用点索引 + 方法解析缓存 + origin 分析缓存 + 入口下游闭包。 */
     private final OriginSupport originSupport;
+    /** 共享规则匹配引擎（随 RuleSet 一次构建，缓存随黑板生命周期）。 */
+    private final RuleEngine ruleEngine;
 
-    private final Map<Long, SinkMark> sinkMarks = new HashMap<>();
-    private final Map<Long, MagicEntryMark> entryMarks = new HashMap<>();
-    private final Map<Long, SinkOutcome> sinkOutcomes = new HashMap<>();
     private final List<Chain> chains = new ArrayList<>();
     private final Set<String> chainKeys = new HashSet<>();
-    private final Map<Long, List<String>> qualityNotes = new HashMap<>();
+    /** sink 裁决（backward-taint 并行分析写）：CALL 节点 id → 裁决，报告层产出 sinks.csv。 */
+    private final Map<Long, SinkOutcome> sinkOutcomes = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 链校准（CALIBRATION 写）：链 key → 拒绝理由；报告层过滤被拒绝的链。 */
+    private final Map<String, String> chainCalibrations = new HashMap<>();
+    /** 链级注释（按链 key 归属，如 gadget 模式标注），报告层输出。 */
+    private final Map<String, List<String>> chainNotes = new HashMap<>();
     private final Deque<Event> queue = new ArrayDeque<>();
-    private final Set<Long> pendingSinks = new HashSet<>();
 
     public Blackboard(Graph graph, ClassHierarchy hierarchy, FieldWriterIndex fieldWriters,
                       RuleSet rules, int maxDepth) {
@@ -50,7 +51,8 @@ public final class Blackboard {
         this.fieldWriters = fieldWriters;
         this.rules = rules;
         this.maxDepth = maxDepth;
-        this.originSupport = new OriginSupport(graph, hierarchy);
+        this.ruleEngine = new RuleEngine(rules, hierarchy);
+        this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine);
     }
 
     public Graph graph() {
@@ -69,6 +71,10 @@ public final class Blackboard {
         return rules;
     }
 
+    public RuleEngine ruleEngine() {
+        return ruleEngine;
+    }
+
     public int maxDepth() {
         return maxDepth;
     }
@@ -77,30 +83,23 @@ public final class Blackboard {
         return originSupport;
     }
 
-    // ---- 标记（KS1 写） ----
+    // ---- 链产物 ----
 
-    public void markSink(long callNodeId, SinkMark mark) {
-        sinkMarks.put(callNodeId, mark);
-    }
-
-    public void markMagicEntry(long methodNodeId, MagicEntryMark mark) {
-        entryMarks.put(methodNodeId, mark);
-    }
-
-    public SinkMark sinkOf(long callNodeId) {
-        return sinkMarks.get(callNodeId);
-    }
-
-    /** KS1 标记与 KS2 裁决的合并视图（校准后的 sink 记录）。 */
-    public Map<Long, SinkRecord> sinkRecords() {
-        Map<Long, SinkRecord> merged = new HashMap<>();
-        for (Map.Entry<Long, SinkMark> entry : sinkMarks.entrySet()) {
-            merged.put(entry.getKey(), new SinkRecord(entry.getValue(), sinkOutcomes.get(entry.getKey())));
+    /** 记录链；按 key 去重（backward 的 per-sink 并行可能并发调用，方法级同步）。返回是否为新链。 */
+    public synchronized boolean addChain(Chain chain) {
+        if (chainKeys.add(chain.key())) {
+            chains.add(chain);
+            publish(Event.of(EventType.CHAIN_FOUND, -1, chain));
+            return true;
         }
-        return merged;
+        return false;
     }
 
-    // ---- sink 裁决（KS2 写，反馈给 KS1 的结果） ----
+    public List<Chain> chains() {
+        return chains;
+    }
+
+    // ---- sink 裁决 ----
 
     public void recordOutcome(long callNodeId, SinkOutcome outcome) {
         sinkOutcomes.put(callNodeId, outcome);
@@ -110,26 +109,7 @@ public final class Blackboard {
         return sinkOutcomes;
     }
 
-    public boolean isMagicEntry(long methodNodeId) {
-        return entryMarks.containsKey(methodNodeId);
-    }
-
-    public MagicEntryMark entryOf(long methodNodeId) {
-        return entryMarks.get(methodNodeId);
-    }
-
-    public int sinkCount() {
-        return sinkMarks.size();
-    }
-
-    public int entryCount() {
-        return entryMarks.size();
-    }
-
-    // ---- 链产物（KS2/KS4 写） ----
-
-    /** 链校准（KS3 写）：链 key → 拒绝理由；报告层过滤被拒绝的链。 */
-    private final Map<String, String> chainCalibrations = new HashMap<>();
+    // ---- 校准与注释 ----
 
     public void calibrateChain(String chainKey, String reason) {
         chainCalibrations.put(chainKey, reason);
@@ -147,54 +127,31 @@ public final class Blackboard {
         return chainCalibrations.size();
     }
 
-    /** 记录链；按 key 去重。返回是否为新链。 */
-    public synchronized boolean addChain(Chain chain) {
-        if (chainKeys.add(chain.key())) {
-            chains.add(chain);
-            publish(Event.of(EventType.CHAIN_FOUND, -1, chain));
-            return true;
-        }
-        return false;
+    /** 链级注释（gadget 模式标注等），附着到具体链 key。 */
+    public void chainNote(String chainKey, String note) {
+        chainNotes.computeIfAbsent(chainKey, k -> new ArrayList<>(1)).add(note);
     }
 
-    public List<Chain> chains() {
-        return chains;
-    }
-
-    // ---- 质量注释 ----
-
-    public void qualityNote(long callNodeId, String note) {
-        qualityNotes.computeIfAbsent(callNodeId, k -> new ArrayList<>(1)).add(note);
-    }
-
-    public List<String> qualityNotesOf(long callNodeId) {
-        List<String> list = qualityNotes.get(callNodeId);
+    public List<String> chainNotesOf(String chainKey) {
+        List<String> list = chainNotes.get(chainKey);
         return list != null ? list : List.of();
     }
 
     // ---- 事件 ----
 
-    public void publish(Event event) {
-        synchronized (queue) {
-            queue.addLast(event);
-        }
+    public synchronized void publish(Event event) {
+        queue.addLast(event);
     }
 
     Event poll() {
-        synchronized (queue) {
-            return queue.pollFirst();
-        }
+        return queue.pollFirst();
     }
 
     boolean hasEvents() {
-        synchronized (queue) {
-            return !queue.isEmpty();
-        }
+        return !queue.isEmpty();
     }
 
     void clearEvents() {
-        synchronized (queue) {
-            queue.clear();
-        }
+        queue.clear();
     }
 }

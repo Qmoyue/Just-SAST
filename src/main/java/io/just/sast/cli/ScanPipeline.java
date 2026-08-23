@@ -5,18 +5,18 @@ import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.Controller;
-import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.config.RuleSet;
 import io.just.sast.config.YamlRuleLoader;
 import io.just.sast.cpg.build.BuiltCpg;
 import io.just.sast.cpg.build.CpgBuilder;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
-import io.just.sast.config.RuleEngine;
 import io.just.sast.frontend.asm.BytecodeFrontend;
+import io.just.sast.frontend.asm.ClassBytes;
 import io.just.sast.frontend.asm.JrtClassSource;
-import io.just.sast.frontend.asm.LoadResult;
 import io.just.sast.frontend.asm.TargetJdkSource;
+import io.just.sast.model.JdkClassSource;
+import io.just.sast.model.LoadResult;
 import io.just.sast.report.ConsoleSummary;
 import io.just.sast.report.CsvReporter;
 import io.just.sast.report.ScanStatistics;
@@ -27,13 +27,15 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
-/** 扫描管线编排：frontend → 层次 → CPG/调用图（构建后冻结）→ 黑板（串行两阶段）→ CSV。 */
+/** 扫描管线编排：frontend → 层次 → CPG/调用图（构建后冻结）→ 黑板（串行三阶段）→ CSV。 */
 public final class ScanPipeline {
 
-    /** 反向回溯深度上限（内部固定，不暴露参数）。 */
-    private static final int MAX_DEPTH = 20;
+    /** 反向回溯递归深度上限（内部固定，不暴露参数）。覆盖 ~8 层链（再深需按链一致性做精度门，见 development.md）。 */
+    private static final int MAX_DEPTH = 64;
 
     private ScanPipeline() {}
 
@@ -45,11 +47,6 @@ public final class ScanPipeline {
 
     /** 扫描结果。 */
     public record ScanResult(int exitCode, List<Chain> chains, ScanStatistics stats) {}
-
-    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-                                 boolean stats, boolean fast) throws Exception {
-        return run(target, deps, output, rules, stats, fast, null);
-    }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
                                  boolean stats, boolean fast, Path jdkHome) throws Exception {
@@ -70,23 +67,30 @@ public final class ScanPipeline {
             targets.addAll(deps);
         }
 
-        // 构建期：JDK 类来源（--jdk-home 指定目标版本，否则用运行时 jrt）
-        BytecodeFrontend frontend = new BytecodeFrontend();
-        io.just.sast.model.JdkClassSource jdkSource;
-        List<io.just.sast.frontend.asm.ClassBytes> jdkClasses;
+        // 构建期：JDK 类来源（--jdk-home 指定目标版本——Java 9+ 真挂载目标镜像，否则用运行时 jrt）
+        JdkClassSource jdkSource;
+        List<ClassBytes> jdkClasses;
         if (jdkHome != null) {
-            TargetJdkSource targetJdk = new TargetJdkSource(jdkHome);
+            TargetJdkSource targetJdk;
+            try {
+                targetJdk = new TargetJdkSource(jdkHome);
+            } catch (IOException e) {
+                throw new UsageException("--jdk-home 加载失败: " + e.getMessage());
+            }
             jdkSource = targetJdk;
             jdkClasses = fast ? List.of() : targetJdk.listAll();
             JustLogger.info("使用目标 JDK：{}（--jdk-home={}）", targetJdk.description(), jdkHome);
         } else {
-            JrtClassSource jrt = new JrtClassSource();
+            JrtClassSource jrt = JrtClassSource.runtime();
             jdkSource = jrt;
             jdkClasses = fast ? List.of() : jrt.listAll(JrtClassSource.DESER_MODULES);
         }
-        LoadResult load = fast
-                ? frontend.load(targets)
-                : frontend.load(targets, jdkClasses);
+        BytecodeFrontend frontend = new BytecodeFrontend();
+        LoadResult load = io.just.sast.cpg.build.CpgCache.tryLoad(target);
+        if (load == null) {
+            load = fast ? frontend.load(targets) : frontend.load(targets, jdkClasses);
+            io.just.sast.cpg.build.CpgCache.save(target, load);
+        }
         JustLogger.info("解析完成：{} 个类（{} 个文件），诊断 {} 条",
                 load.classCount(), load.filesScanned(), load.diagnosticCount());
         if (load.targetMajorVersion() > 0) {
@@ -106,25 +110,34 @@ public final class ScanPipeline {
                 cpg.graph().nodeCount(), cpg.graph().edgeCount(), callEdges,
                 cpg.fieldWriters().fieldCount());
 
-        // 分析期（黑板串行两阶段：ANALYSIS → CALIBRATION）
+        // 分析期（黑板串行三阶段：ANALYSIS → COMPOSITION → CALIBRATION）
+        System.setProperty("just.target.jar", target.toAbsolutePath().toString());
+        System.setProperty("just.fast", String.valueOf(fast));
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), ruleSet, MAX_DEPTH);
         new Controller(blackboard, KnowledgeSources.discover()).run();
 
         // 报告期
         CsvReporter reporter = new CsvReporter();
-        reporter.write(output, blackboard.chains(), blackboard.sinkOutcomes(), blackboard.chainCalibrations());
-        JustLogger.info("CSV 已输出到 {}", output.toAbsolutePath());
+        reporter.withGraph(cpg.graph());
+        reporter.write(output, blackboard.chains(), blackboard.sinkOutcomes(),
+                blackboard.chainCalibrations(), blackboardNotes(blackboard));
+        // C1: SARIF 2.1.0 + E1-E3: JSON/HTML/Markdown 多格式输出
+        new io.just.sast.report.SarifReporter().write(output, blackboard.chains(),
+                blackboard.chainCalibrations(), blackboardNotes(blackboard));
+        new io.just.sast.report.MultiFormatReporter().write(output, blackboard.chains(),
+                blackboard.chainCalibrations(), blackboardNotes(blackboard));
+        JustLogger.info("CSV + SARIF 已输出到 {}", output.toAbsolutePath());
 
-        // KS1 已删除：sink/entry 统计从图直接产出（规则命中即计数）
+        // sink/entry 统计从图直接产出（与引擎同一 RuleEngine 实例，access 过滤口径一致）
         int sinkCount = 0;
         for (Node call : cpg.graph().nodesOfType(NodeType.CALL)) {
-            if (RuleEngine.matchingSink(ruleSet, hierarchy, call).isPresent()) {
+            if (blackboard.ruleEngine().matchingSink(call).isPresent()) {
                 sinkCount++;
             }
         }
         int entryCount = 0;
         for (Node method : cpg.graph().nodesOfType(NodeType.METHOD)) {
-            if (RuleEngine.matchingEntry(ruleSet, hierarchy, method.strProp("owner"),
+            if (blackboard.ruleEngine().matchingEntry(method.strProp("owner"),
                     method.strProp("name"), method.strProp("desc")).isPresent()) {
                 entryCount++;
             }
@@ -140,6 +153,17 @@ public final class ScanPipeline {
         return new ScanResult(ExitCode.OK.code(), blackboard.chains(), scanStats);
     }
 
+    /** 链级注释视图（有注释的链 key → 注释列表快照，报告层消费）。 */
+    private static Map<String, List<String>> blackboardNotes(Blackboard blackboard) {
+        Map<String, List<String>> notes = new HashMap<>();
+        for (Chain chain : blackboard.chains()) {
+            List<String> list = blackboard.chainNotesOf(chain.key());
+            if (!list.isEmpty()) {
+                notes.put(chain.key(), list);
+            }
+        }
+        return notes;
+    }
 
     /** class 文件 major version → JDK 版本描述。 */
     private static String jdkVersionOf(int major) {

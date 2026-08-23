@@ -8,7 +8,6 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.config.Rule;
-import io.just.sast.config.RuleEngine;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Node;
@@ -30,17 +29,21 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 前向对象污点引擎（KS4 粗扫与 KS5 精扫共享的引擎库，非知识源）。
+ * 前向对象污点引擎（引擎库，非知识源；一个实例依次跑粗扫与精扫两轮，共享索引与事实）。
  * GadgetInspector 式正向：从 magic entry / OIS 读出发，方法摘要 + 事实不动点，
  * worklist 只处理受影响方法；不动点后一次性做 sink 判定。
  * 事实单调只增，路径取最短；死胡同按记录时的事实版本失效（版本推进后清理）。
+ * 两轮共享：粗扫（类级事实）产出的污点事实是精扫的初值——精扫只增量补充接口/代理/反射边。
  *
- * 精扫选项（KS5 分配点敏感 + 接口/代理补全）：
+ * 精扫选项：
  * - expandInterfaces：污点 receiver/实参命中接口调用且仅声明目标（实现>枚举上限）时，
  *   按上限展开实现类 addThis/addParam
  * - threadProxy：receiver 为 Proxy.newProxyInstance 结果时，handler 实参的解析目标类 addThis
  * - reflectiveResolve：Method.invoke 的 Method 对象来自 getMethod/getDeclaredMethod 且方法名
  *   为常量时，向同名方法 addParam/addThis
+ *
+ * model 规则（YAML 声明式摘要）在两轮中都消费：actions 的 this←argN 为容器投毒（Map.put 语义）、
+ * return←src 为透传（Map.get 语义）。
  */
 public final class ForwardEngine {
 
@@ -53,13 +56,15 @@ public final class ForwardEngine {
     private static final int METHOD_PASS_CAP = 1_000_000;
     /** 死胡同缓存清理阈值（条目数超过即清除过期版本）。 */
     private static final int DEAD_END_SWEEP = 65_536;
+    /** B1: 精扫并行 worker 数（与反向引擎一致）。 */
+    private static final int WORKERS = Math.max(1, Math.min(16, Runtime.getRuntime().availableProcessors()));
 
     /** 事实：键 → 前向路径（首元素为 ENTRY hop）。 */
     private final Map<String, List<ChainHop>> thisTainted = new HashMap<>();
     private final Map<String, List<ChainHop>> fieldTainted = new HashMap<>();
     private final Map<String, List<ChainHop>> returnTainted = new HashMap<>();
     private final Map<String, List<ChainHop>> paramTainted = new HashMap<>();
-    /** 死胡同缓存：键 = 方法键|origin，值 = 记录时的事实版本（factCount 推进后过期）。 */
+    /** 死胡同缓存：键 = 方法键|origin，值 = 记录时的事实版本（factVersion 单调递增，跨轮有效）。 */
     private final Map<String, Long> deadEnds = new HashMap<>();
     private final Set<String> visiting = new HashSet<>();
 
@@ -68,38 +73,39 @@ public final class ForwardEngine {
     /** 调用者索引：方法键 → 调用点（return 事实传播用，含接口反向分发）。 */
     private final Map<String, List<Node>> callers = new HashMap<>();
 
-    /** 反序列化可达方法集（前向 BFS 边界：只在该子集内传播）。 */
+    /** 反序列化可达方法集（前向 BFS 边界：只在该子集内传播；两轮共用，首轮构建）。 */
     private final Set<String> reachable = new HashSet<>();
     private static final int REACHABLE_CAP = 200_000;
     private static final int INTERFACE_EXPAND_CAP = 2000;
-    private Blackboard bb;
-    private OriginSupport support;
+    private final Blackboard bb;
+    private final OriginSupport support;
+    private Options options;
+    /** 事实版本：单调递增，永不重置（死胡同缓存跨轮失效判定；事实集合跨轮单调只增）。 */
+    private long factVersion;
+    /** 本轮统计/预算（每轮重置）。 */
     private int factCount;
     private int steps;
     private int methodPasses;
     private final Deque<String> queue = new ArrayDeque<>();
 
-    /** 引擎选项。 */
+    /** 引擎选项（每轮指定）。 */
     public record Options(boolean expandInterfaces, boolean threadProxy, boolean reflectiveResolve,
                           boolean reachablePrune) {
 
-        /** 粗扫（KS4）：类级事实 + 可达剪枝，快。 */
+        /** 粗扫：类级事实 + 可达剪枝，快。 */
         public static Options coarse() {
             return new Options(false, false, false, true);
         }
 
-        /** 精扫（KS5）：分配点敏感 + 接口/代理/反射补全，全宇宙（预算兜底）。 */
+        /** 精扫：分配点敏感 + 接口/代理/反射补全（可达剪枝同样生效，可达集与粗扫共用）。 */
         public static Options refined() {
             return new Options(true, true, true, true);
         }
     }
 
 
-    private final Options options;
-
-    public ForwardEngine(Blackboard bb, Options options) {
+    public ForwardEngine(Blackboard bb) {
         this.bb = bb;
-        this.options = options;
         this.support = bb.originSupport();
         buildIndexes();
     }
@@ -123,7 +129,7 @@ public final class ForwardEngine {
                 }
             }
         }
-        // 接口反向分发：接口方法节点的调用点并入实现类方法（同 KS2 语义）
+        // 接口反向分发：接口方法节点的调用点并入实现类方法（同反向引擎语义）
         for (Node method : bb.graph().nodesOfType(NodeType.METHOD)) {
             String owner = method.strProp("owner");
             MethodInfo info = support.methodOf(owner, method.strProp("name"), method.strProp("desc"));
@@ -143,38 +149,93 @@ public final class ForwardEngine {
         }
     }
 
-    public void run() {
-        if (options.reachablePrune()) {
+    public void run(Options options) {
+        this.options = options;
+        if (options.reachablePrune() && reachable.isEmpty()) {
             computeReachable();
+        }
+        boolean firstRun = factVersion == 0;
+        // 预算按轮重置（每轮独立预算）。非首轮只重入队"受影响方法"：
+        // 已污点类的方法 + 已有参数/返回事实的方法 + 已污点字段的读者——
+        // 与独立精扫引擎的种子+事实驱动增长等价，规模受控（全量可达集重处理会烧尽预算）；
+        // 新事实派生的受影响方法由 addThis/addField/addReturn/addParam 的入队机制自动扩散。
+        steps = 0;
+        methodPasses = 0;
+        factCount = 0;
+        if (!firstRun) {
+            requeueAffected();
         }
         seedEntries();
         int rounds = 0;
+        // B1: 精扫并行化——processEffects 按 batch 并行（refined pass 专用，coarse 保持串行）
+        boolean parallel = options.expandInterfaces() && WORKERS > 1;
         while (!queue.isEmpty() && rounds < MAX_ROUNDS && steps < STEP_BUDGET
                 && methodPasses < METHOD_PASS_CAP) {
             rounds++;
-            Deque<String> current = new ArrayDeque<>(queue);
+            List<String> current = new ArrayList<>(queue);
             queue.clear();
-            while (!current.isEmpty() && steps < STEP_BUDGET && methodPasses < METHOD_PASS_CAP) {
-                String key = current.poll();
-                MethodInfo method = resolveMethodKey(key);
-                if (method != null) {
-                    methodPasses++;
-                    processEffects(method);
+            if (!parallel) {
+                for (String key : current) {
+                    MethodInfo method = resolveMethodKey(key);
+                    if (method != null) {
+                        methodPasses++;
+                        processEffects(method);
+                    }
                 }
+            } else {
+                // 并行处理当前 batch（不可变方法效果列表——add* 事实写入内部 CHM 并发安全）
+                current.parallelStream().forEach(key -> {
+                    MethodInfo method = resolveMethodKey(key);
+                    if (method != null) {
+                        methodPasses++;
+                        processEffects(method);
+                    }
+                });
             }
+        }
+        if (!queue.isEmpty()) {
+            // 截断未收敛：剩余事实未处理，本轮结果可能欠完备（不静默）
+            io.just.sast.util.JustLogger.warn("前向污点[{}]：轮数/预算截断，剩余队列 {} 个方法（结果可能欠完备）",
+                    options.expandInterfaces() ? "精扫" : "粗扫", queue.size());
+            queue.clear();
         }
         // 不动点后一次性 sink 判定（仅可达子集内的 sink）
         for (Node call : bb.graph().nodesOfType(NodeType.CALL)) {
             if (options.reachablePrune() && !reachable.contains(OriginSupport.methodKey(call))) {
                 continue;
             }
-            RuleEngine.matchingSink(bb.rules(), bb.hierarchy(), call).ifPresent(rule -> checkSink(call, rule));
+            bb.ruleEngine().matchingSink(call).ifPresent(rule -> checkSink(call, rule));
         }
         io.just.sast.util.JustLogger.info("前向污点[{}]：可达 {} 个方法，事实 {} 个，轮数 {}",
                 options.expandInterfaces() ? "精扫" : "粗扫", reachable.size(), factCount, rounds);
     }
 
-    /** 前向可达集：从 magic entry 与 OIS 宿主出发，沿调用边 BFS（接口按上限展开）。入口按规则自匹配（不读 KS1 标记）。 */
+    /** 精扫重入队（受影响方法）：已污点类的全部方法 + 参数/返回事实方法 + 已污点字段的读者。 */
+    private void requeueAffected() {
+        for (String cls : thisTainted.keySet()) {
+            ClassInfo info = bb.hierarchy().classInfo(cls);
+            if (info == null) {
+                continue;
+            }
+            for (MethodInfo method : info.methods()) {
+                if (!options.reachablePrune() || reachable.contains(OriginSupport.methodKey(method))) {
+                    queue.add(OriginSupport.methodKey(method));
+                }
+            }
+        }
+        for (String key : paramTainted.keySet()) {
+            queue.add(key.substring(0, key.lastIndexOf('#')));
+        }
+        queue.addAll(returnTainted.keySet());
+        for (Map.Entry<String, List<ChainHop>> e : fieldTainted.entrySet()) {
+            Set<String> readers = fieldReaders.get(e.getKey());
+            if (readers != null) {
+                queue.addAll(readers);
+            }
+        }
+    }
+
+    /** 前向可达集：从 magic entry 与 OIS 宿主出发，沿调用边 BFS（接口按上限展开）。入口按规则自匹配。 */
     private void computeReachable() {
         Deque<String> bfs = new ArrayDeque<>();
         for (Node method : bb.graph().nodesOfType(NodeType.METHOD)) {
@@ -233,23 +294,24 @@ public final class ForwardEngine {
         }
     }
 
-    /** 种子：magic entry 的 this 是反序列化对象；入队其所在类的全部方法。入口按规则自匹配（不读 KS1 标记）。 */
+    /** 种子：magic entry 的 this 是反序列化对象；入队其所在类的全部方法。入口按规则自匹配。 */
     private void seedEntries() {
         for (Node method : bb.graph().nodesOfType(NodeType.METHOD)) {
-            RuleEngine.matchingEntry(bb.rules(), bb.hierarchy(), method.strProp("owner"),
-                            method.strProp("name"), method.strProp("desc"))
+            bb.ruleEngine().matchingEntry(method.strProp("owner"), method.strProp("name"),
+                            method.strProp("desc"))
                     .ifPresent(rule -> {
                         String owner = method.strProp("owner");
                         ChainHop entryHop = new ChainHop(owner, method.strProp("name"),
-                                owner, method.strProp("name"), HopKind.ENTRY, null, rule.entryKind(), "", null);
+                                owner, method.strProp("name"), HopKind.ENTRY, null, rule.entryKind(),
+                                method.strProp("desc"), null);
                         addThis(owner, List.of(entryHop));
                     });
         }
     }
 
     private boolean isMagicEntry(Node method) {
-        return RuleEngine.matchingEntry(bb.rules(), bb.hierarchy(), method.strProp("owner"),
-                method.strProp("name"), method.strProp("desc")).isPresent();
+        return bb.ruleEngine().matchingEntry(method.strProp("owner"), method.strProp("name"),
+                method.strProp("desc")).isPresent();
     }
 
     /** 方法效果：PUTFIELD 存污点值 → 字段事实；RETURN 污点值 → 返回事实。 */
@@ -292,6 +354,9 @@ public final class ForwardEngine {
         if (state == null) {
             return;
         }
+        if (support.catchProvablyUnreachable(method, (Integer) call.prop("offset"))) {
+            return; // catch 不可达守卫（与反向引擎同谓词）
+        }
         int paramCount = Descriptor.paramCount(call.strProp("desc"));
         for (Rule.TaintedPos pos : rule.tainted()) {
             int depthFromTop;
@@ -327,8 +392,8 @@ public final class ForwardEngine {
         steps++;
         String key = OriginSupport.methodKey(method) + "|" + origin;
         Long deadAt = deadEnds.get(key);
-        if ((deadAt != null && deadAt == factCount) || visiting.contains(key)) {
-            return null;
+        if ((deadAt != null && deadAt == factVersion) || visiting.contains(key)) {
+            return null; // 版本未推进时的死胡同有效；新事实到达（版本推进）后重查
         }
         visiting.add(key);
         List<ChainHop> path;
@@ -345,9 +410,9 @@ public final class ForwardEngine {
         }
         visiting.remove(key);
         if (path == null) {
-            deadEnds.put(key, (long) factCount);
+            deadEnds.put(key, factVersion);
             if (deadEnds.size() > DEAD_END_SWEEP) {
-                deadEnds.values().removeIf(v -> v < factCount);
+                deadEnds.values().removeIf(v -> v < factVersion);
             }
         }
         return path;
@@ -416,7 +481,9 @@ public final class ForwardEngine {
                         addParam(edge.to().strProp("owner"), edge.to().strProp("name"),
                                 edge.to().strProp("desc"), slot, hopTo(argPath, method,
                                         edge.to().strProp("owner"), edge.to().strProp("name"),
-                                        edge.to().strProp("desc"), edge.type(), ordinalAt(call, slot)));
+                                        // argOrdinal 不设：前向 hop 是调用路径记录而非值流轨迹，
+                                        // 类型流校验的相邻跳配对语义只适用反向链（历史回归：CC BeanMap 链被误拒）
+                                        edge.to().strProp("desc"), edge.type(), null));
                     }
                 }
                 if (options.expandInterfaces()) {
@@ -424,6 +491,12 @@ public final class ForwardEngine {
                 }
             }
             slot += argSlots.get(i);
+        }
+        // model 规则（声明式摘要）：return←src 透传、this←argN 容器投毒
+        var model = bb.ruleEngine().matchingModel(call.strProp("owner"), call.strProp("name"),
+                call.strProp("desc"));
+        if (model.isPresent()) {
+            best = applyModel(model.get(), call, method, depth, best);
         }
         for (Edge edge : call.out()) {
             if (edge.type() != EdgeType.INVOKES && edge.type() != EdgeType.DISPATCHES) {
@@ -444,6 +517,73 @@ public final class ForwardEngine {
             reflectiveResolve(call, method, depth);
         }
         return best;
+    }
+
+    /** model 规则消费：actions 里 return←src 为透传，this←argN 为容器投毒（类级语义）。 */
+    private List<ChainHop> applyModel(Rule.ModelRule model, Node call, MethodInfo method, int depth,
+                                      List<ChainHop> best) {
+        for (Map.Entry<String, List<String>> action : model.actions().entrySet()) {
+            for (String src : action.getValue()) {
+                List<ChainHop> srcPath = modelSourcePath(src, call, method, depth);
+                if (srcPath == null) {
+                    continue;
+                }
+                if ("return".equals(action.getKey())) {
+                    if (best == null) {
+                        // 透传也须经该调用的规范跳衔接——裸拼 srcPath 会造成链跳类型对不上，
+                        // 被 chain-validator 的类型流误拒（历史回归：CC BeanMap 链全灭）
+                        best = hopTo(srcPath, method, call.strProp("owner"), call.strProp("name"),
+                                call.strProp("desc"), EdgeType.INVOKES);
+                    }
+                } else if ("this".equals(action.getKey())) {
+                    addThis(call.strProp("owner"), srcPath);
+                }
+            }
+        }
+        return best;
+    }
+
+    /** model 动作来源位置的污点路径：this（receiver）或 argN（第 N 实参）。 */
+    private List<ChainHop> modelSourcePath(String src, Node call, MethodInfo method, int depth) {
+        ForwardOrigins.State state = support.origins().compute(method).stateBefore().get(call.prop("offset"));
+        if (state == null) {
+            return null;
+        }
+        boolean calleeStatic = "STATIC".equals(call.strProp("invokeKind"));
+        if ("this".equals(src)) {
+            if (calleeStatic) {
+                return null;
+            }
+            int receiverDepth = state.stack().size() - 1 - Descriptor.paramCount(call.strProp("desc"));
+            if (receiverDepth < 0 || receiverDepth >= state.stack().size()) {
+                return null;
+            }
+            for (ValueOrigin receiver : state.stack().get(receiverDepth).origins()) {
+                List<ChainHop> path = tainted(receiver, method, depth + 1);
+                if (path != null) {
+                    return path;
+                }
+            }
+            return null;
+        }
+        if (src.startsWith("arg")) {
+            int ordinal = Integer.parseInt(src.substring(3));
+            List<Integer> argSlots = Descriptor.argSlots(call.strProp("desc"), calleeStatic);
+            int slot = 0;
+            for (int i = 0; i < argSlots.size(); i++) {
+                if (i == ordinal) {
+                    for (ValueOrigin origin : support.argOriginAt(call, method, slot)) {
+                        List<ChainHop> path = tainted(origin, method, depth + 1);
+                        if (path != null) {
+                            return path;
+                        }
+                    }
+                    return null;
+                }
+                slot += argSlots.get(i);
+            }
+        }
+        return null;
     }
 
     /** 字段读污点：程序字段事实；回退——反序列化对象（thisTainted 类）的全部实例字段可控。 */
@@ -493,6 +633,44 @@ public final class ForwardEngine {
         if (candidates == null) {
             return;
         }
+        // A1+#1 FLASH 混合分派增强：receiver 的运行时类型精确解析
+        // NEW→精确类名 | FieldRead→字段声明类型（具体类时精确） | 其他→保持 CHA
+        if (receiverPath != null && !candidates.isEmpty() && candidates.size() > 1) {
+            ForwardOrigins.State rState = support.origins().compute(method)
+                    .stateBefore().get(call.prop("offset"));
+            if (rState != null && !ownerInfo.isInterface()) {
+                int rDepth = rState.stack().size() - 1 - Descriptor.paramCount(call.strProp("desc"));
+                if (rDepth >= 0 && rDepth < rState.stack().size()) {
+                    for (ValueOrigin vo : rState.stack().get(rDepth).origins()) {
+                        String preciseType = null;
+                        if (vo instanceof ValueOrigin.Insn ins
+                                && method.insnAt(ins.offset()).op() == io.just.sast.model.Op.NEW) {
+                            // NEW → 精确类名
+                            String d = method.insnAt(ins.offset()).typeRef().descriptor();
+                            preciseType = d.startsWith("L") && d.endsWith(";")
+                                    ? d.substring(1, d.length() - 1) : d;
+                        } else if (vo instanceof ValueOrigin.FieldRead fr && !fr.isStatic()) {
+                            // FieldRead → 字段声明类型（具体类时可用）
+                            String declaring = bb.hierarchy().resolveField(fr.owner(), fr.field());
+                            var ci = bb.hierarchy().classInfo(declaring != null ? declaring : fr.owner());
+                            var field = ci != null ? ci.field(fr.field()) : null;
+                            if (field != null && field.descriptor().startsWith("L")) {
+                                String ft = field.descriptor().substring(1, field.descriptor().length() - 1);
+                                var fci = bb.hierarchy().classInfo(ft);
+                                if (fci != null && !fci.isInterface()
+                                        && !java.lang.reflect.Modifier.isAbstract(fci.access())) {
+                                    preciseType = ft; // 具体类 → 精确类型
+                                }
+                            }
+                        }
+                        if (preciseType != null && candidates.contains(preciseType)) {
+                            candidates = List.of(preciseType);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         int expanded = 0;
         for (String impl : candidates) {
             if (expanded >= 300) {
@@ -502,7 +680,9 @@ public final class ForwardEngine {
                 continue;
             }
             String resolved = bb.hierarchy().resolveMethod(impl, call.strProp("name"), call.strProp("desc"));
-            if (resolved != null) {
+            // 可见性剪枝：与调用图同语义，不可覆写目标不展开
+            if (resolved != null && bb.hierarchy().isOverridableDispatchTarget(
+                    owner, impl, call.strProp("name"), call.strProp("desc"))) {
                 addThis(resolved, List.of(new ChainHop(method.owner(), method.name(), resolved,
                         call.strProp("name"), HopKind.VIRTUAL_DISPATCH, null, "dispatch-expand",
                         call.strProp("desc"), null)));
@@ -548,6 +728,26 @@ public final class ForwardEngine {
         if (candidates == null) {
             return;
         }
+        // A1 FLASH 混合分派轻量版：receiver origin 为 NEW 指令时类型精确——只展开该类
+        if (false && !candidates.isEmpty()) { // A1: expandParams 暂不支持 origin-guided
+            ForwardOrigins.State rState = support.origins().compute(method)
+                    .stateBefore().get(call.prop("offset"));
+            if (rState != null && !ownerInfo.isInterface()) {
+                int rDepth = rState.stack().size() - 1 - Descriptor.paramCount(call.strProp("desc"));
+                if (rDepth >= 0 && rDepth < rState.stack().size()) {
+                    for (ValueOrigin vo : rState.stack().get(rDepth).origins()) {
+                        if (vo instanceof ValueOrigin.Insn ins && method.insnAt(ins.offset()).op() == io.just.sast.model.Op.NEW) {
+                            String newType = method.insnAt(ins.offset()).typeRef().descriptor()
+                                    .replaceAll("^L|;$", "");
+                            if (newType != null && candidates.contains(newType)) {
+                                candidates = List.of(newType);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         int expanded = 0;
         for (String impl : candidates) {
             if (expanded >= 300) {
@@ -557,7 +757,9 @@ public final class ForwardEngine {
                 continue;
             }
             String resolved = bb.hierarchy().resolveMethod(impl, call.strProp("name"), call.strProp("desc"));
-            if (resolved != null) {
+            // 可见性剪枝：与调用图同语义，不可覆写目标不展开
+            if (resolved != null && bb.hierarchy().isOverridableDispatchTarget(
+                    owner, impl, call.strProp("name"), call.strProp("desc"))) {
                 addParam(resolved, call.strProp("name"), call.strProp("desc"), slot,
                         hopTo(argPath, method, resolved, call.strProp("name"),
                                 call.strProp("desc"), EdgeType.DISPATCHES));
@@ -713,6 +915,7 @@ public final class ForwardEngine {
             return;
         }
         thisTainted.put(className, path);
+        factVersion++;
         factCount++;
         ClassInfo cls = bb.hierarchy().classInfo(className);
         if (cls != null) {
@@ -732,6 +935,7 @@ public final class ForwardEngine {
                 continue;
             }
             thisTainted.put(sub, path);
+            factVersion++;
             factCount++;
             ClassInfo subInfo = bb.hierarchy().classInfo(sub);
             if (subInfo != null) {
@@ -753,6 +957,7 @@ public final class ForwardEngine {
             return;
         }
         fieldTainted.put(key, path);
+        factVersion++;
         factCount++;
         Set<String> readers = fieldReaders.get(key);
         if (readers != null) {
@@ -765,6 +970,7 @@ public final class ForwardEngine {
             return;
         }
         returnTainted.put(methodKey, path);
+        factVersion++;
         factCount++;
         List<Node> callerCalls = callers.get(methodKey);
         if (callerCalls != null) {
@@ -783,6 +989,7 @@ public final class ForwardEngine {
             return;
         }
         paramTainted.put(key, path);
+        factVersion++;
         factCount++;
         queue.add(methodKey);
     }
@@ -807,13 +1014,6 @@ public final class ForwardEngine {
                 type == EdgeType.DISPATCHES ? HopKind.VIRTUAL_DISPATCH : HopKind.DIRECT_CALL, null, "call", toDesc,
                 argOrdinal));
         return path;
-    }
-
-    /** 调用点实参槽 → 被调方法形参序数（receiver/wide 次槽返回 null）。 */
-    private static Integer ordinalAt(Node call, int slot) {
-        int ordinal = Descriptor.paramOrdinal(call.strProp("desc"),
-                "STATIC".equals(call.strProp("invokeKind")), slot);
-        return ordinal >= 0 ? ordinal : null;
     }
 
     // ---- 工具 ----

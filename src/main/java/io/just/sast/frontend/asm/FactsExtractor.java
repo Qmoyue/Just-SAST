@@ -25,7 +25,6 @@ import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
-import org.objectweb.asm.tree.LineNumberNode;
 import org.objectweb.asm.tree.LookupSwitchInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -57,14 +56,15 @@ public final class FactsExtractor {
     }
 
     private MethodInfo extractMethod(String owner, MethodNode m) {
-        // 第一遍：给 label 分配偏移（偏移 = 该 label 处下一个指令的下标）
+        // 第一遍：给 label 分配偏移（偏移 = 该 label 处下一个指令的下标），统计调试信息
         Map<LabelNode, Integer> labelOffsets = new HashMap<>();
         List<AbstractInsnNode> insns = new ArrayList<>();
+        boolean hasDebug = false;
         for (AbstractInsnNode insn = m.instructions.getFirst(); insn != null; insn = insn.getNext()) {
             if (insn.getType() == AbstractInsnNode.LABEL) {
                 labelOffsets.put((LabelNode) insn, insns.size());
             } else if (insn.getType() == AbstractInsnNode.LINE) {
-                // 不计入偏移
+                hasDebug = true; // 不计入偏移
             } else if (insn.getType() == AbstractInsnNode.FRAME) {
                 // 不计入偏移
             } else {
@@ -73,26 +73,30 @@ public final class FactsExtractor {
         }
 
         List<InsnFact> facts = new ArrayList<>(insns.size());
-        boolean hasDebug = false;
         for (int i = 0; i < insns.size(); i++) {
             AbstractInsnNode insn = insns.get(i);
             Op op = Op.fromCode(insn.getOpcode());
-            if (insn.getType() == AbstractInsnNode.LINE) {
-                hasDebug = true;
-                continue;
-            }
             facts.add(new InsnFact(i, op, operands(insn, labelOffsets)));
         }
 
         List<TryCatchFact> tryCatch = new ArrayList<>(m.tryCatchBlocks.size());
         for (TryCatchBlockNode tc : m.tryCatchBlocks) {
             tryCatch.add(new TryCatchFact(
-                    labelOffsets.getOrDefault(tc.start, 0),
-                    labelOffsets.getOrDefault(tc.end, facts.size()),
-                    labelOffsets.getOrDefault(tc.handler, facts.size()),
+                    labelOffset(labelOffsets, tc.start),
+                    labelOffset(labelOffsets, tc.end),
+                    labelOffset(labelOffsets, tc.handler),
                     tc.type));
         }
         return new MethodInfo(owner, m.name, m.desc, m.access, List.copyOf(facts), List.copyOf(tryCatch), hasDebug);
+    }
+
+    /** label 引用缺失说明指令序列异常——解析失败计入诊断，绝不静默生成指向 offset 0 的假边。 */
+    private static int labelOffset(Map<LabelNode, Integer> labelOffsets, LabelNode label) {
+        Integer offset = labelOffsets.get(label);
+        if (offset == null) {
+            throw new IllegalStateException("label 未注册: " + label);
+        }
+        return offset;
     }
 
     private List<Object> operands(AbstractInsnNode insn, Map<LabelNode, Integer> labelOffsets) {
@@ -117,24 +121,24 @@ public final class FactsExtractor {
             case AbstractInsnNode.TYPE_INSN:
                 return List.of(new TypeRef(((TypeInsnNode) insn).desc));
             case AbstractInsnNode.JUMP_INSN:
-                return List.of(labelOffsets.getOrDefault(((JumpInsnNode) insn).label, 0));
+                return List.of(labelOffset(labelOffsets, ((JumpInsnNode) insn).label));
             case AbstractInsnNode.TABLESWITCH_INSN: {
                 TableSwitchInsnNode sw = (TableSwitchInsnNode) insn;
                 List<SwitchCase> cases = new ArrayList<>(sw.labels.size());
                 for (int i = 0; i < sw.labels.size(); i++) {
-                    cases.add(new SwitchCase(sw.min + i, labelOffsets.getOrDefault(sw.labels.get(i), 0)));
+                    cases.add(new SwitchCase(sw.min + i, labelOffset(labelOffsets, sw.labels.get(i))));
                 }
                 return List.of(new SwitchRef(List.copyOf(cases),
-                        labelOffsets.getOrDefault(sw.dflt, 0)));
+                        labelOffset(labelOffsets, sw.dflt)));
             }
             case AbstractInsnNode.LOOKUPSWITCH_INSN: {
                 LookupSwitchInsnNode sw = (LookupSwitchInsnNode) insn;
-                List<SwitchCase> cases = new ArrayList<>(sw.labels.size());
-                for (int i = 0; i < sw.labels.size(); i++) {
-                    cases.add(new SwitchCase(sw.keys.get(i), labelOffsets.getOrDefault(sw.labels.get(i), 0)));
+                List<SwitchCase> cases = new ArrayList<>(sw.keys.size());
+                for (int i = 0; i < sw.keys.size(); i++) {
+                    cases.add(new SwitchCase(sw.keys.get(i), labelOffset(labelOffsets, sw.labels.get(i))));
                 }
                 return List.of(new SwitchRef(List.copyOf(cases),
-                        labelOffsets.getOrDefault(sw.dflt, 0)));
+                        labelOffset(labelOffsets, sw.dflt)));
             }
             case AbstractInsnNode.INVOKE_DYNAMIC_INSN: {
                 InvokeDynamicInsnNode indy = (InvokeDynamicInsnNode) insn;

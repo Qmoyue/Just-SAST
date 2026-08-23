@@ -2,6 +2,7 @@ package io.just.sast.config;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** 规则模型：sink（起点）与 magic-entry（终点）。 */
 public sealed interface Rule {
@@ -27,8 +28,11 @@ public sealed interface Rule {
         }
     }
 
-    /** 方法匹配（用于 magic-entry）。 */
-    record MethodMatcher(Match name, Match descriptor) {
+    /**
+     * 方法匹配（用于 magic-entry）。privateOnly：要求方法为 private
+     * （OIS 机制只回调 private readObject/readObjectNoData/writeObject——ObjectStreamClass 语义）。
+     */
+    record MethodMatcher(Match name, Match descriptor, boolean privateOnly) {
 
         public boolean matches(String name, String desc) {
             return this.name.matches(name) && (descriptor == null || descriptor.matches(desc));
@@ -52,15 +56,30 @@ public sealed interface Rule {
     record MagicEntryRule(String id, String entryKind, MethodMatcher method, String implementsType)
             implements Rule {}
 
+    /** 安全配置声明（挂在 source 规则上，SafeConfig 知识源消费）。owner 为前缀匹配，methods 精确匹配。 */
+    record SafeConfigDecl(Match owner, Set<String> methods) {}
+
     /**
      * source 规则：替代反序列化框架入口调用点（Kryo/SnakeYAML/XStream/Hessian/Fastjson 等）。
      * bridge = serialize（toString→getter 反射）或 deserialize（load→构造器/setter 反射）。
+     * safeConfig 非 null 时：同方法内先安全配置后入口调用（偏移序）→ 入口链抑制。
      */
-    record SourceRule(String id, String bridge, CallMatcher call) implements Rule {}
+    record SourceRule(String id, String bridge, CallMatcher call, SafeConfigDecl safeConfig) implements Rule {}
 
     /**
      * model 规则（tabby actions 模式）：声明式方法摘要——无字节码体的外部/JDK 方法的污点传播。
-     * targets: 污点到达位置 → 来源位置集合。如 {return: [arg0]} 表示 arg0 的污点传播到返回值。
+     * targets: 污点到达位置 → 来源位置集合。如 {return: [arg0]} 表示 arg0 的污点传播到返回值；
+     * {this: [arg1]} 表示 arg1 的污点投毒整个接收者对象（容器投毒，Map.put 语义）。
      */
     record ModelRule(String id, CallMatcher call, Map<String, List<String>> actions) implements Rule {}
+
+    /** 片段跳：类#方法（可选字段流）。 */
+    record HopSpec(String cls, String method, String field) {}
+
+    /**
+     * chain-fragment 规则（IOCD-lite）：声明式已知链片段——全部锚点类在图中可解析才生效，
+     * Fragment 知识源据此合成链（公开 gadget 知识库化，"规则做数据"的延伸）。
+     */
+    record FragmentRule(String id, String entryClass, String entryKind,
+                        List<HopSpec> hops, String sinkOwner, String sinkName) implements Rule {}
 }

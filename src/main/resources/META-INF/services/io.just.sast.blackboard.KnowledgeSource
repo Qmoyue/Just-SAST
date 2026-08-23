@@ -7,4 +7,6 @@ io.just.sast.knowledge.calibrate.ChainValidatorKnowledgeSource
 io.just.sast.knowledge.calibrate.ChainPrunerKnowledgeSource
 io.just.sast.knowledge.calibrate.SafeConfigKnowledgeSource
 io.just.sast.knowledge.calibrate.GadgetPatternKnowledgeSource
+io.just.sast.knowledge.fragment.FragmentKnowledgeSource
 io.just.sast.knowledge.compose.ChainComposerKnowledgeSource
+io.just.sast.knowledge.calibrate.VerifyKnowledgeSource

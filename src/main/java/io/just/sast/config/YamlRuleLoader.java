@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** YAML 规则 → RuleSet。 */
 public final class YamlRuleLoader {
@@ -31,6 +32,7 @@ public final class YamlRuleLoader {
         List<Rule.MagicEntryRule> entries = new ArrayList<>();
         List<Rule.SourceRule> sources = new ArrayList<>();
         List<Rule.ModelRule> models = new ArrayList<>();
+        List<Rule.FragmentRule> fragments = new ArrayList<>();
         for (Object item : list) {
             if (!(item instanceof Map<?, ?> ruleMap)) {
                 continue;
@@ -48,9 +50,12 @@ public final class YamlRuleLoader {
                 sources.add(parseSource(id, ruleMap));
             } else if (kind.equals("model")) {
                 models.add(parseModel(id, ruleMap));
+            } else if (kind.equals("chain-fragment")) {
+                fragments.add(parseFragment(id, ruleMap));
             }
         }
-        return new RuleSet(List.copyOf(sinks), List.copyOf(entries), List.copyOf(sources), List.copyOf(models));
+        return new RuleSet(List.copyOf(sinks), List.copyOf(entries), List.copyOf(sources),
+                List.copyOf(models), List.copyOf(fragments));
     }
 
     @SuppressWarnings("unchecked")
@@ -90,7 +95,8 @@ public final class YamlRuleLoader {
         }
         Rule.MethodMatcher methodMatcher = new Rule.MethodMatcher(
                 matchOf(method.get("name")),
-                matchNullable(method.get("descriptor")));
+                matchNullable(method.get("descriptor")),
+                "private".equalsIgnoreCase(str(method, "access")));
         String implementsType = null;
         Object cls = match.get("class");
         if (cls instanceof Map<?, ?> classMap && classMap.get("implements") != null) {
@@ -110,7 +116,22 @@ public final class YamlRuleLoader {
                 matchOf(call.get("owner")),
                 matchOf(call.get("name")),
                 matchNullable(call.get("descriptor")));
-        return new Rule.SourceRule(id, str(ruleMap, "bridge"), callMatcher);
+        Rule.SafeConfigDecl safeConfig = null;
+        Object safeObj = ruleMap.get("safe-config");
+        if (safeObj instanceof Map<?, ?> safeMap) {
+            Match safeOwner = matchOf(safeMap.get("owner"));
+            Set<String> methods = new java.util.HashSet<>();
+            if (safeMap.get("methods") instanceof List<?> methodList) {
+                for (Object m : methodList) {
+                    methods.add(m.toString());
+                }
+            }
+            if (methods.isEmpty()) {
+                throw new IOException("source 规则 " + id + " 的 safe-config.methods 为空");
+            }
+            safeConfig = new Rule.SafeConfigDecl(safeOwner, Set.copyOf(methods));
+        }
+        return new Rule.SourceRule(id, str(ruleMap, "bridge"), callMatcher, safeConfig);
     }
 
     @SuppressWarnings("unchecked")
@@ -139,6 +160,27 @@ public final class YamlRuleLoader {
             }
         }
         return new Rule.ModelRule(id, callMatcher, Map.copyOf(actions));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Rule.FragmentRule parseFragment(String id, Map<?, ?> ruleMap) throws IOException {
+        String entryClass = str(ruleMap, "entryClass");
+        String entryKind = str(ruleMap, "entryKind");
+        String sinkOwner = str(ruleMap, "sinkOwner");
+        String sinkName = str(ruleMap, "sinkName");
+        List<Rule.HopSpec> hops = new ArrayList<>();
+        if (ruleMap.get("hops") instanceof List<?> hopList) {
+            for (Object h : hopList) {
+                if (h instanceof Map<?, ?> hm) {
+                    hops.add(new Rule.HopSpec(str(hm, "class"), str(hm, "method"), str(hm, "field")));
+                }
+            }
+        }
+        if (entryClass == null || sinkOwner == null || sinkName == null || hops.isEmpty()) {
+            throw new IOException("chain-fragment 规则 " + id + " 缺少 entryClass/sinkOwner/sinkName/hops");
+        }
+        return new Rule.FragmentRule(id, entryClass, entryKind == null ? "readObject" : entryKind,
+                List.copyOf(hops), sinkOwner, sinkName);
     }
 
     private static Match matchOf(Object raw) throws IOException {

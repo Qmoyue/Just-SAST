@@ -2,35 +2,45 @@ package io.just.sast.config;
 
 import java.util.regex.Pattern;
 
-/** 匹配器：精确字符串，或以 "~" 前缀表示锚定正则。 */
-public record Match(String pattern) {
+/** 匹配器：精确字符串，或以 "~" 前缀表示锚定正则（构造时预编译，匹配零编译开销）。 */
+public final class Match {
 
-    public Match {
-        pattern = pattern.strip();
+    private final String pattern;
+    private final boolean regex;
+    private final Pattern compiled;
+
+    public Match(String raw) {
+        String p = raw == null ? "" : raw.strip();
         // YAML 中 ~"a|b" 的引号会进入标量，剥掉以防备选被引号拆散（"a / b"）
-        if (pattern.startsWith("~")) {
-            String rest = pattern.substring(1).strip();
+        if (p.startsWith("~")) {
+            String rest = p.substring(1).strip();
             if (rest.length() >= 2 && rest.startsWith("\"") && rest.endsWith("\"")) {
-                pattern = "~" + rest.substring(1, rest.length() - 1);
+                p = "~" + rest.substring(1, rest.length() - 1);
             }
         }
+        this.pattern = p;
+        this.regex = p.startsWith("~");
+        this.compiled = regex ? Pattern.compile("^(?:" + p.substring(1) + ")$") : null;
     }
 
     public static Match of(String raw) {
         return new Match(raw);
     }
 
-    /** 是否为正则匹配。 */
+    public String pattern() {
+        return pattern;
+    }
+
     public boolean isRegex() {
-        return pattern.startsWith("~");
+        return regex;
     }
 
     public boolean matches(String value) {
         if (value == null) {
             return false;
         }
-        if (isRegex()) {
-            return Pattern.compile("^(?:" + pattern.substring(1) + ")$").matcher(value).matches();
+        if (regex) {
+            return compiled.matcher(value).matches();
         }
         return pattern.equals(value);
     }

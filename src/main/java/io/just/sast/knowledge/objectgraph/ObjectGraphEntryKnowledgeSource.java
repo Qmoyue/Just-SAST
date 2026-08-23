@@ -23,19 +23,25 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * KS7 对象图入口扩散（COMPOSITION 阶段）：反序列化机制按对象图递归触发字段类型的反序列化回调。
- * 类 E（含回调入口方法）的非 transient 字段声明类型 T、T 的子类型 F 可序列化
+ * 对象图入口扩散（COMPOSITION 阶段）：反序列化机制按对象图递归触发字段类型的反序列化回调。
+ * 类 E（含回调入口方法）的非 transient 字段声明类型 T（含 [L..; 数组元素类型）、T 的子类型 F 可序列化
  * → 攻击者可在该字段放置 F 实例 → F 的回调入口在 E 反序列化期间被机制调用。
  * 将 F 入口的既有链重根到 E：E 的入口 → 字段跳 → F 的链，产出新的 entry→sink 覆盖
  * （默认反序列化填充字段，不经显式调用边，前向/反向引擎均不可见——本源补足）。
- * 机制触发的入口类别：readObject/readObjectNoData/readExternal；
- * validateObject 仅当该类 readObject 内有 registerValidation 调用时纳入（机制语义核验）。
+ * 机制触发的入口类别：readObject/readObjectNoData/readExternal/readResolve
+ * （readResolve 在对象图读完后由机制调用，语义同族）；
+ * validateObject 仅当该类 readObject 内有 registerValidation 调用时纳入（机制语义核验）；
+ * proxyInvoke 为使用期触发（非机制期），不参与重根。
  */
 public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
 
     private static final int MAX_REROOTED = 300;
     private static final int MAX_PER_CHAIN = 20;
     private static final int MAX_HOPS = 16;
+    /** 机制期入口类别（E 自身须有其一，重根后的新入口才真实存在）。 */
+    private static final Set<String> MECHANISM_ENTRIES = Set.of(
+            "readObject", "readObjectNoData", "readExternal", "readResolve", "validateObject");
+
     /** 万能容器类型：对任意可序列化子类型平凡成立，重根无信号纯噪音，排除。 */
     private static final Set<String> UNIVERSAL_TYPES = Set.of(
             "java/lang/Object", "java/io/Serializable", "java/lang/Cloneable",
@@ -56,6 +62,11 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
     @Override
     public Phase phase() {
         return Phase.COMPOSITION;
+    }
+
+    @Override
+    public int priority() {
+        return 100;
     }
 
     @Override
@@ -83,13 +94,12 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
                 continue;
             }
             for (FieldInfo f : ci.fields()) {
-                if (Modifier.isTransient(f.access()) || Modifier.isStatic(f.access())
-                        || !f.descriptor().startsWith("L")) {
+                if (Modifier.isTransient(f.access()) || Modifier.isStatic(f.access())) {
                     continue;
                 }
-                String type = f.descriptor().substring(1, f.descriptor().length() - 1);
-                if (UNIVERSAL_TYPES.contains(type)) {
-                    continue; // 万能容器类型：重根对任意 F 平凡成立，无信号
+                String type = referenceTypeOf(f.descriptor());
+                if (type == null || UNIVERSAL_TYPES.contains(type)) {
+                    continue; // 非引用类型 / 万能容器类型：重根无信号
                 }
                 containersByType.computeIfAbsent(type, k -> new ArrayList<>(1))
                         .add(new String[] {owner, f.name()});
@@ -126,16 +136,27 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
                 }
             }
         }
-        JustLogger.info("KS7 对象图入口：重根产链 {} 条", rerooted);
+        JustLogger.info("对象图入口：重根产链 {} 条", rerooted);
     }
 
     /** 入口类别是否由反序列化机制直接调用（validateObject 需注册核验）。 */
     private static boolean mechanismInvoked(String entryKind, String entryClass, Set<String> validationRegistered) {
         return switch (entryKind) {
-            case "readObject", "readObjectNoData", "readExternal" -> true;
+            case "readObject", "readObjectNoData", "readExternal", "readResolve" -> true;
             case "validateObject" -> validationRegistered.contains(entryClass);
             default -> false;
         };
+    }
+
+    /** 字段描述符 → 引用类型名：L..; 直接取，[L..; 取元素类型；其余（基本类型/基本数组）null。 */
+    private static String referenceTypeOf(String desc) {
+        if (desc.startsWith("L") && desc.endsWith(";")) {
+            return desc.substring(1, desc.length() - 1);
+        }
+        if (desc.startsWith("[L") && desc.endsWith(";")) {
+            return desc.substring(2, desc.length() - 1);
+        }
+        return null;
     }
 
     /** F 入口链重根到 E：E 的入口跳 + 字段跳 + F 的链（去 F 入口自跳），sink-first 顺序。 */
@@ -155,7 +176,7 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
         hops.add(new ChainHop(entry[0], entry[1], chain.entryClass(), chain.entryMethod(),
                 HopKind.FIELD_FLOW, field, "object-graph", "", null));
         hops.add(new ChainHop(entry[0], entry[1], entry[0], entry[1],
-                HopKind.ENTRY, null, entry[2], "", null));
+                HopKind.ENTRY, null, entry[2], entry[3], null));
         if (hops.size() > MAX_HOPS) {
             return null;
         }
@@ -171,12 +192,10 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
             return null;
         }
         for (var method : ci.methods()) {
-            var rule = io.just.sast.config.RuleEngine.matchingEntry(bb.rules(), bb.hierarchy(),
-                    owner, method.name(), method.descriptor());
+            var rule = bb.ruleEngine().matchingEntry(owner, method.name(), method.descriptor());
             if (rule.isPresent() && rule.get().entryKind() != null
-                    && Set.of("readObject", "readObjectNoData", "readExternal", "validateObject")
-                            .contains(rule.get().entryKind())) {
-                return new String[] {owner, method.name(), rule.get().entryKind()};
+                    && MECHANISM_ENTRIES.contains(rule.get().entryKind())) {
+                return new String[] {owner, method.name(), rule.get().entryKind(), method.descriptor()};
             }
         }
         return null;

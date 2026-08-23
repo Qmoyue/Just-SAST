@@ -46,7 +46,8 @@ public final class ScanCommand implements Callable<Integer> {
             System.err.println("[just:error] " + e.getMessage());
             return ExitCode.USAGE.code();
         } catch (Exception e) {
-            System.err.println("[just:error] 扫描失败: " + e.getMessage());
+            System.err.println("[just:error] 扫描失败: " + e);
+            e.printStackTrace();
             return ExitCode.INTERNAL.code();
         }
     }

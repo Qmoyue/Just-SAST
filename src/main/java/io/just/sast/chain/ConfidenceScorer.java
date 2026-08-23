@@ -4,36 +4,48 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 
+import java.util.List;
+
 /**
- * 证据化置信度评分：逐跳证据 + 入口权重 + 严重度加成，产出可复核的分值与分桶。
- * 分值依据（每条链的 CSV evidence 列可逐项核对）：
- * 逐跳：DIRECT_CALL +1；FIELD_FLOW +1（带字段名）；VIRTUAL_DISPATCH 0；LAMBDA 0
- * 入口：readObject/readResolve/readObjectNoData/readExternal/hashCode/proxyInvoke +2；
- *       equals/compareTo/compare/toString/finalize +1；deserialization（OIS 源）+1
+ * 证据化置信度评分：逐跳证据 + 入口权重 + 严重度加成 + 模式加分，产出可复核的分值与分桶。
+ * 分值依据（findings.csv 的 evidence 列逐项分解，可人工核对）：
+ * 逐跳：DIRECT_CALL +1；FIELD_FLOW +1（带字段名）；VIRTUAL_DISPATCH 0（保守）；LAMBDA 0
+ * 入口：readObject/readResolve/readObjectNoData/readExternal/writeReplace/hashCode/proxyInvoke +2；
+ *       equals/compareTo/compare/toString/finalize +1；deserialization/serialize（框架源）+1
  * 严重度：HIGH +1
+ * 模式：每个命中的 gadget 模式 +2（notes 中 "pattern:" 前缀计数的实现侧约定）
  * 惩罚：unresolved × 2
- * 分桶：score ≥ 5 → HIGH；≥ 3 → MEDIUM；否则 LOW
+ * 分桶（V2 四级判定，GadgetHunter schema）：
+ * FEASIBLE = 证据充分无降级信号；DEGRADED(reason) = 有降级信号但非可证不可能；
+ * NOT_FEASIBLE = 被校准拒绝或证据极弱
  */
 public final class ConfidenceScorer {
 
+    /** 每命中一个 gadget 模式的证据加分（GadgetPattern 经链注释 "pattern:*" 声明）。 */
+    public static final int PATTERN_BONUS = 2;
+
     private ConfidenceScorer() {}
 
-    public static String score(Chain chain) {
-        return switch (rank(chain)) {
-            case 0 -> "HIGH";
-            case 1 -> "MEDIUM";
-            default -> "LOW";
-        };
+    public static String score(Chain chain, List<String> notes) {
+        int r = rank(chain, notes);
+        List<String> degradations = notes == null ? List.of() : notes.stream()
+                .filter(n -> n.startsWith("degrade:")).toList();
+        if (r == 2 || chain.unresolvedHops() * 2 > evidenceScore(chain, notes)) {
+            return "NOT_FEASIBLE";
+        }
+        if (!degradations.isEmpty()) {
+            return "DEGRADED(" + degradations.get(0).substring("degrade:".length()) + ")";
+        }
+        return r == 0 ? "FEASIBLE" : "FEASIBLE";
     }
 
-    /** 证据分值（越大越可信，供排序与分桶）。 */
-    public static int evidenceScore(Chain chain) {
+    /** 证据分值（越大越可信，供排序与分桶）。notes 为链级注释（pattern 加分来源）。 */
+    public static int evidenceScore(Chain chain, List<String> notes) {
         int points = 0;
         for (ChainHop hop : chain.hops()) {
             points += switch (hop.kind()) {
                 case DIRECT_CALL, FIELD_FLOW -> 1;
-                case VIRTUAL_DISPATCH, LAMBDA -> 0;
-                case ENTRY -> 0;
+                case VIRTUAL_DISPATCH, LAMBDA, ENTRY -> 0;
             };
         }
         points += entryWeight(chain.entryKind());
@@ -41,13 +53,63 @@ public final class ConfidenceScorer {
             points += 1;
         }
         points -= chain.unresolvedHops() * 2;
+        if (notes != null) {
+            points += notes.stream().filter(n -> n.startsWith("pattern:")).count() * PATTERN_BONUS;
+        }
         return points;
     }
 
     /** 置信度等级（数字越小越高）。 */
-    public static int rank(Chain chain) {
-        int score = evidenceScore(chain);
+    public static int rank(Chain chain, List<String> notes) {
+        int score = evidenceScore(chain, notes);
         return score >= 5 ? 0 : score >= 3 ? 1 : 2;
+    }
+
+    /** evidence 列的因子分解串：逐项列出各加分来源，可人工核对总分。 */
+    public static String evidenceDecomposition(Chain chain, List<String> notes) {
+        int direct = 0;
+        int virtual = 0;
+        int fieldFlows = 0;
+        StringBuilder fields = new StringBuilder();
+        for (ChainHop hop : chain.hops()) {
+            if (hop.kind() == HopKind.DIRECT_CALL) {
+                direct++;
+            } else if (hop.kind() == HopKind.VIRTUAL_DISPATCH) {
+                virtual++;
+            } else if (hop.kind() == HopKind.FIELD_FLOW) {
+                fieldFlows++;
+                if (hop.field() != null) {
+                    fields.append(hop.field()).append(',');
+                }
+            }
+        }
+        String fieldNames = fields.length() > 0
+                ? fields.substring(0, fields.length() - 1) : "";
+        StringBuilder sb = new StringBuilder();
+        sb.append("hops:direct=").append(direct).append("+").append(direct)
+                .append(",virtual=").append(virtual).append("+0")
+                .append(",field=").append(fieldFlows).append("+").append(fieldFlows);
+        if (!fieldNames.isEmpty()) {
+            sb.append("(").append(fieldNames).append(")");
+        }
+        sb.append(";entry:").append(chain.entryKind() == null ? "?" : chain.entryKind())
+                .append("+").append(entryWeight(chain.entryKind()));
+        if ("HIGH".equals(chain.severity())) {
+            sb.append(";sev:HIGH+1");
+        }
+        if (chain.unresolvedHops() > 0) {
+            sb.append(";unresolved:").append(chain.unresolvedHops())
+                    .append("-").append(chain.unresolvedHops() * 2);
+        }
+        if (notes != null) {
+            for (String note : notes) {
+                if (note.startsWith("pattern:")) {
+                    sb.append(";pattern:").append(note.substring("pattern:".length()))
+                            .append("+").append(PATTERN_BONUS);
+                }
+            }
+        }
+        return sb.toString();
     }
 
     private static int entryWeight(String entryKind) {
@@ -56,10 +118,9 @@ public final class ConfidenceScorer {
         }
         return switch (entryKind) {
             case "readObject", "readResolve", "readObjectNoData", "readExternal",
-                    "hashCode", "proxyInvoke" -> 2;
+                    "writeReplace", "hashCode", "proxyInvoke" -> 2;
             case "equals", "compareTo", "compare", "toString", "finalize" -> 1;
-            case "deserialization" -> 1;
-            default -> 1;
+            default -> 1; // deserialization / serialize（框架桥源）
         };
     }
 }

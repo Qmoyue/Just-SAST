@@ -17,7 +17,8 @@ import java.util.zip.ZipFile;
 /**
  * 目标 JDK 类来源（--jdk-home 指定）：
  * - Java 8 及以下（有 rt.jar）：从 $jdkHome/jre/lib/ 或 $jdkHome/lib/ 读 rt.jar + 辅助 jar
- * - Java 9+（有 jmods/release）：走 JrtClassSource 挂载外部 jrt-fs
+ * - Java 9+（有 lib/jrt-fs.jar）：挂载目标 JDK 的 jrt-fs.jar 对其模块镜像打开文件系统——
+ *   读取的是目标 JDK 的类而非运行时的（JDK 版本决定 gadget 存亡，不可用运行时顶替）
  */
 public final class TargetJdkSource implements JdkClassSource {
 
@@ -25,7 +26,7 @@ public final class TargetJdkSource implements JdkClassSource {
     /** 内部名 → 所在 jar 路径（Java 8 模式） */
     private final Map<String, Path> classToJar = new HashMap<>();
     private final List<Path> coreJars = new ArrayList<>();
-    /** Java 9+ 模式的 jrt 代理 */
+    /** Java 9+ 模式的目标镜像 */
     private final JrtClassSource jrtDelegate;
     private final String jdkDescription;
 
@@ -57,13 +58,11 @@ public final class TargetJdkSource implements JdkClassSource {
                             .collect(java.util.stream.Collectors.joining(", ")));
             return;
         }
-        // Java 9+：检查 release 文件确认模块化 JDK
-        Path release = home.resolve("release");
-        if (Files.exists(release)) {
-            jdkDescription = readReleaseVersion(home) + "（jrt-fs 模式）";
-            // Java 9+ 的 jrt-fs 挂载：暂不实现（用运行时 jrt 作为回退），只读 release 版本信息
-            jrtDelegate = new JrtClassSource();
-            JustLogger.info("目标 JDK 来源：{}（暂用运行时 jrt-fs，模块化 JDK 精确匹配待实现）", jdkDescription);
+        // Java 9+：挂载目标 JDK 的 jrt-fs（真实现，非运行时回退）
+        if (Files.exists(home.resolve("release"))) {
+            jrtDelegate = JrtClassSource.external(home);
+            jdkDescription = readReleaseVersion(home) + "（jrt-fs 外部挂载）";
+            JustLogger.info("目标 JDK 来源：{}（读取目标镜像，非运行时）", jdkDescription);
             return;
         }
         throw new IOException("--jdk-home 无法识别 JDK 结构（既无 rt.jar 也无 release 文件）: " + home);
@@ -97,10 +96,10 @@ public final class TargetJdkSource implements JdkClassSource {
 
     /** 枚举全部核心 jar 的类（替代 jrt 的 listAll，全量分析用）。 */
     public List<ClassBytes> listAll() throws IOException {
-        List<ClassBytes> result = new ArrayList<>();
         if (jrtDelegate != null) {
             return jrtDelegate.listAll(JrtClassSource.DESER_MODULES);
         }
+        List<ClassBytes> result = new ArrayList<>();
         for (Path jar : coreJars) {
             try (ZipFile zip = new ZipFile(jar.toFile())) {
                 var entries = zip.entries();

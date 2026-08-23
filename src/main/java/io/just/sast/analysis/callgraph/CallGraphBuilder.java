@@ -18,9 +18,10 @@ import java.util.Set;
 
 /**
  * CHA 调用图构建：静态/特殊调用定目标（SPECIAL 边用 resolveMethod 后的真实声明类）；
+ * 分发目标做可见性剪枝（private/static/跨包 package-private 不可覆写，FLASH USENIX'25）；
  * 虚调用/接口调用按**传递子类型闭包**分发（深继承链中的覆写方法同样获得边）；
  * invokedynamic 解析 LambdaMetafactory → lambda 实现方法。
- * 反射与动态代理边不在此处盲加（噪音大），由 KS2 按需解析。
+ * 反射与动态代理边不在此处盲加（噪音大），由前向引擎精扫按需解析。
  */
 public final class CallGraphBuilder {
 
@@ -78,7 +79,10 @@ public final class CallGraphBuilder {
         } else {
             for (String sub : subtypes) {
                 String resolved = hierarchy.resolveMethod(sub, name, desc);
-                if (resolved != null) {
+                // 可见性剪枝（FLASH, USENIX'25）：private/static/跨包 package-private 不可覆写，非真实分发目标
+                // 包比较基准 = 被覆写方法的声明类（declared），非调用点静态类型
+                String overrideRef = declared != null ? declared : owner;
+                if (resolved != null && hierarchy.isOverridableDispatchTarget(overrideRef, sub, name, desc)) {
                     targets.add(resolved);
                 }
             }
@@ -105,7 +109,10 @@ public final class CallGraphBuilder {
         if (impls != null) {
             for (String impl : impls) {
                 String resolved = hierarchy.resolveMethod(impl, name, desc);
-                if (resolved != null) {
+                // 可见性剪枝（FLASH, USENIX'25）：private/static/跨包 package-private 不可覆写，非真实分发目标
+                // 包比较基准 = 被覆写方法的声明类（declared），非调用点静态类型
+                String overrideRef = declared != null ? declared : owner;
+                if (resolved != null && hierarchy.isOverridableDispatchTarget(overrideRef, impl, name, desc)) {
                     targets.add(resolved);
                 }
             }
@@ -132,7 +139,9 @@ public final class CallGraphBuilder {
             Object impl = indy.bootstrapArgs().get(1);
             if (impl instanceof HandleRef h) {
                 String target = hierarchy.resolveMethod(h.owner(), h.name(), h.descriptor());
-                graph.addEdge(call, graph.methodNode(h.owner(), h.name(), h.descriptor(), target == null),
+                // 与 SPECIAL 边同语义：用解析后的真实声明类建节点（方法引用指向继承方法时避免幽灵节点）
+                String edgeOwner = target != null ? target : h.owner();
+                graph.addEdge(call, graph.methodNode(edgeOwner, h.name(), h.descriptor(), target == null),
                         EdgeType.LAMBDA, "LAMBDA");
                 return 1;
             }

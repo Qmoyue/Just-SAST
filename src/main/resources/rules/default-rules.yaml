@@ -298,18 +298,31 @@ rules:
     bridge: deserialize
     match:
       call: { owner: "com/esotericsoftware/kryo/Kryo", name: ~"readClassAndObject|readObject|readObjectOrNull" }
+    safe-config: { owner: "com/esotericsoftware/kryo/Kryo", methods: [setRegistrationRequired] }
+
+  - id: JUST-SOURCE-KRYO5
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "com/esotericsoftware/kryo/kryo5/Kryo", name: ~"readClassAndObject|readObject|readObjectOrNull" }
+    safe-config: { owner: "com/esotericsoftware/kryo/kryo5/Kryo", methods: [setRegistrationRequired] }
+  # 来源：CodeQL Kryo.qll（kryo5 包同建模）；safe-config 同 Kryo.setRegistrationRequired 流
 
   - id: JUST-SOURCE-SNAKEYAML
     kind: source
     bridge: deserialize
     match:
-      call: { owner: "org/yaml/snakeyaml/Yaml", name: ~"load|loadAs|loadOfType" }
+      call: { owner: "org/yaml/snakeyaml/Yaml", name: ~"load|loadAs|loadAll|compose|composeAll|parse" }
+    safe-config: { owner: "org/yaml/snakeyaml/constructor/SafeConstructor", methods: ["<init>"] }
+  # 方法集来源：CodeQL SnakeYaml.qll（compose/composeAll/loadAll 补齐）；SafeConstructor 排除
 
   - id: JUST-SOURCE-XSTREAM
     kind: source
     bridge: deserialize
     match:
-      call: { owner: "com/thoughtworks/xstream/XStream", name: "fromXML" }
+      call: { owner: "com/thoughtworks/xstream/XStream", name: ~"fromXML|unmarshal" }
+    safe-config: { owner: "com/thoughtworks/xstream/XStream", methods: [addPermission, denyPermission, clearPermissions] }
+  # unmarshal 来源：CodeQL XStream.qll；safe-config 为 addPermission(NoTypePermission.NONE) 硬化的名字级近似
 
   - id: JUST-SOURCE-HESSIAN
     kind: source
@@ -322,6 +335,7 @@ rules:
     bridge: deserialize
     match:
       call: { owner: "com/alibaba/fastjson/JSON", name: ~"parseObject|parse|parseArray" }
+    safe-config: { owner: "com/alibaba/fastjson/parser/ParserConfig", methods: [setSafeMode] }
 
   - id: JUST-SOURCE-FASTJSON2
     kind: source
@@ -401,6 +415,15 @@ rules:
     bridge: deserialize
     match:
       call: { owner: "com/fasterxml/jackson/databind/ObjectMapper", name: ~"readValue|readTree|readValueAsTree" }
+    safe-config: { owner: "com/fasterxml/jackson/databind/ObjectMapper", methods: [deactivateDefaultTyping, setPolymorphicTypeValidator] }
+  # safe-config 来源：CodeQL SafeObjectMapperConfig（activateDefaultTyping 为 CodeQL 未建模的留白，此处不抑制）
+
+  # A3: Jackson @JsonTypeInfo 注解检测——注解类存在即多态反序列化开放
+  - id: JUST-SOURCE-JACKSON-JSONTYPEINFO
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "com/fasterxml/jackson/databind/ObjectMapper", name: "readValue" }
 
   - id: JUST-SOURCE-JACKSON-READER
     kind: source
@@ -408,19 +431,12 @@ rules:
     match:
       call: { owner: "com/fasterxml/jackson/databind/ObjectReader", name: ~"readValue|readTree" }
 
-  - id: JUST-SOURCE-JSONIO
-    kind: source
-    bridge: deserialize
-    match:
-      call: { owner: "com/json/io/JsonIoReader", name: "read" }
-  # 来源：CodeQL JsonIo 模块
-
   - id: JUST-SOURCE-YAMLBEANS
     kind: source
     bridge: deserialize
     match:
-      call: { owner: "org/yamlbeans/YamlReader", name: "read" }
-  # 来源：CodeQL YamlBeans 模块
+      call: { owner: "com/esotericsoftware/yamlbeans/YamlReader", name: "read" }
+  # 来源：CodeQL YamlBeans model.yml + marshalsec 源码（owner 修正：com.esotericsoftware）
 
   - id: JUST-SOURCE-JMS-OBJMSG
     kind: source
@@ -508,12 +524,161 @@ rules:
     actions: { return: [this] }
   # 污染集合的 toString 结果可控（触发 hashCode/toString gadget 的关键桥接）
 
+  # ---- 以下 sink 从 GadgetHunter 165 CVE 提炼清单补充（比前版多 9 sources / 15 sinks）----
+  - id: JUST-SINK-SCRIPT-ENGINE-FACTORY
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "javax/script/ScriptEngineFactory", name: "getScriptEngine" }
+    tainted: [{receiver: true}]
+
+  - id: JUST-SINK-URLCLASSLOADER
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "java/net/URLClassLoader", name: "<init>" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-LOADLIBRARY
+    kind: sink
+    category: CODE_EXEC
+    severity: MEDIUM
+    match:
+      call: { owner: "java/lang/System", name: "load" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-MBEAN-REGISTER
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "javax/management/MBeanServer", name: "registerMBean" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-NAMING-BIND
+    kind: sink
+    category: JNDI
+    severity: HIGH
+    match:
+      call: { owner: "javax/naming/Naming", name: "bind" }
+    tainted: [{arg: 1}]
+
+  - id: JUST-SINK-EXECUTOR-EXECUTE
+    kind: sink
+    category: CODE_EXEC
+    severity: MEDIUM
+    match:
+      call: { owner: "java/util/concurrent/Executor", name: "execute" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-PROXY-NEWINSTANCE
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "java/lang/reflect/Proxy", name: "newProxyInstance" }
+    tainted: [{arg: 2}]
+
+  - id: JUST-SINK-CLASS-WRITE
+    kind: sink
+    category: FILE_WRITE
+    severity: MEDIUM
+    match:
+      call: { owner: "java/io/FileWriter", name: "<init>" }
+    tainted: [{arg: 0}]
+
+  # ---- marshalsec 剩余框架（BlazeDS AMF0/3、Burlap、Castor、JsonIO、JYAML）----
+  - id: JUST-SOURCE-BLAZEDS-AMF0
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "flex/messaging/io/amf/Amf0Input", name: "readObject" }
+
+  - id: JUST-SOURCE-BLAZEDS-AMF3
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "flex/messaging/io/amf/Amf3Input", name: "readObject" }
+
+  - id: JUST-SOURCE-BURLAP
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "com/caucho/burlap/client/BurlapInput", name: ~"readObject|readCall" }
+
+  - id: JUST-SOURCE-CASTOR
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "org/exolab/castor/xml/Unmarshaller", name: "unmarshal" }
+
+  - id: JUST-SOURCE-JSONIO
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "com/cedarsoftware/util/io/JsonReader", name: ~"jsonToJava|readObject" }
+
+  - id: JUST-SOURCE-JYAML
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "org/jyaml/JYAML", name: ~"load|loadAs" }
+
+  # ---- ysoserial 片段库扩充（hibernate/jrmp/spring/vaadin）----
+  - id: FRAG-HIBERNATE1
+    kind: chain-fragment
+    entryClass: "org/hibernate/property/BasicPropertyAccessor$BasicGetter"
+    entryKind: readObject
+    hops:
+      - { class: "org/hibernate/cfg/beanvalidation/BeanValidationEventListener", method: "getListener" }
+    sinkOwner: "java/lang/reflect/Method"
+    sinkName: "invoke"
+
+  - id: FRAG-JRMP
+    kind: chain-fragment
+    entryClass: "java/rmi/server/UnicastRemoteObject"
+    entryKind: readObject
+    hops:
+      - { class: "sun/rmi/server/UnicastRef", method: "invoke" }
+    sinkOwner: "java/lang/reflect/Method"
+    sinkName: "invoke"
+
+  - id: FRAG-ROME
+    kind: chain-fragment
+    entryClass: "com/sun/syndication/feed/impl/EqualsBean"
+    entryKind: equals
+    hops:
+      - { class: "com/sun/syndication/feed/impl/ToStringBean", method: "toString" }
+    sinkOwner: "java/lang/reflect/Method"
+    sinkName: "invoke"
+
+  - id: FRAG-SPRING1
+    kind: chain-fragment
+    entryClass: "org/springframework/core/SerializableTypeWrapper$MethodInvokeTypeProvider"
+    entryKind: readObject
+    hops:
+      - { class: "org/springframework/aop/framework/AdvisedSupport", method: "getTarget" }
+    sinkOwner: "java/lang/reflect/Method"
+    sinkName: "invoke"
+
+  - id: FRAG-VAADIN
+    kind: chain-fragment
+    entryClass: "com/vaadin/spring/internal/UIScopeImpl$UIStoreWrapper"
+    entryKind: readObject
+    hops:
+      - { class: "com/vaadin/spring/internal/UIScopeImpl", method: "getUi" }
+    sinkOwner: "java/lang/reflect/Method"
+    sinkName: "invoke"
+
   # ---- magic-entry 终点 ----
+  # OIS 机制只回调 private readObject/readObjectNoData/writeObject（ObjectStreamClass 语义）
   - id: JUST-ENTRY-READOBJECT
     kind: magic-entry
     entryKind: readObject
     match:
-      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V" }
+      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
       class: { implements: "java/io/Serializable" }
 
   - id: JUST-ENTRY-READRESOLVE
@@ -523,11 +688,26 @@ rules:
       method: { name: "readResolve", descriptor: "()Ljava/lang/Object;" }
       class: { implements: "java/io/Serializable" }
 
+  # 序列化侧机制入口（writeReplace/writeObject 由 ObjectOutputStream 机制回调）
+  - id: JUST-ENTRY-WRITEREPLACE
+    kind: magic-entry
+    entryKind: writeReplace
+    match:
+      method: { name: "writeReplace", descriptor: "()Ljava/lang/Object;" }
+      class: { implements: "java/io/Serializable" }
+
+  - id: JUST-ENTRY-WRITEOBJECT
+    kind: magic-entry
+    entryKind: writeObject
+    match:
+      method: { name: "writeObject", descriptor: "(Ljava/io/ObjectOutputStream;)V", access: private }
+      class: { implements: "java/io/Serializable" }
+
   - id: JUST-ENTRY-READOBJECTNODATA
     kind: magic-entry
     entryKind: readObjectNoData
     match:
-      method: { name: "readObjectNoData", descriptor: "()V" }
+      method: { name: "readObjectNoData", descriptor: "()V", access: private }
       class: { implements: "java/io/Serializable" }
 
   - id: JUST-ENTRY-HASHCODE
@@ -592,3 +772,14 @@ rules:
     match:
       method: { name: "validateObject", descriptor: "()V" }
       class: { implements: "java/io/ObjectInputValidation" }
+
+  # ---- chain-fragment 片段库（公开 gadget 知识，锚点类全在图中才生效）----
+  - id: FRAG-CC1
+    kind: chain-fragment
+    entryClass: "sun/reflect/annotation/AnnotationInvocationHandler"
+    entryKind: proxyInvoke
+    hops:
+      - { class: "org/apache/commons/collections/map/LazyMap", method: "get", field: "factory" }
+      - { class: "org/apache/commons/collections/functors/ChainedTransformer", method: "transform" }
+    sinkOwner: "org/apache/commons/collections/Transformer"
+    sinkName: "transform"
