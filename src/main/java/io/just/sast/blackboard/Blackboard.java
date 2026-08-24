@@ -26,9 +26,10 @@ import java.util.Set;
 public final class Blackboard {
 
     /** 扫描输入（管线编排期注入；知识源经黑板读取，无全局属性通道）。 */
-    public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify) {
+    public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
+                             int verifyBudget) {
         public static ScanInputs fastDefault(Path target) {
-            return new ScanInputs(target, List.of(), true, true);
+            return new ScanInputs(target, List.of(), true, true, 20);
         }
     }
 

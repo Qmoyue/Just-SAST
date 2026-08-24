@@ -49,7 +49,8 @@ public final class ScanPipeline {
     public record ScanResult(int exitCode, List<Chain> chains, ScanStatistics stats) {}
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-                                 boolean stats, boolean fast, Path jdkHome, boolean verify) throws Exception {
+                                 boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget) throws Exception {
         long start = System.currentTimeMillis();
 
         // 规则
@@ -109,7 +110,8 @@ public final class ScanPipeline {
         // 分析期（黑板串行三阶段：ANALYSIS → COMPOSITION → CALIBRATION）
         List<Path> scanDeps = deps != null ? deps : List.of();
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), ruleSet, MAX_DEPTH,
-                new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify));
+                new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
+                        verifyBudget));
         new Controller(blackboard, KnowledgeSources.discover()).run();
 
         // 报告期

@@ -1,4 +1,8 @@
 package io.just.sast.verify;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
 import java.lang.reflect.Constructor;
 
 import java.lang.reflect.Field;
@@ -62,11 +66,10 @@ public final class ChainVerifyProbe {
         }
 
         try {
-            // 1. 创建所有类的实例（自底向上）
+            // 1. 创建所有类的实例（自底向上）；无无参构造时回退到参数最少的构造器并按类型填默认值
             Map<String, Object> instances = new HashMap<>();
-            // 先创建入口类
             Class<?> entryCls = Class.forName(entryClass);
-            Object entryInstance = entryCls.getDeclaredConstructor().newInstance();
+            Object entryInstance = newInstance(entryCls);
             instances.put(entryClass, entryInstance);
 
             // 创建链跳中涉及的类
@@ -74,21 +77,8 @@ public final class ChainVerifyProbe {
                 String toClass = link[2].replace('/', '.');
                 if (!instances.containsKey(toClass)) {
                     try {
-                        Class<?> cls = Class.forName(toClass);
-                        Object inst = cls.getDeclaredConstructor().newInstance();
-                        instances.put(toClass, inst);
-                    } catch (Exception e) {
-                        // 某些类可能没有默认构造器——尝试找任何 public 构造器
-                        try {
-                            Class<?> cls = Class.forName(toClass);
-                            for (Constructor<?> ctor : cls.getConstructors()) {
-                                if (ctor.getParameterCount() == 0) {
-                                    instances.put(toClass, ctor.newInstance());
-                                    break;
-                                }
-                            }
-                        } catch (Exception ignored) {
-                        }
+                        instances.put(toClass, newInstance(Class.forName(toClass)));
+                    } catch (Exception ignored) {
                     }
                 }
             }
@@ -105,11 +95,33 @@ public final class ChainVerifyProbe {
                         Field field = findField(fromInstance.getClass(), fieldName);
                         if (field != null) {
                             field.setAccessible(true);
-                            // 如果字段类型不匹配，尝试适配
                             if (field.getType().isInstance(toInstance)) {
                                 field.set(fromInstance, toInstance);
                             } else if (field.getType() == Object.class) {
                                 field.set(fromInstance, toInstance);
+                            } else if (Map.class.isAssignableFrom(field.getType())
+                                    || Set.class.isAssignableFrom(field.getType())
+                                    || List.class.isAssignableFrom(field.getType())) {
+                                // 集合布局构造：容器字段按声明类型实例化，链接目标放入
+                                // key/元素位——后段入口对象经容器槽位进入对象图，
+                                // 容器反序列化时触发其 hashCode/equals/compareTo
+                                Object container = newCollection(field.getType());
+                                if (container != null) {
+                                    if (container instanceof Map<?, ?> map) {
+                                        @SuppressWarnings("unchecked")
+                                        Map<Object, Object> m2 = (Map<Object, Object>) map;
+                                        m2.put(toInstance, "echo CHAIN_OK");
+                                    } else if (container instanceof Set<?> set) {
+                                        @SuppressWarnings("unchecked")
+                                        Set<Object> s2 = (Set<Object>) set;
+                                        s2.add(toInstance);
+                                    } else {
+                                        @SuppressWarnings("unchecked")
+                                        List<Object> l2 = (List<Object>) container;
+                                        l2.add(toInstance);
+                                    }
+                                    field.set(fromInstance, container);
+                                }
                             }
                         }
                     } catch (Exception ignored) {
@@ -126,13 +138,38 @@ public final class ChainVerifyProbe {
                         try {
                             if (f.get(inst) == null) {
                                 if (f.getType() == String.class) {
-                                    f.set(inst, "echo CHAIN_OK");
+                                    // "toString"：在 Object 上恒可解析——方法名语义字段（如
+                                    // methodName）经 getMethod 解析成功后链才能到达 Method.invoke；
+                                    // 非 方法名语义的字符串作为普通参数传入 sink，sink 内抛错仍留栈帧
+                                    f.set(inst, "toString");
                                 } else if (f.getType() == Object.class) {
-                                    f.set(inst, "echo CHAIN_OK");
+                                    f.set(inst, "toString");
+                                } else if (f.getType().isArray()) {
+                                    // 空数组：null 数组传给可变参/参数表方法会 NPE 短路链
+                                    f.set(inst, java.lang.reflect.Array.newInstance(
+                                            f.getType().getComponentType(), 0));
                                 } else if (f.getType() == int.class || f.getType() == Integer.class) {
                                     f.set(inst, 0);
                                 } else if (f.getType() == boolean.class || f.getType() == Boolean.class) {
                                     f.set(inst, false);
+                                } else if (isTriggerMode(mode)
+                                        && (Map.class.isAssignableFrom(f.getType())
+                                            || Set.class.isAssignableFrom(f.getType()))) {
+                                    // 触发忠实模式：空的 Map/Set 字段放入入口对象——
+                                    // 反序列化该容器时即按真实路径触发入口（TRIGGER 桥语义）
+                                    Object container = newCollection(f.getType());
+                                    if (container instanceof Map<?, ?> map) {
+                                        @SuppressWarnings("unchecked")
+                                        Map<Object, Object> m2 = (Map<Object, Object>) map;
+                                        m2.put(entryInstance, "echo CHAIN_OK");
+                                    } else if (container instanceof Set<?> set) {
+                                        @SuppressWarnings("unchecked")
+                                        Set<Object> s2 = (Set<Object>) set;
+                                        s2.add(entryInstance);
+                                    }
+                                    if (container != null) {
+                                        f.set(inst, container);
+                                    }
                                 }
                             }
                         } catch (Exception ignored) {
@@ -141,8 +178,28 @@ public final class ChainVerifyProbe {
                 }
             }
 
-            // 4. 触发入口方法
+            // 4. 触发入口（触发忠实：按真实反序列化的触发路径，非直接调用）
             switch (mode) {
+                case "TRIGGER_HASH" -> {
+                    // hashCode 入口的真实触发：对象作为 HashMap 的 key 被放入
+                    new java.util.HashMap<Object, Object>().put(entryInstance, "echo CHAIN_OK");
+                    System.out.println("EXECUTED");
+                    System.exit(0);
+                }
+                case "TRIGGER_TREESET" -> {
+                    // compareTo/compare 入口的真实触发：对象进入自然有序容器
+                    new java.util.TreeSet<Object>().add(entryInstance);
+                    System.out.println("EXECUTED");
+                    System.exit(0);
+                }
+                case "TRIGGER_CONTAINS" -> {
+                    // equals 入口的真实触发：非空集合的 contains 逐元素调用 equals
+                    java.util.List<Object> l = new java.util.ArrayList<>();
+                    l.add(new Object());
+                    l.contains(entryInstance);
+                    System.out.println("EXECUTED");
+                    System.exit(0);
+                }
                 case "PROXY" -> {
                     if (!java.lang.reflect.InvocationHandler.class.isAssignableFrom(entryCls)) {
                         System.out.println("PARTIAL_PATH: entry-not-handler");
@@ -214,6 +271,100 @@ public final class ChainVerifyProbe {
             }
         }
         return false;
+    }
+
+
+
+    /** 实例化：优先无参构造；否则取参数最少的构造器，参数按类型填默认值。 */
+    static Object newInstance(Class<?> cls) throws Exception {
+        Constructor<?>[] ctors = cls.getDeclaredConstructors();
+        Constructor<?> best = null;
+        for (Constructor<?> c : ctors) {
+            if (c.getParameterCount() == 0) {
+                best = c;
+                break;
+            }
+            if (best == null || c.getParameterCount() < best.getParameterCount()) {
+                best = c;
+            }
+        }
+        if (best == null) {
+            throw new IllegalStateException("no constructor: " + cls.getName());
+        }
+        best.setAccessible(true);
+        Class<?>[] ptypes = best.getParameterTypes();
+        Object[] pvalues = new Object[ptypes.length];
+        for (int i = 0; i < ptypes.length; i++) {
+            pvalues[i] = defaultValue(ptypes[i]);
+        }
+        return best.newInstance(pvalues);
+    }
+
+    /** 按类型的构造参数默认值（字符串用 "toString"——方法名语义恒可解析；数组给空）。 */
+    private static Object defaultValue(Class<?> type) {
+        if (type == String.class || type == Object.class) {
+            return "toString";
+        }
+        if (type == int.class || type == long.class || type == short.class || type == byte.class) {
+            return 0;
+        }
+        if (type == boolean.class) {
+            return false;
+        }
+        if (type == char.class) {
+            return 'a';
+        }
+        if (type == float.class || type == double.class) {
+            return 0.0d;
+        }
+        if (type.isArray()) {
+            return java.lang.reflect.Array.newInstance(type.getComponentType(), 0);
+        }
+        return null;
+    }
+
+    /** 触发忠实模式判定。 */
+    static boolean isTriggerMode(String mode) {
+        return "TRIGGER_HASH".equals(mode) || "TRIGGER_TREESET".equals(mode)
+                || "TRIGGER_CONTAINS".equals(mode);
+    }
+
+    /** 按声明类型实例化集合：具体类型反射实例化；接口/抽象类型——有序系（SortedX/NavigableX）
+     *  取 Tree 实现（保持 compareTo 触发语义），其余取 Hash/Array 默认实现。 */
+    static Object newCollection(Class<?> type) {
+        boolean isCollection = Map.class.isAssignableFrom(type) || Set.class.isAssignableFrom(type)
+                || List.class.isAssignableFrom(type);
+        if (!isCollection) {
+            return null;
+        }
+        boolean ifaceOrAbstract = type.isInterface() || java.lang.reflect.Modifier.isAbstract(type.getModifiers());
+        if (!ifaceOrAbstract) {
+            return newInstanceQuietly(type);
+        }
+        if (java.util.SortedMap.class.isAssignableFrom(type)) {
+            return new java.util.TreeMap<>();
+        }
+        if (Map.class.isAssignableFrom(type)) {
+            return new java.util.HashMap<>();
+        }
+        if (java.util.SortedSet.class.isAssignableFrom(type)) {
+            return new java.util.TreeSet<>();
+        }
+        if (Set.class.isAssignableFrom(type)) {
+            return new java.util.HashSet<>();
+        }
+        if (List.class.isAssignableFrom(type)) {
+            return new java.util.ArrayList<>();
+        }
+        return null;
+    }
+
+    private static Object newInstanceQuietly(Class<?> type) {
+        try {
+            return type.getDeclaredConstructor().newInstance();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static Field findField(Class<?> cls, String name) {

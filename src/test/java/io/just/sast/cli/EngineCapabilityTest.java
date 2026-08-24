@@ -98,7 +98,7 @@ class EngineCapabilityTest {
                 """;
         Path jar = compileToJar(tmp.resolve("arr.jar"), Map.of("app.Carrier", carrier, "app.ArrayGadget", gadget));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false);
+        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
         String findings = Files.readString(out.resolve("findings.csv"));
         assertTrue(findings.contains("app/ArrayGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
                 "数组元素流（fill 内 AASTORE → Carrier.cells 字段污点 → readObject 内 AALOAD）应闭合链:\n"
@@ -133,7 +133,7 @@ class EngineCapabilityTest {
                 """;
         Path jar = compileToJar(tmp.resolve("lambda.jar"), Map.of("app.Fn", fn, "app.LambdaGadget", gadget));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false);
+        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
         String findings = Files.readString(out.resolve("findings.csv"));
         assertTrue(findings.contains("app/LambdaGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
                 "lambda 实参经 f.go(cmd) 分发时污点应到达 lambda$0 实现方法:\n" + findings);
@@ -167,7 +167,7 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("gate.jar"),
                 Map.of("app.Reflective", reflective, "app.Isolated", isolated));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false);
+        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
         String sinks = Files.readString(out.resolve("sinks.csv"));
         assertTrue(sinks.lines().anyMatch(l -> l.contains("app/Isolated") && l.contains("fetch")
                         && l.contains("NO_PATH")),

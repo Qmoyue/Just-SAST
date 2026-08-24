@@ -7,6 +7,7 @@ import io.just.sast.blackboard.HopKind;
 import java.io.File;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
@@ -31,6 +32,8 @@ public final class ParallelVerifier {
     private final List<Path> deps;
     private final Path ownJar;
     private final ConfirmCallback callback;
+    /** fat jar/WAR 嵌套展开缓存：jar → 文件系统 classpath 条目（BOOT-INF/WEB-INF 解包）。 */
+    private static final Map<Path, List<Path>> NESTED_CP = new java.util.concurrent.ConcurrentHashMap<>();
 
     public ParallelVerifier(Path targetJar, List<Path> deps, ConfirmCallback callback) {
         this.targetJar = targetJar.toAbsolutePath().normalize();
@@ -77,12 +80,28 @@ public final class ParallelVerifier {
             for (Chain chain : chains) {
                 futures.add(pool.submit(() -> verifyOne(chain)));
             }
+            List<VerifyResult> first = new ArrayList<>();
             for (Future<VerifyResult> f : futures) {
                 try {
-                    results.add(f.get(TIMEOUT_SECONDS + 3, TimeUnit.SECONDS));
+                    first.add(f.get(TIMEOUT_SECONDS + 3, TimeUnit.SECONDS));
                 } catch (Exception e) {
-                    results.add(new VerifyResult("", "UNTESTABLE", e.getMessage()));
+                    first.add(new VerifyResult("", "UNTESTABLE", e.getMessage()));
                 }
+            }
+            // TIMEOUT/UNTESTABLE 重试一次（瞬时负载/进程启动抖动不产生终局误判）
+            for (int i = 0; i < first.size(); i++) {
+                VerifyResult r = first.get(i);
+                if ("TIMEOUT".equals(r.status()) || "UNTESTABLE".equals(r.status())) {
+                    Chain chain = chains.get(i);
+                    try {
+                        results.add(pool.submit(() -> verifyOne(chain))
+                                .get(TIMEOUT_SECONDS + 3, TimeUnit.SECONDS));
+                        continue;
+                    } catch (Exception e) {
+                        // 重试也失败：保留原结果
+                    }
+                }
+                results.add(r);
             }
         } finally {
             pool.shutdown();
@@ -90,15 +109,24 @@ public final class ParallelVerifier {
         return results;
     }
 
+    /** 入口类型 → 探针模式（触发忠实：hashCode 经 HashMap.put、compareTo 经 TreeSet.add、
+     * equals 经 List.contains、readObject 族经序列化往返、代理经 newProxyInstance）。 */
+    static String modeOf(String entryKind) {
+        return switch (entryKind) {
+            case "proxyInvoke" -> "PROXY";
+            case "readObject", "readObjectNoData", "readExternal", "readResolve" -> "SERIAL";
+            case "hashCode" -> "TRIGGER_HASH";
+            case "compareTo", "compare" -> "TRIGGER_TREESET";
+            case "equals" -> "TRIGGER_CONTAINS";
+            default -> "DIRECT";
+        };
+    }
+
     private VerifyResult verifyOne(Chain chain) {
         try {
             String entryDotted = chain.entryClass().replace('/', '.');
             String entryMethod = chain.entryMethod();
-            String mode = switch (chain.entryKind()) {
-                case "proxyInvoke" -> "PROXY";
-                case "readObject", "readObjectNoData", "readExternal", "readResolve" -> "SERIAL";
-                default -> "DIRECT";
-            };
+            String mode = modeOf(chain.entryKind());
 
             // 提取 FIELD_FLOW 跳（构造对象图用）
             StringBuilder hopDesc = new StringBuilder();
@@ -113,12 +141,23 @@ public final class ParallelVerifier {
             String sinkTarget = chain.sinkClass().replace('/', '.') + "." + chain.sinkMethod();
             String java = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
             String cp = classpathOf(ownJar, targetJar, deps);
+            cp = cp + File.pathSeparator + String.join(File.pathSeparator,
+                    expandedEntries(targetJar).stream().map(Path::toString).toList());
 
-            ProcessBuilder pb = new ProcessBuilder(java, "-cp", cp,
+            // 沙箱参数：隔离工作目录与 tmpdir（防 cwd 文件读写）、内存上限、headless；
+            // fork-per-chain 保持类隔离——静态状态不跨链污染
+            Path isoDir = Files.createTempDirectory("just-verify-");
+            Path isoTmp = Files.createDirectories(isoDir.resolve("tmp"));
+            ProcessBuilder pb = new ProcessBuilder(java,
+                    "-Xmx256m",
+                    "-Djava.io.tmpdir=" + isoTmp,
+                    "-Djava.awt.headless=true",
+                    "-cp", cp,
                     "io.just.sast.verify.ChainVerifyProbe",
                     entryDotted + "|" + entryMethod + "|" + mode,
                     hopDesc.toString(),
                     sinkTarget);
+            pb.directory(isoDir.toFile());
             pb.redirectErrorStream(true);
             Process proc = pb.start();
             // 先 waitFor 再读输出：子 JVM 挂起且未关 stdout 时，readAllBytes 会永久阻塞，
@@ -154,6 +193,65 @@ public final class ParallelVerifier {
             return new VerifyResult(chain.key(), "UNTESTABLE",
                     e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
         }
+    }
+
+
+    /**
+     * fat jar/WAR 的文件系统 classpath 条目（惰性展开一次）：`java -cp fat.jar` 不解析
+     * BOOT-INF/WEB-INF 结构——应用类与嵌套依赖 jar 对探针全部 CNFE。展开到共享临时目录，
+     * 条目 = 解包的 classes 目录 + 解包的各嵌套 jar。普通 jar 返回空（自身即可挂载）。
+     */
+    static List<Path> expandedEntries(Path jar) {
+        return NESTED_CP.computeIfAbsent(jar, j -> {
+            List<Path> entries = new ArrayList<>();
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(j.toFile())) {
+                boolean hasClasses = false;
+                boolean hasLib = false;
+                for (java.util.Enumeration<? extends java.util.zip.ZipEntry> e = zf.entries();
+                        e.hasMoreElements(); ) {
+                    String name = e.nextElement().getName();
+                    if (name.startsWith("BOOT-INF/classes/") || name.startsWith("WEB-INF/classes/")) {
+                        hasClasses = true;
+                    } else if ((name.startsWith("BOOT-INF/lib/") || name.startsWith("WEB-INF/lib/"))
+                            && name.endsWith(".jar")) {
+                        hasLib = true;
+                    }
+                }
+                if (!hasClasses && !hasLib) {
+                    return List.of();
+                }
+                Path root = Files.createTempDirectory("just-fatjar-");
+                Path classes = root.resolve("classes");
+                Path lib = root.resolve("lib");
+                Files.createDirectories(classes);
+                Files.createDirectories(lib);
+                try (java.util.zip.ZipInputStream zin = new java.util.zip.ZipInputStream(
+                        Files.newInputStream(j))) {
+                    java.util.zip.ZipEntry ze;
+                    while ((ze = zin.getNextEntry()) != null) {
+                        String name = ze.getName();
+                        boolean isClassEntry = (name.startsWith("BOOT-INF/classes/")
+                                || name.startsWith("WEB-INF/classes/")) && !name.endsWith("/");
+                        boolean isLibJar = (name.startsWith("BOOT-INF/lib/")
+                                || name.startsWith("WEB-INF/lib/")) && name.endsWith(".jar");
+                        if (!isClassEntry && !isLibJar) {
+                            continue;
+                        }
+                        String relative = name.substring(name.indexOf('/', 0) + 1); // 去 BOOT-INF/ 前缀
+                        Path out = (isClassEntry ? classes : lib).resolve(relative);
+                        Files.createDirectories(out.getParent());
+                        Files.copy(zin, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+                entries.add(classes);
+                try (var stream = Files.list(lib)) {
+                    stream.filter(f -> f.toString().endsWith(".jar")).forEach(entries::add);
+                }
+            } catch (Exception e) {
+                return List.of();
+            }
+            return List.copyOf(entries);
+        });
     }
 
     private static Path locateOwnJar() {

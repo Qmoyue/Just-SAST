@@ -25,7 +25,7 @@
 | FR13 | 链校验：PASM + 类型流（非 final 参与）+ 序列化 + 约束图矛盾 + catch 可达性守卫 |
 | FR14 | 链剪枝：触发上下文 + 深链结构门 + 软预算机制去重 |
 | FR15 | 模式识别：集合包含判定 + patterns 列 + 证据加分 |
-| FR16 | 动态验证：反射构造可行性 + 子进程链级验证（对象图构造、入口类去重 ≤2）。判定：栈帧级精确匹配（sink 类名+方法名全等）；EXECUTED 仅在入口方法真实调用后给出；探针 FAILED 为弱否定证据（链降级，不一票否决）。子进程 classpath 含目标 jar + 全部 `--deps`；`--no-verify` 可关闭（CI/不可执行环境）；验证子进程以当前用户权限真实执行入口方法，不可信工件应在隔离环境扫描 |
+| FR16 | 动态验证：反射构造可行性 + 子进程链级验证（对象图构造、入口类去重 ≤2、预算 `--verify-budget` 可配置默认 20、失败重试一次）。触发忠实模式：hashCode 经 HashMap.put、compareTo 经 TreeSet.add、equals 经 List.contains、readObject 族经序列化往返。集合布局构造：Map/Set/List 字段按声明类型实例化并放入链接目标。判定：栈帧级精确匹配；FAILED 为弱否定证据（降级不否决）。子进程隔离：fork-per-chain + 隔离工作目录/tmpdir + 内存上限；classpath 含目标 jar + 全部 `--deps`。不可构造类按原因类别聚合报告。`--no-verify` 可关闭；验证子进程以当前用户权限真实执行入口方法，不可信工件应在隔离环境扫描 |
 | FR17 | 规则系统：5 种类型改 YAML 零代码；装载校验（未知 kind/缺失 id/重复 id/缺 match 均报错） |
 | FR18 | 输出：CSV 四表（流式写出）+ SARIF（driver.rules/level 映射/startLine/partialFingerprints）+ JSON/HTML/Markdown；CONFIRMED 链置顶 |
 | FR19 | CLI：scan + diff 子命令；退出码 0/2/3。diff 按 RFC4180 解析（表头驱动列定位），链身份键与组序号无关；findings.csv 缺失时报错退出 2 |

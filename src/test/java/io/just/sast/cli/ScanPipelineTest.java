@@ -109,7 +109,7 @@ class ScanPipelineTest {
         Path jar = compileToJar(tmp.resolve("app.jar"),
                 Map.of("app.Gadget", GADGET, "app.EqGadget", EQ_GADGET));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, true);
+        ScanPipeline.run(jar, null, out, null, false, true, null, true, 20);
         String findings = Files.readString(out.resolve("findings.csv"));
         String calibrations = Files.readString(out.resolve("calibrations.csv"));
         // 正向链：app/Gadget.readObject → Runtime.exec（rule JUST-SINK-COMMAND-EXEC-RUNTIME）
@@ -183,7 +183,7 @@ class ScanPipelineTest {
         Path rulesFile = tmp.resolve("rules.yaml");
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, true);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, true, 20);
         String findings = Files.readString(out.resolve("findings.csv"));
         // UnsafeApp：入口链保留，且框架管线中间跳（Fw.load → Fw.run → Method.invoke）保留
         assertTrue(findings.contains("app/UnsafeApp,readObject"), "未安全配置的入口链应上报：\n" + findings);
@@ -200,7 +200,7 @@ class ScanPipelineTest {
     void exitCodeZeroOnSuccess(@TempDir Path tmp) throws Exception {
         Path jar = compileToJar(tmp.resolve("app.jar"), Map.of("app.Gadget", GADGET));
         ScanPipeline.ScanResult result = ScanPipeline.run(jar, null, tmp.resolve("out"), null,
-                false, true, null, true);
+                false, true, null, true, 20);
         assertTrue(result.exitCode() == 0);
         assertFalse(result.chains().isEmpty());
     }

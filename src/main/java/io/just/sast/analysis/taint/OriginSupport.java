@@ -339,7 +339,14 @@ public final class OriginSupport {
             }
         }
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
-            if (isOisRead(call)) {
+            boolean seed = isOisRead(call)
+                    // source（框架反序列化入口）宿主与 OIS 宿主同级 seeding——威胁模型上
+                    // 框架 parse 与 OIS readObject 都是「反序列化发生处」；框架内部的
+                    // Method.invoke 位点由此进入闭包，反射供给伪调用者才能挂接应用类
+                    // 的 setter/getter（fastjson @type / XStream / Hessian 的运行时类名分发）
+                    || ruleEngine.matchingSource(call.strProp("owner"), call.strProp("name"),
+                            call.strProp("desc")).isPresent();
+            if (seed) {
                 Node host = graph.findMethodNode(call.strProp("methodOwner"),
                         call.strProp("methodName"), call.strProp("methodDesc"));
                 String key = host != null ? methodKeyOf(

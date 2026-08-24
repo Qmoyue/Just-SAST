@@ -98,14 +98,22 @@ JAR/WAR → ASM 前端（fat jar/WAR 嵌套 + JDK 懒加载）
 
 自动执行，流程：
 
-1. **候选选择**：按证据分值降序，同一入口类最多 2 条——预算优先覆盖入口多样性
+1. **候选选择**：按证据分值降序，同一入口类最多 2 条——预算优先覆盖入口多样性；
+   预算可配置（`--verify-budget N`，默认 20）；TIMEOUT/UNTESTABLE 的链自动重试一次
 2. **链级探针**（`ChainVerifyProbe`）：解析链的字段流转跳，自底向上反射实例化并按字段链接成
-   完整对象图（含父类字段填充），再触发入口方法
-3. **判定**：堆栈帧级全等匹配（sink 类名 + 方法名），含 cause 链；SINK_TRIGGERED（真到达 sink）
+   完整对象图（含父类字段填充），再触发入口
+3. **触发忠实模式**：入口按真实反序列化触发路径触发——hashCode 入口经 `HashMap.put`、
+   compareTo/compare 入口经 `TreeSet.add`、equals 入口经非空 `List.contains`、
+   readObject 族经序列化-反序列化往返（SERIAL）、代理入口经 `Proxy.newProxyInstance`（PROXY）、
+   其余直接调用（DIRECT）——触发语义与链组装的 TRIGGER 桥一致
+4. **集合布局构造**：字段链接时，Map/Set/List 类型的字段按声明类型实例化，并把链接目标
+   放入 key/元素位——后段入口对象经容器 key 槽进入对象图，容器反序列化时触发其 hashCode/equals/compareTo
+5. **判定**：堆栈帧级全等匹配（sink 类名 + 方法名），含 cause 链；SINK_TRIGGERED（真到达 sink）
    > EXECUTED（入口真实调用且正常返回）> PARTIAL_PATH（中途异常，链降级保留）；
    探针 FAILED 为弱否定证据（降级，不否决）
-4. 预算有界（20 条、4 路并行）；子进程 classpath 含目标 jar 与全部 `--deps`；
-   先 waitFor 超时再读输出
+6. **子进程隔离**：fork-per-chain（静态状态不跨链污染）；沙箱参数——隔离工作目录与 tmpdir、
+   内存上限、headless；classpath 含目标 jar 与全部 `--deps`；先 waitFor 超时再读输出
+7. **构造可行性报告**：不可构造的入口类（抽象/无无参构造/不在类路径）按原因类别聚合输出到日志
 
 ## 5. 规则系统
 

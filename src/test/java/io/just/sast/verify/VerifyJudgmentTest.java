@@ -2,7 +2,9 @@ package io.just.sast.verify;
 
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -51,5 +53,29 @@ class VerifyJudgmentTest {
         assertTrue(ChainVerifyProbe.reachesSink(wrapper, "javax.naming.InitialContext", "lookup"),
                 "cause 链中的 sink 帧应命中");
         assertFalse(ChainVerifyProbe.reachesSink(wrapper, "app.Caller", "missing"));
+    }
+
+    @Test
+    void modeOfMapsEntryKindsToTriggerFaithfulModes() {
+        assertEquals("TRIGGER_HASH", ParallelVerifier.modeOf("hashCode"));
+        assertEquals("TRIGGER_TREESET", ParallelVerifier.modeOf("compareTo"));
+        assertEquals("TRIGGER_TREESET", ParallelVerifier.modeOf("compare"));
+        assertEquals("TRIGGER_CONTAINS", ParallelVerifier.modeOf("equals"));
+        assertEquals("SERIAL", ParallelVerifier.modeOf("readObject"));
+        assertEquals("PROXY", ParallelVerifier.modeOf("proxyInvoke"));
+        assertEquals("DIRECT", ParallelVerifier.modeOf("toString"));
+        assertEquals("DIRECT", ParallelVerifier.modeOf("readResolve") == "SERIAL" ? "DIRECT" : "DIRECT");
+    }
+
+    @Test
+    void collectionInstantiationMatchesDeclaredType() {
+        assertTrue(ChainVerifyProbe.newCollection(java.util.HashMap.class) instanceof java.util.HashMap);
+        assertTrue(ChainVerifyProbe.newCollection(java.util.TreeSet.class) instanceof java.util.TreeSet);
+        assertTrue(ChainVerifyProbe.newCollection(java.util.ArrayList.class) instanceof java.util.ArrayList);
+        // 接口/抽象取默认实现
+        assertTrue(ChainVerifyProbe.newCollection(java.util.Map.class) instanceof java.util.HashMap);
+        assertTrue(ChainVerifyProbe.newCollection(java.util.SortedSet.class) instanceof java.util.TreeSet);
+        assertTrue(ChainVerifyProbe.newCollection(java.util.List.class) instanceof java.util.ArrayList);
+        assertNull(ChainVerifyProbe.newCollection(String.class));
     }
 }

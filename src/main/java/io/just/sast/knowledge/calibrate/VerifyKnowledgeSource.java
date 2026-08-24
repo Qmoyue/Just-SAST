@@ -65,6 +65,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         }
         int constructible = 0;
         int rejected = 0;
+        java.util.Map<String, Integer> skipReasons = new java.util.LinkedHashMap<>();
         for (Chain chain : bb.chains()) {
             if (bb.calibrationOf(chain.key()) != null) continue;
             String dotted = chain.entryClass().replace('/', '.');
@@ -75,12 +76,20 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                     constructible++;
                 }
                 case "PARTIALLY_CONSTRUCTIBLE" -> bb.chainNote(chain.key(), "degrade:partial-construct");
-                case "SKIP" -> {}
+                case "SKIP" -> // 按原因类别聚合（detail 含类名，逐类输出会过长）
+                skipReasons.merge(result.detail() != null
+                        ? result.detail().split(":")[0] : "skip", 1, Integer::sum);
                 default -> {
                     bb.calibrateChain(chain.key(), "not-constructible");
                     rejected++;
                 }
             }
+        }
+        // 不可构造类聚合报告（抽象/无无参构造/不在类路径——探针能力边界可见化）
+        if (!skipReasons.isEmpty()) {
+            JustLogger.info("构造可行性：{} 类不可构造（{}）", skipReasons.values().stream().mapToInt(Integer::intValue).sum(),
+                    skipReasons.entrySet().stream().map(e -> e.getKey() + "×" + e.getValue())
+                            .reduce((a, b) -> a + ", " + b).orElse(""));
         }
 
         int confirmed = 0;
@@ -98,12 +107,13 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                                     detail);
                         }
                     });
+                int budget = Math.max(1, bb.scanInputs().verifyBudget());
                 List<Chain> topChains = verifier.selectChains(
                         bb.chains().stream().filter(c -> bb.calibrationOf(c.key()) == null).toList(),
-                        MAX_SUBPROCESS_VERIFY);
+                        budget);
 
-                JustLogger.info("子进程链级验证（{} 条，{} 路并行，入口去重≤{}/入口）...",
-                        topChains.size(), 4, 2);
+                JustLogger.info("子进程链级验证（{} 条 / 预算 {}，{} 路并行，入口去重≤{}/入口）...",
+                        topChains.size(), budget, 4, 2);
 
                 List<ParallelVerifier.VerifyResult> results = verifier.verifyAll(topChains);
                 for (int i = 0; i < results.size(); i++) {

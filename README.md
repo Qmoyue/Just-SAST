@@ -86,6 +86,7 @@ java -jar target/just-sast-0.2.0.jar diff old-output/ new-output/
 | `--rules <file>` | 自定义规则 YAML | 内置规则 |
 | `--fast` | 跳过 JDK 全量加载 | 关 |
 | `--no-verify` | 关闭子进程链级动态验证 | 关 |
+| `--verify-budget <N>` | 动态验证链数预算 | 20 |
 | `--stats` | 输出扫描统计到 stderr | 关 |
 
 动态验证默认开启：扫描结束自动对高置信链执行子进程验证（有界预算，同一入口类最多 2 条、共 20 条、4 路并行）。注意验证子进程会以当前用户权限真实执行入口方法，扫描不可信工件时建议在隔离环境运行或使用 `--no-verify`。
