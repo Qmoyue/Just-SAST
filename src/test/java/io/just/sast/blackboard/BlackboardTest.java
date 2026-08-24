@@ -1,4 +1,5 @@
 package io.just.sast.blackboard;
+import java.nio.file.Path;
 
 import org.junit.jupiter.api.Test;
 
@@ -15,7 +16,7 @@ class BlackboardTest {
     private static Blackboard empty() {
         return new Blackboard(new io.just.sast.cpg.graph.Graph(),
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
-                new io.just.sast.cpg.build.FieldWriterIndex(), io.just.sast.config.RuleSet.EMPTY, 20);
+                new io.just.sast.cpg.build.FieldWriterIndex(), io.just.sast.config.RuleSet.EMPTY, 20, Blackboard.ScanInputs.fastDefault(Path.of(".")));
     }
 
     private static Chain chain(String entryMethod) {

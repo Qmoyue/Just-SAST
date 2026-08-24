@@ -24,6 +24,7 @@ import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LineNumberNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.LookupSwitchInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
@@ -60,11 +61,15 @@ public final class FactsExtractor {
         Map<LabelNode, Integer> labelOffsets = new HashMap<>();
         List<AbstractInsnNode> insns = new ArrayList<>();
         boolean hasDebug = false;
+        int firstLine = -1;
         for (AbstractInsnNode insn = m.instructions.getFirst(); insn != null; insn = insn.getNext()) {
             if (insn.getType() == AbstractInsnNode.LABEL) {
                 labelOffsets.put((LabelNode) insn, insns.size());
             } else if (insn.getType() == AbstractInsnNode.LINE) {
                 hasDebug = true; // 不计入偏移
+                if (firstLine < 0) {
+                    firstLine = ((LineNumberNode) insn).line;
+                }
             } else if (insn.getType() == AbstractInsnNode.FRAME) {
                 // 不计入偏移
             } else {
@@ -87,7 +92,8 @@ public final class FactsExtractor {
                     labelOffset(labelOffsets, tc.handler),
                     tc.type));
         }
-        return new MethodInfo(owner, m.name, m.desc, m.access, List.copyOf(facts), List.copyOf(tryCatch), hasDebug);
+        return new MethodInfo(owner, m.name, m.desc, m.access, List.copyOf(facts),
+                List.copyOf(tryCatch), hasDebug, firstLine);
     }
 
     /** label 引用缺失说明指令序列异常——解析失败计入诊断，绝不静默生成指向 offset 0 的假边。 */

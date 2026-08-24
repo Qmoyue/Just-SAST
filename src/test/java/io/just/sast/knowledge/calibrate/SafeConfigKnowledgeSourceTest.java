@@ -58,7 +58,8 @@ class SafeConfigKnowledgeSourceTest {
         return new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(classes, null),
                 new io.just.sast.cpg.build.FieldWriterIndex(),
-                new RuleSet(List.of(), List.of(), List.of(source), List.of(), List.of()), 20);
+                new RuleSet(List.of(), List.of(), List.of(source), List.of(), List.of()), 20,
+                Blackboard.ScanInputs.fastDefault(java.nio.file.Path.of(".")));
     }
 
     private static Chain chainWithEntry(String owner, String method) {

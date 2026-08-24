@@ -32,6 +32,16 @@ public final class CpgBuilder {
                         fieldWriters.add(ref.owner(), ref.name(), cls.internalName(),
                                 method.owner(), method.name(), method.descriptor(),
                                 insn.offset(), op == Op.PUTSTATIC);
+                    } else if (op == Op.AASTORE && insn.offset() >= 3) {
+                        // 数组字段写入（窗口近似）：javac 规范形态 [.. GETFIELD f][idx][value][AASTORE]
+                        // ——GETFIELD 恰在 AASTORE 前 3 条。c.f[i]=v 的污点经字段粒度回溯（反向引擎）。
+                        InsnFact arrayField = method.instructions().get(insn.offset() - 3);
+                        if (arrayField.op() == Op.GETFIELD) {
+                            FieldRef ref = arrayField.fieldRef();
+                            fieldWriters.add(ref.owner(), ref.name(), cls.internalName(),
+                                    method.owner(), method.name(), method.descriptor(),
+                                    insn.offset(), false);
+                        }
                     }
                 }
             }

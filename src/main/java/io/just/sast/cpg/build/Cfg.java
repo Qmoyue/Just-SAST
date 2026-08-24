@@ -23,14 +23,20 @@ public final class Cfg {
         for (InsnFact insn : insns) {
             int offset = insn.offset();
             Op op = insn.op();
-            if (op == Op.UNKNOWN) {
-                continue; // 未知指令不产生边，按不可达处理
+            if (op == Op.UNKNOWN || op == Op.RET) {
+                continue; // 未知指令不产生边；RET 从子程序返回（目标在调用方 JSR 的返回地址，无静态后继）
             }
             if (op.isReturn()) {
                 continue;
             }
             List<CfgEdge> succ = edges.computeIfAbsent(offset, k -> new ArrayList<>(2));
-            if (op.isUncondJump()) {
+            if (op == Op.JSR) {
+                // JSR = 调用子程序后继续：JUMP 到子程序 + fall-through 到返回点（ASTORE 的返回地址由 RET 消费）
+                addJump(edges, offset, insn.jumpTarget());
+                if (offset < last) {
+                    succ.add(new CfgEdge(offset + 1, CfgLabel.SEQ));
+                }
+            } else if (op.isUncondJump()) {
                 addJump(edges, offset, insn.jumpTarget());
             } else if (op.isSwitch()) {
                 SwitchRef sw = (SwitchRef) insn.operands().get(0);

@@ -15,7 +15,7 @@ import java.util.*;
  * 2. PARTIALLY_CONSTRUCTIBLE：入口可实例化但部分字段不可填充 → 降级
  * 3. NOT_CONSTRUCTIBLE：入口类不可实例化（无默认构造器/abstract/interface）→ 拒
  * 
- * 纯进程内反射（目标 jar 已在 classpath），子进程验证见 VerifyRunner。
+ * 纯进程内反射（目标 jar 已在 classpath）。
  */
 public final class PayloadConstructor {
 

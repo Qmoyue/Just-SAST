@@ -31,16 +31,25 @@ public final class OriginSupport {
     private final Map<String, MethodInfo> methodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private final ClassHierarchy hierarchy;
     private final RuleEngine ruleEngine;
+    /** --fast（跳过 JDK 全量加载）：入口闭包的框架供给门在 fast 下关闭（同历史行为）。 */
+    private final boolean fast;
     /** 入口下游闭包（惰性一次构建）：反向剪枝与链剪枝共用。 */
     private Set<String> entryDownstream;
     /** 入口 BFS 距离（与下游闭包同一次遍历产出）：反向探索按离入口近者优先。 */
     private Map<String, Integer> entryDepths;
+    /** 接口分发解析记忆：owner#name+desc → (解析类, 方法节点) 列表——闭包展开对同一
+     * 接口签名的全部调用点复用（transitiveSubtypes + resolveMethod + findMethodNode 只算一次）。 */
+    private final Map<String, List<Object[]>> ifaceDispatchCache = new HashMap<>();
     /** 反射跳索引（FLASH 反射跳边的向后版）：常量类 → Method.invoke 调用点（名字常量时精确映射）。 */
     private final Map<String, List<Node>> reflectiveInvokeByClass = new HashMap<>();
     private final Map<String, Node> reflectiveInvokeByMethod = new HashMap<>();
     private final Map<Long, List<String>> reflectiveClassesBySite = new HashMap<>();
-    /** 框架包内的 Method.invoke 位点（非 JDK）——框架反射供给的调用者池。 */
+    /** 框架包内的 Method.invoke 位点——框架反射供给的调用者池（包前缀源自 source 规则声明）。 */
     private final List<Node> frameworkMethodInvokeSites = new ArrayList<>();
+    /** JavaBean 反射位点是否存在于框架包内（入口闭包的框架供给门）。 */
+    private boolean frameworkJavabeanSite;
+    /** 框架包前缀（source 规则声明的框架入口类派生，前 3 段——框架反射供给门的数据源）。 */
+    private final Set<String> frameworkPackages;
     /** JavaBean 反射跳：接收者类型 → invoke 位点；类型不可解 → wildcard 位点。 */
     private final Map<String, List<Long>> javabeanSitesByClass = new HashMap<>();
     private final List<Long> javabeanWildcardSites = new ArrayList<>();
@@ -50,15 +59,52 @@ public final class OriginSupport {
 
     private final java.util.Map<Long, Node> callNodes = new HashMap<>();
 
-    public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine) {
+    public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine, boolean fast) {
         this.hierarchy = hierarchy;
         this.ruleEngine = ruleEngine;
+        this.fast = fast;
+        this.frameworkPackages = deriveFrameworkPackages();
         this.origins = new ForwardOrigins(callIdByKey);
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             callIdByKey.put(methodKey(call) + "@" + call.strProp("offset"), call.id());
             callNodes.put(call.id(), call);
         }
         indexReflectiveJumps(graph);
+    }
+
+    /** 框架包前缀：source 规则声明的框架入口类取前 3 段包名（与框架桥接 KS 的前缀口径一致）。 */
+    private Set<String> deriveFrameworkPackages() {
+        Set<String> packages = new HashSet<>();
+        for (io.just.sast.config.Rule.SourceRule source : ruleEngine.rules().sources()) {
+            io.just.sast.config.Match owner = source.call().owner();
+            if (owner == null || owner.isRegex()) {
+                continue; // 正则 owner 不参与包前缀派生（保守：正则目标不定界）
+            }
+            String[] segments = owner.pattern().split("/");
+            int take = Math.min(3, segments.length);
+            StringBuilder pkg = new StringBuilder();
+            for (int i = 0; i < take; i++) {
+                if (i > 0) {
+                    pkg.append('/');
+                }
+                pkg.append(segments[i]);
+            }
+            packages.add(pkg.toString());
+        }
+        return packages;
+    }
+
+    /** 应用接口无条件传递展开的每构建预算。 */
+    private static final int IFACE_EXPANSION_BUDGET = 0;
+
+    /** 位点宿主是否在框架包内（source 规则派生前缀）。 */
+    private boolean inFrameworkPackage(String hostOwner) {
+        for (String prefix : frameworkPackages) {
+            if (hostOwner.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 反射跳索引规模（诊断）。 */
@@ -85,11 +131,10 @@ public final class OriginSupport {
             }
             scanReflectiveLookup(host, call);
             scanJavaBeanAccess(host, call);
-            // 框架包内的 Method.invoke 位点（非 JDK）——作为反射供给调用者池
-            String hostOwner = host.owner();
-            if (!hostOwner.startsWith("java/") && !hostOwner.startsWith("javax/")
-                    && !hostOwner.startsWith("sun/") && !hostOwner.startsWith("jdk/")
-                    && !hostOwner.startsWith("com/sun/")) {
+            // 框架包内的 Method.invoke 位点——框架反射供给调用者池
+            // （包前缀源自 source 规则：框架以攻击者可控类名反射调用应用类方法的语义，
+            //   只在框架真实出现在 classpath 时成立）
+            if (inFrameworkPackage(host.owner())) {
                 frameworkMethodInvokeSites.add(call);
             }
         }
@@ -160,13 +205,8 @@ public final class OriginSupport {
         if (!read && !write) {
             return;
         }
-        
-        ForwardOrigins.State dbgState = origins.compute(host).stateBefore().get(invokeSite.prop("offset"));
-        
-        if (dbgState != null && dbgState.stack().size() >= 2) {
-            var dbgOrigins = dbgState.stack().get(dbgState.stack().size() - 2).origins();
-            String dbgType = declaredTypeOf(dbgOrigins, host);
-            
+        if (inFrameworkPackage(host.owner())) {
+            frameworkJavabeanSite = true;
         }
         // invoke 接收者（arg0）声明类型
         ForwardOrigins.State state = origins.compute(host)
@@ -335,22 +375,12 @@ public final class OriginSupport {
                 }
             }
         }
-        // 框架反射供给种子：图中存在 Method.invoke 位点在框架包内（框架桥接语义）时，
-        // 所有 Serializable 应用类的 public 非静态方法入闭包——
+        // 框架反射供给种子：Method.invoke / JavaBean 反射位点宿主于框架包内（source 规则派生前缀，
+        // 框架桥接语义真实成立）时，所有应用类的 public 非静态方法入闭包——
         // 框架（fastjson @type / XStream / SnakeYAML 等）以攻击者可控类名反射调用任意 public 方法。
-        // 通用语义：框架存在 → setter/getter/任意 public 方法均为潜在反射目标。
         // 精度门：仅限非 JDK 类（避免万级 JDK 方法涌入闭包）。
-        boolean hasFrameworkInvoke = false;
-        for (Map.Entry<Long, List<String>> entry : reflectiveClassesBySite.entrySet()) {
-            // 检查位点是否在框架包内（有常量类查找）
-            hasFrameworkInvoke = true;
-            break;
-        }
-        if (!hasFrameworkInvoke) {
-            // 也检查 JavaBean 位点（getReadMethod/invoke 模式也在框架包内）
-            hasFrameworkInvoke = !javabeanSiteKinds.isEmpty();
-        }
-        if (hasFrameworkInvoke && !Boolean.getBoolean("just.fast")) {
+        boolean hasFrameworkInvoke = !frameworkMethodInvokeSites.isEmpty() || frameworkJavabeanSite;
+        if (hasFrameworkInvoke && !fast) {
             int added = 0;
             for (Node m : graph.nodesOfType(NodeType.METHOD)) {
                 String owner = m.strProp("owner");
@@ -373,30 +403,6 @@ public final class OriginSupport {
             }
             if (added > 0) {
                 io.just.sast.util.JustLogger.debug("框架反射供给：{} 个方法入闭包", added);
-            }
-        }
-        // JavaBean 直接种子：图中存在 getReadMethod/invoke 模式时（无论 class-based 还是 wildcard），
-        // 所有有 JavaBean getter 的 Serializable 类直接入闭包（不依赖中间方法可达）
-        if (!javabeanSiteKinds.isEmpty()) {
-            Set<String> getterClasses = computeSerializableWithGetters(graph);
-            for (String cls : getterClasses) {
-                var ci = hierarchy.classInfo(cls);
-                if (ci == null) {
-                    continue;
-                }
-                for (var mi : ci.methods()) {
-                    if (javaBeanMatches(mi, "read")) {
-                        String mk = methodKeyOf(cls, mi.name(), mi.descriptor());
-                        if (downstream.add(mk)) {
-                            depths.put(mk, 1);
-                            Node mn = graph.findMethodNode(cls, mi.name(), mi.descriptor());
-                            if (mn != null) {
-                                work.add(mn);
-                                workDepth.add(1);
-                            }
-                        }
-                    }
-                }
             }
         }
         while (!work.isEmpty()) {
@@ -508,37 +514,47 @@ public final class OriginSupport {
                             }
                         }
                     }
-                    // DISPATCH_CAP 超限的调用：调用图无分发边——闭包做全实现者展开
-                    // （通用语义：接口/父类调用可分派到任意实现者，无论调用图是否截断）
-                    if (call.out().size() <= 1) {
-                        String callOwner = call.strProp("owner");
+                    // 分发展开：调用图分发边未物化全接收者集时闭包做全子类型展开。
+                    // VIRTUAL：CHA 物化完整（超限时仅剩声明目标，out≤1）。
+                    // INTERFACE：implementers 不穿透实现类的子类（子类覆写会漏）——应用接口
+                    // 无条件传递展开（hibernate1 形态）；JDK 接口维持 out≤1 声明态
+                    // （万级实现者的传递闭包经 JDK 图病毒扩散，真实语料耗时 3-14 倍）
+                    String callOwner = call.strProp("owner");
+                    boolean jdkIface = "INTERFACE".equals(call.strProp("invokeKind")) && isJdk(callOwner);
+                    if (call.out().size() <= 1
+                            || ("INTERFACE".equals(call.strProp("invokeKind")) && !jdkIface)) {
                         String callName = call.strProp("name");
                         String callDesc = call.strProp("desc");
                         if ("VIRTUAL".equals(call.strProp("invokeKind"))
                                 || "INTERFACE".equals(call.strProp("invokeKind"))) {
-                            var ownerCi = hierarchy.classInfo(callOwner);
-                            if (ownerCi != null) {
-                                // 接口用 implementers；类用子类型闭包（覆盖抽象类多子类场景）
-                                java.util.List<String> impls;
-                                if (ownerCi.isInterface()) {
-                                    impls = hierarchy.implementers(callOwner, 100_000);
-                                } else {
-                                    impls = new ArrayList<>(hierarchy.loadedSubtypes(callOwner));
-                                }
-                                if (impls != null) {
-                                    for (String impl : impls) {
-                                        String resolved = hierarchy.resolveMethod(impl, callName, callDesc);
-                                        if (resolved != null) {
-                                            String mk = methodKeyOf(resolved, callName, callDesc);
-                                            if (downstream.add(mk)) {
-                                                depths.put(mk, depth + 1);
-                                                Node mn = graph.findMethodNode(resolved, callName, callDesc);
-                                                if (mn != null) {
-                                                    work.add(mn);
-                                                    workDepth.add(depth + 1);
-                                                }
+                            String sigKey = callOwner + "#" + callName + callDesc;
+                            List<Object[]> targets = ifaceDispatchCache.get(sigKey);
+                            if (targets == null) {
+                                targets = new ArrayList<>();
+                                var ownerCi = hierarchy.classInfo(callOwner);
+                                if (ownerCi != null) {
+                                    java.util.List<String> impls = hierarchy.transitiveSubtypes(callOwner);
+                                    if (impls != null) {
+                                        for (String impl : impls) {
+                                            String resolved = hierarchy.resolveMethod(impl, callName, callDesc);
+                                            if (resolved != null) {
+                                                targets.add(new Object[]{resolved,
+                                                        graph.findMethodNode(resolved, callName, callDesc)});
                                             }
                                         }
+                                    }
+                                }
+                                ifaceDispatchCache.put(sigKey, targets);
+                            }
+                            for (Object[] t : targets) {
+                                String resolved = (String) t[0];
+                                Node mn = (Node) t[1];
+                                String mk = methodKeyOf(resolved, callName, callDesc);
+                                if (downstream.add(mk)) {
+                                    depths.put(mk, depth + 1);
+                                    if (mn != null) {
+                                        work.add(mn);
+                                        workDepth.add(depth + 1);
                                     }
                                 }
                             }
@@ -566,6 +582,15 @@ public final class OriginSupport {
         entryDepths = depths;
         return downstream;
     }
+
+
+
+    private static boolean isJdk(String internalName) {
+        return internalName.startsWith("java/") || internalName.startsWith("javax/")
+                || internalName.startsWith("jdk/") || internalName.startsWith("sun/")
+                || internalName.startsWith("com/sun/");
+    }
+
 
     /** 方法的入口 BFS 距离（未在下游闭包内返回 Integer.MAX_VALUE）。反向探索按升序使用。 */
     public int entryDepthOf(String methodKey) {

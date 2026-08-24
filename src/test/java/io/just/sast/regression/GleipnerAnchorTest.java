@@ -26,7 +26,7 @@ class GleipnerAnchorTest {
         io.just.sast.cli.ScanPipeline.ScanResult result = io.just.sast.cli.ScanPipeline.run(
                 jar, null, tmp.resolve("basic"),
                 Path.of("benchmark/Gleipner/just-rules.yaml"),
-                false, true, null);
+                false, true, null, true);
         List<String> entries = Files.readAllLines(tmp.resolve("basic/chains.csv")).stream()
                 .skip(1).map(l -> l.split(",")).filter(f -> f.length > 4)
                 .map(f -> f[2] + ";" + f[3]).toList();
@@ -41,7 +41,7 @@ class GleipnerAnchorTest {
         Path jar = Path.of("benchmark/Gleipner/chains/target/gleipner.chains-1.0-depth.jar");
         Assumptions.assumeTrue(Files.exists(jar), "本地无 Gleipner 基准");
         io.just.sast.cli.ScanPipeline.run(jar, null, tmp.resolve("depth"),
-                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null);
+                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null, true);
         List<String> entries = Files.readAllLines(tmp.resolve("depth/chains.csv")).stream()
                 .skip(1).map(l -> l.split(",")).filter(f -> f.length > 4)
                 .map(f -> f[2]).toList();
@@ -54,7 +54,7 @@ class GleipnerAnchorTest {
         Path jar = Path.of("benchmark/Gleipner/chains/target/gleipner.chains-1.0-polymorphism.jar");
         Assumptions.assumeTrue(Files.exists(jar), "本地无 Gleipner 基准");
         io.just.sast.cli.ScanPipeline.run(jar, null, tmp.resolve("poly"),
-                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null);
+                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null, true);
         List<String> entries = Files.readAllLines(tmp.resolve("poly/chains.csv")).stream()
                 .skip(1).map(l -> l.split(",")).filter(f -> f.length > 4)
                 .map(f -> f[2]).toList();

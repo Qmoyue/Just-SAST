@@ -36,6 +36,8 @@ public final class ClassHierarchy {
     /** Optional 包装：empty 表示该上限下放弃枚举（区别于空列表=无实现者）。 */
     private final Map<IfaceKey, Optional<List<String>>> implementersCache =
             new java.util.concurrent.ConcurrentHashMap<>();
+    /** 传递子类型闭包缓存（调用图与引擎侧展开共用同一来源，避免直接/传递口径分叉）。 */
+    private final Map<String, List<String>> transitiveSubtypesCache = new java.util.concurrent.ConcurrentHashMap<>();
 
     public ClassHierarchy(Map<String, ClassInfo> initial, JdkClassSource jdk) {
         this.classes = new java.util.concurrent.ConcurrentHashMap<>(initial);
@@ -77,6 +79,10 @@ public final class ClassHierarchy {
                 subtypeCache.keySet().removeIf(k -> k.contains(newName));
                 resolveCache.keySet().removeIf(k -> k.contains(newName));
                 implementersCache.keySet().removeIf(k -> k.interfaceName().contains(newName));
+                // 传递闭包缓存：新类的全部祖先的闭包获得新成员——按祖先键失效
+                for (String anc : ancestorsOf(newName)) {
+                    transitiveSubtypesCache.remove(anc);
+                }
             }
         }
         return c;
@@ -90,6 +96,68 @@ public final class ClassHierarchy {
     public List<String> loadedSubtypes(String internalName) {
         List<String> list = directSubtypes.get(internalName);
         return list != null ? list : List.of();
+    }
+
+    /**
+     * 传递子类型闭包（含孙类及更深，BFS 穿过子类链；结果冻结 + 记忆化）。
+     * 调用图与引擎侧的分发展开共用本方法——深继承链中的覆写方法两处一致。
+     */
+    public List<String> transitiveSubtypes(String internalName) {
+        List<String> cached = transitiveSubtypesCache.get(internalName);
+        if (cached != null) {
+            return cached;
+        }
+        java.util.Set<String> result = new java.util.LinkedHashSet<>();
+        java.util.Set<String> visited = new HashSet<>();
+        Deque<String> work = new ArrayDeque<>();
+        work.add(internalName);
+        while (!work.isEmpty()) {
+            String cur = work.poll();
+            if (!visited.add(cur)) {
+                continue;
+            }
+            for (String sub : loadedSubtypes(cur)) {
+                result.add(sub);
+                work.add(sub);
+            }
+        }
+        List<String> frozen = List.copyOf(result);
+        transitiveSubtypesCache.put(internalName, frozen);
+        return frozen;
+    }
+
+    /** name 的全部祖先类型（父类链 + 传递接口，不含自身）。 */
+    private java.util.Set<String> ancestorsOf(String internalName) {
+        java.util.Set<String> result = new HashSet<>();
+        Deque<String> queue = new ArrayDeque<>();
+        ClassInfo ci = internalName.equals("") ? null : classes.get(internalName);
+        if (ci == null) {
+            ci = jdk != null ? jdk.load(internalName) : null;
+        }
+        if (ci != null) {
+            if (ci.superName() != null) {
+                queue.add(ci.superName());
+            }
+            queue.addAll(ci.interfaces());
+        }
+        while (!queue.isEmpty()) {
+            String cur = queue.poll();
+            if (!result.add(cur)) {
+                continue;
+            }
+            ClassInfo c = classes.get(cur);
+            if (c == null && jdk != null) {
+                c = jdk.load(cur);
+            }
+            if (c == null) {
+                continue;
+            }
+            if (c.superName() != null) {
+                queue.add(c.superName());
+            }
+            queue.addAll(c.interfaces());
+        }
+        return result;
     }
 
     /** 类的传递接口（含父类继承），供接口反向分发使用。 */

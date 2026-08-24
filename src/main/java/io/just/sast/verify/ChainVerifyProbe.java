@@ -8,17 +8,19 @@ import java.util.*;
 
 /**
  * 链级验证探针：沿链的 FIELD_FLOW 跳构造完整对象图，触发入口方法，
- * 检查 sink 是否真实执行（sink 特异性异常/输出匹配）。
+ * 检查 sink 是否真实执行（异常栈帧的类名+方法名全等匹配）。
  *
  * 参数格式：
  *   arg0: entryClass|entryMethod|mode
  *   arg1: 链跳描述，逗号分隔：fromOwner.fieldName=toOwnerClassName
- *   arg2: sinkClass.sinkMethod（用于 sink 特异性判定）
+ *   arg2: sinkClass.sinkMethod（用于 sink 特异性判定，点分类名）
  *
  * 判定标准：
- *   SINK_TRIGGERED — stderr/stack trace 中包含 sink 类名（链真实到达 sink）
- *   PARTIAL_PATH — 异常来自链中间环节（类型不匹配/空指针），sink 未到达
- *   EXECUTED — 正常执行无异常（可能链较短直接完成）
+ *   SINK_TRIGGERED — 异常栈帧中存在 declaringClass == sinkClass && methodName == sinkMethod
+ *                    （栈帧级全等匹配：子串匹配会把 java.lang.RuntimeException 误判为
+ *                    java.lang.Runtime，已废除）
+ *   PARTIAL_PATH — 异常来自链中间环节（类型不匹配/空指针/入口方法缺失），sink 未到达
+ *   EXECUTED — 入口方法真实调用且正常返回（无异常完成）
  */
 public final class ChainVerifyProbe {
 
@@ -48,11 +50,16 @@ public final class ChainVerifyProbe {
             }
         }
 
+        // sink 目标：方法名不能含 '.'，最后一个 '.' 前是类名（方法名参与判定——只匹配类会把
+        // 路过 sink 类任意方法的堆栈都算触发）
         String sinkTarget = args.length > 2 ? args[2] : "";
-        // sink 类名（内部名→点分）
-        String sinkClassDotted = sinkTarget.contains(".")
-                ? sinkTarget.substring(0, sinkTarget.lastIndexOf('.')).replace('/', '.')
-                : "";
+        String sinkClassDotted = "";
+        String sinkMethod = "";
+        int sinkDot = sinkTarget.lastIndexOf('.');
+        if (sinkDot > 0) {
+            sinkClassDotted = sinkTarget.substring(0, sinkDot).replace('/', '.');
+            sinkMethod = sinkTarget.substring(sinkDot + 1);
+        }
 
         try {
             // 1. 创建所有类的实例（自底向上）
@@ -110,24 +117,26 @@ public final class ChainVerifyProbe {
                 }
             }
 
-            // 3. 填充未链接的 String/Object 字段
+            // 3. 填充未链接的 String/Object 字段（含父类——getDeclaredFields 只看自身类）
             for (Object inst : instances.values()) {
-                for (Field f : inst.getClass().getDeclaredFields()) {
-                    if (Modifier.isStatic(f.getModifiers())) continue;
-                    f.setAccessible(true);
-                    try {
-                        if (f.get(inst) == null) {
-                            if (f.getType() == String.class) {
-                                f.set(inst, "echo CHAIN_OK");
-                            } else if (f.getType() == Object.class) {
-                                f.set(inst, "echo CHAIN_OK");
-                            } else if (f.getType() == int.class || f.getType() == Integer.class) {
-                                f.set(inst, 0);
-                            } else if (f.getType() == boolean.class || f.getType() == Boolean.class) {
-                                f.set(inst, false);
+                for (Class<?> c = inst.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                    for (Field f : c.getDeclaredFields()) {
+                        if (Modifier.isStatic(f.getModifiers())) continue;
+                        f.setAccessible(true);
+                        try {
+                            if (f.get(inst) == null) {
+                                if (f.getType() == String.class) {
+                                    f.set(inst, "echo CHAIN_OK");
+                                } else if (f.getType() == Object.class) {
+                                    f.set(inst, "echo CHAIN_OK");
+                                } else if (f.getType() == int.class || f.getType() == Integer.class) {
+                                    f.set(inst, 0);
+                                } else if (f.getType() == boolean.class || f.getType() == Boolean.class) {
+                                    f.set(inst, false);
+                                }
                             }
+                        } catch (Exception ignored) {
                         }
-                    } catch (Exception ignored) {
                     }
                 }
             }
@@ -135,13 +144,15 @@ public final class ChainVerifyProbe {
             // 4. 触发入口方法
             switch (mode) {
                 case "PROXY" -> {
-                    if (java.lang.reflect.InvocationHandler.class.isAssignableFrom(entryCls)) {
-                        Object proxy = java.lang.reflect.Proxy.newProxyInstance(
-                                ChainVerifyProbe.class.getClassLoader(),
-                                new Class[]{Runnable.class},
-                                (java.lang.reflect.InvocationHandler) entryInstance);
-                        ((Runnable) proxy).run();
+                    if (!java.lang.reflect.InvocationHandler.class.isAssignableFrom(entryCls)) {
+                        System.out.println("PARTIAL_PATH: entry-not-handler");
+                        System.exit(0);
                     }
+                    Object proxy = java.lang.reflect.Proxy.newProxyInstance(
+                            ChainVerifyProbe.class.getClassLoader(),
+                            new Class[]{Runnable.class},
+                            (java.lang.reflect.InvocationHandler) entryInstance);
+                    ((Runnable) proxy).run();
                 }
                 case "SERIAL" -> {
                     java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
@@ -151,13 +162,16 @@ public final class ChainVerifyProbe {
                 }
                 default -> {
                     Method m = findMethod(entryCls, entryMethod);
-                    if (m != null) {
-                        m.setAccessible(true);
-                        if (m.getParameterCount() == 1 && m.getParameterTypes()[0] == String.class) {
-                            m.invoke(entryInstance, "echo CHAIN_OK");
-                        } else {
-                            m.invoke(entryInstance);
-                        }
+                    if (m == null) {
+                        // 入口方法在目标类上不可解析：探针无法触发——不是"链执行完成"
+                        System.out.println("PARTIAL_PATH: entry-method-missing");
+                        System.exit(0);
+                    }
+                    m.setAccessible(true);
+                    if (m.getParameterCount() == 1 && m.getParameterTypes()[0] == String.class) {
+                        m.invoke(entryInstance, "echo CHAIN_OK");
+                    } else {
+                        m.invoke(entryInstance);
                     }
                 }
             }
@@ -166,30 +180,40 @@ public final class ChainVerifyProbe {
             System.exit(0);
 
         } catch (Exception e) {
-            String stackTrace = getStackTrace(e);
-            // Sink 特异性判定：stack trace 中包含 sink 类名
-            if (!sinkClassDotted.isEmpty() && stackTrace.contains(sinkClassDotted)) {
+            // sink 特异性判定：栈帧级全等匹配（类名 + 方法名），含 cause 链
+            if (reachesSink(e, sinkClassDotted, sinkMethod)) {
                 System.out.println("SINK_TRIGGERED: " + sinkClassDotted);
-                System.err.println("SINK_REACHED: " + sinkClassDotted + " in " + e.getClass().getName());
+                System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
+                        + " in " + e.getClass().getName());
                 System.exit(1);
-            }
-            // 检查 caused-by 链
-            Throwable cause = e.getCause();
-            int depth = 0;
-            while (cause != null && depth < 5) {
-                String causeStack = getStackTrace(cause);
-                if (!sinkClassDotted.isEmpty() && causeStack.contains(sinkClassDotted)) {
-                    System.out.println("SINK_TRIGGERED: " + sinkClassDotted);
-                    System.err.println("SINK_REACHED_CAUSE: " + sinkClassDotted);
-                    System.exit(1);
-                }
-                cause = cause.getCause();
-                depth++;
             }
             // 链中间环节失败（非 sink）
             System.out.println("PARTIAL_PATH: " + e.getClass().getSimpleName());
             System.exit(0); // 正常退出 = 未到达 sink
         }
+    }
+
+    /** 异常及其 cause 链（≤6 层）的栈帧中是否存在 declaringClass == sinkClass 且 methodName == sinkMethod 的帧。 */
+    static boolean reachesSink(Throwable top, String sinkClass, String sinkMethod) {
+        if (sinkClass.isEmpty() || sinkMethod.isEmpty()) {
+            return false;
+        }
+        int depth = 0;
+        for (Throwable t = top; t != null && depth < 6; t = t.getCause(), depth++) {
+            for (StackTraceElement frame : t.getStackTrace()) {
+                if (sinkClass.equals(frame.getClassName()) && sinkMethod.equals(frame.getMethodName())) {
+                    return true;
+                }
+            }
+            // getStackTrace 对 JVM 优化过的异常可能返回空数组——退回字符串形式逐帧核对
+            if (t.getStackTrace().length == 0) {
+                String trace = getStackTrace(t);
+                if (trace.contains("at " + sinkClass + "." + sinkMethod + "(")) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static Field findField(Class<?> cls, String name) {

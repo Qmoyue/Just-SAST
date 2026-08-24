@@ -33,7 +33,8 @@ class ChainComposerKnowledgeSourceTest {
                 "java/lang/Runtime", "exec");
         Blackboard bb = new Blackboard(new io.just.sast.cpg.graph.Graph(),
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
-                new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20);
+                new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
+                Blackboard.ScanInputs.fastDefault(java.nio.file.Path.of(".")));
         bb.addChain(front);
         bb.addChain(back);
         new ChainComposerKnowledgeSource().onEvent(bb, Event.of(EventType.SCAN_ANALYZED, -1, null));

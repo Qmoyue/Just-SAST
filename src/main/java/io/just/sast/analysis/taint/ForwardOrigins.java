@@ -142,9 +142,12 @@ public final class ForwardOrigins {
         List<Set<ValueOrigin>> locals = new ArrayList<>(in.locals());
         Op op = insn.op();
         switch (op) {
-            case NOP, GOTO, JSR, RET -> {
-                // 无栈变化
+            case NOP, GOTO, RET -> {
+                // 无栈变化（RET 读局部变量表中的返回地址，CFG 中无后继）
             }
+            case JSR ->
+                    // 压入返回地址占位（不可控常量）；后续 ASTORE 会把它存入局部变量，RET 消费后不再传播
+                    push(stack, new Slot(Set.of(new ValueOrigin.Constant("jsr-address")), false));
             case TABLESWITCH, LOOKUPSWITCH -> pop(stack); // 弹出 switch key
             case ACONST_NULL, ICONST_M1, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5,
                     FCONST_0, FCONST_1, FCONST_2, BIPUSH, SIPUSH ->

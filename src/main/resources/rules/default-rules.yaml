@@ -321,7 +321,7 @@ rules:
     bridge: deserialize
     match:
       call: { owner: "com/thoughtworks/xstream/XStream", name: ~"fromXML|unmarshal" }
-    safe-config: { owner: "com/thoughtworks/xstream/XStream", methods: [addPermission, denyPermission, clearPermissions] }
+    safe-config: { owner: "com/thoughtworks/xstream/XStream", methods: [addPermission, denyPermission, clearPermissions, setupDefaultSecurity, allowTypes, allowTypeHierarchy, allowTypesByRegExp] }
   # unmarshal 来源：CodeQL XStream.qll；safe-config 为 addPermission(NoTypePermission.NONE) 硬化的名字级近似
 
   - id: JUST-SOURCE-HESSIAN
@@ -783,3 +783,558 @@ rules:
       - { class: "org/apache/commons/collections/functors/ChainedTransformer", method: "transform" }
     sinkOwner: "org/apache/commons/collections/Transformer"
     sinkName: "transform"
+
+  # ---- XXE / 任意文件读 / native 加载 / ProcessImpl / SSRF / 表达式解析 ----
+
+  - id: JUST-SINK-XXE-DOCUMENTBUILDER
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: "javax/xml/parsers/DocumentBuilder", name: "parse" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-SAXPARSER
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: "javax/xml/parsers/SAXParser", name: "parse" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-XMLREADER
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: "org/xml/sax/XMLReader", name: "parse" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-STAX
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: "javax/xml/stream/XMLInputFactory", name: "createXMLStreamReader" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-JDOM
+    kind: sink
+    category: XXE
+    severity: MEDIUM
+    match:
+      call: { owner: ~"org/jdom2/input/SAXBuilder|org/jdom/input/SAXBuilder", name: "build" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-DOM4J
+    kind: sink
+    category: XXE
+    severity: MEDIUM
+    match:
+      call: { owner: "org/dom4j/io/SAXReader", name: "read" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-FILEREAD-FIS
+    kind: sink
+    category: FILE_READ
+    severity: MEDIUM
+    match:
+      call: { owner: "java/io/FileInputStream", name: "<init>" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-FILEREAD-FILES
+    kind: sink
+    category: FILE_READ
+    severity: MEDIUM
+    match:
+      call: { owner: "java/nio/file/Files", name: ~"newInputStream|readAllBytes|readString|readAllLines" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-FILEREAD-RAF
+    kind: sink
+    category: FILE_READ
+    severity: MEDIUM
+    match:
+      call: { owner: "java/io/RandomAccessFile", name: "<init>" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-NATIVE-LOADLIBRARY
+    kind: sink
+    category: CODE_EXEC
+    severity: MEDIUM
+    match:
+      call: { owner: "java/lang/System", name: "loadLibrary" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-NATIVE-RUNTIME-LOAD
+    kind: sink
+    category: CODE_EXEC
+    severity: MEDIUM
+    match:
+      call: { owner: "java/lang/Runtime", name: ~"load|loadLibrary" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-PROCESSIMPL-START
+    kind: sink
+    category: COMMAND_EXEC
+    severity: HIGH
+    match:
+      call: { owner: ~"java/lang/ProcessImpl|java/lang/UNIXProcess", name: "start" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SSRF-HTTPURLCONNECT
+    kind: sink
+    category: SSRF
+    severity: HIGH
+    match:
+      call: { owner: "java/net/HttpURLConnection", name: "connect" }
+    tainted: [{receiver: true}]
+
+  - id: JUST-SINK-SSRF-HTTPCLIENT
+    kind: sink
+    category: SSRF
+    severity: HIGH
+    match:
+      call: { owner: "java/net/http/HttpClient", name: "send" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SSRF-SOCKET
+    kind: sink
+    category: SSRF
+    severity: MEDIUM
+    match:
+      call: { owner: "java/net/Socket", name: "<init>" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SPEL-PARSE
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "org/springframework/expression/spel/standard/SpelExpressionParser", name: "parseExpression" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-EL-FACTORY
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "javax/el/ExpressionFactory", name: ~"createValueExpression|createMethodExpression" }
+    tainted: [{arg: 1}]
+
+  # ---- 反序列化框架入口：dubbo 内嵌 hessian 分叉 / Red5 / Coherence / Jabsorb /
+  # 原版 JYaml / Commons SerializationUtils / XMLDecoder / AMFX ----
+
+  - id: JUST-SOURCE-HESSIAN-DUBBO
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: ~"com/alibaba/com/caucho/hessian/io/AbstractHessianInput|com/alibaba/com/caucho/hessian/io/Hessian2Input|com/alibaba/com/caucho/hessian/io/Hessian2StreamingInput", name: ~"readObject|readCall" }
+
+  - id: JUST-SOURCE-HESSIAN-ABSTRACT
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "com/caucho/hessian/io/AbstractHessianInput", name: readObject }
+
+  - id: JUST-SOURCE-RED5-AMF
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: ~"org/red5/io/object/Deserializer|org/red5/io/amf/Input", name: ~"deserialize|readObject" }
+
+  - id: JUST-SOURCE-COHERENCE
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "com/tangosol/util/ExternalizableHelper", name: ~"deserializeInternal|deserialize" }
+
+  - id: JUST-SOURCE-JABSORB
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "org/jabsorb/JSONSerializer", name: ~"unmarshall|fromJSON" }
+
+  - id: JUST-SOURCE-JYAML-ORIG
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "org/ho/yaml/Yaml", name: ~"load|loadType|loadStream|loadStreamOfType" }
+
+  - id: JUST-SOURCE-COMMONS-SERIALIZATIONUTILS
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: ~"org/apache/commons/lang/SerializationUtils|org/apache/commons/lang3/SerializationUtils", name: deserialize }
+
+  - id: JUST-SOURCE-XMLDECODER
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "java/beans/XMLDecoder", name: ~"readObject|close" }
+
+  - id: JUST-SOURCE-AMFX-MESSAGE
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: ~"flex/messaging/io/amfx/AmfxMessageDeserializer|flex/messaging/io/amf/AmfMessageDeserializer", name: readMessage }
+
+  - id: JUST-SOURCE-BLAZEDS-ABSTRACT
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "flex/messaging/io/amf/AbstractAmfInput", name: readObject }
+
+  # Jackson 反序列化入口（树到值接力 / 流式读取）
+  - id: JUST-SOURCE-JACKSON-TREE
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "com/fasterxml/jackson/databind/ObjectMapper", name: ~"readValues|treeToValue|convertValue" }
+
+  # JNDI/目录服务 sink 扩充：RMI Registry、Spring JndiTemplate、SPI NamingManager、
+  # JDBC 连接串、LDAP 搜索、CORBA 对象引用
+  - id: JUST-SINK-JNDI-REGISTRY
+    kind: sink
+    category: JNDI
+    severity: HIGH
+    match:
+      call: { owner: "java/rmi/registry/Registry", name: lookup }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-JNDI-TEMPLATE
+    kind: sink
+    category: JNDI
+    severity: HIGH
+    match:
+      call: { owner: "org/springframework/jndi/JndiTemplate", name: lookup }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-JNDI-NAMINGMANAGER
+    kind: sink
+    category: JNDI
+    severity: HIGH
+    match:
+      call: { owner: ~"javax/naming/spi/NamingManager|javax/naming/spi/DirectoryManager", name: ~"getObjectInstance|getContext|getDirContext" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-JDBC-DRIVERMANAGER
+    kind: sink
+    category: JNDI
+    severity: MEDIUM
+    match:
+      call: { owner: ~"java/sql/DriverManager|java/sql/Driver", name: ~"getConnection|connect" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-JNDI-LOGBACK
+    kind: sink
+    category: JNDI
+    severity: HIGH
+    match:
+      call: { owner: "ch/qos/logback/classic/util/JNDIUtil", name: lookup }
+    tainted: [{arg: 1}]
+
+  - id: JUST-SINK-LDAP-SEARCH
+    kind: sink
+    category: JNDI
+    severity: HIGH
+    match:
+      call: { owner: "javax/naming/directory/DirContext", name: search }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-CORBA-STRINGTOOBJECT
+    kind: sink
+    category: JNDI
+    severity: HIGH
+    match:
+      call: { owner: ~"org/omg/CORBA/ORB|org/omg/CORBA_2_3/ORB", name: string_to_object }
+    tainted: [{arg: 0}]
+
+  # 表达式引擎/脚本 sink 扩充
+  - id: JUST-SINK-MVEL-SHELL
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "org/mvel2/sh/ShellSession", name: exec }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-JXPATH
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "org/apache/commons/jxpath/JXPathContext", name: ~"getValue|setValue" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-EL-METHODEXPRESSION
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: ~"javax/el/MethodExpression|javax/faces/el/MethodBinding", name: invoke }
+    tainted: [{receiver: true}]
+
+  - id: JUST-SINK-VELOCITY-RUNTIME
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: ~"org/apache/velocity/app/Velocity|org/apache/velocity/runtime/RuntimeInstance", name: evaluate }
+    tainted: [{arg: 3}]
+
+  - id: JUST-SINK-BATIK-SVG
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: { owner: "org/apache/batik/swing/svg/JSVGComponent", name: loadSVGDocument }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-H2-RUNSCRIPT
+    kind: sink
+    category: SQLI
+    severity: HIGH
+    match:
+      call: { owner: "org/h2/command/dml/RunScriptCommand", name: execute }
+    tainted: [{arg: 0}]
+
+  # XXE sink 扩充
+  - id: JUST-SINK-XXE-TRANSFORM
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: ~"javax/xml/transform/Transformer|javax/xml/transform/TransformerFactory", name: ~"transform|newTransformer|newTemplates" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-VALIDATOR
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: ~"javax/xml/validation/Validator|javax/xml/validation/SchemaFactory", name: ~"validate|newSchema" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-XPATH
+    kind: sink
+    category: XXE
+    severity: MEDIUM
+    match:
+      call: { owner: ~"javax/xml/xpath/XPath|javax/xml/xpath/XPathExpression", name: evaluate }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-DIGESTER
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: ~"org/apache/commons/digester/Digester|org/apache/commons/digester3/Digester", name: parse }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-DOM4J-PARSETEXT
+    kind: sink
+    category: XXE
+    severity: HIGH
+    match:
+      call: { owner: "org/dom4j/DocumentHelper", name: parseText }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-POI-XSSF
+    kind: sink
+    category: XXE
+    severity: MEDIUM
+    match:
+      call: { owner: "org/apache/poi/xssf/usermodel/XSSFWorkbook", name: "<init>" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-XXE-XLSX-STREAM
+    kind: sink
+    category: XXE
+    severity: MEDIUM
+    match:
+      call: { owner: '~^(?:com/monitorjbl/xlsx/StreamingReader\$Builder|com/monitorjbl/xlsx/XmlUtils)$', name: '~^(?:open|document)$' }
+    tainted: [{arg: 0}]
+
+  # SSRF sink 扩充：Apache HttpClient 4/5、okhttp3、jsoup、Jetty
+  - id: JUST-SINK-SSRF-HTTPCLIENT-EXEC
+    kind: sink
+    category: SSRF
+    severity: HIGH
+    match:
+      call: { owner: "~^(?:org/apache/http/client/HttpClient|org/apache/http/impl/client/CloseableHttpClient|org/apache/hc/client5/http/classic/CloseableHttpClient)$", name: "~^(?:execute|executeMethod)$" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SSRF-HTTP-REQUEST-CTOR
+    kind: sink
+    category: SSRF
+    severity: HIGH
+    match:
+      call: { owner: "~^(?:org/apache/http/client/methods/Http(?:Get|Post|Put|Delete)|org/apache/commons/httpclient/(?:GetMethod|PostMethod))$", name: "<init>" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SSRF-OKHTTP
+    kind: sink
+    category: SSRF
+    severity: HIGH
+    match:
+      call: { owner: '~^(?:okhttp3/Request\$Builder|okhttp3/OkHttpClient|okhttp3/HttpUrl)$', name: '~^(?:url|newCall|parse)$' }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SSRF-JSOUP
+    kind: sink
+    category: SSRF
+    severity: HIGH
+    match:
+      call: { owner: org/jsoup/Jsoup, name: connect }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SSRF-JETTY
+    kind: sink
+    category: SSRF
+    severity: MEDIUM
+    match:
+      call: { owner: org/eclipse/jetty/client/HttpClient, name: "~^(?:newRequest|GET)$" }
+    tainted: [{arg: 0}]
+
+  # 命令注入 sink 扩充
+  - id: JUST-SINK-COMMONS-EXEC-PARSE
+    kind: sink
+    category: COMMAND_EXEC
+    severity: HIGH
+    match:
+      call: { owner: org/apache/commons/exec/CommandLine, name: "~^(?:parse|addArguments)$" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-JSCH-SETEXEC
+    kind: sink
+    category: COMMAND_EXEC
+    severity: HIGH
+    match:
+      call: { owner: com/jcraft/jsch/ChannelExec, name: setCommand }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-PROCESSBUILDER-DIRECTORY
+    kind: sink
+    category: COMMAND_EXEC
+    severity: MEDIUM
+    match:
+      call: { owner: java/lang/ProcessBuilder, name: "~^(?:command|directory)$" }
+    tainted: [{arg: 0}]
+
+  # 文件操作 sink 扩充
+  - id: JUST-SINK-FILES-MUTATE
+    kind: sink
+    category: FILE_WRITE
+    severity: MEDIUM
+    match:
+      call: { owner: java/nio/file/Files, name: "~^(?:copy|move|delete|deleteIfExists|write|writeString|createFile|createDirectory|createDirectories|createTempFile|createTempDirectory|createLink|createSymbolicLink)$" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-FILE-MUTATE
+    kind: sink
+    category: FILE_WRITE
+    severity: MEDIUM
+    match:
+      call: { owner: java/io/File, name: "~^(?:delete|mkdir|mkdirs|renameTo|createNewFile)$" }
+    tainted: [{receiver: true}]
+
+  - id: JUST-SINK-MULTIPART-TRANSFER
+    kind: sink
+    category: FILE_WRITE
+    severity: MEDIUM
+    match:
+      call: { owner: "~^(?:org/springframework/web/multipart/MultipartFile|javax/servlet/http/Part|jakarta/servlet/http/Part)$", name: "~^(?:transferTo|write)$" }
+    tainted: [{arg: 0}]
+
+  # 反射 sink 扩充
+  - id: JUST-SINK-CLASSLOADER-LOADCLASS
+    kind: sink
+    category: REFLECTIVE_INVOKE
+    severity: MEDIUM
+    match:
+      call: { owner: "~^(?:java/lang/ClassLoader|java/net/URLClassLoader)$", name: "~^(?:loadClass|newInstance)$" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SINK-SUN-METHODUTIL
+    kind: sink
+    category: REFLECTIVE_INVOKE
+    severity: HIGH
+    match:
+      call: { owner: "~^(?:sun/reflect/misc/MethodUtil|sun/reflect/NativeMethodAccessorImpl)$", name: "~^(?:invoke|invoke0)$" }
+    tainted: [{arg: 1}]
+
+  - id: JUST-SINK-INTROSPECTOR
+    kind: sink
+    category: REFLECTIVE_INVOKE
+    severity: MEDIUM
+    match:
+      call: { owner: java/beans/Introspector, name: getBeanInfo }
+    tainted: [{arg: 0}]
+
+  # model 扩充：字符串/集合/URL 的声明式污点透传（覆盖链上高频中转方法）
+  - id: JUST-MODEL-STRING-CONCAT
+    kind: model
+    match:
+      call: { owner: java/lang/String, name: concat }
+    actions: { return: [arg0] }
+
+  - id: JUST-MODEL-STRING-OPS
+    kind: model
+    match:
+      call: { owner: java/lang/String, name: "~^(?:trim|substring|toUpperCase|toLowerCase|replace|split|valueOf|toString|intern|getBytes)$" }
+    actions: { return: [this] }
+
+  - id: JUST-MODEL-STRING-FORMAT
+    kind: model
+    match:
+      call: { owner: java/lang/String, name: format }
+    actions: { return: [arg0, arg1] }
+
+  - id: JUST-MODEL-STRINGBUILDER-APPEND
+    kind: model
+    match:
+      call: { owner: "~^(?:java/lang/StringBuilder|java/lang/StringBuffer)$", name: append }
+    actions: { this: [arg0], return: [this] }
+
+  - id: JUST-MODEL-STRINGBUILDER-TOSTRING
+    kind: model
+    match:
+      call: { owner: "~^(?:java/lang/StringBuilder|java/lang/StringBuffer)$", name: toString }
+    actions: { return: [this] }
+
+  - id: JUST-MODEL-MAP-GET
+    kind: model
+    match:
+      call: { owner: java/util/Map, name: get }
+    actions: { return: [this] }
+
+  - id: JUST-MODEL-LIST-ADD
+    kind: model
+    match:
+      call: { owner: java/util/List, name: add }
+    actions: { this: [arg0] }
+
+  - id: JUST-MODEL-OBJECT-TOSTRING
+    kind: model
+    match:
+      call: { owner: java/lang/Object, name: toString }
+    actions: { return: [this] }
+
+  - id: JUST-MODEL-COLLECTIONS-UNMODIFIABLE
+    kind: model
+    match:
+      call: { owner: java/util/Collections, name: "~^unmodifiable" }
+    actions: { return: [arg0] }
+
+  - id: JUST-MODEL-URL-CTOR
+    kind: model
+    match:
+      call: { owner: "~^(?:java/net/URL|java/net/URI)$", name: "<init>" }
+    actions: { this: [arg0] }
+
+  - id: JUST-MODEL-STRING-JOIN
+    kind: model
+    match:
+      call: { owner: java/lang/String, name: join }
+    actions: { return: [arg0, arg1] }

@@ -8,6 +8,6 @@ public enum EventType {
     SCAN_ANALYZED,
     /** 拼装完成：CALIBRATION 阶段知识源执行 */
     SCAN_COMPLETE,
-    /** 新链产出（addChain 时发布；阶段屏障才是当前真实协作机制，此事件留作扩展点） */
+    /** 新链产出（addChain 时发布；当前阶段无订阅者则延迟投递到后续阶段——跨阶段事件机制真实可用） */
     CHAIN_FOUND
 }

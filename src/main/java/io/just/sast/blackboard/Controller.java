@@ -48,8 +48,7 @@ public final class Controller {
             }
         }
         int dispatched = 0;
-        // ANALYSIS 并行：每个知识源一个任务（自足契约），异常隔离，join 屏障后清空残余事件
-        blackboard.publish(Event.of(EventType.SCAN_START, -1, null));
+        // ANALYSIS 并行：每个知识源一个任务（自足契约，合成事件直调不经队列），异常隔离，join 屏障
         dispatched += dispatchParallel(subsByPhase.getOrDefault(Phase.ANALYSIS, Map.of()));
         // COMPOSITION / CALIBRATION 串行（priority 序，跨源数据依赖）
         blackboard.publish(Event.of(EventType.SCAN_ANALYZED, -1, null));
@@ -92,13 +91,18 @@ public final class Controller {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        blackboard.clearEvents(); // CHAIN_FOUND 无订阅者；阶段屏障语义 = 串行 drain 的排空
+        // 不清空队列：ANALYSIS 期产生的 CHAIN_FOUND 留待后续阶段投递（延迟语义见 drain）
         return dispatched.get();
     }
 
-    /** 排空事件队列，按阶段订阅表分发（订阅序 = priority 序）。 */
+    /**
+     * 排空事件队列，按阶段订阅表分发（订阅序 = priority 序）。
+     * 当前阶段无订阅者的非屏障事件（如 ANALYSIS 期产生、CALIBRATION 才订阅的 CHAIN_FOUND）
+     * 延迟回填队列，供后续阶段投递——事件机制跨阶段真实可用，不再静默丢弃。
+     */
     private int drain(Map<EventType, List<KnowledgeSource>> subs) {
         int dispatched = 0;
+        List<Event> deferred = new ArrayList<>();
         while (blackboard.hasEvents()) {
             if (dispatched >= MAX_DISPATCH) {
                 JustLogger.warn("事件派生超上限 {}，本阶段提前结束", MAX_DISPATCH);
@@ -109,9 +113,15 @@ public final class Controller {
             if (event == null) {
                 break;
             }
+            boolean barrier = event.type() == EventType.SCAN_ANALYZED
+                    || event.type() == EventType.SCAN_COMPLETE;
             List<KnowledgeSource> interested = subs.get(event.type());
-            if (interested == null) {
+            if (interested == null && !barrier) {
+                deferred.add(event); // 留给后续阶段的订阅者
                 continue;
+            }
+            if (interested == null) {
+                continue; // 屏障事件无订阅者：消费掉即完成阶段切换
             }
             for (KnowledgeSource ks : interested) {
                 try {
@@ -124,6 +134,9 @@ public final class Controller {
                     }
                 }
             }
+        }
+        for (Event e : deferred) {
+            blackboard.publish(e);
         }
         return dispatched;
     }

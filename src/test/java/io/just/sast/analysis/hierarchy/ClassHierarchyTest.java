@@ -69,4 +69,23 @@ class ClassHierarchyTest {
         assertEquals(5, h.implementers("Itf", 10).size());
         assertNull(h.implementers("Itf", 3), "超上限应返回 null 表示放弃枚举");
     }
+
+    @Test
+    void transitiveSubtypesIncludeGrandchildren() {
+        // 深继承链（JsonSerializer → StdSerializer → BeanSerializerBase → BeanSerializer 形态）：
+        // 传递闭包必须含孙类——调用图与引擎侧展开共用同一来源（历史缺陷：两处直接/传递口径分叉）
+        ClassHierarchy h = new ClassHierarchy(Map.of(
+                "Base", cls("Base", "java/lang/Object"),
+                "Mid", cls("Mid", "Base"),
+                "Deep", cls("Deep", "Base"),
+                "GrandChild", cls("GrandChild", "Mid"),
+                "Unrelated", cls("Unrelated", "java/lang/Object")), null);
+        List<String> closure = h.transitiveSubtypes("Base");
+        assertTrue(closure.contains("Mid") && closure.contains("Deep") && closure.contains("GrandChild"),
+                "闭包须含孙类: " + closure);
+        assertFalse(closure.contains("Unrelated"));
+        assertEquals(closure, h.transitiveSubtypes("Base"), "闭包记忆化：重复调用结果一致");
+        assertTrue(h.transitiveSubtypes("Mid").contains("GrandChild"));
+        assertTrue(h.transitiveSubtypes("Unrelated").isEmpty());
+    }
 }

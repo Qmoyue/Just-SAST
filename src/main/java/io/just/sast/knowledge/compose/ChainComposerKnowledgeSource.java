@@ -112,8 +112,12 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             return Bridge.INVOKE;
         }
 
-        // 2. TRIGGER 桥：前段路径含 HashMap/HashSet/Hashtable/TreeMap → 调 key.hashCode/equals/compareTo/toString
-        if (containsTriggerContainer(front) && isTriggerEntry(backKind)) {
+        // 2. TRIGGER 桥：前段路径含触发容器，且后段入口类可放入容器的 key/元素槽
+        // （有序容器 TreeMap/PriorityQueue 的槽位要求 Comparable——不可比较的入口类放不进去，
+        //   桥不成立；HashMap/HashSet/Hashtable 的 key 槽为 Object 不限）
+        String container = triggerContainerOnPath(front);
+        if (container != null && isTriggerEntry(backKind)
+                && keySlotAccepts(container, back.entryClass())) {
             return Bridge.TRIGGER;
         }
 
@@ -145,17 +149,27 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         return entryMethod.contains("getOutputProperties") || entryMethod.contains("newTransformer");
     }
 
-    /** 前段链路径是否经过触发容器（HashMap/HashSet/Hashtable/TreeMap/PriorityQueue）。 */
-    private static boolean containsTriggerContainer(Chain chain) {
+    /** 前段链路径经过的触发容器（HashMap/HashSet/Hashtable/TreeMap/TreeSet/PriorityQueue），无则 null。 */
+    private static String triggerContainerOnPath(Chain chain) {
         for (ChainHop hop : chain.hops()) {
             String owner = hop.toOwner();
             if (owner.startsWith("java/util/HashMap") || owner.startsWith("java/util/HashSet")
                     || owner.startsWith("java/util/Hashtable") || owner.startsWith("java/util/TreeMap")
+                    || owner.startsWith("java/util/TreeSet")
                     || owner.startsWith("java/util/concurrent/PriorityQueue")) {
-                return true;
+                return owner;
             }
         }
-        return false;
+        return null;
+    }
+
+    /** 后段入口类能否放入容器的 key/元素槽：有序容器要求 Comparable。 */
+    private boolean keySlotAccepts(String container, String entryClass) {
+        if (container.startsWith("java/util/TreeMap") || container.startsWith("java/util/TreeSet")
+                || container.startsWith("java/util/concurrent/PriorityQueue")) {
+            return bb.hierarchy().isSubtypeOf(entryClass, "java/lang/Comparable");
+        }
+        return true;
     }
 
     private static boolean onPath(Chain chain, String className) {

@@ -38,16 +38,19 @@ public final class ScanCommand implements Callable<Integer> {
     @Option(names = "--stats", description = "输出扫描统计")
     boolean stats;
 
+    @Option(names = "--no-verify",
+            description = "关闭子进程链级动态验证（CI/不可执行环境；默认验证会在子 JVM 中真实执行入口方法）")
+    boolean noVerify;
+
     @Override
     public Integer call() {
         try {
-            return ScanPipeline.run(target, deps, output, rules, stats, fast, jdkHome).exitCode();
+            return ScanPipeline.run(target, deps, output, rules, stats, fast, jdkHome, !noVerify).exitCode();
         } catch (ScanPipeline.UsageException e) {
             System.err.println("[just:error] " + e.getMessage());
             return ExitCode.USAGE.code();
         } catch (Exception e) {
             System.err.println("[just:error] 扫描失败: " + e);
-            e.printStackTrace();
             return ExitCode.INTERNAL.code();
         }
     }

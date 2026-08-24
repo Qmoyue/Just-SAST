@@ -59,6 +59,10 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         if (event.type() != EventType.SCAN_COMPLETE) {
             return;
         }
+        if (!bb.scanInputs().verify()) {
+            JustLogger.info("动态验证已关闭（--no-verify）");
+            return;
+        }
         int constructible = 0;
         int rejected = 0;
         for (Chain chain : bb.chains()) {
@@ -82,18 +86,18 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         int confirmed = 0;
         int failed = 0;
         try {
-            Path targetJar = findTargetJar();
-            if (targetJar != null) {
-                ParallelVerifier verifier = new ParallelVerifier(targetJar, (chain, detail, sinkReached) -> {
-                    if (sinkReached) {
-                        JustLogger.info("  ✓ CONFIRMED: {}#{} → {}.{}  [{}]",
-                                chain.entryClass().replace('/', '.'),
-                                chain.entryMethod(),
-                                chain.sinkClass().replace('/', '.'),
-                                chain.sinkMethod(),
-                                detail);
-                    }
-                });
+            Path targetJar = bb.scanInputs().target();
+            ParallelVerifier verifier = new ParallelVerifier(targetJar, bb.scanInputs().deps(),
+                    (chain, detail, sinkReached) -> {
+                        if (sinkReached) {
+                            JustLogger.info("  ✓ CONFIRMED: {}#{} → {}.{}  [{}]",
+                                    chain.entryClass().replace('/', '.'),
+                                    chain.entryMethod(),
+                                    chain.sinkClass().replace('/', '.'),
+                                    chain.sinkMethod(),
+                                    detail);
+                        }
+                    });
                 List<Chain> topChains = verifier.selectChains(
                         bb.chains().stream().filter(c -> bb.calibrationOf(c.key()) == null).toList(),
                         MAX_SUBPROCESS_VERIFY);
@@ -110,26 +114,24 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                             bb.chainNote(chain.key(), "verify:confirmed");
                             confirmed++;
                         }
+                        // 入口真实执行但未证实 sink：证据注记，不置顶（CONFIRMED 仅留给 SINK_TRIGGERED）
+                        case "EXECUTED" -> bb.chainNote(chain.key(), "verify:executed");
                         case "PARTIAL" -> bb.chainNote(chain.key(), "degrade:partial-path");
+                        // 探针 FAILED 是弱否定证据（可能源于依赖缺失/构造限制等探针自身局限）：
+                        // 降级保留，不一票否决
                         case "FAILED" -> {
-                            bb.calibrateChain(chain.key(), "verify-failed");
+                            bb.chainNote(chain.key(), "degrade:verify-failed");
                             failed++;
                         }
                         default -> {}
                     }
                 }
                 verifier.cleanup();
-            }
         } catch (Exception e) {
             JustLogger.debug("子进程验证失败: {}", e.getMessage());
         }
 
         JustLogger.info("动态验证：构造可行 {} / 不可构造 {} | 子进程 CONFIRMED {} / FAILED {}",
                 constructible, rejected, confirmed, failed);
-    }
-
-    private Path findTargetJar() {
-        String jarPath = System.getProperty("just.target.jar");
-        return jarPath != null ? Path.of(jarPath) : null;
     }
 }

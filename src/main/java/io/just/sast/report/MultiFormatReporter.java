@@ -39,17 +39,21 @@ public final class MultiFormatReporter {
             }
             first = false;
             List<String> cn = notes.getOrDefault(c.key(), List.of());
-            sb.append("  {\"rule_id\":\"").append(esc(c.ruleId()))
-                    .append("\",\"category\":\"").append(esc(c.category()))
-                    .append("\",\"severity\":\"").append(esc(c.severity()))
-                    .append("\",\"confidence\":\"").append(esc(ConfidenceScorer.score(c, cn)))
-                    .append("\",\"entry_class\":\"").append(esc(c.entryClass().replace('/', '.')))
-                    .append("\",\"entry_method\":\"").append(esc(c.entryMethod()))
-                    .append("\",\"sink_class\":\"").append(esc(c.sinkClass().replace('/', '.')))
-                    .append("\",\"sink_method\":\"").append(esc(c.sinkMethod()))
+            String verify = cn.stream().filter(n -> n.startsWith("verify:"))
+                    .reduce((a, b) -> b).map(n -> n.substring("verify:".length())).orElse("");
+            sb.append("  {\"rule_id\":\"").append(escJson(c.ruleId()))
+                    .append("\",\"category\":\"").append(escJson(c.category()))
+                    .append("\",\"severity\":\"").append(escJson(c.severity()))
+                    .append("\",\"confidence\":\"").append(escJson(ConfidenceScorer.score(c, cn)))
+                    .append("\",\"entry_class\":\"").append(escJson(c.entryClass().replace('/', '.')))
+                    .append("\",\"entry_method\":\"").append(escJson(c.entryMethod()))
+                    .append("\",\"sink_class\":\"").append(escJson(c.sinkClass().replace('/', '.')))
+                    .append("\",\"sink_method\":\"").append(escJson(c.sinkMethod()))
                     .append("\",\"chain_length\":").append(c.hops().size())
                     .append(",\"unresolved_hops\":").append(c.unresolvedHops())
-                    .append("}");
+                    .append(",\"path\":\"").append(escJson(CsvReporter.pathSummary(c)))
+                    .append("\",\"verify\":\"").append(escJson(verify))
+                    .append("\"}");
         }
         sb.append("\n]");
         Files.write(path, sb.toString().getBytes(StandardCharsets.UTF_8));
@@ -75,10 +79,10 @@ public final class MultiFormatReporter {
             List<String> cn = notes.getOrDefault(c.key(), List.of());
             String conf = ConfidenceScorer.score(c, cn);
             sb.append("<tr><td>").append(seq)
-                    .append("</td><td>").append(esc(c.ruleId()))
+                    .append("</td><td>").append(escHtml(c.ruleId()))
                     .append("</td><td class='").append(conf.contains("DEGRADED") ? "DEGRADED" : "FEASIBLE").append("'>").append(conf)
-                    .append("</td><td>").append(esc(c.entryClass().replace('/', '.'))).append(".").append(esc(c.entryMethod()))
-                    .append("</td><td>").append(esc(c.sinkClass().replace('/', '.'))).append(".").append(esc(c.sinkMethod()))
+                    .append("</td><td>").append(escHtml(c.entryClass().replace('/', '.'))).append(".").append(escHtml(c.entryMethod()))
+                    .append("</td><td>").append(escHtml(c.sinkClass().replace('/', '.'))).append(".").append(escHtml(c.sinkMethod()))
                     .append("</td><td>").append(c.hops().size()).append("</td></tr>\n");
         }
         sb.append("</table></body></html>");
@@ -99,10 +103,10 @@ public final class MultiFormatReporter {
             seq++;
             List<String> cn = notes.getOrDefault(c.key(), List.of());
             sb.append("| ").append(seq)
-                    .append(" | `").append(c.ruleId()).append("`")
-                    .append(" | ").append(ConfidenceScorer.score(c, cn))
-                    .append(" | `").append(c.entryClass().replace('/', '.')).append(".").append(c.entryMethod()).append("`")
-                    .append(" | `").append(c.sinkClass().replace('/', '.')).append(".").append(c.sinkMethod()).append("`")
+                    .append(" | `").append(escMd(c.ruleId())).append("`")
+                    .append(" | ").append(escMd(ConfidenceScorer.score(c, cn)))
+                    .append(" | `").append(escMd(c.entryClass().replace('/', '.'))).append(".").append(escMd(c.entryMethod())).append("`")
+                    .append(" | `").append(escMd(c.sinkClass().replace('/', '.'))).append(".").append(escMd(c.sinkMethod())).append("`")
                     .append(" | ").append(c.hops().size()).append(" |\n");
         }
         Files.write(path, sb.toString().getBytes(StandardCharsets.UTF_8));
@@ -125,10 +129,45 @@ public final class MultiFormatReporter {
         Files.write(outDir.resolve("dormant.md"), sb.toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String esc(String s) {
+    /** JSON 字符串转义（含控制字符；不做 HTML 实体——实体泄漏进 JSON 是历史缺陷）。 */
+    private static String escJson(String s) {
         if (s == null) {
             return "";
         }
-        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("<", "&lt;").replace(">", "&gt;");
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            switch (ch) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (ch < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) ch));
+                    } else {
+                        sb.append(ch);
+                    }
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /** HTML 文本转义。 */
+    private static String escHtml(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /** Markdown 表格转义（管道符破坏列结构，换行破坏行结构）。 */
+    private static String escMd(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("|", "\\|").replace("\r", " ").replace("\n", " ");
     }
 }

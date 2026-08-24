@@ -28,6 +28,11 @@ public final class RuleEngine {
         this.hierarchy = hierarchy;
     }
 
+    /** 编译后的规则集（框架包前缀等派生数据的来源）。 */
+    public RuleSet rules() {
+        return rules;
+    }
+
     public Optional<Rule.SinkRule> matchingSink(Node call) {
         return matchingSink(call.strProp("owner"), call.strProp("name"), call.strProp("desc"));
     }

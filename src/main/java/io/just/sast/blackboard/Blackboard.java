@@ -7,6 +7,7 @@ import io.just.sast.config.RuleSet;
 import io.just.sast.cpg.build.FieldWriterIndex;
 import io.just.sast.cpg.graph.Graph;
 
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -24,11 +25,19 @@ import java.util.Set;
  */
 public final class Blackboard {
 
+    /** 扫描输入（管线编排期注入；知识源经黑板读取，无全局属性通道）。 */
+    public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify) {
+        public static ScanInputs fastDefault(Path target) {
+            return new ScanInputs(target, List.of(), true, true);
+        }
+    }
+
     private final Graph graph;
     private final ClassHierarchy hierarchy;
     private final FieldWriterIndex fieldWriters;
     private final RuleSet rules;
     private final int maxDepth;
+    private final ScanInputs scanInputs;
     /** 共享分析支撑：调用点索引 + 方法解析缓存 + origin 分析缓存 + 入口下游闭包。 */
     private final OriginSupport originSupport;
     /** 共享规则匹配引擎（随 RuleSet 一次构建，缓存随黑板生命周期）。 */
@@ -45,14 +54,15 @@ public final class Blackboard {
     private final Deque<Event> queue = new ArrayDeque<>();
 
     public Blackboard(Graph graph, ClassHierarchy hierarchy, FieldWriterIndex fieldWriters,
-                      RuleSet rules, int maxDepth) {
+                      RuleSet rules, int maxDepth, ScanInputs scanInputs) {
         this.graph = graph;
         this.hierarchy = hierarchy;
         this.fieldWriters = fieldWriters;
         this.rules = rules;
         this.maxDepth = maxDepth;
+        this.scanInputs = scanInputs;
         this.ruleEngine = new RuleEngine(rules, hierarchy);
-        this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine);
+        this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, scanInputs.fast());
     }
 
     public Graph graph() {
@@ -77,6 +87,10 @@ public final class Blackboard {
 
     public int maxDepth() {
         return maxDepth;
+    }
+
+    public ScanInputs scanInputs() {
+        return scanInputs;
     }
 
     public OriginSupport originSupport() {

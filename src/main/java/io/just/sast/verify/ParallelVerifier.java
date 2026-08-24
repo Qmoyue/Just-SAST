@@ -6,6 +6,7 @@ import io.just.sast.blackboard.HopKind;
 
 import java.io.File;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
@@ -27,13 +28,25 @@ public final class ParallelVerifier {
     private static final int MAX_PER_ENTRY = 2;
 
     private final Path targetJar;
+    private final List<Path> deps;
     private final Path ownJar;
     private final ConfirmCallback callback;
 
-    public ParallelVerifier(Path targetJar, ConfirmCallback callback) {
+    public ParallelVerifier(Path targetJar, List<Path> deps, ConfirmCallback callback) {
         this.targetJar = targetJar.toAbsolutePath().normalize();
+        this.deps = deps != null ? deps : List.of();
         this.callback = callback;
         this.ownJar = locateOwnJar();
+    }
+
+    /** 子进程 classpath：探针 jar + 目标 jar + 全部依赖（依赖中的 gadget 类可解析）。 */
+    static String classpathOf(Path ownJar, Path targetJar, List<Path> deps) {
+        StringBuilder cp = new StringBuilder(ownJar.toString());
+        cp.append(File.pathSeparator).append(targetJar);
+        for (Path dep : deps != null ? deps : List.<Path>of()) {
+            cp.append(File.pathSeparator).append(dep.toAbsolutePath().normalize());
+        }
+        return cp.toString();
     }
 
     /** 选择要验证的链：按置信度降序 + 入口类去重（同一入口最多 2 条不同 sink）。 */
@@ -99,7 +112,7 @@ public final class ParallelVerifier {
 
             String sinkTarget = chain.sinkClass().replace('/', '.') + "." + chain.sinkMethod();
             String java = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
-            String cp = ownJar + File.pathSeparator + targetJar;
+            String cp = classpathOf(ownJar, targetJar, deps);
 
             ProcessBuilder pb = new ProcessBuilder(java, "-cp", cp,
                     "io.just.sast.verify.ChainVerifyProbe",
@@ -108,30 +121,32 @@ public final class ParallelVerifier {
                     sinkTarget);
             pb.redirectErrorStream(true);
             Process proc = pb.start();
-            String output = new String(proc.getInputStream().readAllBytes());
+            // 先 waitFor 再读输出：子 JVM 挂起且未关 stdout 时，readAllBytes 会永久阻塞，
+            // 超时判定必须先行。探针输出为单行（远小于 OS 管道容量），进程退出后读取即达 EOF。
             boolean finished = proc.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
             if (!finished) {
                 proc.destroyForcibly();
-                return new VerifyResult(chain.key(), "TIMEOUT", "8s");
+                return new VerifyResult(chain.key(), "TIMEOUT", TIMEOUT_SECONDS + "s");
             }
+            String output = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            String[] lines = output.strip().split("\\R");
+            String firstLine = lines.length > 0 ? lines[0] : "";
 
-            if (output.contains("SINK_TRIGGERED") || output.contains("SINK_REACHED")) {
-                String detail = output.trim().split("\n")[0];
-                if (callback != null) callback.onConfirmed(chain, detail, true);
+            if (firstLine.startsWith("SINK_TRIGGERED")) {
+                if (callback != null) callback.onConfirmed(chain, firstLine, true);
                 return new VerifyResult(chain.key(), "CONFIRMED", "SINK_REACHED");
             }
-            if (output.contains("EXECUTED")) {
-                if (callback != null) callback.onConfirmed(chain, "executed", true);
-                return new VerifyResult(chain.key(), "CONFIRMED", "EXECUTED");
+            if (firstLine.equals("EXECUTED")) {
+                // 入口方法真实调用且正常返回——链可执行，但未证伪/证实 sink 到达
+                return new VerifyResult(chain.key(), "EXECUTED", "executed");
             }
-            if (output.contains("PARTIAL_PATH")) {
-                return new VerifyResult(chain.key(), "PARTIAL", output.trim().split("\n")[0]);
+            if (firstLine.startsWith("PARTIAL_PATH")) {
+                return new VerifyResult(chain.key(), "PARTIAL", firstLine);
             }
             int exit = proc.exitValue();
             if (exit != 0) {
                 return new VerifyResult(chain.key(), "PARTIAL",
-                        "exit=" + exit + " " + output.trim().split("\n")[0]);
+                        "exit=" + exit + " " + firstLine);
             }
             return new VerifyResult(chain.key(), "FAILED", "no trigger");
 

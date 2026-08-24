@@ -11,6 +11,12 @@
 
   <name>Just SAST</name>
   <description>Lightweight bytecode-based static analyzer for Java deserialization gadget chain discovery</description>
+  <licenses>
+    <license>
+      <name>GNU General Public License v3.0 only</name>
+      <url>https://www.gnu.org/licenses/gpl-3.0.txt</url>
+    </license>
+  </licenses>
 
   <properties>
     <maven.compiler.release>17</maven.compiler.release>

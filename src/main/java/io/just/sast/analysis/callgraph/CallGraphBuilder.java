@@ -6,9 +6,7 @@ import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.HandleRef;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
 import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.util.JustLogger;
 
@@ -64,8 +62,8 @@ public final class CallGraphBuilder {
 
     private int addVirtual(Graph graph, Node call, String owner, String name, String desc) {
         String declared = hierarchy.resolveMethod(owner, name, desc);
-        // 传递子类型闭包（直接子类 + 所有孙类）：深继承链中的覆写方法同样获得分发边
-        List<String> subtypes = transitiveSubtypes(owner);
+        // 传递子类型闭包（ClassHierarchy 记忆化；直接子类 + 所有孙类）：深继承链中的覆写方法同样获得分发边
+        List<String> subtypes = hierarchy.transitiveSubtypes(owner);
         if (declared == null && subtypes.isEmpty()) {
             graph.addEdge(call, graph.methodNode(owner, name, desc, true), EdgeType.INVOKES, "VIRTUAL");
             return 1;
@@ -147,24 +145,5 @@ public final class CallGraphBuilder {
             }
         }
         return 0;
-    }
-
-    /** 传递子类型闭包：BFS 穿过子类链（如 JsonSerializer → StdSerializer → BeanSerializerBase → BeanSerializer）。 */
-    private List<String> transitiveSubtypes(String owner) {
-        Set<String> result = new LinkedHashSet<>();
-        Set<String> visited = new java.util.HashSet<>();
-        Deque<String> work = new ArrayDeque<>();
-        work.add(owner);
-        while (!work.isEmpty()) {
-            String cur = work.poll();
-            if (!visited.add(cur)) {
-                continue;
-            }
-            for (String sub : hierarchy.loadedSubtypes(cur)) {
-                result.add(sub);
-                work.add(sub);
-            }
-        }
-        return new ArrayList<>(result);
     }
 }

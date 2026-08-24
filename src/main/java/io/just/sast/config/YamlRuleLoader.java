@@ -33,25 +33,27 @@ public final class YamlRuleLoader {
         List<Rule.SourceRule> sources = new ArrayList<>();
         List<Rule.ModelRule> models = new ArrayList<>();
         List<Rule.FragmentRule> fragments = new ArrayList<>();
+        java.util.Set<String> seenIds = new java.util.HashSet<>();
         for (Object item : list) {
             if (!(item instanceof Map<?, ?> ruleMap)) {
-                continue;
+                throw new IOException("规则格式错误：rules 列表元素必须是 map，实际 " + item);
             }
             String kind = str(ruleMap, "kind");
             String id = str(ruleMap, "id");
             if (id == null || kind == null) {
-                continue;
+                throw new IOException("规则缺少 id/kind 字段（静默跳过会掩盖拼写错误）: " + ruleMap);
             }
-            if (kind.equals("sink")) {
-                sinks.add(parseSink(id, ruleMap));
-            } else if (kind.equals("magic-entry")) {
-                entries.add(parseEntry(id, ruleMap));
-            } else if (kind.equals("source")) {
-                sources.add(parseSource(id, ruleMap));
-            } else if (kind.equals("model")) {
-                models.add(parseModel(id, ruleMap));
-            } else if (kind.equals("chain-fragment")) {
-                fragments.add(parseFragment(id, ruleMap));
+            if (!seenIds.add(id)) {
+                throw new IOException("规则 id 重复: " + id + "（重复规则互相遮蔽，历史事故：基准规则双 FRAG-CC1）");
+            }
+            switch (kind) {
+                case "sink" -> sinks.add(parseSink(id, ruleMap));
+                case "magic-entry" -> entries.add(parseEntry(id, ruleMap));
+                case "source" -> sources.add(parseSource(id, ruleMap));
+                case "model" -> models.add(parseModel(id, ruleMap));
+                case "chain-fragment" -> fragments.add(parseFragment(id, ruleMap));
+                default -> throw new IOException("未知规则 kind: " + kind + "（规则 " + id
+                        + "；合法值 sink/magic-entry/source/model/chain-fragment）");
             }
         }
         return new RuleSet(List.copyOf(sinks), List.copyOf(entries), List.copyOf(sources),
@@ -61,6 +63,9 @@ public final class YamlRuleLoader {
     @SuppressWarnings("unchecked")
     private Rule.SinkRule parseSink(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = (Map<?, ?>) ruleMap.get("match");
+        if (match == null) {
+            throw new IOException(ruleMap.get("kind") + " 规则 " + id + " 缺少 match 块");
+        }
         Map<?, ?> call = (Map<?, ?>) match.get("call");
         if (call == null) {
             throw new IOException("sink 规则 " + id + " 缺少 match.call");
@@ -89,6 +94,9 @@ public final class YamlRuleLoader {
     @SuppressWarnings("unchecked")
     private Rule.MagicEntryRule parseEntry(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = (Map<?, ?>) ruleMap.get("match");
+        if (match == null) {
+            throw new IOException("magic-entry 规则 " + id + " 缺少 match 块");
+        }
         Map<?, ?> method = (Map<?, ?>) match.get("method");
         if (method == null) {
             throw new IOException("magic-entry 规则 " + id + " 缺少 match.method");
@@ -108,6 +116,9 @@ public final class YamlRuleLoader {
     @SuppressWarnings("unchecked")
     private Rule.SourceRule parseSource(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = (Map<?, ?>) ruleMap.get("match");
+        if (match == null) {
+            throw new IOException(ruleMap.get("kind") + " 规则 " + id + " 缺少 match 块");
+        }
         Map<?, ?> call = (Map<?, ?>) match.get("call");
         if (call == null) {
             throw new IOException("source 规则 " + id + " 缺少 match.call");
@@ -137,6 +148,9 @@ public final class YamlRuleLoader {
     @SuppressWarnings("unchecked")
     private Rule.ModelRule parseModel(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = (Map<?, ?>) ruleMap.get("match");
+        if (match == null) {
+            throw new IOException(ruleMap.get("kind") + " 规则 " + id + " 缺少 match 块");
+        }
         Map<?, ?> call = (Map<?, ?>) match.get("call");
         if (call == null) {
             throw new IOException("model 规则 " + id + " 缺少 match.call");

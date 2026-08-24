@@ -24,10 +24,6 @@ import io.just.sast.model.Op;
 import io.just.sast.util.JustLogger;
 
 import java.lang.reflect.Modifier;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -77,8 +73,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     /** B5: per-thread 死胡同缓存（减少 CHM 争用），每 sink 开始时合并到全局 */
     private final ThreadLocal<Set<String>> localDeadEnds = ThreadLocal.withInitial(java.util.HashSet::new);
     private final Set<String> deadEnds = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /** V9-lite 段级记忆化（JDD IOCD 精神）：方法键 → 最近成功入口（类，kind，跳数）——
-     * 跨 sink 复用"从此方法可达某入口"的结论，避免重复回溯。 */
+    /** 段级记忆化（JDD IOCD 精神）：方法键 → 最近成功入口 [入口类, entryKind, 跳数]——
+     * 跨 sink 复用"从此方法可达某入口"的结论。捷径链非阻断：产出后继续真实探索
+     * （早退会把被校准拒绝的捷径链变成整组丢失——历史回归：demo 语料 findings -40%）。 */
     private final java.util.concurrent.ConcurrentHashMap<String, String[]> segmentCache =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, Optional<Rule.MagicEntryRule>> entryRuleCache =
@@ -175,27 +172,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
             }
         }
-        JustLogger.info("反向污点[{} workers]：{} ms（全局步数 {}，段缓存 {} 条）",
-                WORKERS, System.currentTimeMillis() - startTime, globalSteps.get(), segmentCache.size());
-        // D2: 段缓存持久化——跨扫描复用（同一 jar 重扫时直接命中）
-        if (!segmentCache.isEmpty()) {
-            try {
-                Path fragFile = Path.of("just-fragments.ser");
-                if (Files.exists(fragFile)) {
-                    try (ObjectInputStream oin = new ObjectInputStream(Files.newInputStream(fragFile))) {
-                        @SuppressWarnings("unchecked")
-                        var saved = (java.util.concurrent.ConcurrentHashMap<String, String[]>) oin.readObject();
-                        saved.putAll(segmentCache);
-                        segmentCache.putAll(saved);
-                    }
-                }
-                try (ObjectOutputStream oout = new ObjectOutputStream(Files.newOutputStream(fragFile))) {
-                    oout.writeObject(new java.util.HashMap<>(segmentCache));
-                }
-            } catch (Exception e) {
-                JustLogger.debug("段缓存持久化失败: {}", e.getMessage());
-            }
-        }
+        JustLogger.info("反向污点[{} workers]：{} ms（全局步数 {}）",
+                WORKERS, System.currentTimeMillis() - startTime, globalSteps.get());
     }
 
     private void analyzeSink(long callNodeId, SinkMark mark) {
@@ -206,7 +184,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             return;
         }
         if (!entryReaching.contains(OriginSupport.methodKey(method))) {
-            // sink 宿主方法不在入口下游集内：可证明无链
+            // sink 宿主方法不在入口下游集内：可证明无链。
+            // 注：子类覆写下钻不足（implementers 不穿透实现类）的豁免尝试（覆写感知门/闭包下钻）
+            // 均实测会经全局预算重分配挤掉多态类链——预算按序分配的敏感性是根因，见 development.md
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
             return;
         }
@@ -263,6 +243,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private int controlled(ValueOrigin origin, MethodInfo method, int depth, Trace trace, SinkMark mark) {
         long stepsSoFar = globalSteps.get();
         if (depth > bb.maxDepth() || trace.steps > STEP_BUDGET_ADJUSTED || stepsSoFar > GLOBAL_BUDGET) {
+            trace.truncated++;
             return 0;
         }
         // 预算尾部截断的结果不可靠，不写入死胡同缓存（防假阴性污染）
@@ -278,6 +259,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             return 0;
         }
         trace.visited.add(memoKey);
+        int truncatedBefore = trace.truncated;
         int produced;
         if (origin instanceof ValueOrigin.Param p) {
             produced = controlledParam(p.slot(), method, depth, trace, mark);
@@ -291,7 +273,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             produced = 0; // 常量不可控
         }
         trace.visited.remove(memoKey);
-        if (produced == 0 && memoizable && !nearBudget) {
+        // 子树内发生过深度/预算截断的"无链"结论是探索不完整，不是可证明无链——不记忆化
+        if (produced == 0 && memoizable && !nearBudget && trace.truncated == truncatedBefore) {
             localDead.add(memoKey);
         }
         return produced;
@@ -329,21 +312,24 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
             }
         }
-        // V9-lite：段缓存命中——此方法已知可达某入口，直接完成链
-        String[] cached = segmentCache.get(OriginSupport.methodKey(method));
-        if (cached != null) {
-            ChainHop shortcutHop = new ChainHop(method.owner(), method.name(),
-                    cached[0], cached[1], HopKind.DIRECT_CALL, null,
-                    "segment-reuse(" + cached[2] + ")", "", null);
-            trace.hops.add(shortcutHop);
-            int result = completeChain(mark, cached[1],
-                    bb.hierarchy().classInfo(cached[0]) != null
-                            ? support.methodOf(cached[0], cached[1],
-                                    firstDescriptorOfEntry(cached[0], cached[1]))
-                            : null, trace, "segment-reuse");
-            trace.hops.remove(trace.hops.size() - 1);
-            if (result > 0) {
-                return result;
+        // 段缓存命中：此方法已知可达某入口——直接完成捷径链（非阻断，真实探索继续）。
+        // 入口方法不可解析时跳过捷径（completeChain 需要入口方法构造 ENTRY 跳）
+        String segKey = OriginSupport.methodKey(method);
+        String[] cached = segmentCache.get(segKey);
+        if (cached != null && trace.segmentUsed.add(segKey)) {
+            MethodInfo entryMethod = bb.hierarchy().classInfo(cached[0]) != null
+                    ? support.methodOf(cached[0], cached[1], firstDescriptorOfEntry(cached[0], cached[1]))
+                    : null;
+            if (entryMethod != null) {
+                ChainHop shortcutHop = new ChainHop(method.owner(), method.name(),
+                        cached[0], cached[1], HopKind.DIRECT_CALL, null,
+                        "segment-reuse(" + cached[2] + ")", "", null);
+                trace.hops.add(shortcutHop);
+                int shortcutChains = completeChain(mark, cached[1], entryMethod, trace, "segment-reuse");
+                trace.hops.remove(trace.hops.size() - 1);
+                if (shortcutChains > 0) {
+                    return shortcutChains; // 阻断：捷径已闭合，预算留给其他 sink（全局池共享）
+                }
             }
         }
         int callerCap = merged ? MAX_MERGED_CALLERS : MAX_CALLERS;
@@ -418,7 +404,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         }
         // 框架反射供给（性能优化版）：仅 setter/getter/isXxx 接受框架伪调用者——
         // 且仅限闭包内的 invoke 位点（不可达的框架代码无意义）
-        if (!Boolean.getBoolean("just.fast") && isJavaBeanMethod(method.name())) {
+        if (!bb.scanInputs().fast() && isJavaBeanMethod(method.name())) {
             for (Node site : support.frameworkMethodInvokeSites()) {
                 String hostKey = OriginSupport.methodKeyOf(
                         site.strProp("methodOwner"), site.strProp("methodName"), site.strProp("methodDesc"));
@@ -474,6 +460,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         }
         return result;
     }
+
+
+
 
     /** 指令产物：数组分配←元素；数组读←数组；其余←消耗的操作数。 */
     private int controlledInsn(int offset, MethodInfo method, int depth, Trace trace, SinkMark mark) {
@@ -622,10 +611,13 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         Chain chain = new Chain(mark.ruleId(), mark.category(), mark.severity(),
                 entryClass, entryName, entryKind,
                 trace.sinkOwner, trace.sinkMethod, hops, trace.unresolved);
-        // V9-lite：记录"此方法可经 N 跳到入口"——下次其他 sink 的 trace 经同一方法时直接完成
+        // 段缓存存储：中点跳的目标方法键（与查询侧同构）；字段跳无描述符不参与
         if (trace.hops.size() >= 3) {
-            String midKey = trace.hops.get(trace.hops.size() / 2).toOwner();
-            segmentCache.putIfAbsent(midKey, new String[] {entryClass, entryKind, String.valueOf(trace.hops.size())});
+            ChainHop mid = trace.hops.get(trace.hops.size() / 2);
+            if (mid.desc() != null && !mid.desc().isEmpty()) {
+                segmentCache.putIfAbsent(OriginSupport.methodKeyOf(mid.toOwner(), mid.toName(), mid.desc()),
+                        new String[]{entryClass, entryKind, String.valueOf(trace.hops.size())});
+            }
         }
         return bb.addChain(chain) ? 1 : 0;
     }
@@ -678,15 +670,17 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 chains, verdict, steps, unresolved, tooLong);
     }
 
-    /** 一次回溯的路径与统计。 */
+    /** 一次回溯的路径与统计。truncated：深度/预算截断发生次数（子树结论作废判定）。 */
     private static final class Trace {
         final String sinkOwner;
         final String sinkMethod;
         final List<ChainHop> hops = new ArrayList<>();
         final Set<String> visited = new HashSet<>();
+        final Set<String> segmentUsed = new HashSet<>();
         int unresolved;
         int tooLong;
         int steps;
+        int truncated;
 
         Trace(String sinkOwner, String sinkMethod) {
             this.sinkOwner = sinkOwner;

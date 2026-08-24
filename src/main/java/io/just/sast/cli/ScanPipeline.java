@@ -49,7 +49,7 @@ public final class ScanPipeline {
     public record ScanResult(int exitCode, List<Chain> chains, ScanStatistics stats) {}
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-                                 boolean stats, boolean fast, Path jdkHome) throws Exception {
+                                 boolean stats, boolean fast, Path jdkHome, boolean verify) throws Exception {
         long start = System.currentTimeMillis();
 
         // 规则
@@ -86,11 +86,7 @@ public final class ScanPipeline {
             jdkClasses = fast ? List.of() : jrt.listAll(JrtClassSource.DESER_MODULES);
         }
         BytecodeFrontend frontend = new BytecodeFrontend();
-        LoadResult load = io.just.sast.cpg.build.CpgCache.tryLoad(target);
-        if (load == null) {
-            load = fast ? frontend.load(targets) : frontend.load(targets, jdkClasses);
-            io.just.sast.cpg.build.CpgCache.save(target, load);
-        }
+        LoadResult load = fast ? frontend.load(targets) : frontend.load(targets, jdkClasses);
         JustLogger.info("解析完成：{} 个类（{} 个文件），诊断 {} 条",
                 load.classCount(), load.filesScanned(), load.diagnosticCount());
         if (load.targetMajorVersion() > 0) {
@@ -111,9 +107,9 @@ public final class ScanPipeline {
                 cpg.fieldWriters().fieldCount());
 
         // 分析期（黑板串行三阶段：ANALYSIS → COMPOSITION → CALIBRATION）
-        System.setProperty("just.target.jar", target.toAbsolutePath().toString());
-        System.setProperty("just.fast", String.valueOf(fast));
-        Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), ruleSet, MAX_DEPTH);
+        List<Path> scanDeps = deps != null ? deps : List.of();
+        Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), ruleSet, MAX_DEPTH,
+                new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify));
         new Controller(blackboard, KnowledgeSources.discover()).run();
 
         // 报告期
@@ -122,8 +118,8 @@ public final class ScanPipeline {
         reporter.write(output, blackboard.chains(), blackboard.sinkOutcomes(),
                 blackboard.chainCalibrations(), blackboardNotes(blackboard));
         // C1: SARIF 2.1.0 + E1-E3: JSON/HTML/Markdown 多格式输出
-        new io.just.sast.report.SarifReporter().write(output, blackboard.chains(),
-                blackboard.chainCalibrations(), blackboardNotes(blackboard));
+        new io.just.sast.report.SarifReporter().withHierarchy(hierarchy).withRules(ruleSet).write(
+                output, blackboard.chains(), blackboard.chainCalibrations(), blackboardNotes(blackboard));
         new io.just.sast.report.MultiFormatReporter().write(output, blackboard.chains(),
                 blackboard.chainCalibrations(), blackboardNotes(blackboard));
         JustLogger.info("CSV + SARIF 已输出到 {}", output.toAbsolutePath());

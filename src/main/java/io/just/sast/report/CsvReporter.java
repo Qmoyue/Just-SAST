@@ -30,9 +30,11 @@ public final class CsvReporter {
         this.cpgGraph = graph;
     }
 
+    private final RegionRegions regions = new RegionRegions();
+
     public void write(Path outDir, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
                       Map<String, String> calibrations, Map<String, List<String>> chainNotes) throws IOException {
-        RegionRegions.attach(cpgGraph);
+        regions.attach(cpgGraph);
         Files.createDirectories(outDir);
         List<Row> findings = new ArrayList<>();
         List<Row> edges = new ArrayList<>();
@@ -77,7 +79,7 @@ public final class CsvReporter {
                 allChains.add(new Row(ChainIds.id(variant.key()), variant.ruleId(),
                         variant.entryClass(), variant.entryMethod(), entryDescriptor(variant), variant.entryKind(),
                         variant.sinkClass(), variant.sinkMethod(),
-                        String.valueOf(RegionRegions.crossings(variant)), pathSummary(variant)));
+                        String.valueOf(regions.crossings(variant)), pathSummary(variant)));
             }
         }
         writeCsv(outDir.resolve("chains.csv"), CHAINS_HEADER, allChains);
@@ -216,8 +218,8 @@ public final class CsvReporter {
         return "";
     }
 
-    /** entry → sink 的人读顺序：反转 hops，每跳 from → to。 */
-    private String pathSummary(Chain chain) {
+    /** entry → sink 的人读顺序：反转 hops，每跳 from → to（包内共享给多格式报告）。 */
+    static String pathSummary(Chain chain) {
         StringBuilder sb = new StringBuilder();
         List<ChainHop> hops = new ArrayList<>(chain.hops());
         java.util.Collections.reverse(hops);
@@ -263,17 +265,18 @@ public final class CsvReporter {
         };
     }
 
-    /** region 跨越数（惰性 RegionMap，链上相邻跳的 region 切换计数）。 */
+    /** region 跨越数（惰性 RegionMap，链上相邻跳的 region 切换计数）。
+     * 实例字段（历史缺陷：static map 跨扫描复用旧图，同 JVM 二扫的 region_crossings 失真）。 */
     static final class RegionRegions {
-        private static io.just.sast.analysis.taint.RegionMap map;
+        private io.just.sast.analysis.taint.RegionMap map;
 
-        static void attach(io.just.sast.cpg.graph.Graph graph) {
+        void attach(io.just.sast.cpg.graph.Graph graph) {
             if (graph != null && map == null) {
                 map = new io.just.sast.analysis.taint.RegionMap(graph);
             }
         }
 
-        static int crossings(Chain chain) {
+        int crossings(Chain chain) {
             if (map == null) {
                 return 0;
             }
