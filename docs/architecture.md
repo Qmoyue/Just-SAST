@@ -29,7 +29,7 @@ JAR/WAR → ASM 前端（fat jar/WAR 嵌套 + JDK 懒加载）
 | FrameworkBridge | framework | ANALYSIS (400) | 规则驱动框架桥接（12+ marshaller） |
 | ObjectGraph | objectgraph | COMPOSITION (100) | 对象图入口扩散（字段类型回调重根） |
 | Fragment | fragment | COMPOSITION (150) | chain-fragment 规则合成已知链 |
-| ChainComposer | compose | COMPOSITION (200) | INVOKE/TRIGGER/TEMPLATE/DESER 语义桥接 |
+| ChainComposer | compose | COMPOSITION (200) | INVOKE/TRIGGER/TEMPLATE/DESER 语义桥接 + 源宿主容器触发桥 |
 | ChainValidator | calibrate | CALIBRATION (100) | PASM + 类型流 + 序列化可行性 + 约束图矛盾 |
 | ChainPruner | calibrate | CALIBRATION (200) | 触发上下文 + 深链结构门 + 机制去重（软预算） |
 | SafeConfig | calibrate | CALIBRATION (300) | 安全配置抑制（偏移序校验） |
@@ -86,6 +86,22 @@ JAR/WAR → ASM 前端（fat jar/WAR 嵌套 + JDK 懒加载）
   规则数据，引擎零硬编码
 - 距离表供调度使用
 
+### 4.5 链组装扩展：源宿主容器触发桥
+
+方法 M 体内含反序列化源调用（OIS readObject/readUnshared 或任一 `bridge: deserialize` 框架源，
+如 Kryo.readClassAndObject / fastjson JSON.parse）时，M 是反序列化源宿主——框架的容器/bean
+反序列化机制会以攻击者数据回调元素 hashCode/equals/compareTo。组装器将每个源宿主与全部
+trigger-entry 后段链（含公开 gadget 片段）组装成完整攻击路径，机制桥接跳标注框架入口
+（如 `Kryo.readClassAndObject`）。宿主排除 JDK 运行时包（java/javax/sun/com.sun/jdk 等，
+其 readObject 体是容器触发机制本身）与源框架同包的管线内部调用。合成链带
+`pattern:src-container-trigger` 注记；其入口参数是攻击者载荷，不进子进程探针，改由
+**段归因**继承证据：内段链（桥接跳目标入口 + 同 sink）被子进程 CONFIRMED 时，完整链标注
+`verify:segment-confirmed` 并获得证据加分，排序紧随 CONFIRMED 链。
+
+SafeConfig 布尔求值：`safe-config` 声明可带 `safe-value`（如 Kryo
+`setRegistrationRequired` 的安全值为 true）——抑制仅在调用点实参常量等于安全值时生效，
+`setRegistrationRequired(false)`（关闭安全模式）不再被误判为已加固。
+
 ### 4.5 校准
 
 - Validator 五层：PASM 可行性 / 类型流（非 final 无共同子类即拒） / 序列化可行性 / equals 卫式降级 / 约束图矛盾
@@ -93,12 +109,14 @@ JAR/WAR → ASM 前端（fat jar/WAR 嵌套 + JDK 懒加载）
 - 深链结构门：动态分派跳 >14 且字段流 <17% 剪
 - Pruner 软预算：前 8 家族保留，高证据溢出链 DEGRADED
 - 四级判定：FEASIBLE / DEGRADED(reason) / NOT_FEASIBLE
+- SafeConfig 布尔求值：调用点实参常量等于 `safe-value` 才抑制（setRegistrationRequired(false) 不算加固）
 
 ### 4.6 动态验证（子进程链级）
 
 自动执行，流程：
 
-1. **候选选择**：按证据分值降序，同一入口类最多 2 条——预算优先覆盖入口多样性；
+1. **候选选择**：危险 sink 类别加权（JNDI/命令执行/字节码加载/反射/网络/文件）之上叠加
+   结构证据分值降序，同一入口类最多 2 条——预算有限时优先消耗在高价值链；
    预算可配置（`--verify-budget N`，默认 20）；TIMEOUT/UNTESTABLE 的链自动重试一次
 2. **链级探针**（`ChainVerifyProbe`）：解析链的字段流转跳，自底向上反射实例化并按字段链接成
    完整对象图（含父类字段填充），再触发入口
@@ -108,12 +126,24 @@ JAR/WAR → ASM 前端（fat jar/WAR 嵌套 + JDK 懒加载）
    其余直接调用（DIRECT）——触发语义与链组装的 TRIGGER 桥一致
 4. **集合布局构造**：字段链接时，Map/Set/List 类型的字段按声明类型实例化，并把链接目标
    放入 key/元素位——后段入口对象经容器 key 槽进入对象图，容器反序列化时触发其 hashCode/equals/compareTo
-5. **判定**：堆栈帧级全等匹配（sink 类名 + 方法名），含 cause 链；SINK_TRIGGERED（真到达 sink）
-   > EXECUTED（入口真实调用且正常返回）> PARTIAL_PATH（中途异常，链降级保留）；
-   探针 FAILED 为弱否定证据（降级，不否决）
+5. **sink canary 插桩判定**（`SinkCanaryAgent`，-javaagent 自挂载 + ASM 注入）：
+   每条链的子 JVM 启动时把本链 sink 方法入口改写为门卫调用 `SinkCanaryGate.hit(spec)`——
+   门卫检查调用栈存在链入口帧才抛 `SinkReachedError`（Error 语义穿透 gadget 的
+   `catch(Exception)`），否则放行（JVM 自身与探针基础设施对
+   `Constructor.newInstance`/`URL.openConnection`/`Class.forName` 等通用方法的调用不受影响）。
+   java.base 核心 sink（如 `Method.invoke`）经 `retransformClasses` 补插桩，标记类经最小
+   bootstrap jar 挂载。命中判定：canary 标记 > 栈帧级全等匹配（sink 类名 + 方法名，含 cause
+   链），均要求入口帧在场；SINK_TRIGGERED（真到达 sink）> EXECUTED（入口真实调用且正常返回）
+   > PARTIAL_PATH（中途异常，链降级保留）；探针 FAILED 为弱否定证据（降级，不否决）。
+   canary 命中的 sink 真实方法体不执行——exec/defineClass/connect 类危险副作用被天然解除
 6. **子进程隔离**：fork-per-chain（静态状态不跨链污染）；沙箱参数——隔离工作目录与 tmpdir、
-   内存上限、headless；classpath 含目标 jar 与全部 `--deps`；先 waitFor 超时再读输出
+   内存上限、headless；classpath 含目标 jar 与全部 `--deps`；fat jar/WAR 惰性展开
+   BOOT-INF/WEB-INF 的 classes 与嵌套依赖 jar 供探针解析；先 waitFor 超时再读输出
 7. **构造可行性报告**：不可构造的入口类（抽象/无无参构造/不在类路径）按原因类别聚合输出到日志
+
+已知边界：动态验证的入口触发基于 Java 序列化语义（OIS/TRIGGER 桥）；以框架解析为入口的链
+（fastjson autoType、Kryo Input、Hutool 二次反序列化等）静态可发现、动态验证覆盖其
+gadget 中段（hashCode/equals/readObject 段），框架入口段为后续触发模式扩展方向。
 
 ## 5. 规则系统
 

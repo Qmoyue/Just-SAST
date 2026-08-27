@@ -1,6 +1,7 @@
 package io.just.sast.knowledge.calibrate;
 
 import io.just.sast.blackboard.Blackboard;
+import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
@@ -108,8 +109,11 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                         }
                     });
                 int budget = Math.max(1, bb.scanInputs().verifyBudget());
+                // entryKind=source 的完整链是组装器合成（源宿主→容器触发→gadget 段），
+                // 其入口参数是攻击者载荷、探针无法构造——跳过子进程执行，走段归因路径
                 List<Chain> topChains = verifier.selectChains(
-                        bb.chains().stream().filter(c -> bb.calibrationOf(c.key()) == null).toList(),
+                        bb.chains().stream().filter(c -> bb.calibrationOf(c.key()) == null
+                                && !"source".equals(c.entryKind())).toList(),
                         budget);
 
                 JustLogger.info("子进程链级验证（{} 条 / 预算 {}，{} 路并行，入口去重≤{}/入口）...",
@@ -135,6 +139,44 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                         }
                         default -> {}
                     }
+                }
+                // 段归因：源宿主触发的完整链（entryKind=source）无法以合成参数端到端执行——
+                // 其 gadget 内段（bridge-trigger-src 桥之后的 hashCode/equals 段）若已被子进程
+                // 证实（入口方法与 sink 全等），完整链继承该动态证据
+                Set<String> confirmedEntries = new java.util.HashSet<>();
+                for (int i = 0; i < results.size(); i++) {
+                    if ("CONFIRMED".equals(results.get(i).status())) {
+                        Chain c = topChains.get(i);
+                        confirmedEntries.add(c.entryClass() + "#" + c.entryMethod()
+                                + "|" + c.sinkClass() + "." + c.sinkMethod());
+                    }
+                }
+                int segment = 0;
+                for (Chain chain : bb.chains()) {
+                    if (!"source".equals(chain.entryKind())) {
+                        continue;
+                    }
+                    List<String> notes = bb.chainNotesOf(chain.key());
+                    if (notes.stream().anyMatch(n -> n.equals("verify:confirmed")
+                            || n.equals("verify:segment-confirmed"))) {
+                        continue;
+                    }
+                    for (ChainHop hop : chain.hops()) {
+                        if (hop.reason() != null && hop.reason().equals("bridge-trigger-src")
+                                && confirmedEntries.contains(hop.toOwner() + "#" + hop.toName()
+                                        + "|" + chain.sinkClass() + "." + chain.sinkMethod())) {
+                            bb.chainNote(chain.key(), "verify:segment-confirmed");
+                            segment++;
+                            JustLogger.info("段归因: {}#{} → {}.{}（内段 {}#{} 已子进程证实）",
+                                    chain.entryClass(), chain.entryMethod(),
+                                    chain.sinkClass(), chain.sinkMethod(),
+                                    hop.toOwner(), hop.toName());
+                            break;
+                        }
+                    }
+                }
+                if (segment > 0) {
+                    JustLogger.info("段归因确认 {} 条完整链（内段被子进程证实）", segment);
                 }
                 verifier.cleanup();
         } catch (Exception e) {

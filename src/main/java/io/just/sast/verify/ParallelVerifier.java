@@ -34,6 +34,9 @@ public final class ParallelVerifier {
     private final ConfirmCallback callback;
     /** fat jar/WAR 嵌套展开缓存：jar → 文件系统 classpath 条目（BOOT-INF/WEB-INF 解包）。 */
     private static final Map<Path, List<Path>> NESTED_CP = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 本扫描进程产生的待清理产物：fat jar 展开根目录 + sink canary bootstrap jar。 */
+    private static final List<Path> OWN_ARTIFACTS = java.util.Collections.synchronizedList(new ArrayList<>());
+    private static volatile Path bootstrapJar;
 
     public ParallelVerifier(Path targetJar, List<Path> deps, ConfirmCallback callback) {
         this.targetJar = targetJar.toAbsolutePath().normalize();
@@ -52,12 +55,12 @@ public final class ParallelVerifier {
         return cp.toString();
     }
 
-    /** 选择要验证的链：按置信度降序 + 入口类去重（同一入口最多 2 条不同 sink）。 */
+    /** 选择要验证的链：危险 sink 类别加权 + 置信度降序 + 入口类去重（同一入口最多 2 条不同 sink）。 */
     public List<Chain> selectChains(List<Chain> candidates, int maxTotal) {
         List<Chain> sorted = new ArrayList<>(candidates);
         sorted.sort((a, b) -> Integer.compare(
-                io.just.sast.chain.ConfidenceScorer.evidenceScore(b, null),
-                io.just.sast.chain.ConfidenceScorer.evidenceScore(a, null)));
+                probePriority(b),
+                probePriority(a)));
         Map<String, Integer> entryCount = new HashMap<>();
         List<Chain> selected = new ArrayList<>();
         for (Chain chain : sorted) {
@@ -69,6 +72,35 @@ public final class ParallelVerifier {
             if (selected.size() >= maxTotal) break;
         }
         return selected;
+    }
+
+    /**
+     * 探测优先级：结构性证据分之上叠加 sink 危险类别加权——同等证据下，
+     * 指向 JNDI/命令执行/类定义/反射调用的链优先消耗验证预算（预算有限时的价值排序）。
+     */
+    static int probePriority(Chain chain) {
+        int score = io.just.sast.chain.ConfidenceScorer.evidenceScore(chain, null);
+        String sc = chain.sinkClass();
+        if (sc.startsWith("javax/naming/") || sc.contains("/jndi/")) {
+            score += 4; // JNDI 注入
+        }
+        if (sc.startsWith("java/lang/Runtime") || sc.startsWith("java/lang/ProcessBuilder")) {
+            score += 4; // 命令执行
+        }
+        if (sc.startsWith("com/sun/org/apache/xalan") || sc.startsWith("javax/xml/transform")
+                || sc.startsWith("java/net/URLClassLoader") || sc.equals("java/lang/Class")) {
+            score += 3; // 字节码加载 / 类定义
+        }
+        if (sc.startsWith("java/lang/reflect/")) {
+            score += 2; // 反射调用
+        }
+        if (sc.startsWith("java/net/")) {
+            score += 2; // 网络外联
+        }
+        if (sc.startsWith("java/io/") || sc.startsWith("java/nio/file/")) {
+            score += 1; // 文件系统
+        }
+        return score;
     }
 
     /** 批量并行验证。 */
@@ -144,6 +176,11 @@ public final class ParallelVerifier {
             cp = cp + File.pathSeparator + String.join(File.pathSeparator,
                     expandedEntries(targetJar).stream().map(Path::toString).toList());
 
+            // sink canary 插桩：本链 sink 方法入口注入门卫调用（见 SinkCanaryAgent）；
+            // 门卫按调用栈判定，JVM/探针基础设施的同名调用被放行
+            String agentSpec = chain.sinkClass() + "#" + chain.sinkMethod();
+            String entrySpec = entryDotted + "#" + entryMethod;
+
             // 沙箱参数：隔离工作目录与 tmpdir（防 cwd 文件读写）、内存上限、headless；
             // fork-per-chain 保持类隔离——静态状态不跨链污染
             Path isoDir = Files.createTempDirectory("just-verify-");
@@ -152,6 +189,8 @@ public final class ParallelVerifier {
                     "-Xmx256m",
                     "-Djava.io.tmpdir=" + isoTmp,
                     "-Djava.awt.headless=true",
+                    "-javaagent:" + ownJar.toAbsolutePath() + "=" + bootstrapCanaryJar()
+                            + "|" + entrySpec + "|" + agentSpec,
                     "-cp", cp,
                     "io.just.sast.verify.ChainVerifyProbe",
                     entryDotted + "|" + entryMethod + "|" + mode,
@@ -168,9 +207,29 @@ public final class ParallelVerifier {
                 return new VerifyResult(chain.key(), "TIMEOUT", TIMEOUT_SECONDS + "s");
             }
             String output = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String[] lines = output.strip().split("\\R");
-            String firstLine = lines.length > 0 ? lines[0] : "";
-
+            // redirectErrorStream 合并了 stderr——先剥离 JVM 警告行（如 canary 追加 bootstrap
+            // classpath 触发的 CDS sharing 警告），再取首个已知判定行
+            String firstLine = null;
+            String firstAny = null;
+            for (String line : output.split("\\R")) {
+                String trimmed = line.strip();
+                if (trimmed.isEmpty() || trimmed.startsWith("OpenJDK")
+                        || trimmed.startsWith("Java HotSpot") || trimmed.startsWith("WARNING")
+                        || trimmed.startsWith("Warning")) {
+                    continue;
+                }
+                if (firstAny == null) {
+                    firstAny = trimmed;
+                }
+                if (trimmed.startsWith("SINK_TRIGGERED") || trimmed.equals("EXECUTED")
+                        || trimmed.startsWith("PARTIAL_PATH")) {
+                    firstLine = trimmed;
+                    break;
+                }
+            }
+            if (firstLine == null) {
+                firstLine = firstAny == null ? "" : firstAny;
+            }
             if (firstLine.startsWith("SINK_TRIGGERED")) {
                 if (callback != null) callback.onConfirmed(chain, firstLine, true);
                 return new VerifyResult(chain.key(), "CONFIRMED", "SINK_REACHED");
@@ -221,6 +280,7 @@ public final class ParallelVerifier {
                     return List.of();
                 }
                 Path root = Files.createTempDirectory("just-fatjar-");
+                OWN_ARTIFACTS.add(root);
                 Path classes = root.resolve("classes");
                 Path lib = root.resolve("lib");
                 Files.createDirectories(classes);
@@ -237,8 +297,11 @@ public final class ParallelVerifier {
                         if (!isClassEntry && !isLibJar) {
                             continue;
                         }
-                        String relative = name.substring(name.indexOf('/', 0) + 1); // 去 BOOT-INF/ 前缀
-                        Path out = (isClassEntry ? classes : lib).resolve(relative);
+                        // 去 BOOT-INF/WEB-INF 一级前缀得 classes/x / lib/x，再落到对应目录
+                        String prefix = name.startsWith("BOOT-INF/") ? "BOOT-INF/" : "WEB-INF/";
+                        String relative = name.substring(prefix.length());
+                        String sub = relative.substring(relative.indexOf('/') + 1);
+                        Path out = (isClassEntry ? classes : lib).resolve(sub);
                         Files.createDirectories(out.getParent());
                         Files.copy(zin, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                     }
@@ -263,6 +326,81 @@ public final class ParallelVerifier {
         }
     }
 
+    /**
+     * sink canary 的最小 bootstrap jar（仅含 SinkReachedError.class）：插桩 java.base sink
+     * 时标记类必须对 bootstrap 可见。从自身 jar/class 目录提取类文件现场生成，进程内缓存。
+     */
+    private static Path bootstrapCanaryJar() {
+        Path jar = bootstrapJar;
+        if (jar != null) {
+            return jar;
+        }
+        synchronized (ParallelVerifier.class) {
+            if (bootstrapJar != null) {
+                return bootstrapJar;
+            }
+            try {
+                String marker = "/io/just/sast/verify/boot/SinkReachedError.class";
+                String gate = "/io/just/sast/verify/boot/SinkCanaryGate.class";
+                try (var in = ParallelVerifier.class.getResourceAsStream(marker);
+                     var gin = ParallelVerifier.class.getResourceAsStream(gate)) {
+                    if (in == null || gin == null) {
+                        // 资源缺失（异常构建）：返回不存在路径，agent 挂载退化为被动判定
+                        return Path.of(System.getProperty("java.io.tmpdir"), "just-missing-boot.jar");
+                    }
+                    Path out = Files.createTempFile("just-canary-boot-", ".jar");
+                    try (var zip = new java.util.zip.ZipOutputStream(
+                            Files.newOutputStream(out))) {
+                        zip.putNextEntry(new java.util.zip.ZipEntry(
+                                "io/just/sast/verify/boot/SinkReachedError.class"));
+                        in.transferTo(zip);
+                        zip.closeEntry();
+                        zip.putNextEntry(new java.util.zip.ZipEntry(
+                                "io/just/sast/verify/boot/SinkCanaryGate.class"));
+                        gin.transferTo(zip);
+                        zip.closeEntry();
+                    }
+                    OWN_ARTIFACTS.add(out);
+                    bootstrapJar = out;
+                    return out;
+                }
+            } catch (Exception e) {
+                return Path.of(System.getProperty("java.io.tmpdir"), "just-missing-boot.jar");
+            }
+        }
+    }
+
     public void cleanup() {
+        List<Path> artifacts;
+        synchronized (OWN_ARTIFACTS) {
+            artifacts = new ArrayList<>(OWN_ARTIFACTS);
+            OWN_ARTIFACTS.clear();
+            NESTED_CP.clear();
+        }
+        bootstrapJar = null;
+        for (Path p : artifacts) {
+            deleteQuietly(p);
+        }
+    }
+
+    private static void deleteQuietly(Path p) {
+        if (p == null || !Files.exists(p)) {
+            return;
+        }
+        if (Files.isDirectory(p)) {
+            try (var walk = Files.walk(p)) {
+                walk.sorted(Comparator.reverseOrder()).forEach(ParallelVerifier::deleteFileQuietly);
+            } catch (Exception ignored) {
+            }
+        } else {
+            deleteFileQuietly(p);
+        }
+    }
+
+    private static void deleteFileQuietly(Path p) {
+        try {
+            Files.deleteIfExists(p);
+        } catch (Exception ignored) {
+        }
     }
 }

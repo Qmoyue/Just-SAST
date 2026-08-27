@@ -140,7 +140,9 @@ public final class YamlRuleLoader {
             if (methods.isEmpty()) {
                 throw new IOException("source 规则 " + id + " 的 safe-config.methods 为空");
             }
-            safeConfig = new Rule.SafeConfigDecl(safeOwner, Set.copyOf(methods));
+            Object safeValue = safeMap.get("safe-value");
+            Boolean safeBool = safeValue instanceof Boolean b ? b : null;
+            safeConfig = new Rule.SafeConfigDecl(safeOwner, Set.copyOf(methods), safeBool);
         }
         return new Rule.SourceRule(id, str(ruleMap, "bridge"), callMatcher, safeConfig);
     }

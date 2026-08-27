@@ -95,7 +95,10 @@ public final class CsvReporter {
             List<String> notes = chainNotes.get(c.key());
             if (notes != null) {
                 for (String n : notes) {
-                    if (n.startsWith("verify:confirmed")) return true;
+                    // 子进程确认与段归因确认（完整链的内段被子进程证实）均置顶
+                    if (n.startsWith("verify:confirmed") || n.equals("verify:segment-confirmed")) {
+                        return true;
+                    }
                 }
             }
         }

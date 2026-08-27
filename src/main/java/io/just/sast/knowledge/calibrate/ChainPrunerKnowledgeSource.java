@@ -36,6 +36,10 @@ import java.util.Set;
  */
 public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
 
+    /** JDK 机制内部实现类前缀：其调用边属框架 machinery 语义，不构成 gadget 路径。 */
+    private static final java.util.List<String> MACHINERY_INTERNALS = java.util.List.of(
+            "java/util/ServiceLoader$");
+
     private static final Set<String> TRIGGER_REQUIRED = Set.of(
             "hashCode", "equals", "compareTo", "compare", "toString");
     /** 同机制保留的入口类代表上限。家族 = 入口类本身（不同类即不同发现；同类变体仍被去重）。 */
@@ -100,6 +104,19 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
                 deep++;
             }
         }
+        // 1.8 JDK 机制内部类噪音：路径穿过 JDK 机制内部实现类（ServiceLoader$ 迭代器等）
+        // 的"链"是框架自身 machinery，非攻击者经反序列化语义可触发的 gadget 路径
+        int machinery = 0;
+        for (Chain chain : bb.chains()) {
+            if (bb.calibrationOf(chain.key()) != null) {
+                continue;
+            }
+            if (chain.hops().stream().anyMatch(h -> MACHINERY_INTERNALS.stream()
+                    .anyMatch(p -> h.toOwner().startsWith(p)))) {
+                bb.calibrateChain(chain.key(), "machinery-hop");
+                machinery++;
+            }
+        }
         // 2. 机制去重（按家族）
         Map<String, List<Chain>> groups = new LinkedHashMap<>();
         for (Chain chain : bb.chains()) {
@@ -137,7 +154,8 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
                 }
             }
         }
-        JustLogger.info("链剪枝：无触发拒绝 {}，机制去重 {}（共 {} 条）", noTrigger, dedup, bb.chains().size());
+        JustLogger.info("链剪枝：无触发拒绝 {}，机制内部类 {}，机制去重 {}（共 {} 条）",
+                noTrigger, machinery, dedup, bb.chains().size());
     }
 
     // ---- 触发上下文 ----

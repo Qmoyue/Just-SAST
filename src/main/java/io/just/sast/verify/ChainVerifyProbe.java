@@ -66,9 +66,17 @@ public final class ChainVerifyProbe {
         }
 
         try {
-            // 1. 创建所有类的实例（自底向上）；无无参构造时回退到参数最少的构造器并按类型填默认值
+            // 0. 预初始化 printStackTrace 依赖的 IdentityHashMap：深层 gadget 递归栈中首次
+            //    触发其 <clinit> 会因 SOE 被永久毒化（此后一切栈打印 NCDFE），浅栈先建即免疫
+            try {
+                load("java.util.IdentityHashMap");
+            } catch (Throwable ignored) {
+            }
+
+            // 1. 创建所有类的实例（自底向上）；无无参构造时回退到参数最少的构造器并按类型填默认值。
+            //    类加载走 loadClass（非 Class.forName）——探针自身的类解析不得踩中 Class#forName canary
             Map<String, Object> instances = new HashMap<>();
-            Class<?> entryCls = Class.forName(entryClass);
+            Class<?> entryCls = load(entryClass);
             Object entryInstance = newInstance(entryCls);
             instances.put(entryClass, entryInstance);
 
@@ -77,7 +85,7 @@ public final class ChainVerifyProbe {
                 String toClass = link[2].replace('/', '.');
                 if (!instances.containsKey(toClass)) {
                     try {
-                        instances.put(toClass, newInstance(Class.forName(toClass)));
+                        instances.put(toClass, newInstance(load(toClass)));
                     } catch (Exception ignored) {
                     }
                 }
@@ -236,18 +244,64 @@ public final class ChainVerifyProbe {
             System.out.println("EXECUTED");
             System.exit(0);
 
-        } catch (Exception e) {
-            // sink 特异性判定：栈帧级全等匹配（类名 + 方法名），含 cause 链
-            if (reachesSink(e, sinkClassDotted, sinkMethod)) {
+        } catch (Throwable t) {
+            // 优先：sink canary 主动命中（插桩 sink 入口抛出的标记 Error，穿透 gadget 的
+            // catch(Exception)）。命中须同时满足：标记 spec == 本链 sink 且栈中存在
+            // 链入口方法帧（在 sink 帧之下）——排除探针自身基础设施误踩 sink。
+            String marker = markerSpec(t);
+            if (marker != null && sameSink(marker, sinkClassDotted, sinkMethod)
+                    && entryReached(t, entryClass, entryMethod)) {
                 System.out.println("SINK_TRIGGERED: " + sinkClassDotted);
                 System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
-                        + " in " + e.getClass().getName());
+                        + " (canary)");
                 System.exit(1);
             }
-            // 链中间环节失败（非 sink）
-            System.out.println("PARTIAL_PATH: " + e.getClass().getSimpleName());
+            // 次选：栈帧级全等匹配（类名 + 方法名），含 cause 链——同样要求入口帧在场
+            if (reachesSink(t, sinkClassDotted, sinkMethod)
+                    && entryReached(t, entryClass, entryMethod)) {
+                System.out.println("SINK_TRIGGERED: " + sinkClassDotted);
+                System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
+                        + " in " + t.getClass().getName());
+                System.exit(1);
+            }
+            // 链中间环节失败（非 sink）；消息带关键归因（如缺失类名），截断防长链污染输出
+            String detail = t.getMessage();
+            System.out.println("PARTIAL_PATH: " + t.getClass().getSimpleName()
+                    + (detail != null ? ": " + detail.split("\\R")[0].transform(
+                        s -> s.length() > 120 ? s.substring(0, 120) : s) : ""));
             System.exit(0); // 正常退出 = 未到达 sink
         }
+    }
+
+    /** 沿异常 cause 链（≤6 层）查找 SinkReachedError 标记，返回其 spec（无则 null）。 */
+    static String markerSpec(Throwable top) {
+        int depth = 0;
+        for (Throwable t = top; t != null && depth < 6; t = t.getCause(), depth++) {
+            if (t instanceof io.just.sast.verify.boot.SinkReachedError err) {
+                return err.getMessage();
+            }
+        }
+        return null;
+    }
+
+    /** canary spec 与链 sink 全等比对（spec 为内部类名，sink 为点分）。 */
+    static boolean sameSink(String spec, String sinkClassDotted, String sinkMethod) {
+        int h = spec.indexOf('#');
+        if (h <= 0) {
+            return false;
+        }
+        return spec.substring(0, h).replace('/', '.').equals(sinkClassDotted)
+                && spec.substring(h + 1).equals(sinkMethod);
+    }
+
+    /** 栈中是否存在链入口类#入口方法帧（真实执行过入口——探针基础设施误踩 sink 无此帧）。 */
+    static boolean entryReached(Throwable top, String entryClass, String entryMethod) {
+        for (StackTraceElement frame : top.getStackTrace()) {
+            if (entryClass.equals(frame.getClassName()) && entryMethod.equals(frame.getMethodName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 异常及其 cause 链（≤6 层）的栈帧中是否存在 declaringClass == sinkClass 且 methodName == sinkMethod 的帧。 */
@@ -367,8 +421,12 @@ public final class ChainVerifyProbe {
         }
     }
 
-    private static Field findField(Class<?> cls, String name) {
-        for (Class<?> c = cls; c != null; c = c.getSuperclass()) {
+    /** 类加载统一走应用 classloader 的 loadClass：探针自身解析不触发 Class#forName canary。 */
+    private static Class<?> load(String name) throws ClassNotFoundException {
+        return ClassLoader.getSystemClassLoader().loadClass(name);
+    }
+
+    private static Field findField(Class<?> cls, String name) {        for (Class<?> c = cls; c != null; c = c.getSuperclass()) {
             try {
                 return c.getDeclaredField(name);
             } catch (NoSuchFieldException ignored) {

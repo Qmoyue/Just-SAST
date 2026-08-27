@@ -81,6 +81,10 @@
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <mainClass>io.just.sast.cli.JustMain</mainClass>
+                  <manifestEntries>
+                    <Premain-Class>io.just.sast.verify.SinkCanaryAgent</Premain-Class>
+                    <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                  </manifestEntries>
                 </transformer>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
               </transformers>

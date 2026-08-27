@@ -11,8 +11,10 @@ import io.just.sast.blackboard.Phase;
 import io.just.sast.util.JustLogger;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -32,13 +34,23 @@ import java.util.Set;
  */
 public final class ChainComposerKnowledgeSource implements KnowledgeSource {
 
-    private static final int MAX_COMPOSED = 100;
+    private static final int MAX_COMPOSED = 400;
     private static final int MAX_HOPS = 16;
+    private static final int MAX_SOURCE_HOSTS = 1000;
+
+    /** 哈希触发容器：其反序列化机制以元素/键回调 hashCode/equals/compareTo。 */
+    private static final Set<String> TRIGGER_CONTAINERS = Set.of(
+            "java/util/Map", "java/util/Collection", "java/util/Set", "java/util/List",
+            "java/util/HashMap", "java/util/HashSet", "java/util/Hashtable",
+            "java/util/LinkedHashMap", "java/util/LinkedHashSet",
+            "java/util/TreeMap", "java/util/TreeSet", "java/util/concurrent/PriorityQueue");
 
     /** 桥接类型。 */
     enum Bridge { INVOKE, TRIGGER, TEMPLATE, DESER }
 
     private Blackboard bb;
+    /** 反序列化源宿主：hostKey(methodOwner.#methodName) → 源框架入口 (owner, method)。 */
+    private Map<String, String[]> deserHosts;
 
     @Override
     public String id() {
@@ -97,7 +109,123 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 }
             }
         }
-        JustLogger.info("链组装：语义桥接产链 {} 条", composed);
+        // 源宿主桥使用含本轮 INVOKE/DESER 合成链的新快照——完整链（多段桥接产物）也能再挂源宿主；
+        // 图不可用（最小夹具）时宿主扫描无从进行，跳过该桥
+        int sourceComposed = this.bb != null && this.bb.graph() != null
+                ? composeSourceHosted(List.copyOf(this.bb.chains())) : 0;
+        JustLogger.info("链组装：语义桥接产链 {} 条（源宿主容器触发 {} 条）", composed, sourceComposed);
+    }
+
+    /**
+     * 源宿主容器触发桥：方法 M 体内含反序列化源调用（OIS 读取或 bridge:deserialize 框架源），
+     * 且操作哈希触发容器（Map/Set 的 add/put/iterator）——容器反序列化机制以攻击者数据回调
+     * 元素 hashCode/equals/compareTo（如 HashSet.readObject → HashMap.hash → 元素 hashCode）。
+     * 此类方法直接作为触发容器桥的前段宿主，与 trigger-entry 后段链组装成完整攻击路径。
+     */
+    private int composeSourceHosted(List<Chain> chains) {
+        if (deserHosts == null) {
+            scanHosts();
+        }
+        int composed = 0;
+        // 公开 gadget 片段链（已知触发语义）优先消耗预算，其余按黑板顺序
+        List<Chain> ordered = new ArrayList<>();
+        List<Chain> rest = new ArrayList<>();
+        for (Chain back : chains) {
+            boolean fragment = back.hops().stream()
+                    .anyMatch(h -> "fragment".equals(h.reason()));
+            (fragment ? ordered : rest).add(back);
+        }
+        ordered.addAll(rest);
+        for (Chain back : ordered) {
+            if (composed >= MAX_COMPOSED || !isTriggerEntry(back.entryKind())) {
+                continue;
+            }
+            for (Map.Entry<String, String[]> host : deserHosts.entrySet()) {
+                if (composed >= MAX_COMPOSED) {
+                    break;
+                }
+                String hostKey = host.getKey();
+                int sep = hostKey.lastIndexOf(".#");
+                String hostClass = hostKey.substring(0, sep);
+                String hostMethod = hostKey.substring(sep + 2);
+                // 防环：后段入口类不得就是宿主自身（宿主内自触发无源语义）
+                if (back.entryClass().equals(hostClass)) {
+                    continue;
+                }
+                String[] frame = host.getValue();
+                List<ChainHop> hops = new ArrayList<>();
+                for (int i = 0; i < back.hops().size() - 1; i++) {
+                    hops.add(back.hops().get(i));
+                }
+                // 机制桥接跳：反序列化框架的容器/bean 机制以攻击者数据回调后段入口
+                // （OIS: HashSet.readObject→HashMap.hash；Kryo: MapSerializer.read→put；
+                //   fastjson: JavaBeanDeserializer→setter——框架管线语义，非调用图相邻）
+                hops.add(new ChainHop(frame[0], frame[1],
+                        back.entryClass(), back.entryMethod(),
+                        HopKind.VIRTUAL_DISPATCH, null, "bridge-trigger-src", "", null));
+                hops.add(back.hops().get(back.hops().size() - 1));
+                if (hops.size() > MAX_HOPS) {
+                    continue;
+                }
+                Chain merged = new Chain(back.ruleId(), back.category(), back.severity(),
+                        hostClass, hostMethod, "source",
+                        back.sinkClass(), back.sinkMethod(), hops, back.unresolvedHops());
+                if (bb.addChain(merged)) {
+                    bb.chainNote(merged.key(), "pattern:src-container-trigger");
+                    composed++;
+                }
+            }
+        }
+        return composed;
+    }
+
+    /** 全图单遍扫描：反序列化源宿主（体内含 OIS 读取或 bridge:deserialize 源调用，
+     *  排除 JDK 运行时包——其 readObject 体是容器触发机制本身，以机制桥接跳建模）。 */
+    private void scanHosts() {
+        Map<String, String[]> hosts = new HashMap<>();
+        for (var call : bb.graph().nodesOfType(io.just.sast.cpg.graph.NodeType.CALL)) {
+            String callOwner = call.strProp("owner");
+            String callName = call.strProp("name");
+            String hostOwner = call.strProp("methodOwner");
+            String hostName = call.strProp("methodName");
+            if (hostOwner == null || hostName == null || isJdkInternal(hostOwner)) {
+                continue;
+            }
+            String frameOwner = null;
+            String frameMethod = null;
+            if ("java/io/ObjectInputStream".equals(callOwner)
+                    && ("readObject".equals(callName) || "readUnshared".equals(callName))) {
+                frameOwner = callOwner;
+                frameMethod = callName;
+            } else if (callName != null) {
+                var rule = bb.ruleEngine().matchingSource(callOwner, callName, call.strProp("desc"))
+                        .filter(r -> "deserialize".equals(r.bridge())).orElse(null);
+                if (rule != null) {
+                    frameOwner = callOwner;
+                    frameMethod = callName;
+                }
+            }
+            if (frameOwner == null || hosts.size() >= MAX_SOURCE_HOSTS) {
+                continue;
+            }
+            // 框架自身管线内的同名调用（Kryo 序列化器内部再调 readObject 等）是机制 plumbing，
+            // 不是攻击面宿主——排除与源框架同包的宿主
+            int slash = frameOwner.lastIndexOf('/');
+            String framePkg = slash > 0 ? frameOwner.substring(0, slash + 1) : frameOwner;
+            if (!hostOwner.startsWith(framePkg)) {
+                hosts.putIfAbsent(hostOwner + ".#" + hostName,
+                        new String[] {frameOwner, frameMethod});
+            }
+        }
+        deserHosts = hosts;
+    }
+
+    /** JDK 运行时包前缀（这些包里的反序列化源宿主是机制本身，不是攻击面宿主）。 */
+    private static boolean isJdkInternal(String owner) {
+        return owner.startsWith("java/") || owner.startsWith("javax/")
+                || owner.startsWith("sun/") || owner.startsWith("com/sun/")
+                || owner.startsWith("jdk/") || owner.startsWith("org/w3c/")
+                || owner.startsWith("org/xml/") || owner.startsWith("org/omg/");
     }
 
     /** 判断前段链的 sink 能否语义上触发后段链的 entry。 */

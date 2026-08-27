@@ -54,7 +54,7 @@ class SafeConfigKnowledgeSourceTest {
         }
         Rule.SourceRule source = new Rule.SourceRule("T-SOURCE", "deserialize",
                 new Rule.CallMatcher(Match.of("fake/Fw"), Match.of("load"), null),
-                new Rule.SafeConfigDecl(Match.of("fake/Fw"), Set.of("lock")));
+                new Rule.SafeConfigDecl(Match.of("fake/Fw"), Set.of("lock"), null));
         return new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(classes, null),
                 new io.just.sast.cpg.build.FieldWriterIndex(),

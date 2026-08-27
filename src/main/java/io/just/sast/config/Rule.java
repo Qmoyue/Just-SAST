@@ -57,7 +57,7 @@ public sealed interface Rule {
             implements Rule {}
 
     /** 安全配置声明（挂在 source 规则上，SafeConfig 知识源消费）。owner 为前缀匹配，methods 精确匹配。 */
-    record SafeConfigDecl(Match owner, Set<String> methods) {}
+    record SafeConfigDecl(Match owner, Set<String> methods, Boolean safeValue) {}
 
     /**
      * source 规则：替代反序列化框架入口调用点（Kryo/SnakeYAML/XStream/Hessian/Fastjson 等）。

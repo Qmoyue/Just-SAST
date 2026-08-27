@@ -102,7 +102,9 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
             }
             // 每条规则记最早的安全配置偏移与最早的入口调用偏移
             Map<io.just.sast.config.Rule.SourceRule, int[]> offsets = new HashMap<>();
-            for (InsnFact insn : info.instructions()) {
+            List<InsnFact> insns = info.instructions();
+            for (int idx = 0; idx < insns.size(); idx++) {
+                InsnFact insn = insns.get(idx);
                 if (!insn.op().isInvoke() || insn.operands().isEmpty()) {
                     continue;
                 }
@@ -112,7 +114,14 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
                 for (io.just.sast.config.Rule.SourceRule src : guarded) {
                     int[] pair = offsets.computeIfAbsent(src, k -> new int[] {Integer.MAX_VALUE, Integer.MAX_VALUE});
                     if (isSafeConfigCall(src.safeConfig(), ref.owner(), ref.name())) {
-                        pair[0] = Math.min(pair[0], insn.offset());
+                        // 布尔安全开关求值：实参常量 == safe-value 才算已加固
+                        // （如 Kryo.setRegistrationRequired(false) 是关闭安全模式，不是加固）
+                        Boolean actual = pushedBooleanValue(info.instructions(), idx);
+                        Boolean expected = src.safeConfig().safeValue();
+                        boolean safe = expected == null || actual == null || actual.equals(expected);
+                        if (safe) {
+                            pair[0] = Math.min(pair[0], insn.offset());
+                        }
                     }
                     if (src.call().matches(ref.owner(), ref.name(), ref.descriptor())) {
                         pair[1] = Math.min(pair[1], insn.offset());
@@ -131,5 +140,29 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
 
     private static boolean isSafeConfigCall(io.just.sast.config.Rule.SafeConfigDecl safe, String owner, String name) {
         return owner.startsWith(safe.owner().pattern()) && safe.methods().contains(name);
+    }
+
+    /** 调用点前最近的一条整型常量推送（≤6 条内）：ICONST/BIPUSH/SIPUSH/LDC-int。无法判定为 null。 */
+    private static Boolean pushedBooleanValue(List<InsnFact> insns, int invokeIdx) {
+        for (int j = invokeIdx - 1; j >= 0 && j >= invokeIdx - 6; j--) {
+            InsnFact f = insns.get(j);
+            switch (f.op()) {
+                case ICONST_0 -> {
+                    return false;
+                }
+                case ICONST_1 -> {
+                    return true;
+                }
+                case BIPUSH, SIPUSH, LDC -> {
+                    if (!f.operands().isEmpty() && f.operands().get(0) instanceof Integer i) {
+                        return i == 1;
+                    }
+                    return null;
+                }
+                default -> {
+                }
+            }
+        }
+        return null;
     }
 }

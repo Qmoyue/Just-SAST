@@ -298,14 +298,14 @@ rules:
     bridge: deserialize
     match:
       call: { owner: "com/esotericsoftware/kryo/Kryo", name: ~"readClassAndObject|readObject|readObjectOrNull" }
-    safe-config: { owner: "com/esotericsoftware/kryo/Kryo", methods: [setRegistrationRequired] }
+    safe-config: { owner: "com/esotericsoftware/kryo/Kryo", methods: [setRegistrationRequired], safe-value: true }
 
   - id: JUST-SOURCE-KRYO5
     kind: source
     bridge: deserialize
     match:
       call: { owner: "com/esotericsoftware/kryo/kryo5/Kryo", name: ~"readClassAndObject|readObject|readObjectOrNull" }
-    safe-config: { owner: "com/esotericsoftware/kryo/kryo5/Kryo", methods: [setRegistrationRequired] }
+    safe-config: { owner: "com/esotericsoftware/kryo/kryo5/Kryo", methods: [setRegistrationRequired], safe-value: true }
   # 来源：CodeQL Kryo.qll（kryo5 包同建模）；safe-config 同 Kryo.setRegistrationRequired 流
 
   - id: JUST-SOURCE-SNAKEYAML
@@ -335,7 +335,7 @@ rules:
     bridge: deserialize
     match:
       call: { owner: "com/alibaba/fastjson/JSON", name: ~"parseObject|parse|parseArray" }
-    safe-config: { owner: "com/alibaba/fastjson/parser/ParserConfig", methods: [setSafeMode] }
+    safe-config: { owner: "com/alibaba/fastjson/parser/ParserConfig", methods: [setSafeMode], safe-value: true }
 
   - id: JUST-SOURCE-FASTJSON2
     kind: source
@@ -653,6 +653,24 @@ rules:
       - { class: "com/sun/syndication/feed/impl/ToStringBean", method: "toString" }
     sinkOwner: "java/lang/reflect/Method"
     sinkName: "invoke"
+
+  - id: FRAG-ROME-HASHCODE
+    kind: chain-fragment
+    entryClass: "com/sun/syndication/feed/impl/EqualsBean"
+    entryKind: hashCode
+    hops:
+      - { class: "com/sun/syndication/feed/impl/ToStringBean", method: "toString" }
+    sinkOwner: "java/lang/reflect/Method"
+    sinkName: "invoke"
+
+  - id: FRAG-ROME-TEMPLATE
+    kind: chain-fragment
+    entryClass: "com/sun/syndication/feed/impl/ToStringBean"
+    entryKind: toString
+    hops:
+      - { class: "javax/xml/transform/Templates", method: "getOutputProperties" }
+    sinkOwner: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"
+    sinkName: "newTransformer"
 
   - id: FRAG-SPRING1
     kind: chain-fragment
