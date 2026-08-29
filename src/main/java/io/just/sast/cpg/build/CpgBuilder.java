@@ -11,16 +11,19 @@ import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
 
-/** CPG 构建：METHOD 节点 + CALL 节点（含调用事实），收集字段写入索引。 */
+/** CPG 构建：METHOD/CALL 核心节点、字段写入索引和紧凑方法语义切片。 */
 public final class CpgBuilder {
 
     public BuiltCpg build(LoadResult load) {
         Graph graph = new Graph();
         FieldWriterIndex fieldWriters = new FieldWriterIndex();
+        CpgIndex.Builder index = CpgIndex.builder();
         for (ClassInfo cls : load.classes().values()) {
             for (MethodInfo method : cls.methods()) {
                 graph.methodNode(method.owner(), method.name(), method.descriptor(), false);
+                CpgIndex.Builder.MethodSliceBuilder slice = index.start(method);
                 for (InsnFact insn : method.instructions()) {
+                    slice.accept(insn);
                     Op op = insn.op();
                     if (op.isInvoke()) {
                         addCall(graph, insn, cls.internalName(), method);
@@ -41,9 +44,13 @@ public final class CpgBuilder {
                         }
                     }
                 }
+                for (var tryCatch : method.tryCatch()) {
+                    slice.accept(tryCatch);
+                }
+                slice.finish();
             }
         }
-        return new BuiltCpg(graph, fieldWriters);
+        return new BuiltCpg(graph, fieldWriters, index.build());
     }
 
     private static void addCall(Graph graph, InsnFact insn, String clsName, MethodInfo enclosing) {

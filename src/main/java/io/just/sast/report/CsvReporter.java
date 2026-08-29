@@ -35,8 +35,14 @@ public final class CsvReporter {
 
     public void write(Path outDir, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
                       Map<String, String> calibrations, Map<String, List<String>> chainNotes) throws IOException {
+        write(ReportLayout.flat(outDir), chains, outcomes, calibrations, chainNotes);
+    }
+
+    public void write(ReportLayout layout, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
+                      Map<String, String> calibrations, Map<String, List<String>> chainNotes) throws IOException {
         regions.attach(cpgGraph);
-        Files.createDirectories(outDir);
+        Files.createDirectories(layout.findings());
+        Files.createDirectories(layout.evidence());
         List<Row> findings = new ArrayList<>();
         List<Row> edges = new ArrayList<>();
         // 按 (entry, sink, category) 折叠：代表链取最短路径，其余计入 variant_count
@@ -88,11 +94,11 @@ public final class CsvReporter {
                         String.valueOf(regions.crossings(variant)), pathSummary(variant)));
             }
         }
-        writeCsv(outDir.resolve("chains.csv"), CHAINS_HEADER, allChains);
-        writeCsv(outDir.resolve("findings.csv"), FINDINGS_HEADER, findings);
-        writeCsv(outDir.resolve("edges.csv"), EDGES_HEADER, edges);
-        writeCsv(outDir.resolve("sinks.csv"), SINKS_HEADER, sinks);
-        writeCsv(outDir.resolve("calibrations.csv"), CALIBRATIONS_HEADER, calibrationRows);
+        writeCsv(layout.evidence().resolve("chains.csv"), CHAINS_HEADER, allChains);
+        writeCsv(layout.findings().resolve("findings.csv"), FINDINGS_HEADER, findings);
+        writeCsv(layout.evidence().resolve("edges.csv"), EDGES_HEADER, edges);
+        writeCsv(layout.evidence().resolve("sinks.csv"), SINKS_HEADER, sinks);
+        writeCsv(layout.evidence().resolve("calibrations.csv"), CALIBRATIONS_HEADER, calibrationRows);
     }
 
     /** 组内任一变体有 verify:confirmed 注释。 */
@@ -102,7 +108,8 @@ public final class CsvReporter {
             if (notes != null) {
                 for (String n : notes) {
                     // 子进程确认与段归因确认（完整链的内段被子进程证实）均置顶
-                    if (n.startsWith("verify:confirmed") || n.equals("verify:segment-confirmed")) {
+                    if (n.startsWith("verify:sink-blocked") || n.startsWith("verify:confirmed")
+                            || n.equals("verify:segment-confirmed")) {
                         return true;
                     }
                 }
@@ -118,12 +125,12 @@ public final class CsvReporter {
                 + "|" + chain.category();
     }
 
-    /** 组排序：CONFIRMED 链置顶 → 证据分值降序 → 链长（短优先） → 变体数（多优先）。 */
+    /** 组排序：SINK_BLOCKED 链置顶 → 证据分值降序 → 链长（短优先） → 变体数（多优先）。 */
     private static int compareGroups(List<Chain> g1, List<Chain> g2,
                                      Map<String, List<String>> chainNotes) {
         Chain c1 = g1.get(0);
         Chain c2 = g2.get(0);
-        // CONFIRMED 优先（子进程验证为真的链排最前）
+        // SINK_BLOCKED 优先（真实前缀抵达 canary、但 sink body 未进入的链排最前）
         boolean confirmed1 = hasConfirmedNote(g1, chainNotes);
         boolean confirmed2 = hasConfirmedNote(g2, chainNotes);
         if (confirmed1 != confirmed2) {

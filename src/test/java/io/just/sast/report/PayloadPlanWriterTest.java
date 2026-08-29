@@ -38,5 +38,40 @@ class PayloadPlanWriterTest {
                 && plan.contains("\"status\":\"CONFIRMED\"")
                 && plan.contains("NO_COMMAND_EXECUTION")
                 && !plan.contains("\"payload_bytes\""));
+
+        String readableJson = Files.readString(temp.resolve("payload.json"));
+        String readableMarkdown = Files.readString(temp.resolve("payload.md"));
+        assertTrue(readableJson.contains("\"steps\"")
+                && readableJson.contains("\"execution\":\"NOT_EXECUTED_BY_INERT_PLAN\"")
+                && readableJson.contains("\"observed_boundary\":\"NOT_PROVEN\"")
+                && !readableJson.contains("BLOCK_BEFORE_SINK_BODY"));
+        assertTrue(readableMarkdown.contains("### Steps")
+                && readableMarkdown.contains("SINK BOUNDARY")
+                && readableMarkdown.contains("SINK BOUNDARY NOT PROVEN"));
+    }
+
+    @Test
+    void keepsSinkBlockedBoundarySeparateFromPayloadExecution(@TempDir Path temp) throws Exception {
+        Chain chain = new Chain("R", "C", "HIGH", "app/Entry", "readObject",
+                "readObject", "java/lang/Runtime", "exec", List.of(), 0);
+        VerificationSummary verification = new VerificationSummary(
+                "JVM_SANDBOX", 1, 1, 0, 1,
+                Map.of("SINK_BLOCKED", 1), Map.of(),
+                List.of(new VerificationSummary.ChainResult(
+                        1, chain.key(), "SINK_BLOCKED", "sink-canary",
+                        "HIGH", 10, 1, 4, "SINK_CANARY_BOUNDARY")));
+
+        new PayloadPlanWriter().write(temp, List.of(chain), Map.of(), Map.of(), verification);
+
+        String readableJson = Files.readString(temp.resolve("payload.json"));
+        String readableMarkdown = Files.readString(temp.resolve("payload.md"));
+        assertTrue(readableJson.contains("\"status\":\"SINK_BLOCKED\"")
+                        && readableJson.contains("\"observed_boundary\":\"SINK_BLOCKED_BEFORE_BODY\"")
+                        && readableJson.contains("\"execution\":\"NOT_EXECUTED_BY_INERT_PLAN\""),
+                "canary 边界必须与最终 payload 执行严格分离：\n" + readableJson);
+        assertTrue(readableMarkdown.contains("SINK BLOCKED BEFORE BODY")
+                        && readableMarkdown.contains("real prefix reached the canary")
+                        && readableMarkdown.contains("No command, network, native load"),
+                "人类可读视图必须说明 canary 边界和安全限制：\n" + readableMarkdown);
     }
 }

@@ -31,9 +31,14 @@ import io.just.sast.util.AdaptiveParallelism;
 public final class ParallelVerifier {
 
     public record VerifyResult(String chainKey, String status, String detail,
-                               int attempt, long durationMs) {
+                               int attempt, long durationMs, String evidence) {
         public VerifyResult(String chainKey, String status, String detail) {
-            this(chainKey, status, detail, 1, 0L);
+            this(chainKey, status, detail, 1, 0L, defaultEvidence(status, detail));
+        }
+
+        public VerifyResult(String chainKey, String status, String detail,
+                            int attempt, long durationMs) {
+            this(chainKey, status, detail, attempt, durationMs, defaultEvidence(status, detail));
         }
 
         public VerifyResult {
@@ -42,6 +47,22 @@ public final class ParallelVerifier {
             detail = detail == null ? "" : detail;
             attempt = Math.max(1, attempt);
             durationMs = Math.max(0L, durationMs);
+            evidence = evidence == null || evidence.isBlank()
+                    ? defaultEvidence(status, detail) : evidence;
+        }
+
+        private static String defaultEvidence(String status, String detail) {
+            return switch (status == null ? "" : status) {
+                case "SINK_BLOCKED" -> "SINK_CANARY_BOUNDARY";
+                case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER";
+                case "EXECUTED" -> "ENTRY_RETURNED";
+                case "PARTIAL" -> "PARTIAL_PATH";
+                case "TIMEOUT" -> "PROCESS_TIMEOUT";
+                case "UNTESTABLE" -> detail != null && detail.startsWith("SANDBOX_UNAVAILABLE")
+                        ? "SANDBOX_UNAVAILABLE" : "VERIFIER_CAPABILITY_LIMIT";
+                case "FAILED" -> "NO_TRIGGER";
+                default -> "UNKNOWN";
+            };
         }
     }
 
@@ -493,7 +514,7 @@ public final class ParallelVerifier {
         for (int i = 0; i < chains.size(); i++) {
             final int index = i;
             Future<IndexedResult> future = completion.submit(
-                    () -> new IndexedResult(index, verifyOne(chains.get(index))));
+                    () -> new IndexedResult(index, verifyOne(chains.get(index), attempt)));
             pending.put(future, index);
         }
         while (!pending.isEmpty()) {
@@ -550,12 +571,14 @@ public final class ParallelVerifier {
         };
     }
 
-    private VerifyResult verifyOne(Chain chain) {
+    private VerifyResult verifyOne(Chain chain, int attempt) {
         long started = System.nanoTime();
         VerifyResult result = verifyOneInternal(chain);
         return new VerifyResult(result.chainKey(), result.status(), result.detail(),
-                result.attempt(),
-                Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)));
+                attempt,
+                Math.max(result.durationMs(),
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)),
+                result.evidence());
     }
 
     private VerifyResult verifyOneInternal(Chain chain) {
@@ -685,9 +708,10 @@ public final class ParallelVerifier {
                 if (firstAny == null) {
                     firstAny = trimmed;
                 }
-                if (trimmed.startsWith("SINK_TRIGGERED") || trimmed.startsWith("EXECUTED")
+                if (trimmed.startsWith("SINK_BLOCKED") || trimmed.startsWith("SINK_TRIGGERED")
+                        || trimmed.startsWith("CONCRETE_REACHED") || trimmed.startsWith("EXECUTED")
                         || trimmed.startsWith("SANDBOX_UNAVAILABLE")
-                        || trimmed.startsWith("PARTIAL_PATH")) {
+                        || trimmed.startsWith("UNTESTABLE") || trimmed.startsWith("PARTIAL_PATH")) {
                     firstLine = trimmed;
                     break;
                 }
@@ -695,9 +719,14 @@ public final class ParallelVerifier {
             if (firstLine == null) {
                 firstLine = firstAny == null ? "" : firstAny;
             }
-            if (firstLine.startsWith("SINK_TRIGGERED")) {
+            if (firstLine.startsWith("SINK_BLOCKED") || firstLine.startsWith("SINK_TRIGGERED")) {
                 if (callback != null) callback.onConfirmed(chain, firstLine, true);
-                return new VerifyResult(chain.key(), "CONFIRMED", "SINK_REACHED");
+                return new VerifyResult(chain.key(), "SINK_BLOCKED", "SINK_CANARY_BOUNDARY",
+                        1, 0L, "SINK_CANARY_BOUNDARY");
+            }
+            if (firstLine.startsWith("CONCRETE_REACHED")) {
+                return new VerifyResult(chain.key(), "CONCRETE_REACHED", firstLine,
+                        1, 0L, "CONCRETE_TRIGGER");
             }
             if (firstLine.startsWith("EXECUTED")) {
                 // 入口方法真实调用且正常返回——链可执行，但未证伪/证实 sink 到达
@@ -707,6 +736,9 @@ public final class ParallelVerifier {
                 return new VerifyResult(chain.key(), "PARTIAL", firstLine);
             }
             if (firstLine.startsWith("SANDBOX_UNAVAILABLE")) {
+                return new VerifyResult(chain.key(), "UNTESTABLE", firstLine);
+            }
+            if (firstLine.startsWith("UNTESTABLE")) {
                 return new VerifyResult(chain.key(), "UNTESTABLE", firstLine);
             }
             int exit = proc.exitValue();

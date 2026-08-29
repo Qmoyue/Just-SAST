@@ -98,22 +98,32 @@ public final class LegacyChainVerifyProbe {
             }
 
             trigger(entryType, entryInstance, entryMethod, entryDescriptor, mode);
-            System.out.println("EXECUTED");
+            if (LegacySinkCanaryGate.wasReached()) {
+                System.out.println("SINK_BLOCKED: " + sinkClass);
+                System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
+                        + " (canary-latched)");
+            } else if ("SERIAL".equals(mode) || "PROXY".equals(mode)
+                    || mode.startsWith("TRIGGER_")) {
+                System.out.println("CONCRETE_REACHED: " + mode);
+            } else {
+                System.out.println("EXECUTED");
+            }
             System.exit(0);
         } catch (Throwable failure) {
             String marker = markerSpec(failure);
             if (marker != null && sameSink(marker, sinkClass, sinkMethod, sinkDescriptor)
                     && entryReached(failure, entryClass, entryMethod)) {
-                System.out.println("SINK_TRIGGERED: " + sinkClass);
+                System.out.println("SINK_BLOCKED: " + sinkClass);
                 System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod + " (canary)");
                 System.exit(1);
                 return;
             }
             if (sinkDescriptor.length() == 0 && reachesSink(failure, sinkClass, sinkMethod)
                     && entryReached(failure, entryClass, entryMethod)) {
-                System.out.println("SINK_TRIGGERED: " + sinkClass);
-                System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod);
-                System.exit(1);
+                System.out.println("UNTESTABLE: sink-frame-without-canary");
+                System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
+                        + " without canary (not confirmed)");
+                System.exit(0);
                 return;
             }
             String detail = failure.getMessage();

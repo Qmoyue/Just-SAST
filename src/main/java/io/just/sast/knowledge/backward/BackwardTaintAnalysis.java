@@ -947,7 +947,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 if (handler == null) {
                     continue;
                 }
-                Set<Integer> returnOffsets = ForwardEngine.proxyMethodReturnOffsets(handler, call.name());
+                Set<Integer> returnOffsets = ForwardEngine.proxyMethodReturnOffsets(handler, call.name(),
+                        support::cfg);
                 if (returnOffsets.isEmpty()) {
                     bb.markIncomplete("PROXY_RETURN_METADATA");
                     returnSummary(handler, depth, trace, mark);

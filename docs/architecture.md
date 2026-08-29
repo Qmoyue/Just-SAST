@@ -78,19 +78,24 @@ Just 的核心任务是：从 JAR/WAR/class 目录中提取 Java 字节码事实
 
 ASM 不穿透到 knowledge 层。这样可以替换或测试推理语义，而不把 ASM visitor 状态扩散到整个系统。
 
-### 3.3 图表示
+### 3.3 图表示：面向 Java 字节码的混合 CPG
 
-代码图是建立后冻结的只读索引，主要包含 METHOD/CALL 节点、调用/分发/lambda 边、字段写入索引和类层次索引。方法内 CFG 通过 `Cfg` 按需计算；来源传播状态由 `ForwardOrigins` 和局部摘要维护，不把每个抽象状态物化成全局图节点。
+Just 采用“语义核心图 + 按需关系”的混合 CPG，而不是把每条指令、每个抽象状态都物化成重型图对象。核心图冻结后主要保存 METHOD/CALL 节点、调用/分发/lambda 边、字段写入索引和类层次索引；`CpgIndex` 为方法维护紧凑的调用、字段、控制流语义切片，`Cfg`、异常边、值/字段关系和污点摘要按查询需要展开并共享。
+
+这使图仍然可以表达 CPG 所需的 AST/CFG/数据关系，但适合没有源码、直接分析 JAR/WAR 的场景：ASM 只负责产生稳定字节码事实，查询层按需提供 containment、CFG、call、def-use、field、type、exception 和 taint 关系。全量预建指令图会放大对象数量和内存峰值，不符合 Just 的轻量目标。
 
 设计重点：
 
 - 邻接和调用索引采用稳定键，避免 worker 观察到不同遍历顺序；
+- CPG 查询使用方法键和紧凑 offset/id 索引；同一个方法的 CFG 和语义切片在分析阶段复用，避免每个知识源重复重建图；
 - 类层次闭包按需记忆化；可见性、`private`、`static` 和跨包 package-private 约束在分发前应用；
 - JSR/RET、异常边、fall-through 和 lambda 目标在 CFG/调用图中保持显式语义；
 - `DISPATCH_CAP`、实现者展开、路径和证明预算触顶时记录 `PARTIAL` 原因；
 - 图构建与调度分离。CPU worker 可并行计算局部结果，但黑板只接受稳定合并后的 delta。
 
 GPU 不属于默认后端。当前热路径是分支密集的对象/字段来源、反射和路径状态，不满足无条件搬运到 GPU 的同构数据条件；只有 profile 证明 bitset 可达性或 SCC 内核是主要成本，并通过 CPU 等价回归，才考虑可选实验后端。
+
+本轮采用的研究依据包括：[CPG 原始模型](https://www.ieee-security.org/TC/SP2014/papers/ModelingandDiscoveringVulnerabilitieswithCodePropertyGraphs.pdf) 对 AST/CFG/PDG 合一查询的定义，[图可达性/IFDS 基础](https://www.sciencedirect.com/science/article/pii/S0950584998000937)，面向大 Java 程序的按需 access-path 分析[研究](https://arxiv.org/abs/2103.16240)，以及 Java 上下文敏感 points-to 的 [Qilin ECOOP 论文](https://drops.dagstuhl.de/storage/00lipics/lipics-vol222-ecoop2022/LIPIcs.ECOOP.2022.30/LIPIcs.ECOOP.2022.30.pdf)。它们共同支持“按需求解、共享摘要、在精度/时间边界内展开”的取舍，而不是盲目增加图规模。
 
 ## 4. Blackboard 与知识源
 
@@ -174,7 +179,8 @@ sink 规则描述危险能力和 tainted 参数，例如命令执行、JNDI、�
 
 | 状态 | 语义 |
 | --- | --- |
-| `CONFIRMED` | canary 或入口归因的精确 sink 栈帧命中，危险方法体不继续执行 |
+| `SINK_BLOCKED` | 真实序列化/触发链到达精确 sink 边界，canary 阻断危险方法体；最高动态证据 |
+| `CONCRETE_REACHED` | 真实触发前缀到达安全观察点，但尚未到达精确 sink 边界 |
 | `EXECUTED` | 入口调用成功，但没有 sink 到达证据 |
 | `PARTIAL` | 构造/触发只完成一部分，保留静态链 |
 | `FAILED` | 验证进程失败或非零退出，属于弱否定证据 |
@@ -184,20 +190,26 @@ JVM deny-by-default 权限门只能减少 Java 层能力，不能隔离任意不
 
 ## 8. 报告与稳定性
 
-报告由独立 reporter 生成：
+报告由独立 reporter 生成，并按阅读任务分类：
 
-- CSV：`findings.csv`、`chains.csv`、`edges.csv`、`sinks.csv`、`calibrations.csv`；
-- 机器接口：`findings.json`、`findings.sarif`；
-- 阅读接口：`findings.html`、`findings.md`、`dormant.md`；
-- 过程证据：`scan-metadata.json`、`dynamic-verification.json`、`payload-plan.json`。
+```text
+just-out/
+├── index.md
+├── findings/       findings.csv/json/sarif/html/md
+├── verification/   payload.md/json、dynamic-verification.json
+├── evidence/       chains.csv、edges.csv、sinks.csv、calibrations.csv、dormant.md
+└── meta/           scan-metadata.json、payload-plan.json
+```
+
+所有格式从同一份规范化链路视图渲染；Markdown 面向人读，JSON 面向 agent，CSV/SARIF 面向导入和审计，旁车证据不重新推导静态结论。
 
 `findings.csv` 是折叠后的主链，`chains.csv` 保留路径变体；`edges.csv` 负责解释逐跳语义；`calibrations.csv` 让拒绝原因可审计。动态和完整性旁车文件不改变既有 findings JSON 数组契约。
 
-payload writer 输出确定性的对象图、字段依赖、触发模式、危险能力和验证证据计划。它是后续经过授权的框架适配器的输入，不是可直接执行的攻击 payload。
+payload writer 输出确定性的对象图、字段依赖、触发模式、危险能力和验证证据计划。`verification/payload.md` 以“反序列化入口 → 触发器 → gadget → sink 边界”的逐跳形式展示，`verification/payload.json` 以稳定字段供人和 agent 消费；两者都是安全计划和证据视图，不是可直接执行的攻击 payload。
 
 ## 9. 性能与内存原则
 
-当前实现使用流式输入、原始字节早释放、冻结只读索引、惰性 CFG、局部来源状态、缓存生命周期和自适应 CPU 并行。性能优化必须同时满足：
+当前实现使用流式输入、原始字节早释放、冻结只读索引、按需 CPG/CFG、局部来源状态、共享摘要和自适应 CPU 并行。性能优化必须同时满足：
 
 1. 链身份、sink、规则归因和完整性原因不变或有解释；
 2. 结果合并与报告排序确定；
@@ -228,12 +240,14 @@ rules:
 
 当前仓库验证基线：
 
-- `mvn test`：143 项通过，0 失败，2 项环境跳过；
-- Gleipner 全量：块级 `TP=219, FP=22`，入口去重 `TP=126, FP=17`；
-- 指定 WP 语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 有静态证据和安全动态确认；
-- `javamix` 当前工件不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，不能用另一份工件的结果替代；
+- `mvn test`：146 项通过，0 失败，2 项环境跳过；
+- Gleipner 全量使用 `evidence/chains.csv` 的全路径变体：块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载路径限制单独记录，不折算成扫描器分数；
+- 指定 WP 语料的安全动态结果为：`demo=2/3/15`、`demo2=2/3/15`、`babychain=1/0/19`、`n1cat=1/0/19`、`qiao=3/0/17`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；
+- `javamix` 当前工件产生 21,544 条静态候选，动态选择 20 条且均为 `PARTIAL`；它不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，不能用另一份工件的结果替代；
 - 大型工件的 live heap 仍然较高，不能宣称已经满足严格低内存发布门槛；
 - 复杂框架真实输入、代理、JNI/JRMP 和 JDK 版本差异仍可能产生 `PARTIAL`/`UNTESTABLE`；
 - 安全 payload plan、JVM 权限门和 canary 都不等价于生产级 exploit runner 或 OS sandbox。
+
+动态验证的设计参考 [JDD](https://zxlfd.github.io/papers/jdd.pdf) 的 bottom-up gadget search 与 dataflow-aided object construction 思路，并参考 [FLASH（USENIX Security 2025）](https://www.usenix.org/system/files/usenixsecurity25-zhang-yiheng.pdf) 对反序列化引导调用图和按需可控性分析的讨论。Just 只借鉴其“真实前置链 + 按需可控性”原则，不执行最终危险能力，也不把论文中的完整 exploit 生成器带入默认 CLI。
 
 这些限制必须进入报告和版本说明，不能通过增加参数、降低扫描深度、删除动态验证或 benchmark 特判来掩盖。

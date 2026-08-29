@@ -127,13 +127,10 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
     private boolean trustedProbeCaller() {
         Class<?>[] context = getClassContext();
         for (Class<?> frame : context) {
-            if (frame == LegacySandboxSecurityManager.class || isJdkFrame(frame.getName())) {
+            if (frame == LegacySandboxSecurityManager.class || isPlatformFrame(frame)) {
                 continue;
             }
-            String name = frame.getName();
-            return name.startsWith("io.just.sast.verify.legacy.")
-                    && trustedCodeSource != null
-                    && trustedCodeSource.equals(codeSourceOf(frame));
+            return isVerifierFrame(frame);
         }
         return false;
     }
@@ -176,9 +173,14 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
     }
 
-    private static boolean isJdkFrame(String name) {
-        return name.startsWith("java.") || name.startsWith("javax.")
-                || name.startsWith("sun.") || name.startsWith("com.sun.");
+    private static boolean isPlatformFrame(Class<?> frame) {
+        return frame.getClassLoader() == null;
+    }
+
+    private boolean isVerifierFrame(Class<?> frame) {
+        return frame.getName().startsWith("io.just.sast.verify.legacy.")
+                && trustedCodeSource != null
+                && trustedCodeSource.equals(codeSourceOf(frame));
     }
 
     private static String codeSourceOf(Class<?> type) {
@@ -193,19 +195,19 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkExit(int status) {
-        StackTraceElement[] stack = new Throwable().getStackTrace();
-        for (int i = 1; i < stack.length; i++) {
-            String owner = stack[i].getClassName();
-            if (owner.startsWith("java.") || owner.startsWith("javax.")
-                    || owner.startsWith("sun.") || owner.startsWith("com.sun.")) {
-                continue;
-            }
-            if (owner.equals(LegacyChainVerifyProbe.class.getName())) {
-                return;
-            }
-            throw new SecurityException("target System.exit denied: " + status);
+        if (firstNonPlatformFrame() == LegacyChainVerifyProbe.class) {
+            return;
         }
-        throw new SecurityException("System.exit denied: " + status);
+        throw new SecurityException("target System.exit denied: " + status);
+    }
+
+    private Class<?> firstNonPlatformFrame() {
+        for (Class<?> frame : getClassContext()) {
+            if (frame != LegacySandboxSecurityManager.class && !isPlatformFrame(frame)) {
+                return frame;
+            }
+        }
+        return null;
     }
 
     @Override

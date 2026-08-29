@@ -28,7 +28,15 @@ public record VerificationSummary(
             String confidence,
             int confidenceScore,
             int attempt,
-            long durationMs) {
+            long durationMs,
+            String evidence) {
+
+        public ChainResult(int rank, String chainKey, String status, String detail,
+                           String confidence, int confidenceScore, int attempt,
+                           long durationMs) {
+            this(rank, chainKey, status, detail, confidence, confidenceScore, attempt,
+                    durationMs, null);
+        }
 
         public ChainResult {
             chainKey = chainKey == null ? "" : chainKey;
@@ -37,6 +45,7 @@ public record VerificationSummary(
             confidence = confidence == null ? "UNKNOWN" : confidence;
             attempt = Math.max(1, attempt);
             durationMs = Math.max(0L, durationMs);
+            evidence = evidence == null || evidence.isBlank() ? "UNKNOWN" : evidence;
         }
     }
 

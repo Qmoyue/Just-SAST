@@ -44,8 +44,8 @@ public final class DiffCommand implements Callable<Integer> {
         Map<String, String> oldChains;
         Map<String, String> newChains;
         try {
-            oldChains = readChains(oldDir.resolve("findings.csv"), oldDir);
-            newChains = readChains(newDir.resolve("findings.csv"), newDir);
+            oldChains = readChains(findingsCsv(oldDir), oldDir);
+            newChains = readChains(findingsCsv(newDir), newDir);
         } catch (IllegalArgumentException e) {
             System.err.println("[just:error] " + e.getMessage());
             return ExitCode.USAGE.code();
@@ -80,6 +80,12 @@ public final class DiffCommand implements Callable<Integer> {
         }
         System.out.println("不变链: " + (newChains.size() - added.size() - changed.size()));
         return ExitCode.OK.code();
+    }
+
+    /** 读取分类布局中的 findings/findings.csv；同时兼容旧版根目录 findings.csv。 */
+    private static Path findingsCsv(Path dir) {
+        Path classified = dir.resolve("findings").resolve("findings.csv");
+        return Files.exists(classified) ? classified : dir.resolve("findings.csv");
     }
 
     /** 读 findings.csv 为 身份键 → 语义指纹。目录缺 findings.csv 是用法错误（显式报错，不当空集）。 */

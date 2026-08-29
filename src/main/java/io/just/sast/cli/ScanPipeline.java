@@ -21,6 +21,8 @@ import io.just.sast.model.JdkClassSource;
 import io.just.sast.model.LoadResult;
 import io.just.sast.report.ConsoleSummary;
 import io.just.sast.report.CsvReporter;
+import io.just.sast.report.ReportIndexWriter;
+import io.just.sast.report.ReportLayout;
 import io.just.sast.report.ScanStatistics;
 import io.just.sast.util.JustLogger;
 
@@ -141,7 +143,7 @@ public final class ScanPipeline {
         // 分析期（黑板串行三阶段：ANALYSIS → COMPOSITION → CALIBRATION）
         List<Path> scanDeps = deps != null ? deps : List.of();
         long analysisStart = System.currentTimeMillis();
-        Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), ruleSet, MAX_DEPTH,
+        Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
                         verifyBudget, jdkHome, load.targetMajorVersion()));
         new Controller(blackboard, KnowledgeSources.discover()).run();
@@ -149,20 +151,21 @@ public final class ScanPipeline {
 
         // 报告期
         long reportStart = System.currentTimeMillis();
+        ReportLayout reportLayout = ReportLayout.create(output);
         CsvReporter reporter = new CsvReporter();
         io.just.sast.report.MultiFormatReporter multiFormatReporter = new io.just.sast.report.MultiFormatReporter();
         reporter.withGraph(cpg.graph());
-        reporter.write(output, blackboard.chains(), blackboard.sinkOutcomes(),
+        reporter.write(reportLayout, blackboard.chains(), blackboard.sinkOutcomes(),
                 blackboard.chainCalibrations(), blackboardNotes(blackboard));
         // C1: SARIF 2.1.0 + E1-E3: JSON/HTML/Markdown 多格式输出
         new io.just.sast.report.SarifReporter().withHierarchy(hierarchy).withRules(ruleSet).write(
-                output, blackboard.chains(), blackboard.chainCalibrations(), blackboardNotes(blackboard));
-        multiFormatReporter.write(output, blackboard.chains(),
+                reportLayout, blackboard.chains(), blackboard.chainCalibrations(), blackboardNotes(blackboard));
+        multiFormatReporter.write(reportLayout, blackboard.chains(),
                 blackboard.chainCalibrations(), blackboardNotes(blackboard));
-        new io.just.sast.report.PayloadPlanWriter().write(output, blackboard.chains(),
+        new io.just.sast.report.PayloadPlanWriter().write(reportLayout, blackboard.chains(),
                 blackboard.chainCalibrations(), blackboardNotes(blackboard),
                 blackboard.verificationSummary());
-        JustLogger.info("CSV + SARIF 已输出到 {}", output.toAbsolutePath());
+        JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
 
         // sink/entry 统计从图直接产出（与引擎同一 RuleEngine 实例，access 过滤口径一致）
         int sinkCount = 0;
@@ -191,7 +194,8 @@ public final class ScanPipeline {
                 completenessReasons, phaseMs, verify ? blackboard.verificationStatus() : "DISABLED",
                 verify ? blackboard.verificationSummary()
                         : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget));
-        multiFormatReporter.writeMetadata(output, scanStats);
+        multiFormatReporter.writeMetadata(reportLayout, scanStats);
+        new ReportIndexWriter().write(reportLayout, scanStats);
         if (stats) {
             ConsoleSummary.print(scanStats, outcomes);
         }

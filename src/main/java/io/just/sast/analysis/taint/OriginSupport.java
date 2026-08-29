@@ -5,6 +5,7 @@ import io.just.sast.config.RuleEngine;
 import io.just.sast.cpg.build.Cfg;
 import io.just.sast.cpg.build.CfgEdge;
 import io.just.sast.cpg.build.CfgLabel;
+import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Graph;
@@ -40,6 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class OriginSupport {
 
     private final Graph graph;
+    private final CpgIndex cpgIndex;
     private final ForwardOrigins origins;
     private final Map<String, Long> callIdByKey = new HashMap<>();
     private final Map<String, MethodInfo> methodCache = new java.util.concurrent.ConcurrentHashMap<>();
@@ -133,11 +135,17 @@ public final class OriginSupport {
     private final java.util.Map<Long, Node> callNodes = new HashMap<>();
 
     public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine, boolean fast) {
+        this(graph, hierarchy, ruleEngine, fast, CpgIndex.empty());
+    }
+
+    public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine,
+                         boolean fast, CpgIndex cpgIndex) {
         this.graph = graph;
+        this.cpgIndex = cpgIndex == null ? CpgIndex.empty() : cpgIndex;
         this.hierarchy = hierarchy;
         this.ruleEngine = ruleEngine;
         this.frameworkPackages = deriveFrameworkPackages();
-        this.origins = new ForwardOrigins(callIdByKey);
+        this.origins = new ForwardOrigins(callIdByKey, this.cpgIndex::cfg);
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             callIdByKey.put(methodKey(call) + "@" + call.strProp("offset"), call.id());
             callNodes.put(call.id(), call);
@@ -145,6 +153,15 @@ public final class OriginSupport {
         frameworkDeserializeSourceAvailable = hasDeserializeSource(graph);
         indexReflectiveJumps(graph);
         indexNativeCallbacks(graph);
+    }
+
+    /** Shared CFG access for all semantic consumers, including bounded metadata analyses. */
+    public Cfg.Indexed cfg(MethodInfo method) {
+        return cpgIndex.cfg(method);
+    }
+
+    public CpgIndex cpgIndex() {
+        return cpgIndex;
     }
 
     /**
@@ -1561,13 +1578,13 @@ public final class OriginSupport {
         return fieldDominators.computeIfAbsent(key, ignored -> buildDominators(method));
     }
 
-    private static DominatorIndex buildDominators(MethodInfo method) {
+    private DominatorIndex buildDominators(MethodInfo method) {
         return buildDominators(method, true);
     }
 
-    private static DominatorIndex buildDominators(MethodInfo method, boolean includeExceptions) {
+    private DominatorIndex buildDominators(MethodInfo method, boolean includeExceptions) {
         int size = method.instructions().size();
-        Cfg.Indexed cfg = Cfg.computeIndexed(method);
+        Cfg.Indexed cfg = cfg(method);
         List<List<Integer>> predecessors = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
             predecessors.add(new ArrayList<>(2));
@@ -1762,7 +1779,7 @@ public final class OriginSupport {
         ConstantProofContext previous = constantProof.get();
         constantProof.set(new ConstantProofContext());
         try {
-            Cfg.Indexed cfg = Cfg.computeIndexed(method);
+            Cfg.Indexed cfg = cfg(method);
             ForwardOrigins.Result result = origins.compute(method);
             int size = method.instructions().size();
             boolean[] canReachSink = new boolean[size];
@@ -3151,8 +3168,8 @@ public final class OriginSupport {
      * conditional branch and the guarded invocation.  Require that this short path is the
      * branch's unique normal fall-through, with no nested control transfer or alternate edge.
      */
-    private static boolean straightLineGuardPath(MethodInfo method, int branchOffset,
-                                                  int throwerOffset) {
+    private boolean straightLineGuardPath(MethodInfo method, int branchOffset,
+                                          int throwerOffset) {
         int previous = branchOffset;
         for (int current = branchOffset + 1; current <= throwerOffset; current++) {
             if (current < throwerOffset && (method.instructions().get(current).op().isCondJump()
@@ -3187,8 +3204,8 @@ public final class OriginSupport {
         return false;
     }
 
-    private static boolean hasOnlyNormalPredecessor(MethodInfo method, int target, int expected) {
-        Cfg.Indexed cfg = Cfg.computeIndexed(method);
+    private boolean hasOnlyNormalPredecessor(MethodInfo method, int target, int expected) {
+        Cfg.Indexed cfg = cfg(method);
         for (int source = 0; source < method.instructions().size(); source++) {
             for (CfgEdge edge : cfg.successorsAt(source)) {
                 if (edge.targetOffset() == target && edge.label() != CfgLabel.EXCEPTION

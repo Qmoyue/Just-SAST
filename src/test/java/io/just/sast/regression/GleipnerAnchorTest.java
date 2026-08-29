@@ -27,9 +27,7 @@ class GleipnerAnchorTest {
                 jar, null, tmp.resolve("basic"),
                 Path.of("benchmark/Gleipner/just-rules.yaml"),
                 false, true, null, true, 20);
-        List<String> entries = Files.readAllLines(tmp.resolve("basic/chains.csv")).stream()
-                .skip(1).map(l -> l.split(",")).filter(f -> f.length > 4)
-                .map(f -> f[2] + ";" + f[3]).toList();
+        List<String> entries = csvColumn(tmp.resolve("basic"), "entry_class");
         assertTrue(entries.stream().anyMatch(e -> e.contains("BasicTriggerGadget")),
                 "basic_001 锚点丢失: " + entries);
         assertTrue(entries.stream().anyMatch(e -> e.contains("BasicLinkGadget")),
@@ -42,9 +40,7 @@ class GleipnerAnchorTest {
         Assumptions.assumeTrue(Files.exists(jar), "本地无 Gleipner 基准");
         io.just.sast.cli.ScanPipeline.run(jar, null, tmp.resolve("depth"),
                 Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null, true, 20);
-        List<String> entries = Files.readAllLines(tmp.resolve("depth/chains.csv")).stream()
-                .skip(1).map(l -> l.split(",")).filter(f -> f.length > 4)
-                .map(f -> f[2]).toList();
+        List<String> entries = csvColumn(tmp.resolve("depth"), "entry_class");
         long found = entries.stream().filter(e -> e.contains("Depth_0")).distinct().count();
         assertTrue(found >= 15, "depth 锚点数 " + found + " < 15（历史稳定 ≥15，漂移即红）");
     }
@@ -55,10 +51,37 @@ class GleipnerAnchorTest {
         Assumptions.assumeTrue(Files.exists(jar), "本地无 Gleipner 基准");
         io.just.sast.cli.ScanPipeline.run(jar, null, tmp.resolve("poly"),
                 Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null, true, 20);
-        List<String> entries = Files.readAllLines(tmp.resolve("poly/chains.csv")).stream()
-                .skip(1).map(l -> l.split(",")).filter(f -> f.length > 4)
-                .map(f -> f[2]).toList();
+        List<String> entries = csvColumn(tmp.resolve("poly"), "entry_class");
         long found = entries.stream().filter(e -> e.contains("Polymorphism_0")).distinct().count();
         assertTrue(found >= 12, "polymorphism 锚点数 " + found + " < 12（历史 ≥12）");
+    }
+
+    private static Path findingsCsv(Path output) {
+        Path grouped = output.resolve("findings").resolve("findings.csv");
+        return Files.exists(grouped) ? grouped : output.resolve("chains.csv");
+    }
+
+    private static List<String> csvColumn(Path output, String name) throws Exception {
+        List<String> lines = Files.readAllLines(findingsCsv(output));
+        if (lines.isEmpty()) {
+            return List.of();
+        }
+        String[] header = lines.get(0).split(",", -1);
+        int column = -1;
+        for (int i = 0; i < header.length; i++) {
+            if (name.equals(header[i])) {
+                column = i;
+                break;
+            }
+        }
+        assertTrue(column >= 0, "CSV 缺少列 " + name + ": " + lines.get(0));
+        List<String> values = new java.util.ArrayList<>();
+        for (String line : lines.subList(1, lines.size())) {
+            String[] row = line.split(",", -1);
+            if (row.length > column) {
+                values.add(row[column]);
+            }
+        }
+        return values;
     }
 }

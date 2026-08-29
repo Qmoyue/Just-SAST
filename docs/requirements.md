@@ -27,7 +27,7 @@ Just 面向两类输入：
 
 | ID | 需求 |
 | --- | --- |
-| FR-06 | 建立冻结的调用/分发/lambda/字段索引和类层次；方法 CFG 按需计算 |
+| FR-06 | 建立冻结的字节码语义 CPG 核心和调用/分发/lambda/字段/类型索引；方法 CFG、异常和 def-use 关系按需计算并复用 |
 | FR-07 | 支持可见性、传递子类型、接口、lambda、异常边、JSR/RET 和反射目标约束 |
 | FR-08 | 支持前向方法摘要不动点和后向 sink 导向回溯；数组元素、字段、返回值、receiver 和调用点来源必须可传播 |
 | FR-09 | 预算、分发上限、路径上限和证明上限必须有界；截断不能伪装成完整扫描，也不能污染不相容上下文的缓存 |
@@ -48,10 +48,10 @@ Just 面向两类输入：
 | ID | 需求 |
 | --- | --- |
 | FR-16 | 链校准包含类型流、PASM、序列化可行性、catch 可达性、字段依赖和约束矛盾检查；校准不能替代静态证据 |
-| FR-17 | 动态验证默认开启，采用 fork-per-chain 子 JVM、对象图构造、真实触发模式和 sink canary；`--no-verify` 显式关闭 |
-| FR-18 | 动态状态至少区分 `CONFIRMED`、`EXECUTED`、`PARTIAL`、`FAILED`、`UNTESTABLE`；`CONFIRMED` 必须有入口归因的 canary/精确 sink 栈证据 |
+| FR-17 | 动态验证默认开启，采用 fork-per-chain 子 JVM、真实序列化/反序列化前置链、对象图构造、真实触发模式和 sink canary；`--no-verify` 显式关闭 |
+| FR-18 | 动态状态至少区分 `SINK_BLOCKED`、`CONCRETE_REACHED`、`EXECUTED`、`PARTIAL`、`FAILED`、`UNTESTABLE`；`SINK_BLOCKED` 必须有入口归因的 canary/精确 sink 边界证据，且危险 sink 方法体不继续执行 |
 | FR-19 | 动态验证必须持久化候选选择、能力、状态、证据、尝试次数、耗时和失败原因；静态候选不能因动态失败而消失 |
-| FR-20 | 输出 CSV、JSON、SARIF 2.1.0、HTML、Markdown、扫描元数据、动态汇总和不可直接执行的 payload plan |
+| FR-20 | 输出分类目录、`index.md`、CSV、JSON、SARIF 2.1.0、HTML、Markdown、扫描元数据、动态汇总，以及人/agent 可读且不可直接执行的 payload 视图和 plan |
 | FR-21 | `diff` 依据规则、入口和 sink 的语义身份比较扫描，不依赖并行顺序和变体编号 |
 | FR-22 | 退出码为：`0` 成功，`2` 参数/输入错误，`3` 扫描内部错误 |
 
@@ -72,7 +72,7 @@ Just 面向两类输入：
 | ID | 需求 |
 | --- | --- |
 | NFR-01 | 默认交付不依赖外部服务；运行时依赖保持为 ASM、picocli、SnakeYAML |
-| NFR-02 | 大工件采用流式读取、原始字节早释放、冻结只读索引、惰性 CFG 和有界缓存；必须同时记录报告时 live heap 与完整性边界 |
+| NFR-02 | 大工件采用流式读取、原始字节早释放、冻结只读索引、按需 CPG/CFG、共享摘要和有界缓存；必须同时记录报告时 live heap 与完整性边界 |
 | NFR-03 | `heap_used_mb` 明确表示报告时 JVM live heap，不得冒充 OS RSS 峰值；真实内存门槛须用外部采样验证 |
 | NFR-04 | 并行采用有界、自适应 worker 和局部结果合并，保留桌面资源；线程数不是性能验收指标 |
 | NFR-05 | 性能优化不得牺牲扫描深度、规则覆盖、链身份、规则归因或确定性；没有 profile 和等价回归不得默认引入 GPU |
@@ -86,18 +86,20 @@ Just 面向两类输入：
 扫描输出目录至少包含：
 
 ```text
-findings.csv             折叠后的主链
-chains.csv               所有路径变体
-edges.csv                逐跳关系
-sinks.csv                sink 裁决
-calibrations.csv         校准拒绝/降级原因
-findings.json            机器消费的链数据
-findings.sarif           SARIF 2.1.0
-findings.html / .md      人工审查报告
-scan-metadata.json       输入、JDK、阶段、预算和完整性
-dynamic-verification.json 动态候选、状态和证据
-payload-plan.json       安全、确定性的对象图/字段依赖计划
-dormant.md               可达但未成链的入口
+index.md                         扫描导航和摘要
+findings/findings.csv            折叠后的主链
+findings/findings.json           机器消费的链数据
+findings/findings.sarif          SARIF 2.1.0
+findings/findings.html/.md       人工审查报告
+verification/dynamic-verification.json 动态候选、状态和证据
+verification/payload.md/json     人/agent 可读的安全 payload 视图
+evidence/chains.csv              所有路径变体
+evidence/edges.csv               逐跳关系
+evidence/sinks.csv               sink 裁决
+evidence/calibrations.csv        校准拒绝/降级原因
+evidence/dormant.md              可达但未成链的入口
+meta/scan-metadata.json           输入、JDK、阶段、预算和完整性
+meta/payload-plan.json            安全、确定性的对象图/字段依赖计划
 ```
 
 `COMPLETE`/`PARTIAL` 表示扫描覆盖；`FEASIBLE`/`DEGRADED`/`NOT_FEASIBLE` 表示静态校准；动态状态表示运行时证据。三套状态必须同时保留，不能互相覆盖。
@@ -112,10 +114,10 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 
 截至当前代码：
 
-- `mvn test`：143 项通过，0 失败，2 项环境跳过；
-- Gleipner 全量：块级 `TP=219, FP=22`，入口去重 `TP=126, FP=17`；
-- 默认全量校准语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 具备静态证据和安全动态确认；
-- `javamix` 当前工件缺少 WP 文档所述 `InternalDataServiceImpl.processTask`，因此不将其它工件的 WP 结果代入；
+- `mvn test`：146 项通过，0 失败，2 项环境跳过；
+- Gleipner 全量（`evidence/chains.csv` 全路径变体）：块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载失败作为环境限制；
+- 默认全量校准语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 的安全动态结果分别为 `2/3/15`、`2/3/15`、`1/0/19`、`1/0/19`、`3/0/17`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；
+- `javamix` 当前工件缺少 WP 文档所述 `InternalDataServiceImpl.processTask`，动态选择的 20 条候选均为 `PARTIAL`，因此不将其它工件的 WP 结果代入；
 - Windows Gleipner JNI 块缺少 evaluator 对应的 native `.eval.txt`，按环境限制处理；
 - 大型工件的真实 RSS 峰值尚未建立可复现的外部采样基线，不能宣称严格低内存目标已经达成。
 

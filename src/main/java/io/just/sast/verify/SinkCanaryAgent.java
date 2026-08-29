@@ -29,7 +29,7 @@ import java.util.Set;
  * 必须对 bootstrap 可见，经 appendToBootstrapClassLoaderSearch 挂载。
  *
  * 核心类（java.lang.reflect.Method 等）先于 premain 加载，需 retransformClasses 补插桩；
- * JVM 不支持时该 sink 退化为原有的异常栈帧被动判定。
+ * 无法插桩时不产生 sink-boundary 确认，探针仍由权限门阻断并报告为不可验证/部分结果。
  */
 public final class SinkCanaryAgent {
 

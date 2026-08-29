@@ -11,6 +11,7 @@ import io.just.sast.config.Rule;
 import io.just.sast.cpg.build.Cfg;
 import io.just.sast.cpg.build.CfgEdge;
 import io.just.sast.cpg.build.CfgLabel;
+import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Node;
@@ -192,15 +193,29 @@ public final class ForwardEngine {
             }
             String key = OriginSupport.methodKey(info);
             List<InsnFact> effects = new ArrayList<>();
-            for (InsnFact insn : info.instructions()) {
-                if (insn.op().isFieldRead()) {
+            CpgIndex.MethodSlice slice = support.cpgIndex().slice(key);
+            if (slice != null) {
+                for (int offset : slice.fieldReadOffsets()) {
+                    InsnFact insn = info.insnAt(offset);
                     fieldReaders.computeIfAbsent(insn.fieldRef().owner() + "#" + insn.fieldRef().name(),
                             k -> new HashSet<>()).add(key);
                 }
-                Op op = insn.op();
-                if (op.isFieldWrite() || op == Op.AASTORE || op.isInvoke()
-                        || (op.isReturn() && op != Op.RETURN && op != Op.ATHROW)) {
-                    effects.add(insn);
+                for (int offset : slice.effectOffsets()) {
+                    effects.add(info.insnAt(offset));
+                }
+            } else {
+                // Direct Blackboard construction remains supported for extensions/tests
+                // that do not have a frontend-produced CpgIndex.
+                for (InsnFact insn : info.instructions()) {
+                    if (insn.op().isFieldRead()) {
+                        fieldReaders.computeIfAbsent(insn.fieldRef().owner() + "#" + insn.fieldRef().name(),
+                                k -> new HashSet<>()).add(key);
+                    }
+                    Op op = insn.op();
+                    if (op.isFieldWrite() || op == Op.AASTORE || op.isInvoke()
+                            || (op.isReturn() && op != Op.RETURN && op != Op.ATHROW)) {
+                        effects.add(insn);
+                    }
                 }
             }
             if (!effects.isEmpty()) {
@@ -1634,7 +1649,7 @@ public final class ForwardEngine {
                     continue;
                 }
                 ForwardOrigins.Result handlerOrigins = origins(handler, ex);
-                Set<Integer> returns = proxyMethodReturnOffsets(handler, proxyCall.name());
+                Set<Integer> returns = proxyMethodReturnOffsets(handler, proxyCall.name(), support::cfg);
                 if (returns.isEmpty()) {
                     // Unknown handler bytecode must not silently become a negative result.
                     // The ordinary summary is conservative, while the incomplete marker tells
@@ -1772,10 +1787,17 @@ public final class ForwardEngine {
 
     /** Shared by the forward and backward engines so proxy branch semantics cannot drift. */
     public static Set<Integer> proxyMethodReturnOffsets(MethodInfo method, String requestedName) {
+        return proxyMethodReturnOffsets(method, requestedName, Cfg::computeIndexed);
+    }
+
+    /** Shared proxy analysis with the scan-wide CPG CFG provider. */
+    public static Set<Integer> proxyMethodReturnOffsets(MethodInfo method, String requestedName,
+                                                        CpgIndex.CfgProvider cfgProvider) {
         if (method == null || requestedName == null || method.instructions().isEmpty()) {
             return Set.of();
         }
-        Cfg.Indexed cfg = Cfg.computeIndexed(method);
+        CpgIndex.CfgProvider provider = cfgProvider == null ? Cfg::computeIndexed : cfgProvider;
+        Cfg.Indexed cfg = provider.cfg(method);
         Map<Integer, Set<ProxyFlow>> states = new HashMap<>();
         Deque<Integer> work = new ArrayDeque<>();
         Map<Integer, ProxyValue> initialLocals = new HashMap<>();

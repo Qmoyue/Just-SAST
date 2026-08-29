@@ -16,12 +16,12 @@ Just 的输出目标是一条可审计的证据链：
 | 能力 | 说明 |
 | --- | --- |
 | 输入 | JAR、WAR、class 目录；支持 Spring Boot `BOOT-INF`、WAR `WEB-INF` 和嵌套依赖 |
-| 静态分析 | ASM 字节码事实、调用图、方法内 CFG、字段流、前/后向污点、反射、lambda、数组和继承回调 |
+| 静态分析 | ASM 字节码事实、语义 CPG 索引、调用图、按需方法内 CFG、字段流、前/后向污点、反射、lambda、数组和继承回调 |
 | 反序列化语义 | 原生 `ObjectInputStream`、`readObject`/`readObjectNoData`/`readExternal`/`readResolve`，以及 Kryo、Fastjson、Jackson、Hessian 系等替代框架入口 |
 | 链语义 | 集合触发、动态代理、JavaBean setter、反射调用、模板/类加载、JNI/native 和 JRMP/RMI 能力边界 |
 | 规则 | sink、source、magic-entry、model、chain-fragment 五类 YAML 规则；通过 ServiceLoader 扩展知识源 |
-| 动态验证 | 每条候选链独立子 JVM、对象图构造、真实触发模式和 sink canary；确认时在危险 sink 方法体前停止 |
-| 输出 | CSV、JSON、SARIF 2.1.0、HTML、Markdown，以及扫描完整性、动态汇总和安全 payload plan |
+| 动态验证 | 每条候选链独立子 JVM、真实序列化/触发模式和 sink canary；到达精确 sink 边界后停止，不执行 sink 方法体 |
+| 输出 | 分类的 CSV、JSON、SARIF 2.1.0、HTML、Markdown，以及人/agent 可读的 payload 视图、动态汇总和安全 payload plan |
 
 ### 设计取舍
 
@@ -30,6 +30,7 @@ Just 的输出目标是一条可审计的证据链：
 - **规则即数据**：新增或调整攻击面优先修改 YAML；分析引擎只负责通用语义。
 - **确定性**：任务键、路径代表和报告排序都有稳定全序；并行不会改变链身份或结果顺序。
 - **目标 JDK 保真**：通过 `--jdk-home` 挂载与目标字节码匹配的 JDK，Java 8 使用 `rt.jar`，Java 9+ 使用 `jrt-fs`。
+- **按需 CPG**：保留轻量、稳定的字节码语义核心；CFG、异常、字段/值流和调用关系按查询需求展开并共享索引，不为每条指令预先创建重型图对象。
 - **安全默认值**：动态验证只使用 canary 和默认输入，不发送网络请求、不加载 native 库、不执行命令，也不输出可直接使用的攻击字节流。
 
 ## 快速开始
@@ -123,7 +124,7 @@ JAR/WAR/classpath
 JarReader → ASM frontend → Just model
                               │
                               ▼
-             冻结的调用/层次/字段索引 + 按需 CFG
+       冻结的语义 CPG 核心 + 按需 CFG/数据流关系索引
                               │
                               ▼
                      Blackboard 调度
@@ -139,7 +140,7 @@ JarReader → ASM frontend → Just model
                   patterns / dynamic verification
                               │
                               ▼
-                   CSV / JSON / SARIF / HTML / MD
+                分类报告目录 + 人类可读链路视图
 ```
 
 边界是单向的：ASM 只出现在 frontend；知识源通过 Blackboard 共享事实和事件；知识源之间不直接调用；规则描述攻击面，engine 实现通用推理。
@@ -156,7 +157,7 @@ JarReader → ASM frontend → Just model
 
 ## 动态验证与安全边界
 
-动态验证是安全 canary 验证器，不是通用 exploit runner：
+动态验证是安全 canary 验证器，不是通用 exploit runner。它验证真实的序列化/反序列化前置链、触发器和 sink 可达性，在危险能力的最后一个安全观察边界阻断：
 
 1. 从静态证据中选择有限候选，同一入口类最多两条；
 2. 每条链 fork 独立 JVM，使用隔离工作目录/tmp、超时和内存限制；
@@ -168,32 +169,26 @@ JarReader → ASM frontend → Just model
 
 | 状态 | 含义 |
 | --- | --- |
-| `CONFIRMED` | canary 或带入口归因的精确 sink 栈帧命中 |
+| `SINK_BLOCKED` | 真实触发链到达精确 sink 边界，canary 阻断危险方法体；这是最高动态证据 |
+| `CONCRETE_REACHED` | 真实序列化/触发前缀到达安全观察点，但尚未到达精确 sink 边界 |
 | `EXECUTED` | 入口被实际调用并返回，但没有 sink 命中证据 |
 | `PARTIAL` | 对象构造或触发路径只完成了一部分 |
 | `FAILED` | 验证进程失败；不能推翻静态候选 |
 | `UNTESTABLE` | 缺类、JDK/权限/native/运行时能力等导致无法测试 |
 
-JVM 权限门不是 OS 沙箱。扫描不可信 JAR 时，应额外使用容器或虚拟机、低权限账户、只读输入和无网络环境。JDK 24+ 不应依赖已移除的 Security Manager 提供进程隔离。Just 不会为了验证真实漏洞而执行命令、连接远端、加载 native 库或生成可直接武器化 payload。
+JVM 权限门不是 OS 沙箱。扫描不可信 JAR 时，应额外使用容器或虚拟机、低权限账户、只读输入和无网络环境。JDK 24+ 不应依赖已移除的 Security Manager 提供进程隔离。当前轮次不引入 Docker/WSL 运行时依赖；Just 不会为了验证真实漏洞而执行命令、连接远端、加载 native 库或生成可直接武器化 payload。
 
 ## 输出契约
 
 | 文件 | 内容 |
 | --- | --- |
-| `findings.csv` | 折叠后的主链，按验证状态和证据分数排序 |
-| `chains.csv` | 未折叠的完整路径变体 |
-| `edges.csv` | 每条链逐跳调用、字段流和桥接边 |
-| `sinks.csv` | 每个 sink 的裁决、规则和截断原因 |
-| `calibrations.csv` | 被校准拒绝或降级的候选及原因 |
-| `findings.json` | 机器消费的链与证据数据 |
-| `findings.sarif` | SARIF 2.1.0，可接入代码扫描平台 |
-| `findings.html` / `findings.md` | 人工阅读和审查用报告 |
-| `scan-metadata.json` | 输入、JDK、阶段统计、完整性和资源信息 |
-| `dynamic-verification.json` | 动态能力、候选选择、每链状态和证据 |
-| `payload-plan.json` | 不可直接执行的对象图/字段依赖/触发计划 |
-| `dormant.md` | 可达但尚未形成完整链的入口信息 |
+| `index.md` | 扫描导航、摘要、状态解释和产物入口 |
+| `findings/*` | `findings.csv/json/sarif/html/md`，主链与人工审查报告 |
+| `verification/*` | `payload.md/json` 和 `dynamic-verification.json`，真实触发证据与人/agent 可读 payload 视图 |
+| `evidence/*` | `chains.csv`、`edges.csv`、`sinks.csv`、`calibrations.csv`、`dormant.md`，完整审计细节 |
+| `meta/*` | `scan-metadata.json`、`payload-plan.json`，扫描元数据和不可执行构造计划 |
 
-重要判读：`PARTIAL` 表示扫描或验证边界被触发，不表示“没有漏洞”；`EXECUTED` 不等于 sink 到达；只有 `CONFIRMED` 才表示安全 canary 观察到精确 sink。
+重要判读：`PARTIAL` 表示扫描或验证边界被触发，不表示“没有漏洞”；`EXECUTED` 不等于 sink 到达；只有 `SINK_BLOCKED` 才表示真实触发链观察到精确 sink 边界。`payload.md` 用类似 ysoserial 的逐跳表示帮助人工复核，但它不是可直接投递的攻击字节流。
 
 ## 规则与扩展
 
@@ -230,10 +225,20 @@ rules:
 
 仓库当前回归基线：
 
-- `mvn test`：143 项通过，0 失败，2 项环境跳过；
-- Gleipner 全量：块级 `TP=219, FP=22`，入口去重 `TP=126, FP=17`；
-- 默认全量 WP 语料：`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 已有静态证据和安全动态确认；
-- 当前 `javamix` 工件不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，因此不伪造确认结果；
+- `mvn test`：146 项通过，0 失败，2 项环境跳过；
+- Gleipner 全量：基于 `evidence/chains.csv` 的全变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重为 `TP=126, FP=17`；JNI 块在 Windows evaluator 上受 native 加载路径限制，按环境限制记录；
+- 默认完整校准语料的实际动态结果如下（列顺序为 `SINK_BLOCKED / CONCRETE_REACHED+EXECUTED / PARTIAL`）：
+
+  | 语料 | 静态候选链 | 动态结果 | 扫描耗时 |
+  | --- | ---: | --- | ---: |
+  | `demo` | 8,310 | `2 / 3 / 15` | 54.7 s |
+  | `demo2` | 8,313 | `2 / 3 / 15` | 54.3 s |
+  | `babychain` | 8,964 | `1 / 0 / 19` | 58.7 s |
+  | `javamix`（当前 JAR） | 21,544 | `0 / 0 / 20` | 133.7 s |
+  | `n1cat` | 6,084 | `1 / 0 / 19` | 35.2 s |
+  | `qiao` | 2,826 | `3 / 0 / 17` | 50.2 s |
+
+- `demo`、`demo2`、`babychain`、`n1cat`、`qiao` 均有静态证据和安全动态 sink-boundary 证据；`javamix` 当前 JAR 不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，20 条动态候选均为 `PARTIAL`，因此不伪造 WP 确认结果；
 - 报告中的 `heap_used_mb` 是 JVM 报告时 live heap，不是 OS RSS 峰值，大型工件的内存优化仍需独立峰值采样验证。
 
 Gleipner 本地基准和 CTF 语料属于开发者本地资产，不随仓库发布。Windows 上 native evaluator 缺失对应 `.eval.txt` 时，结果会如实标记为环境限制。
@@ -242,7 +247,7 @@ Gleipner 本地基准和 CTF 语料属于开发者本地资产，不随仓库发
 
 - 静态分析在大型、强反射、深层对象图和复杂框架输入下会触发有界预算；报告会公开截断原因。
 - 动态验证需要匹配的 JDK、依赖和可加载类；框架入口、JNI/JRMP、复杂代理可能只能得到 `PARTIAL` 或 `UNTESTABLE`。
-- 安全 payload plan 只描述构造约束，不是 ysoserial 风格的可执行 payload 生成器。
+- `payload.md/json` 是对安全构造计划和证据的可读渲染，不是 ysoserial 风格的可执行 payload 生成器。
 - 生产部署必须提供 OS/容器级隔离；JVM 内权限门不能替代它。
 
 ## 开发

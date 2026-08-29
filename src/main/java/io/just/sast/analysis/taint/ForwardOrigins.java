@@ -3,6 +3,7 @@ package io.just.sast.analysis.taint;
 import io.just.sast.cpg.build.Cfg;
 import io.just.sast.cpg.build.CfgEdge;
 import io.just.sast.cpg.build.CfgLabel;
+import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.model.Descriptor;
 import io.just.sast.model.InsnFact;
 import io.just.sast.model.InvokeDynamicRef;
@@ -146,9 +147,15 @@ public final class ForwardOrigins {
 
     private final Map<String, Long> callIdByKey;
     private final Map<String, Result> cache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final CpgIndex.CfgProvider cfgProvider;
 
     public ForwardOrigins(Map<String, Long> callIdByKey) {
+        this(callIdByKey, Cfg::computeIndexed);
+    }
+
+    public ForwardOrigins(Map<String, Long> callIdByKey, CpgIndex.CfgProvider cfgProvider) {
         this.callIdByKey = callIdByKey;
+        this.cfgProvider = cfgProvider == null ? Cfg::computeIndexed : cfgProvider;
     }
 
     public Result compute(MethodInfo method) {
@@ -166,7 +173,7 @@ public final class ForwardOrigins {
         if (method.instructions().isEmpty()) {
             return new Result(Map.of(), Map.of(), Map.of());
         }
-        Cfg.Indexed cfg = Cfg.computeIndexed(method);
+        Cfg.Indexed cfg = cfgProvider.cfg(method);
         int maxLocals = maxLocals(method);
         List<Set<ValueOrigin>> initLocals = new ArrayList<>(maxLocals);
         for (int i = 0; i < maxLocals; i++) {

@@ -5,6 +5,7 @@ import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.config.RuleEngine;
 import io.just.sast.config.RuleSet;
 import io.just.sast.cpg.build.FieldWriterIndex;
+import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.cpg.graph.Graph;
 
 import java.nio.file.Path;
@@ -47,6 +48,7 @@ public final class Blackboard {
     private final Graph graph;
     private final ClassHierarchy hierarchy;
     private final FieldWriterIndex fieldWriters;
+    private final CpgIndex cpgIndex;
     private final RuleSet rules;
     private final int maxDepth;
     private final ScanInputs scanInputs;
@@ -73,14 +75,21 @@ public final class Blackboard {
 
     public Blackboard(Graph graph, ClassHierarchy hierarchy, FieldWriterIndex fieldWriters,
                       RuleSet rules, int maxDepth, ScanInputs scanInputs) {
+        this(graph, hierarchy, fieldWriters, CpgIndex.empty(), rules, maxDepth, scanInputs);
+    }
+
+    public Blackboard(Graph graph, ClassHierarchy hierarchy, FieldWriterIndex fieldWriters,
+                      CpgIndex cpgIndex, RuleSet rules, int maxDepth, ScanInputs scanInputs) {
         this.graph = graph;
         this.hierarchy = hierarchy;
         this.fieldWriters = fieldWriters;
+        this.cpgIndex = cpgIndex == null ? CpgIndex.empty() : cpgIndex;
         this.rules = rules;
         this.maxDepth = maxDepth;
         this.scanInputs = scanInputs;
         this.ruleEngine = new RuleEngine(rules, hierarchy);
-        this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, scanInputs.fast());
+        this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, scanInputs.fast(),
+                this.cpgIndex);
     }
 
     public Graph graph() {
@@ -93,6 +102,10 @@ public final class Blackboard {
 
     public FieldWriterIndex fieldWriters() {
         return fieldWriters;
+    }
+
+    public CpgIndex cpgIndex() {
+        return cpgIndex;
     }
 
     public RuleSet rules() {

@@ -104,7 +104,8 @@ class ScanDeterminismTest {
         Path out2 = tmp.resolve("out2");
         ScanPipeline.run(jar, null, out1, null, false, true, null, true, 20);
         ScanPipeline.run(jar, null, out2, null, false, true, null, true, 20);
-        for (String file : List.of("findings.csv", "chains.csv", "edges.csv", "calibrations.csv")) {
+        for (String file : List.of("findings/findings.csv", "evidence/chains.csv",
+                "evidence/edges.csv", "evidence/calibrations.csv")) {
             assertEquals(Files.readString(out1.resolve(file)), Files.readString(out2.resolve(file)),
                     file + " 两次扫描应逐字节一致（NFR8）");
         }

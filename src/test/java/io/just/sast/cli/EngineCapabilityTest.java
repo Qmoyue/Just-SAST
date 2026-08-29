@@ -99,7 +99,7 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("arr.jar"), Map.of("app.Carrier", carrier, "app.ArrayGadget", gadget));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
-        String findings = Files.readString(out.resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/ArrayGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
                 "数组元素流（fill 内 AASTORE → Carrier.cells 字段污点 → readObject 内 AALOAD）应闭合链:\n"
                         + findings);
@@ -134,7 +134,7 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("lambda.jar"), Map.of("app.Fn", fn, "app.LambdaGadget", gadget));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
-        String findings = Files.readString(out.resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/LambdaGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
                 "lambda 实参经 f.go(cmd) 分发时污点应到达 lambda$0 实现方法:\n" + findings);
     }
@@ -161,7 +161,7 @@ class EngineCapabilityTest {
                 Map.of("app.DirectLambdaGadget", gadget));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
-        String findings = Files.readString(out.resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/DirectLambdaGadget,readObject")
                         && findings.contains("java/lang/Runtime,exec"),
                 "直接调用捕获 this 的 lambda 时，污点应映射到 synthetic 实现方法:\n" + findings);
@@ -196,11 +196,11 @@ class EngineCapabilityTest {
                 Map.of("app.Reflective", reflective, "app.Isolated", isolated));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
-        String sinks = Files.readString(out.resolve("sinks.csv"));
+        String sinks = Files.readString(out.resolve("evidence").resolve("sinks.csv"));
         assertTrue(sinks.lines().anyMatch(l -> l.contains("app/Isolated") && l.contains("fetch")
                         && l.contains("NO_PATH")),
                 "无框架时不可达入口的 sink 宿主应判 NO_PATH:\n" + sinks);
-        String findings = Files.readString(out.resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertFalse(findings.contains("app/Isolated,fetch"), "不可达链不得出现在 findings");
     }
 }

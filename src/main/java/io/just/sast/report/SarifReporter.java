@@ -43,7 +43,12 @@ public final class SarifReporter {
 
     public void write(Path outDir, List<Chain> chains,
                       Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
-        Files.createDirectories(outDir);
+        write(ReportLayout.flat(outDir), chains, calibrations, notes);
+    }
+
+    public void write(ReportLayout layout, List<Chain> chains,
+                      Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
+        Files.createDirectories(layout.findings());
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
         sb.append("  \"version\": \"2.1.0\",\n");
@@ -72,7 +77,9 @@ public final class SarifReporter {
                 continue; // 同组变体只报一次（与 findings.csv 折叠口径一致）
             }
             List<String> chainNotes = notes.getOrDefault(chain.key(), List.of());
-            String confidence = chainNotes.stream().anyMatch(n -> n.startsWith("verify:confirmed"))
+            String confidence = chainNotes.stream().anyMatch(n -> n.startsWith("verify:sink-blocked"))
+                    ? "SINK_BLOCKED"
+                    : chainNotes.stream().anyMatch(n -> n.startsWith("verify:confirmed"))
                     ? "CONFIRMED" : ConfidenceScorer.score(chain, chainNotes);
             String message = escape(chain.entryKind() + " → " + chain.sinkClass().replace('/', '.')
                     + "." + chain.sinkMethod());
@@ -103,7 +110,8 @@ public final class SarifReporter {
         sb.append("\n    ]\n");
         sb.append("  }]\n");
         sb.append("}");
-        Files.write(outDir.resolve("findings.sarif"), sb.toString().getBytes(StandardCharsets.UTF_8));
+        Files.write(layout.findings().resolve("findings.sarif"),
+                sb.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     /** 入口方法首行（ENTRY 跳携带描述符；层次/行号缺失输出空段——不造假日行号）。 */
@@ -167,7 +175,8 @@ public final class SarifReporter {
 
     private static boolean hasConfirmedNote(Map<String, List<String>> notes, Chain chain) {
         return notes.getOrDefault(chain.key(), List.of()).stream()
-                .anyMatch(n -> n.startsWith("verify:confirmed") || n.equals("verify:segment-confirmed"));
+                .anyMatch(n -> n.startsWith("verify:sink-blocked") || n.startsWith("verify:confirmed")
+                        || n.equals("verify:segment-confirmed"));
     }
 
     private static String resultIdentity(Chain chain, String ruleId) {

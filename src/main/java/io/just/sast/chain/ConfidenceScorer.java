@@ -24,8 +24,10 @@ public final class ConfidenceScorer {
 
     /** 每命中一个 gadget 模式的证据加分（GadgetPattern 经链注释 "pattern:*" 声明）。 */
     public static final int PATTERN_BONUS = 2;
-    /** 动态验证证据加分：子进程确认（sink 真实到达）为最强正向证据。 */
-    public static final int CONFIRMED_BONUS = 4;
+    /** 动态验证证据加分：sink 边界真实到达并被 canary 阻断。 */
+    public static final int SINK_BLOCKED_BONUS = 4;
+    /** 旧注记常量保留给外部扩展的源兼容性。 */
+    public static final int CONFIRMED_BONUS = SINK_BLOCKED_BONUS;
     /** 段归因确认（完整链的内段被子进程证实）加分。 */
     public static final int SEGMENT_CONFIRMED_BONUS = 2;
     /** bridge=deserialize 对 JavaBean setter 参数的外部输入边界证据。 */
@@ -44,7 +46,8 @@ public final class ConfidenceScorer {
         // the target method actually reached the modeled sink in the isolated child JVM.
         // Keep the construction limitation in the verification summary/notes, but do not
         // let it demote a directly confirmed path in the primary finding ranking.
-        if (notes != null && notes.stream().anyMatch("verify:confirmed"::equals)) {
+        if (notes != null && notes.stream().anyMatch(n -> "verify:sink-blocked".equals(n)
+                || "verify:confirmed".equals(n))) {
             return "FEASIBLE";
         }
         if (!degradations.isEmpty()) {
@@ -73,11 +76,13 @@ public final class ConfidenceScorer {
         if (notes != null) {
             points += notes.stream().filter(n -> n.startsWith("pattern:")).count() * PATTERN_BONUS;
             // 动态验证证据：确认 > 段归因确认 > 执行
-            if (notes.stream().anyMatch(n -> n.equals("verify:confirmed"))) {
-                points += CONFIRMED_BONUS;
+            if (notes.stream().anyMatch(n -> n.equals("verify:sink-blocked")
+                    || n.equals("verify:confirmed"))) {
+                points += SINK_BLOCKED_BONUS;
             } else if (notes.stream().anyMatch(n -> n.equals("verify:segment-confirmed"))) {
                 points += SEGMENT_CONFIRMED_BONUS;
-            } else if (notes.stream().anyMatch(n -> n.equals("verify:executed"))) {
+            } else if (notes.stream().anyMatch(n -> n.equals("verify:concrete-reached")
+                    || n.equals("verify:executed"))) {
                 points += 1;
             }
         }

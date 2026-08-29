@@ -119,8 +119,8 @@ class ScanPipelineTest {
                 Map.of("app.Gadget", GADGET, "app.EqGadget", EQ_GADGET));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null, true, 20);
-        String findings = Files.readString(out.resolve("findings.csv"));
-        String calibrations = Files.readString(out.resolve("calibrations.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        String calibrations = Files.readString(out.resolve("evidence").resolve("calibrations.csv"));
         // 正向链：app/Gadget.readObject → Runtime.exec（rule JUST-SINK-COMMAND-EXEC-RUNTIME）
         assertTrue(findings.contains("app/Gadget,readObject") && findings.contains("java/lang/Runtime,exec"),
                 "readObject 链应检出：\n" + findings);
@@ -168,7 +168,7 @@ class ScanPipelineTest {
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
-        String findings = Files.readString(out.resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/SourceApp,run")
                         && findings.contains("java/lang/Runtime,exec"),
                 "deserialize source 的返回值应作为前向污点入口闭合到 sink:\n" + findings);
@@ -228,7 +228,7 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
 
-        String findings = Files.readString(out.resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Bean,setCommand")
                         && findings.contains("java/lang/Runtime,exec"),
                 "deserialize source 应建立通用 setter 输入边界：\n" + findings);
@@ -299,14 +299,14 @@ class ScanPipelineTest {
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null, true, 20);
-        String findings = Files.readString(out.resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         // UnsafeApp：入口链保留，且框架管线中间跳（Fw.load → Fw.run → Method.invoke）保留
         assertTrue(findings.contains("app/UnsafeApp,readObject"), "未安全配置的入口链应上报：\n" + findings);
         assertTrue(findings.contains("fake/Fw.run"), "管线中间跳应保留：\n" + findings);
         // SafeApp：先 lock 后 load → safe-config 抑制
         assertFalse(findings.contains("app/SafeApp,readObject"),
                 "安全配置先于入口的链应被抑制：\n" + findings);
-        String calibrations = Files.readString(out.resolve("calibrations.csv"));
+        String calibrations = Files.readString(out.resolve("evidence").resolve("calibrations.csv"));
         assertTrue(calibrations.contains("app/SafeApp") && calibrations.contains("safe-config"),
                 "抑制理由应进 calibrations.csv：\n" + calibrations);
     }
@@ -318,10 +318,20 @@ class ScanPipelineTest {
                 false, true, null, true, 20);
         assertTrue(result.exitCode() == 0);
         assertFalse(result.chains().isEmpty());
-        String metadata = Files.readString(tmp.resolve("out").resolve("scan-metadata.json"));
+        Path output = tmp.resolve("out");
+        String metadata = Files.readString(output.resolve("meta").resolve("scan-metadata.json"));
         assertTrue(metadata.contains("\"completeness\"")
                         && metadata.contains("\"verification\":\"")
                         && metadata.contains("\"phase_ms\""),
                 "扫描元数据必须公开完整性、验证模式和阶段耗时：\n" + metadata);
+        assertTrue(Files.exists(output.resolve("index.md"))
+                        && Files.exists(output.resolve("findings").resolve("findings.md"))
+                        && Files.exists(output.resolve("verification").resolve("payload.json"))
+                        && Files.exists(output.resolve("verification").resolve("payload.md")),
+                "生产扫描必须生成根索引和分类后的阅读产物");
+        String index = Files.readString(output.resolve("index.md"));
+        assertTrue(index.contains("[Payload review](verification/payload.md)")
+                        && index.contains("[Dynamic verification](verification/dynamic-verification.json)"),
+                "根索引必须暴露人类/agent 两条阅读入口：\n" + index);
     }
 }

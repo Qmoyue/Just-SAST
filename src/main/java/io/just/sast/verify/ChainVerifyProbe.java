@@ -37,7 +37,7 @@ import java.util.jar.JarFile;
  *   arg2: sinkClass.sinkMethod[|descriptor]（用于 sink 特异性判定，点分类名）
  *
  * 判定标准：
- *   SINK_TRIGGERED — 异常栈帧中存在 declaringClass == sinkClass && methodName == sinkMethod
+ *   SINK_BLOCKED — canary 在 declaringClass == sinkClass && methodName == sinkMethod 的边界抛出
  *                    （栈帧级全等匹配：子串匹配会把 java.lang.RuntimeException 误判为
  *                    java.lang.Runtime，已废除）
  *   PARTIAL_PATH — 异常来自链中间环节（类型不匹配/空指针/入口方法缺失），sink 未到达
@@ -417,7 +417,7 @@ public final class ChainVerifyProbe {
                     // hashCode 入口的真实触发：对象作为 HashMap 的 key 被放入
                     new java.util.HashMap<Object, Object>().put(entryInstance, "echo CHAIN_OK");
                     if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("EXECUTED");
+                    System.out.println("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "TRIGGER_COMPARETO" -> {
@@ -427,7 +427,7 @@ public final class ChainVerifyProbe {
                     set.add(newInstance(entryCls, serializationSemantics));
                     set.add(entryInstance);
                     if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("EXECUTED");
+                    System.out.println("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "TRIGGER_COMPARATOR" -> {
@@ -443,7 +443,7 @@ public final class ChainVerifyProbe {
                     map.put("CHAIN_LEFT", "left");
                     map.put("CHAIN_RIGHT", "right");
                     if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("EXECUTED");
+                    System.out.println("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "TRIGGER_CONTAINS" -> {
@@ -452,7 +452,7 @@ public final class ChainVerifyProbe {
                     l.add(new Object());
                     l.contains(entryInstance);
                     if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("EXECUTED");
+                    System.out.println("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "PROXY" -> {
@@ -514,7 +514,7 @@ public final class ChainVerifyProbe {
                     // partial source failure; otherwise a real source-to-trigger path is
                     // systematically downgraded even though the sink was reached.
                     if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("EXECUTED: source-default-input");
+                    System.out.println("CONCRETE_REACHED: source-entry-returned");
                     System.exit(0);
                 }
                 default -> {
@@ -531,7 +531,11 @@ public final class ChainVerifyProbe {
             }
 
             if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-            System.out.println("EXECUTED");
+            if ("SERIAL".equals(mode) || "PROXY".equals(mode) || isTriggerMode(mode)) {
+                System.out.println("CONCRETE_REACHED: " + mode);
+            } else {
+                System.out.println("EXECUTED");
+            }
             System.exit(0);
 
         } catch (Throwable t) {
@@ -546,7 +550,7 @@ public final class ChainVerifyProbe {
             String marker = markerSpec(t);
             if (marker != null && sameSink(marker, sinkClassDotted, sinkMethod, sinkDescriptor)
                     && entryReached(t, entryClass, entryMethod)) {
-                System.out.println("SINK_TRIGGERED: " + sinkClassDotted);
+                System.out.println("SINK_BLOCKED: " + sinkClassDotted);
                 System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
                         + " (canary)");
                 System.exit(1);
@@ -554,10 +558,10 @@ public final class ChainVerifyProbe {
             // 次选：栈帧级全等匹配（类名 + 方法名），含 cause 链——同样要求入口帧在场
             if (sinkDescriptor.isEmpty() && reachesSink(t, sinkClassDotted, sinkMethod)
                     && entryReached(t, entryClass, entryMethod)) {
-                System.out.println("SINK_TRIGGERED: " + sinkClassDotted);
+                System.out.println("UNTESTABLE: sink-frame-without-canary");
                 System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
-                        + " in " + t.getClass().getName());
-                System.exit(1);
+                        + " without canary (not confirmed)");
+                System.exit(0);
             }
             // 链中间环节失败（非 sink）；消息带关键归因（如缺失类名），截断防长链污染输出
             Throwable detailCause = t;
@@ -853,7 +857,7 @@ public final class ChainVerifyProbe {
         if (!io.just.sast.verify.boot.SinkCanaryGate.wasReached()) {
             return false;
         }
-        System.out.println("SINK_TRIGGERED: " + sinkClass);
+        System.out.println("SINK_BLOCKED: " + sinkClass);
         System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod + " (canary-latched)");
         return true;
     }
@@ -1484,6 +1488,16 @@ public final class ChainVerifyProbe {
             }
             if (type == byte[].class) {
                 return payload;
+            }
+            if (type == java.io.ObjectInputStream.class) {
+                try {
+                    return new java.io.ObjectInputStream(
+                            new java.io.ByteArrayInputStream(payload));
+                } catch (IOException ignored) {
+                    // The bounded in-memory payload is valid; an unexpected stream failure is
+                    // a genuine adapter capability boundary, not a reason to invoke a target
+                    // ObjectInputStream subclass constructor.
+                }
             }
             if (java.io.InputStream.class.isAssignableFrom(type)) {
                 return new java.io.ByteArrayInputStream(payload);

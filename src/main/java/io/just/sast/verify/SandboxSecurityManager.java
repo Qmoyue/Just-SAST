@@ -176,18 +176,12 @@ public final class SandboxSecurityManager extends SecurityManager {
      */
     private boolean trustedProbeCaller() {
         Class<?> frame = firstNonPlatformFrame();
-        if (frame != null) {
-            String name = frame.getName();
-            return name.startsWith("io.just.sast.verify.")
-                    && trustedCodeSource != null
-                    && trustedCodeSource.equals(codeSourceOf(frame));
-        }
-        return false;
+        return frame != null && isVerifierFrame(frame);
     }
 
     private Class<?> firstNonPlatformFrame() {
         for (Class<?> frame : getClassContext()) {
-            if (frame != SandboxSecurityManager.class && !isJdkFrame(frame.getName())) {
+            if (frame != SandboxSecurityManager.class && !isPlatformFrame(frame)) {
                 return frame;
             }
         }
@@ -262,11 +256,11 @@ public final class SandboxSecurityManager extends SecurityManager {
         }
         boolean sawProbe = false;
         for (Class<?> frame : getClassContext()) {
-            if (frame == SandboxSecurityManager.class || isJdkFrame(frame.getName())) {
+            if (frame == SandboxSecurityManager.class || isPlatformFrame(frame)) {
                 continue;
             }
             String name = frame.getName();
-            if (name.startsWith("io.just.sast.verify.")) {
+            if (isVerifierFrame(frame)) {
                 sawProbe = true;
                 continue;
             }
@@ -281,10 +275,15 @@ public final class SandboxSecurityManager extends SecurityManager {
         return sawProbe;
     }
 
-    private static boolean isJdkFrame(String name) {
-        return name.startsWith("java.") || name.startsWith("javax.")
-                || name.startsWith("jdk.") || name.startsWith("sun.")
-                || name.startsWith("com.sun.");
+    private static boolean isPlatformFrame(Class<?> frame) {
+        ClassLoader loader = frame.getClassLoader();
+        return loader == null || loader == ClassLoader.getPlatformClassLoader();
+    }
+
+    private boolean isVerifierFrame(Class<?> frame) {
+        return frame.getName().startsWith("io.just.sast.verify.")
+                && trustedCodeSource != null
+                && trustedCodeSource.equals(codeSourceOf(frame));
     }
 
     private static String codeSourceOf(Class<?> type) {
@@ -299,24 +298,13 @@ public final class SandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkExit(int status) {
-        StackTraceElement[] stack = new Throwable().getStackTrace();
-        for (int i = 1; i < stack.length; i++) {
-            String owner = stack[i].getClassName();
-            if (owner.equals(SandboxSecurityManager.class.getName())) {
-                continue;
-            }
-            // System.exit 经过 java.lang.Runtime/Shutdown 等 JDK 帧；跳过这些实现帧，
-            // 只看第一个应用帧，才能区分探针收尾和目标工件主动退出。
-            if (owner.startsWith("java.") || owner.startsWith("javax.")
-                    || owner.startsWith("jdk.") || owner.startsWith("sun.")) {
-                continue;
-            }
-            if (owner.equals(ChainVerifyProbe.class.getName())) {
-                return;
-            }
-            throw new SecurityException("target System.exit denied: " + status);
+        // Runtime/Shutdown implementation frames are platform-loader classes. The first
+        // application frame is the capability boundary; class identity prevents an input
+        // JAR from spoofing the probe package or class name.
+        if (firstNonPlatformFrame() == ChainVerifyProbe.class) {
+            return;
         }
-        throw new SecurityException("System.exit denied: " + status);
+        throw new SecurityException("target System.exit denied: " + status);
     }
 
     @Override

@@ -21,19 +21,30 @@ public final class MultiFormatReporter {
 
     public void write(Path outDir, List<Chain> chains,
                       Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
+        write(ReportLayout.flat(outDir), chains, calibrations, notes);
+    }
+
+    public void write(ReportLayout layout, List<Chain> chains,
+                      Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
+        Files.createDirectories(layout.findings());
         List<Chain> orderedChains = new ArrayList<>(chains);
         orderedChains.sort(Comparator.comparing(Chain::key));
         // E1: JSON
-        writeJson(outDir.resolve("findings.json"), orderedChains, calibrations, notes);
+        writeJson(layout.findings().resolve("findings.json"), orderedChains, calibrations, notes);
         // E2: HTML
-        writeHtml(outDir.resolve("findings.html"), orderedChains, calibrations, notes);
+        writeHtml(layout.findings().resolve("findings.html"), orderedChains, calibrations, notes);
         // E3: Markdown
-        writeMarkdown(outDir.resolve("findings.md"), orderedChains, calibrations, notes);
+        writeMarkdown(layout.findings().resolve("findings.md"), orderedChains, calibrations, notes);
     }
 
     /** 扫描元数据旁车文件：不破坏 findings.json 数组契约，同时公开完整性和性能边界。 */
     public void writeMetadata(Path outDir, ScanStatistics stats) throws IOException {
-        Files.createDirectories(outDir);
+        writeMetadata(ReportLayout.flat(outDir), stats);
+    }
+
+    public void writeMetadata(ReportLayout layout, ScanStatistics stats) throws IOException {
+        Files.createDirectories(layout.meta());
+        Files.createDirectories(layout.verification());
         StringBuilder sb = new StringBuilder("{\n")
                 .append("  \"files_scanned\":").append(stats.filesScanned())
                 .append(",\"classes_loaded\":").append(stats.classesLoaded())
@@ -61,11 +72,12 @@ public final class MultiFormatReporter {
         sb.append("},\"dynamic_verification\":");
         appendVerificationJson(sb, stats.dynamicVerification());
         sb.append("\n}\n");
-        Files.write(outDir.resolve("scan-metadata.json"), sb.toString().getBytes(StandardCharsets.UTF_8));
+        Files.write(layout.meta().resolve("scan-metadata.json"),
+                sb.toString().getBytes(StandardCharsets.UTF_8));
         StringBuilder dynamic = new StringBuilder();
         appendVerificationJson(dynamic, stats.dynamicVerification());
         dynamic.append('\n');
-        Files.write(outDir.resolve("dynamic-verification.json"),
+        Files.write(layout.verification().resolve("dynamic-verification.json"),
                 dynamic.toString().getBytes(StandardCharsets.UTF_8));
     }
 
@@ -95,6 +107,7 @@ public final class MultiFormatReporter {
                     .append(",\"confidence_score\":").append(result.confidenceScore())
                     .append(",\"attempt\":").append(result.attempt())
                     .append(",\"duration_ms\":").append(result.durationMs())
+                    .append(",\"evidence\":\"").append(escJson(result.evidence())).append("\"")
                     .append('}');
         }
         sb.append("]}");
@@ -204,6 +217,11 @@ public final class MultiFormatReporter {
     /** D4: 休眠链检测——Serializable 类有 sink 调用但不在入口闭包内（依赖变更可激活）。 */
     public void writeDormant(Path outDir, java.util.Set<String> entryReachable,
                              java.util.Set<String> sinkHosts) throws IOException {
+        writeDormant(ReportLayout.flat(outDir), entryReachable, sinkHosts);
+    }
+
+    public void writeDormant(ReportLayout layout, java.util.Set<String> entryReachable,
+                             java.util.Set<String> sinkHosts) throws IOException {
         java.util.Set<String> dormant = new java.util.TreeSet<>(sinkHosts);
         dormant.removeAll(entryReachable);
         if (dormant.isEmpty()) {
@@ -215,7 +233,9 @@ public final class MultiFormatReporter {
         for (String d : dormant) {
             sb.append("- `").append(d.replace('/', '.')).append("`\n");
         }
-        Files.write(outDir.resolve("dormant.md"), sb.toString().getBytes(StandardCharsets.UTF_8));
+        Files.createDirectories(layout.evidence());
+        Files.write(layout.evidence().resolve("dormant.md"),
+                sb.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     /** JSON 字符串转义（含控制字符；不做 HTML 实体——实体泄漏进 JSON 是历史缺陷）。 */

@@ -1,7 +1,6 @@
 package io.just.sast.knowledge.calibrate;
 
 import io.just.sast.blackboard.Blackboard;
-import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
@@ -25,7 +24,7 @@ import java.util.Set;
 /**
  * 动态验证知识源（CALIBRATION priority 500）：
  * Phase 1: 构造可行性检查（快速筛选）
- * Phase 2: 并行子进程验证（预编译探针 + 4 路并行 + 实时输出 CONFIRMED 链）
+ * Phase 2: 并行子进程验证（预编译探针 + 4 路并行 + sink-boundary 证据）
  */
 public final class VerifyKnowledgeSource implements KnowledgeSource {
 
@@ -133,7 +132,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                     bb.scanInputs().jdkHome(), bb.scanInputs().targetMajorVersion(),
                     (chain, detail, sinkReached) -> {
                         if (sinkReached) {
-                            JustLogger.info("  ✓ CONFIRMED: {}#{} → {}.{}  [{}]",
+                            JustLogger.info("  ✓ SINK_BLOCKED: {}#{} → {}.{}  [{}]",
                                     chain.entryClass().replace('/', '.'),
                                     chain.entryMethod(),
                                     chain.sinkClass().replace('/', '.'),
@@ -142,8 +141,8 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                         }
                     });
                 // entryKind=source 的完整链也进入隔离探针。探针使用统一的受限默认参数
-                // 适配器验证宿主是否真实执行；这不是攻击者 payload 生成，未建模的源输入
-                // 仍只能得到 EXECUTED/PARTIAL，不能凭入口执行提升为 CONFIRMED。
+                // 适配器验证宿主是否真实执行；这不是攻击者 payload 生成。只有同一候选
+                // 到达 sink canary 边界才能得到 SINK_BLOCKED。
                 List<Chain> topChains = verifier.selectChains(
                         bb.chains().stream().filter(c -> bb.calibrationOf(c.key()) == null
                         ).toList(),
@@ -160,11 +159,16 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                     ParallelVerifier.VerifyResult result = results.get(i);
                     Chain chain = topChains.get(i);
                     switch (result.status()) {
-                        case "CONFIRMED" -> {
-                            bb.chainNote(chain.key(), "verify:confirmed");
+                        case "SINK_BLOCKED" -> {
+                            bb.chainNote(chain.key(), "verify:sink-blocked");
                             confirmed++;
                         }
-                        // 入口真实执行但未证实 sink：证据注记，不置顶（CONFIRMED 仅留给 SINK_TRIGGERED）
+                        // 真实触发前缀完成但未到达精确 sink 边界：保留为低于 sink 的正向证据。
+                        case "CONCRETE_REACHED" -> {
+                            bb.chainNote(chain.key(), "verify:concrete-reached");
+                            executed++;
+                        }
+                        // 入口真实执行但未证实 sink：兼容 direct/source 旧探针结果。
                         case "EXECUTED" -> {
                             bb.chainNote(chain.key(), "verify:executed");
                             executed++;
@@ -194,44 +198,9 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                         default -> { }
                     }
                 }
-                // 段归因：若源宿主自身未被选入有限验证预算，且其 gadget 内段（bridge-trigger-src
-                // 桥之后的 hashCode/equals 段）已被子进程证实，则把证据附着到完整链。源宿主
-                // 自身若已被验证，不重复添加段注释。
-                Set<String> confirmedEntries = new java.util.HashSet<>();
-                for (int i = 0; i < results.size(); i++) {
-                    if ("CONFIRMED".equals(results.get(i).status())) {
-                        Chain c = topChains.get(i);
-                        confirmedEntries.add(c.entryClass() + "#" + c.entryMethod()
-                                + "|" + c.sinkClass() + "." + c.sinkMethod());
-                    }
-                }
-                int segment = 0;
-                for (Chain chain : bb.chains()) {
-                    if (!"source".equals(chain.entryKind())) {
-                        continue;
-                    }
-                    List<String> notes = bb.chainNotesOf(chain.key());
-                    if (notes.stream().anyMatch(n -> n.equals("verify:confirmed")
-                            || n.equals("verify:segment-confirmed"))) {
-                        continue;
-                    }
-                    for (ChainHop hop : chain.hops()) {
-                        if (hop.reason() != null && hop.reason().equals("bridge-trigger-src")
-                                && confirmedEntries.contains(hop.toOwner() + "#" + hop.toName()
-                                        + "|" + chain.sinkClass() + "." + chain.sinkMethod())) {
-                            bb.chainNote(chain.key(), "verify:segment-confirmed");
-                            segment++;
-                            JustLogger.info("段归因: {}#{} → {}.{}（内段 {}#{} 已子进程证实）",
-                                    chain.entryClass(), chain.entryMethod(),
-                                    chain.sinkClass(), chain.sinkMethod(),
-                                    hop.toOwner(), hop.toName());
-                            break;
-                        }
-                    }
-                }
-                if (segment > 0) {
-                    JustLogger.info("段归因确认 {} 条完整链（内段被子进程证实）", segment);
-                }
+                // 不把另一个候选链的 gadget 内段证据提升为当前完整链的确认。
+                // 只有同一 entry/sink 候选在本次子 JVM 中到达 sink 边界，才能产生
+                // verify:sink-blocked；有限预算之外的链仍保留静态结果。
         } catch (Exception e) {
             bb.setVerificationStatus(verifier == null
                     ? "JVM_SANDBOX_UNAVAILABLE" : verifier.capability());
@@ -246,7 +215,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
             bb.setVerificationStatus(verifier.capability());
         }
 
-        JustLogger.info("动态验证：构造可行 {} / 不可构造 {} | 子进程 CONFIRMED {} / EXECUTED {} / "
+        JustLogger.info("动态验证：构造可行 {} / 不可构造 {} | 子进程 SINK_BLOCKED {} / CONCRETE_REACHED/EXECUTED {} / "
                         + "PARTIAL {} / FAILED {} / TIMEOUT {} / UNTESTABLE {}",
                 constructible, rejected, confirmed, executed, partial, failed, timeout, untestable);
         if (!verificationDetails.isEmpty()) {
@@ -278,7 +247,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
             int score = ConfidenceScorer.evidenceScore(chain, notes);
             items.add(new VerificationSummary.ChainResult(i + 1, chain.key(), result.status(),
                     result.detail(), ConfidenceScorer.score(chain, notes), score,
-                    result.attempt(), result.durationMs()));
+                    result.attempt(), result.durationMs(), result.evidence()));
         }
         return new VerificationSummary(bb.verificationStatus(), budget, constructible, rejected,
                 selected.size(), statuses, detailCounts, items);
