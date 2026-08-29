@@ -32,7 +32,12 @@ public final class JrtClassSource implements JdkClassSource {
 
     /** 与反序列化链相关的 JDK 模块（全量加载集）。 */
     public static final List<String> DESER_MODULES = List.of(
-            "java.base", "java.naming", "java.rmi", "java.management", "java.scripting", "java.sql");
+            "java.base", "java.naming", "java.rmi", "java.management", "java.scripting", "java.sql",
+            // TemplatesImpl and the XML transformer implementation are part of
+            // the JDK XML module. They are a common deserialization sink even
+            // when the application bytecode reaches them through reflection,
+            // so omitting java.xml makes the default full scan incomplete.
+            "java.xml");
 
     private final ClassFileReader reader = new ClassFileReader();
     private final FileSystem jrt;

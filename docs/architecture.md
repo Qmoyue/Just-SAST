@@ -1,180 +1,239 @@
-# Just — 架构设计
+# Just 架构设计
 
-## 1. 目标
+本文描述 Just 的稳定模块边界、数据流、分析契约和安全边界。它面向贡献者和需要评估扫描结果的使用者；性能数字和回归结论以仓库当前代码和 CI 为准，不把单次机器测量当成架构保证。
 
-轻量字节码 SAST：对 JAR/WAR 挖掘 Java 反序列化 gadget 利用链。单 JAR 交付，零外部服务。
+## 1. 产品边界
 
-## 2. 总体架构
+Just 的核心任务是：从 JAR/WAR/class 目录中提取 Java 字节码事实，建立可解释的调用与数据流关系，组合反序列化入口到危险 sink 的候选链，再通过校准和安全 canary 给出分层证据。
 
+核心不变量：
+
+1. ASM 只存在于 frontend；分析层只依赖 Just 自有 model。
+2. 规则描述攻击面，知识源实现通用语义；不得为 benchmark、题目、包名或某条 WP 链增加分支。
+3. 分析阶段可并行，跨线程事实只能通过局部 delta 和稳定顺序合并。
+4. 静态候选、动态证据和完整性状态互相独立；动态失败不能静默变成“无链”。
+5. 所有链带有 `rule_id`、入口、sink、逐跳路径和可追溯的拒绝/截断原因。
+6. 动态验证只允许安全 canary 观测，不执行命令、网络访问、native 加载或可直接武器化 payload。
+
+## 2. 分层与数据流
+
+```text
+输入工件 / 依赖 / 目标 JDK
+              │
+              ▼
+      frontend.asm（ASM、嵌套工件、JDK source）
+              │  immutable model facts
+              ▼
+        cpg/build + analysis indexes
+              │  frozen graph / lazy CFG / hierarchy
+              ▼
+              Blackboard
+       ┌──────┴──────────────────┐
+       │                         │
+       │ ANALYSIS                │ COMPOSITION
+       │ backward taint          │ object graph
+       │ forward taint           │ fragments
+       │ OIS callbacks           │ semantic composer
+       │ framework bridge        │
+       └──────────────┬──────────┘
+                      ▼
+                 CALIBRATION
+          validate → prune → safe config
+          patterns → dynamic verification
+                      │
+                      ▼
+     CSV / JSON / SARIF / HTML / Markdown / plan
 ```
-JAR/WAR → ASM 前端（fat jar/WAR 嵌套 + JDK 懒加载）
-  → 轻量代码图（CHA 调用图 + 字段写入索引，构建后冻结；CFG/def-use 由分析引擎按需惰性计算）
-  → 黑板三阶段调度（12 个知识源）
-      ANALYSIS:     反向污点 ∥ 前向污点 ∥ OIS 回调 ∥ 框架桥接
-      COMPOSITION:  对象图扩散 → 片段合成 → 语义链组装
-      CALIBRATION:  校验 → 剪枝 → SafeConfig → 模式识别 → 动态验证
-  → 置信度 → 六格式输出
+
+模块依赖方向为 `frontend → model → cpg/analysis → blackboard/knowledge → report/verify`。report 只消费已合并的事实和证据；verify 不反向改变静态图。
+
+### 2.1 所有权边界
+
+| 模块 | 唯一职责 | 不应拥有的职责 |
+| --- | --- | --- |
+| `frontend.asm` | 读取工件、解析 ASM、选择目标 JDK、生成事实 | 污点推理、链排序、报告格式 |
+| `model` | 保存类、方法、字段、调用和指令事实 | 类路径扫描和全局缓存策略 |
+| `cpg` / `analysis` | 图索引、CFG、层次、来源传播和可达性 | 直接写最终报告 |
+| `blackboard` | 事实、链、事件、阶段屏障和确定性合并 | 解释某个攻击面的细节 |
+| `knowledge` | 以知识源形式提供 source/sink/回调/组合/校准语义 | 直接调用另一个知识源 |
+| `verify` | 独立子 JVM 中构造和观察安全触发 | 替代静态分析或执行 exploit |
+| `report` | 将结果持久化为稳定格式 | 重新推导链或修改置信度事实 |
+
+## 3. Frontend 与代码图
+
+### 3.1 工件读取
+
+`JarReader` 以流式方式读取目标工件和显式依赖，识别普通 JAR、Spring Boot fat JAR、WAR 以及嵌套 JAR。递归展开有深度、条目数量和单条目大小上限；失败或上限会进入完整性原因。
+
+`JdkClassSelector` 根据目标 class 的 major version 选择兼容的 JDK source：Java 8 读取 `rt.jar`，Java 9+ 通过目标 JDK 的 `jrt-fs.jar` 访问模块类。应用类优先于依赖，依赖优先于 JDK；缺少类不会伪造空方法体。
+
+### 3.2 ASM 到 Just model
+
+`BytecodeFrontend` 和 `FactsExtractor` 将 ASM 事件收敛为：
+
+- 类、父类、接口、访问标志和序列化能力；
+- 方法签名、访问标志、首行号、指令和异常表；
+- 调用、字段读写、对象分配、数组操作、方法句柄和 lambda 事实；
+- 不保留跨阶段不必要的原始 class byte 数组。
+
+ASM 不穿透到 knowledge 层。这样可以替换或测试推理语义，而不把 ASM visitor 状态扩散到整个系统。
+
+### 3.3 图表示
+
+代码图是建立后冻结的只读索引，主要包含 METHOD/CALL 节点、调用/分发/lambda 边、字段写入索引和类层次索引。方法内 CFG 通过 `Cfg` 按需计算；来源传播状态由 `ForwardOrigins` 和局部摘要维护，不把每个抽象状态物化成全局图节点。
+
+设计重点：
+
+- 邻接和调用索引采用稳定键，避免 worker 观察到不同遍历顺序；
+- 类层次闭包按需记忆化；可见性、`private`、`static` 和跨包 package-private 约束在分发前应用；
+- JSR/RET、异常边、fall-through 和 lambda 目标在 CFG/调用图中保持显式语义；
+- `DISPATCH_CAP`、实现者展开、路径和证明预算触顶时记录 `PARTIAL` 原因；
+- 图构建与调度分离。CPU worker 可并行计算局部结果，但黑板只接受稳定合并后的 delta。
+
+GPU 不属于默认后端。当前热路径是分支密集的对象/字段来源、反射和路径状态，不满足无条件搬运到 GPU 的同构数据条件；只有 profile 证明 bitset 可达性或 SCC 内核是主要成本，并通过 CPU 等价回归，才考虑可选实验后端。
+
+## 4. Blackboard 与知识源
+
+Controller 按 `Phase` 和 `KnowledgeSource.priority()` 调度，阶段内使用屏障：
+
+- `ANALYSIS`：互相独立的知识源并行运行；
+- `COMPOSITION`：按优先级消费分析事实，构造对象图和语义链；
+- `CALIBRATION`：按优先级做可行性校准、剪枝、模式标注和动态验证。
+
+跨阶段事件延迟投递，避免在生产者尚未完成时消费不完整事实。知识源只通过 Blackboard 合作，禁止互相持有和调用实现类。
+
+| 知识源 | 阶段 | 责任 |
+| --- | --- | --- |
+| `BackwardTaintAnalysis` | ANALYSIS | 从 sink 反向寻找入口、字段和可控 receiver |
+| `ForwardTaintKnowledgeSource` | ANALYSIS | 方法摘要不动点和对象来源传播 |
+| `DeserializationCallbackKnowledgeSource` | ANALYSIS | OIS 回调、`readUnshared`、继承回调 |
+| `FrameworkBridgeKnowledgeSource` | ANALYSIS | YAML source 与替代反序列化框架桥接 |
+| `ObjectGraphEntryKnowledgeSource` | COMPOSITION | 字段类型和 `readResolve` 对象图重根 |
+| `FragmentKnowledgeSource` | COMPOSITION | 声明式公开链片段 |
+| `ChainComposerKnowledgeSource` | COMPOSITION | INVOKE、TRIGGER、TEMPLATE、DESER 和 source-host 组合 |
+| `ChainValidatorKnowledgeSource` | CALIBRATION | 类型流、序列化、约束和 catch 可行性 |
+| `ChainPrunerKnowledgeSource` | CALIBRATION | 触发上下文、深链结构和软预算校准 |
+| `SafeConfigKnowledgeSource` | CALIBRATION | 对调用点实参求值后应用安全配置抑制 |
+| `GadgetPatternKnowledgeSource` | CALIBRATION | 已知集合/链模式标注和证据因子 |
+| `VerifyKnowledgeSource` | CALIBRATION | 构造可行性、子 JVM 动态验证和汇总 |
+
+## 5. 静态语义
+
+### 5.1 入口、source 与 sink
+
+原生序列化入口包括 `readObject`、`readObjectNoData`、`readExternal`、`readResolve`、`resolveClass` 和 `resolveProxyClass`。替代框架入口由 YAML `source` 规则声明，并由框架桥接知识源连接到通用对象图/触发语义。
+
+sink 规则描述危险能力和 tainted 参数，例如命令执行、JNDI、文件、网络、反射、类加载、表达式和模板。命中 sink 不等于形成漏洞链；必须有从入口到 sink 的可解释路径和必要的可控性证据。
+
+### 5.2 来源传播与可达性
+
+前向分析通过模型规则、字段读写、数组元素、返回值、receiver 和调用点敏感性传播来源；后向分析从 sink 按入口距离调度回溯。两者的结果通过稳定链 key 合并，互不以对方的临时状态作为隐藏前置条件。
+
+反射、代理和框架桥接遵循“已解析优先、未知保留为不确定证据”的原则：
+
+- `getMethod`/`getDeclaredMethod` 只有在类、方法名和参数类型有证据时扩展精确目标；
+- `Method.invoke` 的目标需要 receiver/Method 来源约束；
+- 动态代理需要接口方法、handler 和 receiver 兼容；
+- 框架供给只由 source 规则派生包前缀和 JavaBean 形态控制，不把任意 public 方法泛化成外部输入；
+- JNI 和 JRMP/RMI 作为能力转换/边界节点保留静态证据，不假设 native 或远端行为已经发生。
+
+### 5.3 触发器与组合
+
+组合器把后段 gadget 和反序列化源宿主连接起来。集合触发器要求声明类型和入口方法兼容：`HashMap` 对应 `hashCode`，有序容器对应 `compareTo`/`compare`，线性集合对应 `equals`。每条桥接边保留机制标签和 provenance，便于报告解释和动态段归因。
+
+## 6. 校准、置信度与完整性
+
+校准不是简单删链，而是将静态证据拆成可检查的约束：PASM/类型流、构造和序列化可行性、catch 可达性、receiver 兼容、字段依赖和 sink 路径。未知条件不会被当作已证伪；只有可证明不满足时才拒绝。
+
+完整性状态独立记录以下原因：
+
+- JDK 未挂载或版本不兼容；
+- class、嵌套工件或依赖解析失败；
+- 调用者/实现者/分发、路径、对象图、事件或证明预算触顶；
+- 动态验证缺类、超时、权限、native 或运行时能力不可用。
+
+`COMPLETE`/`PARTIAL` 描述扫描覆盖，不描述漏洞是否存在。`FEASIBLE`/`DEGRADED`/`NOT_FEASIBLE` 描述链校准；动态状态描述运行时证据，三者不能互相替代。
+
+## 7. 动态验证架构
+
+动态验证由 `VerifyKnowledgeSource` 选择候选，由 `ParallelVerifier` 管理 fork-per-chain 子 JVM，由 `ChainVerifyProbe` 构造和触发对象图，由 Java agent 在精确 sink 处安装 canary。
+
+单条验证流程：
+
+```text
+静态链
+  → 候选选择（入口覆盖 + sink family + 证据排序）
+  → 独立 JVM / 隔离 cwd、tmp、超时、内存
+  → 反射构造字段依赖图
+  → 触发模式（SERIAL / HASH / COMPARE / EQUALS / PROXY / DIRECT）
+  → canary 检查入口帧和 sink 全等匹配
+  → 持久化状态、原因、证据、尝试次数和耗时
 ```
 
-物化的图结构为「METHOD/CALL 节点 + 调用/分发/LAMBDA 边」的轻量调用图与字段写入侧索引；
-方法内 CFG 由 `Cfg` 纯函数现算，值来源由 `ForwardOrigins` 惰性抽象解释，均不落图。
+验证状态：
 
-## 3. 知识源（12 个）
+| 状态 | 语义 |
+| --- | --- |
+| `CONFIRMED` | canary 或入口归因的精确 sink 栈帧命中，危险方法体不继续执行 |
+| `EXECUTED` | 入口调用成功，但没有 sink 到达证据 |
+| `PARTIAL` | 构造/触发只完成一部分，保留静态链 |
+| `FAILED` | 验证进程失败或非零退出，属于弱否定证据 |
+| `UNTESTABLE` | 缺类、JDK、权限、native 或其它运行时能力导致无法测试 |
 
-| KS | 包 | 阶段 (priority) | 职责 |
-|---|---|---|---|
-| BackwardTaint | backward | ANALYSIS (100) | 从 sink 反向回溯可控性（per-sink 并行，段级记忆化） |
-| ForwardTaint | engine | ANALYSIS (200) | 前向污点不动点（粗扫+精扫单引擎两轮，拓扑序处理） |
-| OisCallback | ois | ANALYSIS (300) | resolveClass/resolveProxyClass 回调建模 |
-| FrameworkBridge | framework | ANALYSIS (400) | 规则驱动框架桥接（12+ marshaller） |
-| ObjectGraph | objectgraph | COMPOSITION (100) | 对象图入口扩散（字段类型回调重根） |
-| Fragment | fragment | COMPOSITION (150) | chain-fragment 规则合成已知链 |
-| ChainComposer | compose | COMPOSITION (200) | INVOKE/TRIGGER/TEMPLATE/DESER 语义桥接 + 源宿主容器触发桥 |
-| ChainValidator | calibrate | CALIBRATION (100) | PASM + 类型流 + 序列化可行性 + 约束图矛盾 |
-| ChainPruner | calibrate | CALIBRATION (200) | 触发上下文 + 深链结构门 + 机制去重（软预算） |
-| SafeConfig | calibrate | CALIBRATION (300) | 安全配置抑制（偏移序校验） |
-| GadgetPattern | calibrate | CALIBRATION (400) | 已知模式标注（集合包含判定） |
-| Verify | calibrate | CALIBRATION (500) | 反射构造可行性 + 子进程链级动态验证 |
+JVM deny-by-default 权限门只能减少 Java 层能力，不能隔离任意不可信代码。生产使用必须叠加 OS/容器/虚拟机、低权限账户、只读输入和无网络策略；JDK 24+ 不能把 Security Manager 当作可用的 OS 隔离。
 
-调度：ANALYSIS 并行派发（自足契约 + join 屏障），COMPOSITION/CALIBRATION 按 priority 串行。
-事件机制：CHAIN_FOUND 跨阶段延迟投递（当前阶段无订阅者则回填队列，后续阶段可消费）。
+## 8. 报告与稳定性
 
-## 4. 核心分析
+报告由独立 reporter 生成：
 
-### 4.1 调用图
+- CSV：`findings.csv`、`chains.csv`、`edges.csv`、`sinks.csv`、`calibrations.csv`；
+- 机器接口：`findings.json`、`findings.sarif`；
+- 阅读接口：`findings.html`、`findings.md`、`dormant.md`；
+- 过程证据：`scan-metadata.json`、`dynamic-verification.json`、`payload-plan.json`。
 
-- CHA 传递子类型闭包分发（`ClassHierarchy.transitiveSubtypes` 记忆化，调用图与引擎侧展开同源）
-- 可见性剪枝（private/static/跨包 package-private 不可覆写）
-- DISPATCH_CAP=200 超限时闭包做全子类型展开
-- LAMBDA 边用 resolveMethod 后的声明类
-- JSR/RET 子程序语义：JSR 建 JUMP 边 + fall-through 后继（RET 返回点），RET 无后继
+`findings.csv` 是折叠后的主链，`chains.csv` 保留路径变体；`edges.csv` 负责解释逐跳语义；`calibrations.csv` 让拒绝原因可审计。动态和完整性旁车文件不改变既有 findings JSON 数组契约。
 
-### 4.2 反向污点
+payload writer 输出确定性的对象图、字段依赖、触发模式、危险能力和验证证据计划。它是后续经过授权的框架适配器的输入，不是可直接执行的攻击 payload。
 
-- 从 sink 反向回溯，直到 magic entry
-- 可控语义：OIS 读 / 入口 this / proxy args / 字段 / 数组 / passthrough
-- **反射跳边**：常量类 `getMethod/getDeclaredMethod` 的 invoke 位点视为目标类 public 方法的伪调用者
-- **JavaBean 反射跳**：`getReadMethod/getWriteMethod` 模式 → getter 前缀方法目标（万能类型走 wildcard）
-- **入口距离调度**：sink 与调用者按入口 BFS 距离升序——预算优先花在高可达成区
-- **段级记忆化**：`方法X→入口Y` 结论跨 sink 复用（JDD IOCD 思想）；按 sink×段去重，捷径链
-  命中即短路当前回溯（预算留给其他 sink）
-- **死胡同缓存截断守卫**：深度/预算截断产生的"无链"结论不写入死胡同缓存
-- per-sink 有序 work-stealing（16 worker 自适应）
+## 9. 性能与内存原则
 
-### 4.3 前向污点
+当前实现使用流式输入、原始字节早释放、冻结只读索引、惰性 CFG、局部来源状态、缓存生命周期和自适应 CPU 并行。性能优化必须同时满足：
 
-- 粗扫（类级事实）→ 精扫（接口/代理/反射精化）单引擎两轮共享
-- **调度**：worklist 按方法键去重（pending 集）+ 可达集边界限定 + 调用图后序处理
-  （被调者先——事实沿调用链单遍向下流动，GadgetInspector 技术）
-- MODEL 规则消费：`this←argN` 容器投毒 / `return←src` 透传
-- origin-guided 分发精度：NEW→精确类、FieldRead→声明类型
-- **数组元素流**：AASTORE 存污点值 → 数组值污点（param/field 粒度）→ 传参/存字段后 AALOAD 读出可控
-- **lambda 分发**：接口调用的 receiver 为 invokedynamic 结果时，沿 LAMBDA 边到实现方法
-  （实参槽位按「捕获前缀 + 接口实参序数」映射）
-- **并发与确定性**：事实表/死胡同缓存为 ConcurrentHashMap、队列为 ConcurrentLinkedQueue、
-  计数为 LongAdder/AtomicLong；环守卫按探索私有（参数传递）；截断产生的 null 不写死胡同缓存
-  （按帧判定）；事实替换按「链长 + 跳序列规范形」全序取最小——结果与处理顺序无关
+1. 链身份、sink、规则归因和完整性原因不变或有解释；
+2. 结果合并与报告排序确定；
+3. 预算截断不污染跨上下文死胡同缓存；
+4. 以同一 JAR/JDK/规则测量 wall time、报告时 live heap 和 OS RSS；
+5. 没有 profile 和等价回归时，不引入 GPU 或额外运行时依赖。
 
-### 4.4 入口闭包
+`scan-metadata.json` 中的 `heap_used_mb` 是报告时 JVM live heap，不是 RSS 峰值。大型工件的真实内存发布门槛必须用外部进程采样器验证，不能从一个结束时快照推导峰值。
 
-- 从 magic entry + OIS 宿主 BFS
-- DISPATCH_CAP 超限展开；接口分发做传递子类型展开（implementers 不穿透实现类的子类，
-  展开补齐该缺口；JDK 接口维持声明态以防图扩散）
-- 反射跳展开 + JavaBean wildcard 直接种子
-- **框架反射供给门**：source 规则声明的框架入口类派生包前缀；仅当 Method.invoke /
-  JavaBean 反射位点宿主于框架包内时，应用类的 public 非静态方法才入闭包——包前缀来自
-  规则数据，引擎零硬编码
-- 距离表供调度使用
+## 10. 扩展方式
 
-### 4.5 链组装扩展：源宿主容器触发桥
+新增攻击面优先增加 YAML 规则：
 
-方法 M 体内含反序列化源调用（OIS readObject/readUnshared 或任一 `bridge: deserialize` 框架源，
-如 Kryo.readClassAndObject / fastjson JSON.parse）时，M 是反序列化源宿主——框架的容器/bean
-反序列化机制会以攻击者数据回调元素 hashCode/equals/compareTo。组装器将每个源宿主与全部
-trigger-entry 后段链（含公开 gadget 片段）组装成完整攻击路径，机制桥接跳标注框架入口
-（如 `Kryo.readClassAndObject`）。宿主排除 JDK 运行时包（java/javax/sun/com.sun/jdk 等，
-其 readObject 体是容器触发机制本身）与源框架同包的管线内部调用。合成链带
-`pattern:src-container-trigger` 注记；其入口参数是攻击者载荷，不进子进程探针，改由
-**段归因**继承证据：内段链（桥接跳目标入口 + 同 sink）被子进程 CONFIRMED 时，完整链标注
-`verify:segment-confirmed` 并获得证据加分，排序紧随 CONFIRMED 链。
+```yaml
+rules:
+  - id: EXAMPLE-SINK
+    kind: sink
+    category: CODE_EXEC
+    severity: HIGH
+    match:
+      call: {owner: "java/lang/Runtime", name: "exec"}
+    tainted: [{arg: 0}]
+```
 
-SafeConfig 布尔求值：`safe-config` 声明可带 `safe-value`（如 Kryo
-`setRegistrationRequired` 的安全值为 true）——抑制仅在调用点实参常量等于安全值时生效，
-`setRegistrationRequired(false)`（关闭安全模式）不再被误判为已加固。
+需要新的分析语义时，实现 `KnowledgeSource` 并声明 `phase()`、`priority()`、`interests()`；用 Blackboard 事实和事件通信，通过 ServiceLoader 注册。不要在 CLI、报告器或其它 knowledge source 中硬编码攻击面，也不要为单个工件写条件分支。
 
-### 4.5 校准
+## 11. 当前验证与已知限制
 
-- Validator 五层：PASM 可行性 / 类型流（非 final 无共同子类即拒） / 序列化可行性 / equals 卫式降级 / 约束图矛盾
-- catch 可达性守卫：CCE 类型安全 cast / 受检反射必成功 / 确定性运行时异常无可抛源
-- 深链结构门：动态分派跳 >14 且字段流 <17% 剪
-- Pruner 软预算：前 8 家族保留，高证据溢出链 DEGRADED
-- 四级判定：FEASIBLE / DEGRADED(reason) / NOT_FEASIBLE
-- SafeConfig 布尔求值：调用点实参常量等于 `safe-value` 才抑制（setRegistrationRequired(false) 不算加固）
+当前仓库验证基线：
 
-### 4.6 动态验证（子进程链级）
+- `mvn test`：143 项通过，0 失败，2 项环境跳过；
+- Gleipner 全量：块级 `TP=219, FP=22`，入口去重 `TP=126, FP=17`；
+- 指定 WP 语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 有静态证据和安全动态确认；
+- `javamix` 当前工件不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，不能用另一份工件的结果替代；
+- 大型工件的 live heap 仍然较高，不能宣称已经满足严格低内存发布门槛；
+- 复杂框架真实输入、代理、JNI/JRMP 和 JDK 版本差异仍可能产生 `PARTIAL`/`UNTESTABLE`；
+- 安全 payload plan、JVM 权限门和 canary 都不等价于生产级 exploit runner 或 OS sandbox。
 
-自动执行，流程：
-
-1. **候选选择**：危险 sink 类别加权（JNDI/命令执行/字节码加载/反射/网络/文件）之上叠加
-   结构证据分值降序，同一入口类最多 2 条——预算有限时优先消耗在高价值链；
-   预算可配置（`--verify-budget N`，默认 20）；TIMEOUT/UNTESTABLE 的链自动重试一次
-2. **链级探针**（`ChainVerifyProbe`）：解析链的字段流转跳，自底向上反射实例化并按字段链接成
-   完整对象图（含父类字段填充），再触发入口
-3. **触发忠实模式**：入口按真实反序列化触发路径触发——hashCode 入口经 `HashMap.put`、
-   compareTo/compare 入口经 `TreeSet.add`、equals 入口经非空 `List.contains`、
-   readObject 族经序列化-反序列化往返（SERIAL）、代理入口经 `Proxy.newProxyInstance`（PROXY）、
-   其余直接调用（DIRECT）——触发语义与链组装的 TRIGGER 桥一致
-4. **集合布局构造**：字段链接时，Map/Set/List 类型的字段按声明类型实例化，并把链接目标
-   放入 key/元素位——后段入口对象经容器 key 槽进入对象图，容器反序列化时触发其 hashCode/equals/compareTo
-5. **sink canary 插桩判定**（`SinkCanaryAgent`，-javaagent 自挂载 + ASM 注入）：
-   每条链的子 JVM 启动时把本链 sink 方法入口改写为门卫调用 `SinkCanaryGate.hit(spec)`——
-   门卫检查调用栈存在链入口帧才抛 `SinkReachedError`（Error 语义穿透 gadget 的
-   `catch(Exception)`），否则放行（JVM 自身与探针基础设施对
-   `Constructor.newInstance`/`URL.openConnection`/`Class.forName` 等通用方法的调用不受影响）。
-   java.base 核心 sink（如 `Method.invoke`）经 `retransformClasses` 补插桩，标记类经最小
-   bootstrap jar 挂载。命中判定：canary 标记 > 栈帧级全等匹配（sink 类名 + 方法名，含 cause
-   链），均要求入口帧在场；SINK_TRIGGERED（真到达 sink）> EXECUTED（入口真实调用且正常返回）
-   > PARTIAL_PATH（中途异常，链降级保留）；探针 FAILED 为弱否定证据（降级，不否决）。
-   canary 命中的 sink 真实方法体不执行——exec/defineClass/connect 类危险副作用被天然解除
-6. **子进程隔离**：fork-per-chain（静态状态不跨链污染）；沙箱参数——隔离工作目录与 tmpdir、
-   内存上限、headless；classpath 含目标 jar 与全部 `--deps`；fat jar/WAR 惰性展开
-   BOOT-INF/WEB-INF 的 classes 与嵌套依赖 jar 供探针解析；先 waitFor 超时再读输出
-7. **构造可行性报告**：不可构造的入口类（抽象/无无参构造/不在类路径）按原因类别聚合输出到日志
-
-已知边界：动态验证的入口触发基于 Java 序列化语义（OIS/TRIGGER 桥）；以框架解析为入口的链
-（fastjson autoType、Kryo Input、Hutool 二次反序列化等）静态可发现、动态验证覆盖其
-gadget 中段（hashCode/equals/readObject 段），框架入口段为后续触发模式扩展方向。
-
-## 5. 规则系统
-
-5 种类型（sink / magic-entry / source / model / chain-fragment），全在 YAML。
-
-- sink：owner/name/descriptor 匹配 + 层次命中
-- magic-entry：方法匹配 + implements + `access: private` 过滤
-- source：框架入口 + `safe-config` 声明块（偏移序抑制）
-- model：声明式污点透传（actions）
-- chain-fragment：声明式已知链（entryClass/hops/sinkOwner，后缀匹配支持 repackaged）
-
-装载校验：未知 kind / 缺失 id / 重复 id / 缺失 match 均报错。
-
-## 6. 前端
-
-- fat jar（BOOT-INF）+ WAR（WEB-INF）嵌套 jar 递归（深度 4，条目数与单条目大小双上限）
-- 装载顺序 target → deps → JDK；应用类优先，JDK 类不遮蔽
-- label 引用缺失即失败（不静默假边）
-- 方法首行号进事实模型（`MethodInfo.entryLine`，SARIF 定位用）
-- `--jdk-home`：Java 8 读 rt.jar，Java 9+ URLClassLoader 挂载目标 jrt-fs.jar
-
-## 7. 输出
-
-CSV 四表 + SARIF 2.1.0（driver.rules 声明、severity→level 映射、region.startLine、
-partialFingerprints）+ JSON/HTML/Markdown。CSV 流式写出（大语料不整表驻留内存）。
-diff 子命令按 RFC 4180 解析、链身份键与组序号无关。
-
-## 8. 基准
-
-Gleipner evaluator（`benchmark/Gleipner/run-gleipner.sh`，本地不入库）：
-
-- 链覆盖 106/122，误报块 22/47（evaluator 块计数 TP=148 / FP=22）
-- 能力面：multipath 10/10、depth 18/20、polymorphism 20/20
-- 9 语料回归全通过（demo/demo2/Unictf/java-quote/Remo/warmup/javamix/n1cat/qiao）
+这些限制必须进入报告和版本说明，不能通过增加参数、降低扫描深度、删除动态验证或 benchmark 特判来掩盖。

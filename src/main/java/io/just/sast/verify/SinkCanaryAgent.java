@@ -16,13 +16,15 @@ import java.util.Set;
 
 /**
  * sink canary 插桩代理（与扫描器同一 shaded jar，经 -javaagent 自挂载）：
- * 在链 sink 方法入口注入 {@code SinkCanaryGate.hit("内部类名#方法名")}——
+ * 在链 sink 方法入口注入 {@code SinkCanaryGate.hit("内部类名#方法名#描述符")}——
  * 门卫按调用栈判定：存在链入口帧才抛 {@code SinkReachedError}（见 SinkCanaryGate）。
  * 判定从"异常栈帧被动检测"升级为"主动命中检测"；Error 语义穿透 gadget 的 catch(Exception)；
  * 命中的 sink 真实方法体不再执行，exec / defineClass / connect 类危险副作用被天然解除。
+ * 子 JVM 的 exec/网络/文件/线程限制由 SandboxSecurityManager 负责；代理只改写明确的 sink
+ * 方法，不对目标工件做全量方法级重写，避免改变类加载/初始化语义并降低验证开销。
  *
  * premain 参数格式：{@code <bootstrapJarPath>|<入口点分类名>#<入口方法>|<spec1>,<spec2>…}
- * spec = 内部类名#方法名。
+ * spec = 内部类名#方法名[#描述符]；没有描述符时兼容旧的按方法名匹配。
  * bootstrapJar 仅含 boot 包两个类——插桩 java.base 类（如 Method.invoke）时其引用
  * 必须对 bootstrap 可见，经 appendToBootstrapClassLoaderSearch 挂载。
  *
@@ -51,21 +53,20 @@ public final class SinkCanaryAgent {
                         .add(spec.substring(p + 1));
             }
         }
-        if (sinks.isEmpty()) {
-            return;
-        }
         try {
             inst.appendToBootstrapClassLoaderSearch(new java.util.jar.JarFile(bootJar));
         } catch (Exception ignored) {
             // bootstrap 挂载失败：仅 java.base 类 sink 不可插桩，其余照常
         }
         try {
-            Class<?> gate = Class.forName(GATE_INTERNAL.replace('/', '.'), true,
-                    SinkCanaryAgent.class.getClassLoader());
+            // The transformed java.base method resolves the gate through the bootstrap
+            // loader. Configure that same class identity; using the agent/application loader
+            // here creates a second gate whose latch is invisible to the transformed method.
+            Class<?> gate = Class.forName(GATE_INTERNAL.replace('/', '.'), true, null);
             gate.getDeclaredMethod("setEntry", String.class, String.class)
                     .invoke(null, parts[1].substring(0, h), parts[1].substring(h + 1));
         } catch (Throwable ignored) {
-            return; // 门卫不可用：插桩无判定依据，直接放弃
+            // canary 不可用时仍保留子 JVM 权限门；安全失败不能降级成任意执行。
         }
         inst.addTransformer(new CanaryTransformer(sinks), true);
         for (String name : sinks.keySet()) {
@@ -81,11 +82,19 @@ public final class SinkCanaryAgent {
         }
     }
 
-    /** sink 插桩变换器：命中类名 → 所有同名方法入口注入门卫调用。 */
+    /**
+     * Sink canary transformer.  Ordinary sinks are guarded at their method entry.  Native
+     * sinks (notably Method.invoke and several Class/VM entry points) have no bytecode entry
+     * to rewrite, so matching call sites are guarded immediately before the invocation.  The
+     * latter is also safer for constructors: the canary throws before the target body or native
+     * capability is entered.  The matcher remains descriptor-aware and is driven only by the
+     * current chain's sink specification.
+     */
     static final class CanaryTransformer implements ClassFileTransformer {
 
         private final Map<String, Set<String>> sinks;
 
+        /** Compatibility constructor for direct transformer tests and callers that only want canaries. */
         CanaryTransformer(Map<String, Set<String>> sinks) {
             this.sinks = sinks;
         }
@@ -93,10 +102,11 @@ public final class SinkCanaryAgent {
         @Override
         public byte[] transform(ClassLoader loader, String className, Class<?> beingDefined,
                                 ProtectionDomain pd, byte[] bytes) {
-            Set<String> methods = className == null ? null : sinks.get(className);
-            if (methods == null || bytes == null) {
+            if (bytes == null || className == null) {
                 return null;
             }
+            Set<String> entryMethods = sinks.get(className);
+            boolean[] changed = {false};
             try {
                 ClassReader cr = new ClassReader(bytes);
                 ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_MAXS);
@@ -105,27 +115,52 @@ public final class SinkCanaryAgent {
                     public MethodVisitor visitMethod(int access, String name, String desc,
                                                      String sig, String[] exceptions) {
                         MethodVisitor mv = super.visitMethod(access, name, desc, sig, exceptions);
-                        boolean injectable = methods.contains(name)
+                        boolean injectable = entryMethods != null
+                                && (entryMethods.contains(name)
+                                || entryMethods.contains(name + "#" + desc))
                                 && (access & Opcodes.ACC_ABSTRACT) == 0
                                 && (access & Opcodes.ACC_NATIVE) == 0;
-                        if (!injectable) {
+                        if (!injectable && entryMethods == null && sinks.isEmpty()) {
                             return mv;
                         }
                         return new MethodVisitor(Opcodes.ASM9, mv) {
                             @Override
                             public void visitCode() {
                                 super.visitCode();
-                                visitLdcInsn(className + "#" + name);
-                                visitMethodInsn(Opcodes.INVOKESTATIC, GATE_INTERNAL,
-                                        "hit", "(Ljava/lang/String;)V", false);
+                                if (injectable) {
+                                    visitLdcInsn(className + "#" + name + "#" + desc);
+                                    visitMethodInsn(Opcodes.INVOKESTATIC, GATE_INTERNAL,
+                                            "hit", "(Ljava/lang/String;)V", false);
+                                    changed[0] = true;
+                                }
+                            }
+
+                            @Override
+                            public void visitMethodInsn(int opcode, String owner, String calledName,
+                                                        String calledDesc, boolean isInterface) {
+                                Set<String> callMethods = sinks.get(owner);
+                                if (callMethods != null
+                                        && (callMethods.contains(calledName)
+                                        || callMethods.contains(calledName + "#" + calledDesc))) {
+                                    visitLdcInsn(owner + "#" + calledName + "#" + calledDesc);
+                                    visitMethodInsn(Opcodes.INVOKESTATIC, GATE_INTERNAL,
+                                            "hit", "(Ljava/lang/String;)V", false);
+                                    changed[0] = true;
+                                }
+                                super.visitMethodInsn(opcode, owner, calledName, calledDesc,
+                                        isInterface);
                             }
                         };
                     }
                 }, 0);
-                return cw.toByteArray();
+                // Preserve the old direct-transformer contract for a sink class, even if the
+                // selected overload is absent.  For all other classes avoid rewriting bytes
+                // when no matching call site exists.
+                return changed[0] || entryMethods != null ? cw.toByteArray() : null;
             } catch (Throwable t) {
                 return null; // 插桩失败不阻断目标类加载
             }
         }
+
     }
 }

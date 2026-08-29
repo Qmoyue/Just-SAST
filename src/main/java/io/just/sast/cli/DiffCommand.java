@@ -20,14 +20,15 @@ import java.util.TreeSet;
  * Semgrep --baseline / CodeQL baseline 模式的本地版。
  *
  * 解析为 RFC 4180（带引号字段可含逗号/转义引号）；列按表头名定位（不依赖列序）。
- * 链身份键 = 入口类#方法 + sink类#方法 + rule_id——不含 chain_id 序号（组序号随排序变化，
+ * 链身份键 = rule_id + 入口类/方法/描述符/种类 + sink 类/方法/描述符——不含 chain_id 序号（组序号随排序变化，
  * 两次扫描只要发现相同链集合与语义，diff 应报告零差异）。
  */
 @Command(name = "diff", description = "对比两次扫描结果，报告链变更")
 public final class DiffCommand implements Callable<Integer> {
 
     /** 身份列：构成链的唯一标识。 */
-    private static final String[] IDENTITY_COLUMNS = {"rule_id", "entry_class", "entry_method", "sink_class", "sink_method"};
+    private static final String[] IDENTITY_COLUMNS = {"rule_id", "entry_class", "entry_method", "entry_descriptor",
+            "entry_kind", "sink_class", "sink_method", "sink_descriptor"};
     /** 语义列：身份之外参与"变更"判定的字段。 */
     private static final String[] SEMANTIC_COLUMNS = {"category", "severity", "confidence", "confidence_score",
             "chain_length", "unresolved_hops", "variant_count", "patterns", "path", "evidence", "verify"};
@@ -101,13 +102,25 @@ public final class DiffCommand implements Callable<Integer> {
                     throw new IllegalArgumentException("findings.csv 表头缺少身份列: " + csv.toAbsolutePath());
                 }
                 semanticIdx = indexOf(fields, SEMANTIC_COLUMNS);
+                if (semanticIdx == null) {
+                    throw new IllegalArgumentException("findings.csv 表头缺少语义列: " + csv.toAbsolutePath());
+                }
                 continue; // 表头行
+            }
+            if (fields.size() < headerWidth(identityIdx, semanticIdx)) {
+                throw new IllegalArgumentException("findings.csv 行列数不足: " + csv.toAbsolutePath());
             }
             String identity = joinAt(fields, identityIdx);
             if (identity == null) {
-                continue; // 缺身份列的畸形行
+                throw new IllegalArgumentException("findings.csv 存在畸形数据行: " + csv.toAbsolutePath());
             }
-            map.put(identity, joinAt(fields, semanticIdx));
+            String semantic = joinAt(fields, semanticIdx);
+            if (semantic == null) {
+                throw new IllegalArgumentException("findings.csv 存在畸形数据行: " + csv.toAbsolutePath());
+            }
+            if (map.put(identity, semantic) != null) {
+                throw new IllegalArgumentException("findings.csv 存在重复链身份: " + identity);
+            }
         }
         return map;
     }
@@ -140,6 +153,13 @@ public final class DiffCommand implements Callable<Integer> {
             sb.append(fields.get(idx[i]));
         }
         return sb.toString();
+    }
+
+    private static int headerWidth(int[] identityIdx, int[] semanticIdx) {
+        int max = -1;
+        for (int i : identityIdx) max = Math.max(max, i);
+        for (int i : semanticIdx) max = Math.max(max, i);
+        return max + 1;
     }
 
     /** RFC 4180 单行解析：双引号包裹的字段可含逗号与转义引号（""）。 */
@@ -178,6 +198,9 @@ public final class DiffCommand implements Callable<Integer> {
         }
         if (started || !fields.isEmpty()) {
             fields.add(cur.toString());
+        }
+        if (inQuotes) {
+            throw new IllegalArgumentException("CSV 字段引号未闭合");
         }
         return fields;
     }

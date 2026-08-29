@@ -81,5 +81,12 @@ public sealed interface Rule {
      * Fragment 知识源据此合成链（公开 gadget 知识库化，"规则做数据"的延伸）。
      */
     record FragmentRule(String id, String entryClass, String entryKind,
-                        List<HopSpec> hops, String sinkOwner, String sinkName) implements Rule {}
+                        List<HopSpec> hops, String sinkOwner, String sinkName,
+                        String sinkDescriptor) implements Rule {
+        /** 兼容旧的程序化规则构造；YAML 可用 sinkDescriptor 消除重载歧义。 */
+        public FragmentRule(String id, String entryClass, String entryKind,
+                            List<HopSpec> hops, String sinkOwner, String sinkName) {
+            this(id, entryClass, entryKind, hops, sinkOwner, sinkName, null);
+        }
+    }
 }

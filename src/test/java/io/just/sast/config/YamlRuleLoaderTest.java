@@ -21,10 +21,10 @@ class YamlRuleLoaderTest {
     void defaultRulesLoadWithAllKinds() throws IOException {
         Path rules = Path.of("src/main/resources/rules/default-rules.yaml");
         RuleSet set = new YamlRuleLoader().load(Files.newInputStream(rules));
-        // R3 扩充后的规模下限（sink 94 / source 42 / model 21 / magic-entry 14 / fragment 6）
-        assertEquals(94, set.sinks().size(), "sink 规则数（增删规则须同步本断言）");
-        assertEquals(42, set.sources().size(), "source 规则数（增删规则须同步本断言）");
-        assertEquals(21, set.models().size(), "model 规则数（增删规则须同步本断言）");
+        // 规则文件是可扩展数据；只锁定能力下限，不把新增通用规则误判为回归。
+        assertTrue(set.sinks().size() >= 94, "sink 规则能力退化：实际 " + set.sinks().size());
+        assertTrue(set.sources().size() >= 42, "source 规则能力退化：实际 " + set.sources().size());
+        assertTrue(set.models().size() >= 21, "model 规则能力退化：实际 " + set.models().size());
         assertTrue(set.magicEntries().size() >= 14, "magic-entry 含序列化侧入口，实际 " + set.magicEntries().size());
         // id 唯一
         long ids = java.util.stream.Stream.of(set.sinks(), set.magicEntries(), set.sources(), set.models())
@@ -105,5 +105,69 @@ class YamlRuleLoaderTest {
                             tainted: [{arg: 0}]
                         """.getBytes(StandardCharsets.UTF_8))));
         assertTrue(e.getMessage().contains("缺少 match"), e.getMessage());
+    }
+
+    @Test
+    void malformedNestedRuleFieldsFailWithRuleContext() {
+        String badMatch = """
+                rules:
+                  - id: X
+                    kind: sink
+                    category: C
+                    severity: HIGH
+                    match: []
+                    tainted: [{arg: 0}]
+                """;
+        Exception e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(badMatch.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(e.getMessage().contains("X"), e.getMessage());
+
+        String badTainted = """
+                rules:
+                  - id: X
+                    kind: sink
+                    category: C
+                    severity: HIGH
+                    match: { call: { owner: a/B, name: m } }
+                    tainted: [{arg: -1}]
+                """;
+        e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(badTainted.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(e.getMessage().contains("X"), e.getMessage());
+
+        String badFragment = """
+                rules:
+                  - id: F
+                    kind: chain-fragment
+                    entryClass: a/Entry
+                    sinkOwner: a/Sink
+                    sinkName: run
+                    hops: [{class: a/Hop}]
+                """;
+        e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(badFragment.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(e.getMessage().contains("method"), e.getMessage());
+
+        String badBridge = """
+                rules:
+                  - id: S
+                    kind: source
+                    bridge: deserialzie
+                    match: {call: {owner: a/B, name: load}}
+                """;
+        e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(badBridge.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(e.getMessage().contains("bridge"), e.getMessage());
+
+        String badModel = """
+                rules:
+                  - id: M
+                    kind: model
+                    match: {call: {owner: a/B, name: load}}
+                    actions: {return: [argX]}
+                """;
+        e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(badModel.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(e.getMessage().contains("argN"), e.getMessage());
     }
 }

@@ -2,23 +2,36 @@ package io.just.sast.analysis.taint;
 
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.config.RuleEngine;
+import io.just.sast.cpg.build.Cfg;
+import io.just.sast.cpg.build.CfgEdge;
+import io.just.sast.cpg.build.CfgLabel;
 import io.just.sast.cpg.graph.Edge;
+import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.Descriptor;
+import io.just.sast.model.FieldRef;
+import io.just.sast.model.InsnFact;
 import io.just.sast.model.MethodInfo;
+import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
+import io.just.sast.model.TryCatchFact;
+import io.just.sast.util.JustLogger;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 共享分析支撑（经黑板分发，全部知识源复用同一实例）：
@@ -26,13 +39,18 @@ import java.util.Set;
  */
 public final class OriginSupport {
 
+    private final Graph graph;
     private final ForwardOrigins origins;
     private final Map<String, Long> callIdByKey = new HashMap<>();
     private final Map<String, MethodInfo> methodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 负方法解析缓存带层次版本。大型 JAR 的调用图包含大量外部/未加载方法节点；
+     * 在没有这个集合时，每个 sink 回溯都会重复走 classInfo + 父类解析。JDK 懒加载
+     * 会改变层次，所以不能使用无版本的永久负缓存。
+     */
+    private final Map<String, Long> missingMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private final ClassHierarchy hierarchy;
     private final RuleEngine ruleEngine;
-    /** --fast（跳过 JDK 全量加载）：入口闭包的框架供给门在 fast 下关闭（同历史行为）。 */
-    private final boolean fast;
     /** 入口下游闭包（惰性一次构建）：反向剪枝与链剪枝共用。 */
     private Set<String> entryDownstream;
     /** 入口 BFS 距离（与下游闭包同一次遍历产出）：反向探索按离入口近者优先。 */
@@ -46,8 +64,24 @@ public final class OriginSupport {
     private final Map<Long, List<String>> reflectiveClassesBySite = new HashMap<>();
     /** 框架包内的 Method.invoke 位点——框架反射供给的调用者池（包前缀源自 source 规则声明）。 */
     private final List<Node> frameworkMethodInvokeSites = new ArrayList<>();
+    /** InvocationHandler 内由代理运行时提供 Method 参数的反射调用位点。 */
+    private final List<Node> proxyMethodInvokeSites = new ArrayList<>();
+    /** Method.invoke sites consuming a Method object obtained from a typed iterator/list read. */
+    private final List<Node> methodCollectionInvokeSites = new ArrayList<>();
+    /**
+     * Native call sites whose same-receiver callback family is structurally recoverable.
+     * JNI bytecode is outside the Java class file, so this index deliberately models only
+     * the bounded contract that can be justified from both sides: an instance native call
+     * may call a public/protected, no-argument, void Java method on the same receiver type.
+     * Unknown native callbacks remain an explicit completeness boundary instead of turning
+     * every native call into a call to every application method.
+     */
+    private final Map<String, List<Node>> nativeCallbackSitesByTarget = new HashMap<>();
+    private final Map<Long, List<Node>> nativeCallbackTargetsBySite = new HashMap<>();
     /** JavaBean 反射位点是否存在于框架包内（入口闭包的框架供给门）。 */
     private boolean frameworkJavabeanSite;
+    /** 图中存在 bridge=deserialize 的框架源调用：JavaBean setter 参数可由外部对象绑定提供。 */
+    private boolean frameworkDeserializeSourceAvailable;
     /** 框架包前缀（source 规则声明的框架入口类派生，前 3 段——框架反射供给门的数据源）。 */
     private final Set<String> frameworkPackages;
     /** JavaBean 反射跳：接收者类型 → invoke 位点；类型不可解 → wildcard 位点。 */
@@ -57,19 +91,80 @@ public final class OriginSupport {
     /** 占位类型集（JavaBean wildcard 精度门，惰性）。 */
     private java.util.Set<String> occupiableTypes;
 
+    /**
+     * 方法内字段重初始化的支配关系只在 receiver 精度查询时按需建立。
+     * 大工件绝不能为每个方法预分配 O(n^2) dominator 位图，因此超过上限的
+     * 方法不进入缓存，调用方回退到未知 receiver 的保守语义。
+     */
+    private final ConcurrentHashMap<String, DominatorIndex> fieldDominators =
+            new ConcurrentHashMap<>();
+    private static final int DOMINATOR_METHOD_LIMIT = 4096;
+
+    /**
+     * Exact CFG feasibility is a precision refinement, not the source of taint facts.  It
+     * must therefore fail open when constant propagation becomes expensive.  Large JARs
+     * commonly contain many callers of a small method; without a per-proof memo/budget the
+     * interprocedural parameter walk becomes exponential and can dominate the scan.
+     */
+    public static final int CONSTANT_PROOF_BUDGET = 4096;
+    private final Map<CfgProofKey, Boolean> sinkPathCache = new ConcurrentHashMap<>();
+    private final ThreadLocal<ConstantProofContext> constantProof = new ThreadLocal<>();
+    private final AtomicBoolean constantProofBudgetExceeded = new AtomicBoolean();
+
+    private record CfgProofKey(String methodKey, int offset) {
+    }
+
+    private record ConstantFactKey(String methodKey, ValueOrigin value) {
+    }
+
+    private static final class ConstantProofContext {
+        private int remaining = CONSTANT_PROOF_BUDGET;
+        private final Map<ConstantFactKey, Integer> facts = new HashMap<>();
+        private final Set<ConstantFactKey> active = new HashSet<>();
+
+        private boolean consume() {
+            return remaining-- > 0;
+        }
+    }
+
+    private record DominatorIndex(BitSet[] dominators, boolean[] reachable) {
+    }
+
     private final java.util.Map<Long, Node> callNodes = new HashMap<>();
 
     public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine, boolean fast) {
+        this.graph = graph;
         this.hierarchy = hierarchy;
         this.ruleEngine = ruleEngine;
-        this.fast = fast;
         this.frameworkPackages = deriveFrameworkPackages();
         this.origins = new ForwardOrigins(callIdByKey);
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             callIdByKey.put(methodKey(call) + "@" + call.strProp("offset"), call.id());
             callNodes.put(call.id(), call);
         }
+        frameworkDeserializeSourceAvailable = hasDeserializeSource(graph);
         indexReflectiveJumps(graph);
+        indexNativeCallbacks(graph);
+    }
+
+    /**
+     * source 规则的 bridge 是数据契约，不把某个具体框架或目标类写进引擎：
+     * 只要已加载图中存在一个 deserialize source 调用，就允许后续 JavaBean
+     * setter 作为框架对象绑定边界参与反向污点分析。
+     */
+    private boolean hasDeserializeSource(Graph graph) {
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            var source = ruleEngine.matchingSource(call.strProp("owner"), call.strProp("name"),
+                    call.strProp("desc"));
+            if (source.isPresent() && isDeserializeSource(source.get())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isDeserializeSource(io.just.sast.config.Rule.SourceRule source) {
+        return source != null && !"serialize".equalsIgnoreCase(source.bridge());
     }
 
     /** 框架包前缀：source 规则声明的框架入口类取前 3 段包名（与框架桥接 KS 的前缀口径一致）。 */
@@ -137,10 +232,94 @@ public final class OriginSupport {
             if (inFrameworkPackage(host.owner())) {
                 frameworkMethodInvokeSites.add(call);
             }
+            if (proxyReflectiveInvokeSite(call)) {
+                proxyMethodInvokeSites.add(call);
+            }
+            if (methodCollectionReflectiveInvokeSite(call)) {
+                methodCollectionInvokeSites.add(call);
+            }
         }
         if (!reflectiveClassesBySite.isEmpty()) {
             io.just.sast.util.JustLogger.info("反射跳索引：{} 个 invoke 位点", reflectiveClassesBySite.size());
         }
+        JustLogger.debug("框架反射供给索引：{} 个 Method.invoke 位点，包前缀 {}",
+                frameworkMethodInvokeSites.size(), frameworkPackages);
+    }
+
+    /**
+     * Index the Java-visible part of a JNI callback without reading or loading native code.
+     * The descriptor restriction is intentional: it is a sound compatibility filter for the
+     * common {@code CallVoidMethod(obj, mid)} shape and keeps an opaque native boundary bounded.
+     */
+    private void indexNativeCallbacks(Graph graph) {
+        Map<Long, List<Node>> targetsBySite = new HashMap<>();
+        List<Node> callbackCandidates = graph.nodesOfType(NodeType.METHOD).stream()
+                .filter(candidate -> !isJdk(candidate.owner()))
+                .filter(candidate -> "()V".equals(candidate.descriptor()))
+                .filter(candidate -> !candidate.name().startsWith("<"))
+                .filter(candidate -> {
+                    MethodInfo target = methodOf(candidate.owner(), candidate.name(), candidate.descriptor());
+                    return target != null && !target.isStatic()
+                            && !java.lang.reflect.Modifier.isNative(target.access())
+                            && !java.lang.reflect.Modifier.isAbstract(target.access())
+                            && (java.lang.reflect.Modifier.isPublic(target.access())
+                            || java.lang.reflect.Modifier.isProtected(target.access()));
+                })
+                .sorted(java.util.Comparator.comparing(Node::owner)
+                        .thenComparing(Node::name)
+                        .thenComparing(Node::descriptor))
+                .toList();
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            if (isJdk(call.owner()) || "STATIC".equals(call.invokeKind())
+                    || "DYNAMIC".equals(call.invokeKind())) {
+                continue;
+            }
+            MethodInfo nativeMethod = methodOf(call.owner(), call.name(), call.descriptor());
+            if (nativeMethod == null || !java.lang.reflect.Modifier.isNative(nativeMethod.access())) {
+                continue;
+            }
+            List<Node> targets = new ArrayList<>();
+            for (Node candidate : callbackCandidates) {
+                MethodInfo target = methodOf(candidate.owner(), candidate.name(), candidate.descriptor());
+                if (target == null || !nativeCallbackCompatible(call, target)) {
+                    continue;
+                }
+                targets.add(candidate);
+                nativeCallbackSitesByTarget.computeIfAbsent(methodKey(target), ignored -> new ArrayList<>(1))
+                        .add(call);
+            }
+            if (!targets.isEmpty()) {
+                targets.sort(java.util.Comparator.comparing(n -> methodKeyOf(n.owner(), n.name(), n.descriptor())));
+                targetsBySite.put(call.id(), List.copyOf(targets));
+            }
+        }
+        for (Map.Entry<Long, List<Node>> entry : targetsBySite.entrySet()) {
+            nativeCallbackTargetsBySite.put(entry.getKey(), entry.getValue());
+        }
+        for (Map.Entry<String, List<Node>> entry : nativeCallbackSitesByTarget.entrySet()) {
+            entry.getValue().sort(java.util.Comparator.comparingLong(Node::id));
+        }
+        if (!nativeCallbackTargetsBySite.isEmpty()) {
+            JustLogger.debug("JNI 同接收者回调索引：{} 个 native 位点，{} 个目标方法",
+                    nativeCallbackTargetsBySite.size(), nativeCallbackSitesByTarget.size());
+        }
+    }
+
+    private boolean nativeCallbackCompatible(Node nativeCall, MethodInfo target) {
+        if (isJdk(nativeCall.owner()) || target.isStatic() || target.name().startsWith("<")
+                || java.lang.reflect.Modifier.isNative(target.access())
+                || java.lang.reflect.Modifier.isAbstract(target.access())
+                || !"()V".equals(target.descriptor())
+                || isJdk(target.owner())) {
+            return false;
+        }
+        if (!java.lang.reflect.Modifier.isPublic(target.access())
+                && !java.lang.reflect.Modifier.isProtected(target.access())) {
+            return false;
+        }
+        // The receiver of an instance native call is the object supplied to JNI.  A subtype
+        // override is also a legal callback target; unrelated classes are not.
+        return hierarchy.isSubtypeOf(target.owner(), nativeCall.owner());
     }
 
     /** 在 invoke 宿主方法体内找 `C.class.getXxxMethod(name, ...)` 模式（窗口式近似，窗口内常量配对）。 */
@@ -285,6 +464,172 @@ public final class OriginSupport {
         return frameworkMethodInvokeSites;
     }
 
+    /** Cached proxy-runtime Method.invoke sites used by the reverse reflective wildcard. */
+    public List<Node> proxyMethodInvokeSites() {
+        return proxyMethodInvokeSites;
+    }
+
+    /** Cached reflective sites whose Method receiver is a typed collection element. */
+    public List<Node> methodCollectionInvokeSites() {
+        return methodCollectionInvokeSites;
+    }
+
+    /** Native callback targets attached to one Java native call site. */
+    public List<Node> nativeCallbackTargets(Node nativeCall) {
+        return nativeCall == null ? List.of()
+                : nativeCallbackTargetsBySite.getOrDefault(nativeCall.id(), List.of());
+    }
+
+    /** Native call sites that may invoke the requested same-receiver callback method. */
+    public List<Node> nativeCallbackSitesOf(MethodInfo target) {
+        return target == null ? List.of()
+                : nativeCallbackSitesByTarget.getOrDefault(methodKey(target), List.of());
+    }
+
+    public boolean nativeCallbackSite(Node nativeCall, MethodInfo target) {
+        if (nativeCall == null || target == null) {
+            return false;
+        }
+        return nativeCallbackTargets(nativeCall).stream()
+                .anyMatch(candidate -> methodKeyOf(candidate.owner(), candidate.name(), candidate.descriptor())
+                        .equals(methodKey(target)));
+    }
+
+    /**
+     * Map a Java native call's receiver/arguments to the bounded callback target contract.
+     * The current index admits only {@code ()V} instance callbacks, so receiver mapping is
+     * the useful case; matching argument forwarding is retained for future compatible rules.
+     */
+    public Set<ValueOrigin> nativeTargetArgumentAt(Node nativeCall, MethodInfo target, int slot,
+                                                   ForwardOrigins.Result callerResult) {
+        if (!nativeCallbackSite(nativeCall, target)) {
+            return Set.of();
+        }
+        if (!target.isStatic() && slot == 0) {
+            return argOriginAtOrdinal(nativeCall, -1, callerResult);
+        }
+        MethodInfo nativeMethod = methodOf(nativeCall.owner(), nativeCall.name(), nativeCall.descriptor());
+        if (nativeMethod == null || target.isStatic()) {
+            return Set.of();
+        }
+        int ordinal = Descriptor.paramOrdinal(target.descriptor(), false, slot);
+        if (ordinal < 0 || ordinal >= Descriptor.paramCount(nativeMethod.descriptor())) {
+            return Set.of();
+        }
+        return argOriginAtOrdinal(nativeCall, ordinal, callerResult);
+    }
+
+    /**
+     * Whether a Method.invoke site is the ordinary InvocationHandler callback form where the
+     * Method object is supplied by the proxy runtime (invoke argument slot 2).  A proxy can be
+     * assembled outside the scanned artifact, so there is intentionally no requirement for a
+     * local Proxy.newProxyInstance call.  The check remains narrow: it needs the standard
+     * InvocationHandler entry contract and a direct method argument, not an arbitrary
+     * application Method.invoke.
+     */
+    public boolean proxyReflectiveInvokeSite(Node invoke) {
+        if (invoke == null || !"java/lang/reflect/Method".equals(invoke.owner())
+                || !"invoke".equals(invoke.name())) {
+            return false;
+        }
+        MethodInfo host = enclosingMethod(invoke);
+        if (host == null || ruleEngine.matchingEntry(host.owner(), host.name(), host.descriptor())
+                .filter(entry -> "proxyInvoke".equals(entry.entryKind())).isEmpty()) {
+            return false;
+        }
+        ForwardOrigins.Result result = origins.compute(host);
+        return argOriginAtOrdinal(invoke, -1, result).stream()
+                .anyMatch(origin -> origin instanceof ValueOrigin.Param param && param.slot() == 2);
+    }
+
+    /**
+     * A reflective proxy callback may select only methods exposed by an interface implemented
+     * by the target object.  This keeps the external-proxy wildcard bounded to JVM-valid proxy
+     * dispatch instead of treating Method.invoke as a call to every public method.
+     */
+    public boolean proxyCallable(MethodInfo target) {
+        if (target == null || target.isStatic()
+                || !java.lang.reflect.Modifier.isPublic(target.access())) {
+            return false;
+        }
+        for (String iface : hierarchy.transitiveInterfaces(target.owner())) {
+            MethodInfo declaration = methodOf(iface, target.name(), target.descriptor());
+            if (declaration != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Recognize a framework-style method collection without naming the framework: the receiver
+     * of Method.invoke is a CHECKCAST Method produced by Iterator.next/List.get.  The cast is a
+     * useful JVM-level type fact even when the collection itself is populated by a helper method.
+     */
+    public boolean methodCollectionReflectiveInvokeSite(Node invoke) {
+        if (invoke == null || !"java/lang/reflect/Method".equals(invoke.owner())
+                || !"invoke".equals(invoke.name())) {
+            return false;
+        }
+        MethodInfo host = enclosingMethod(invoke);
+        if (host == null) {
+            return false;
+        }
+        ForwardOrigins.Result result = origins.compute(host);
+        for (ValueOrigin methodValue : argOriginAtOrdinal(invoke, -1, result)) {
+            if (methodCollectionElement(methodValue, host, result, new HashSet<>())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean methodCollectionElement(ValueOrigin value, MethodInfo host,
+                                            ForwardOrigins.Result result,
+                                            Set<ValueOrigin> visiting) {
+        if (value == null || !visiting.add(value)) {
+            return false;
+        }
+        try {
+            if (value instanceof ValueOrigin.Insn instruction
+                    && instruction.offset() >= 0
+                    && instruction.offset() < host.instructions().size()
+                    && host.insnAt(instruction.offset()).op() == Op.CHECKCAST) {
+                ForwardOrigins.State before = result.stateBefore().get(instruction.offset());
+                if (before == null || before.stack().isEmpty()) {
+                    return false;
+                }
+                for (ValueOrigin candidate : before.stack().get(before.stack().size() - 1).origins()) {
+                    if (methodCollectionElement(candidate, host, result, visiting)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if (!(value instanceof ValueOrigin.CallResult callResult)
+                    || callResult.callNodeId() < 0) {
+                return false;
+            }
+            Node call = callNodes.get(callResult.callNodeId());
+            if (call == null) {
+                return false;
+            }
+            if (("java/util/Iterator".equals(call.owner()) && "next".equals(call.name()))
+                    || ("java/util/List".equals(call.owner()) && "get".equals(call.name()))
+                    || ("java/util/Collection".equals(call.owner()) && "toArray".equals(call.name()))) {
+                return true;
+            }
+            return false;
+        } finally {
+            visiting.remove(value);
+        }
+    }
+
+    /** 是否存在可作为外部对象绑定边界的 deserialize source。 */
+    public boolean frameworkDeserializeSourceAvailable() {
+        return frameworkDeserializeSourceAvailable;
+    }
+
     public Map<Long, List<String>> reflectiveSites() {
         return reflectiveClassesBySite;
     }
@@ -329,9 +674,42 @@ public final class OriginSupport {
         Map<String, Integer> depths = new HashMap<>();
         Deque<Node> work = new ArrayDeque<>();
         Deque<Integer> workDepth = new ArrayDeque<>();
+        List<Node> proxyTargets = new ArrayList<>();
+        if (!proxyMethodInvokeSites.isEmpty()) {
+            for (Node candidate : graph.nodesOfType(NodeType.METHOD)) {
+                String owner = candidate.strProp("owner");
+                if (isJdk(owner)) {
+                    continue;
+                }
+                MethodInfo target = methodOf(owner, candidate.strProp("name"), candidate.strProp("desc"));
+                if (proxyCallable(target)) {
+                    proxyTargets.add(candidate);
+                }
+            }
+        }
+        List<Node> methodCollectionTargets = new ArrayList<>();
+        if (!methodCollectionInvokeSites.isEmpty()) {
+            for (Node candidate : graph.nodesOfType(NodeType.METHOD)) {
+                String owner = candidate.strProp("owner");
+                if (isJdk(owner)) {
+                    continue;
+                }
+                MethodInfo target = methodOf(owner, candidate.strProp("name"), candidate.strProp("desc"));
+                if (target != null && javaBeanMatches(target, "read")) {
+                    methodCollectionTargets.add(candidate);
+                }
+            }
+        }
         for (Node m : graph.nodesOfType(NodeType.METHOD)) {
             String key = methodKeyOf(m.strProp("owner"), m.strProp("name"), m.strProp("desc"));
-            if (ruleEngine.matchingEntry(m.strProp("owner"), m.strProp("name"), m.strProp("desc")).isPresent()
+            // JDK 的 readObject/hashCode 等方法是反序列化机制实现，不是一个可以
+            // 脱离应用对象图独立启动污点的用户入口。ForwardEngine 已经采用同一
+            // 边界；若这里仍把每个已物化的 JDK magic-entry 作为全局根，JDK
+            // 内部调用会互相扩散，反向闭包在大 JDK 上先耗尽预算而不是分析应用。
+            // JDK 类仍可由应用引用、调用边、对象图与规则片段进入闭包，因此这
+            // 是根语义收敛，不是按样本删除某个 gadget。
+            if (!isJdk(m.strProp("owner"))
+                    && ruleEngine.matchingEntry(m.strProp("owner"), m.strProp("name"), m.strProp("desc")).isPresent()
                     && downstream.add(key)) {
                 depths.put(key, 0);
                 work.add(m);
@@ -387,7 +765,11 @@ public final class OriginSupport {
         // 框架（fastjson @type / XStream / SnakeYAML 等）以攻击者可控类名反射调用任意 public 方法。
         // 精度门：仅限非 JDK 类（避免万级 JDK 方法涌入闭包）。
         boolean hasFrameworkInvoke = !frameworkMethodInvokeSites.isEmpty() || frameworkJavabeanSite;
-        if (hasFrameworkInvoke && !fast) {
+        boolean hasFrameworkBoundary = hasFrameworkInvoke || frameworkDeserializeSourceAvailable;
+        // 框架供给只枚举已加载目标/依赖中的 public bean 方法，不依赖 JDK 全量加载；
+        // 因此 --fast 也必须保留这条低成本的入口语义，否则 Fastjson/XStream 等
+        // 通过 JavaBean setter 触发的应用类 sink 会在快速扫描中整体消失。
+        if (hasFrameworkBoundary) {
             int added = 0;
             for (Node m : graph.nodesOfType(NodeType.METHOD)) {
                 String owner = m.strProp("owner");
@@ -400,6 +782,15 @@ public final class OriginSupport {
                 int access = hierarchy.methodAccess(owner, m.strProp("name"), m.strProp("desc"));
                 if (access >= 0 && java.lang.reflect.Modifier.isPublic(access)
                         && !java.lang.reflect.Modifier.isStatic(access)) {
+                    // 没有明确的 Method.invoke/PropertyDescriptor 位点时，
+                    // deserialize source 只建立通用 bean setter 输入边界，避免把所有公共方法
+                    // 错当作可由请求对象直接调用；已有反射位点则保留原有反射语义。
+                    if (!hasFrameworkInvoke) {
+                        MethodInfo candidate = methodOf(owner, m.strProp("name"), m.strProp("desc"));
+                        if (candidate == null || !javaBeanMatches(candidate, "write")) {
+                            continue;
+                        }
+                    }
                     String mk = methodKeyOf(owner, m.strProp("name"), m.strProp("desc"));
                     if (downstream.add(mk)) {
                         depths.put(mk, 1);
@@ -521,6 +912,50 @@ public final class OriginSupport {
                             }
                         }
                     }
+                    // The proxy object may be constructed by the deserialization payload rather
+                    // than in the scanned artifact.  A handler Method.invoke therefore has a
+                    // bounded external-dispatch family: public methods exposed by application
+                    // interfaces.  Materialize that family in the entry closure so reverse
+                    // analysis can reach the target without inventing non-interface calls.
+                    if (proxyReflectiveInvokeSite(call)) {
+                        for (Node target : proxyTargets) {
+                            String targetKey = methodKeyOf(target.strProp("owner"),
+                                    target.strProp("name"), target.strProp("desc"));
+                            if (downstream.add(targetKey)) {
+                                depths.put(targetKey, depth + 1);
+                                work.add(target);
+                                workDepth.add(depth + 1);
+                            }
+                        }
+                    }
+                    // A typed Method collection (for example a property path assembled by a
+                    // helper) can be populated outside the scan unit.  Keep this external edge
+                    // bounded to public no-arg bean readers, the only methods compatible with a
+                    // zero-argument property getter invocation.
+                    if (methodCollectionReflectiveInvokeSite(call)) {
+                        for (Node target : methodCollectionTargets) {
+                            String targetKey = methodKeyOf(target.strProp("owner"),
+                                    target.strProp("name"), target.strProp("desc"));
+                            if (downstream.add(targetKey)) {
+                                depths.put(targetKey, depth + 1);
+                                work.add(target);
+                                workDepth.add(depth + 1);
+                            }
+                        }
+                    }
+                    // JNI callback bridge: native code is outside the Java call graph, but a
+                    // bounded same-receiver callback family can still be represented without
+                    // loading a library.  Keep these targets in the entry closure so the
+                    // backward sink gate and the forward reachability gate agree.
+                    for (Node target : nativeCallbackTargets(call)) {
+                        String targetKey = methodKeyOf(target.strProp("owner"),
+                                target.strProp("name"), target.strProp("desc"));
+                        if (downstream.add(targetKey)) {
+                            depths.put(targetKey, depth + 1);
+                            work.add(target);
+                            workDepth.add(depth + 1);
+                        }
+                    }
                     // 分发展开：调用图分发边未物化全接收者集时闭包做全子类型展开。
                     // VIRTUAL：CHA 物化完整（超限时仅剩声明目标，out≤1）。
                     // INTERFACE：implementers 不穿透实现类的子类（子类覆写会漏）——应用接口
@@ -598,6 +1033,11 @@ public final class OriginSupport {
                 || internalName.startsWith("com/sun/");
     }
 
+    /** JVM 调用指令中只有 static 与 invokedynamic 没有隐含 receiver。 */
+    private static boolean isStaticLike(String invokeKind) {
+        return "STATIC".equals(invokeKind) || "DYNAMIC".equals(invokeKind);
+    }
+
 
     /** 方法的入口 BFS 距离（未在下游闭包内返回 Integer.MAX_VALUE）。反向探索按升序使用。 */
     public int entryDepthOf(String methodKey) {
@@ -619,23 +1059,43 @@ public final class OriginSupport {
         return callIdByKey.get(methodKey + "@" + offset);
     }
 
+    /** 调用点直接索引；供遍历热路径避免 id 装箱和二次 graph.node 查找。 */
+    public Node callNode(String methodKey, int offset) {
+        return graph.findCallNode(methodKey, offset);
+    }
+
+    /** 由来源值中的 call node id 反查调用点；仅保留给跨方法 ValueOrigin 消费者。 */
+    public Node callNode(long id) {
+        return callNodes.get(id);
+    }
+
     public MethodInfo methodOf(String owner, String name, String desc) {
         String key = methodKeyOf(owner, name, desc);
         MethodInfo cached = methodCache.get(key);
         if (cached != null) {
             return cached;
         }
+        long revision = hierarchy.revision();
+        Long missingAt = missingMethodCache.get(key);
+        if (missingAt != null && missingAt == revision) {
+            return null;
+        }
         ClassInfo cls = hierarchy.classInfo(owner);
         MethodInfo method = cls != null ? cls.method(name, desc) : null;
         if (method != null) {
             methodCache.put(key, method);
+            missingMethodCache.remove(key);
+        } else {
+            // classInfo(owner) may have loaded a JDK class and advanced the revision; record
+            // the post-lookup version so a later lazy load can invalidate this result.
+            missingMethodCache.put(key, hierarchy.revision());
         }
         return method;
     }
 
     /** CALL 节点所在的方法。 */
     public MethodInfo enclosingMethod(Node call) {
-        return methodOf(call.strProp("methodOwner"), call.strProp("methodName"), call.strProp("methodDesc"));
+        return methodOf(call.methodOwner(), call.methodName(), call.methodDescriptor());
     }
 
     /**
@@ -644,18 +1104,35 @@ public final class OriginSupport {
      * cat-2 实参与 cat-1 一样各占一个栈条目）；返回空集表示该位置无来源记录。
      */
     public Set<ValueOrigin> argOriginAt(Node callerCall, MethodInfo callerMethod, int slot) {
-        ForwardOrigins.State state = origins.compute(callerMethod)
-                .stateBefore().get(callerCall.prop("offset"));
+        return argOriginAt(callerCall, callerMethod, slot, origins.compute(callerMethod));
+    }
+
+    /** Same lookup with a caller-supplied result, used by hot forward exploration loops. */
+    public Set<ValueOrigin> argOriginAt(Node callerCall, MethodInfo callerMethod, int slot,
+                                        ForwardOrigins.Result originResult) {
+        String desc = callerCall.descriptor();
+        boolean calleeStatic = isStaticLike(callerCall.invokeKind());
+        int ordinal = Descriptor.paramOrdinal(desc, calleeStatic, slot);
+        return argOriginAtOrdinal(callerCall, ordinal, originResult);
+    }
+
+    /**
+     * Hot-path variant when the caller already enumerates argument positions.  Ordinal -1 is
+     * the receiver of an instance call; non-negative values are real arguments.  Avoiding a
+     * slot-to-ordinal scan preserves the same stack mapping while removing descriptor work from
+     * every forward propagation attempt.
+     */
+    public Set<ValueOrigin> argOriginAtOrdinal(Node callerCall, int ordinal,
+                                               ForwardOrigins.Result originResult) {
+        ForwardOrigins.State state = originResult.stateBefore().get(callerCall.offset());
         if (state == null) {
             return Set.of();
         }
-        String desc = callerCall.strProp("desc");
-        boolean calleeStatic = "STATIC".equals(callerCall.strProp("invokeKind"));
-        int ordinal = Descriptor.paramOrdinal(desc, calleeStatic, slot);
-        if (ordinal == -2) {
+        String desc = callerCall.descriptor();
+        int paramCount = Descriptor.paramCount(desc);
+        if (ordinal < -1 || ordinal >= paramCount) {
             return Set.of();
         }
-        int paramCount = Descriptor.paramCount(desc);
         int depthFromTop = ordinal == -1 ? paramCount : paramCount - 1 - ordinal;
         if (depthFromTop < 0 || depthFromTop >= state.stack().size()) {
             return Set.of();
@@ -663,6 +1140,508 @@ public final class OriginSupport {
         return state.stack().get(state.stack().size() - 1 - depthFromTop).origins();
     }
 
+    /**
+     * Map a reflective {@code Method.invoke} call back to a slot in the reflected target.
+     * The Java reflection API keeps the target receiver in explicit argument 0 and packs
+     * target parameters into the second argument's Object[]; treating the call descriptor as
+     * the target descriptor accidentally returns Method.invoke's receiver for target slot 0.
+     * Keep this mapping in the shared origin layer so forward feasibility and backward taint
+     * use the same JVM-level reflection convention.
+     */
+    public Set<ValueOrigin> reflectiveTargetArgumentAt(Node invoke, MethodInfo target, int slot,
+                                                       ForwardOrigins.Result callerResult) {
+        if (invoke == null || target == null
+                || !"java/lang/reflect/Method".equals(invoke.owner())
+                || !"invoke".equals(invoke.name())) {
+            return Set.of();
+        }
+        if (!target.isStatic() && slot == 0) {
+            return argOriginAtOrdinal(invoke, 0, callerResult);
+        }
+        return reflectiveMethodArgumentAt(invoke, target, slot, callerResult);
+    }
+
+    /**
+     * Return exact concrete receiver types when every origin is locally recoverable.
+     * An empty set means "unknown", not "provably no receiver".  The method deliberately
+     * recognizes only JVM facts that do not require whole-program points-to guessing:
+     * NEW, CHECKCAST of a recoverable value, and a field whose value was assigned by a
+     * dominating local write to the same receiver.  This is the precision boundary used by
+     * both forward and backward engines, so the two analyses cannot disagree about a
+     * virtual/interface dispatch solely because they were run in different directions.
+     */
+    public Set<String> exactConcreteTypes(Set<ValueOrigin> values, MethodInfo method,
+                                          int beforeOffset) {
+        if (values == null || values.isEmpty() || method == null) {
+            return Set.of();
+        }
+        Set<String> result = new LinkedHashSet<>();
+        Set<ValueOrigin> visiting = new HashSet<>();
+        for (ValueOrigin value : values) {
+            String type = exactConcreteType(value, method, beforeOffset, visiting);
+            if (type == null) {
+                return Set.of();
+            }
+            result.add(type);
+        }
+        return Set.copyOf(result);
+    }
+
+    /**
+     * Check whether a call site can dynamically dispatch to the requested method.  A
+     * concrete local receiver gets JVM resolution equality; an unknown receiver remains
+     * accepted so unresolved aliases and deserialized object fields do not create false
+     * negatives.  Static calls do not have a receiver and are always accepted.
+     */
+    public boolean receiverMayDispatchTo(Node call, MethodInfo caller,
+                                         String targetOwner, String targetName,
+                                         String targetDescriptor) {
+        if (call == null || caller == null || targetOwner == null || targetName == null
+                || "STATIC".equals(call.invokeKind()) || "SPECIAL".equals(call.invokeKind())
+                || "DYNAMIC".equals(call.invokeKind())) {
+            return true;
+        }
+        ForwardOrigins.Result result = origins.compute(caller);
+        Set<ValueOrigin> receivers = argOriginAtOrdinal(call, -1, result);
+        Set<String> concrete = exactConcreteTypes(receivers, caller, call.offset());
+        if (concrete.isEmpty()) {
+            Set<String> possible = possibleConcreteTypes(receivers, caller, call.offset());
+            if (!possible.isEmpty()) {
+                for (String type : possible) {
+                    String resolved = hierarchy.resolveMethod(type, targetName, targetDescriptor);
+                    // A known NEW/factory type whose class model is unavailable is still an
+                    // external boundary.  Preserve the conservative answer in that case.
+                    if (resolved == null || targetOwner.equals(resolved)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            // A field which is reinitialized on every reachable write with a platform
+            // allocation/factory result cannot hold an application implementation at this
+            // call site.  This is intentionally a one-way precision gate: anything that is
+            // not proven platform-bound stays on the conservative CHA path.
+            if (platformBoundReceiver(receivers, caller, call.offset())) {
+                return isJdk(targetOwner);
+            }
+            return true;
+        }
+        for (String type : concrete) {
+            String resolved = hierarchy.resolveMethod(type, targetName, targetDescriptor);
+            // A missing external method model is an unknown boundary, not proof that the
+            // dispatch is impossible.  When resolution is available, only the JVM-selected
+            // declaration can receive this call.
+            if (resolved == null || targetOwner.equals(resolved)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Collect the possible local concrete types for a field even when the writes are in
+     * mutually exclusive branches. Unlike exactFieldValueType this is a may-set: every
+     * reachable write must remain locally recoverable, but no write is required to dominate
+     * the read. It is therefore safe for dispatch filtering and conservative for unknown
+     * or aliased assignments.
+     */
+    private Set<String> possibleConcreteTypes(Set<ValueOrigin> receivers, MethodInfo method,
+                                              int beforeOffset) {
+        if (receivers == null || receivers.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> result = new LinkedHashSet<>();
+        for (ValueOrigin receiver : receivers) {
+            if (!(receiver instanceof ValueOrigin.FieldRead field)) {
+                return Set.of();
+            }
+            Set<String> fieldTypes = possibleFieldValueTypes(field, method, beforeOffset);
+            if (fieldTypes.isEmpty()) {
+                return Set.of();
+            }
+            result.addAll(fieldTypes);
+        }
+        return Set.copyOf(result);
+    }
+
+    private Set<String> possibleFieldValueTypes(ValueOrigin.FieldRead field, MethodInfo method,
+                                                int beforeOffset) {
+        ForwardOrigins.Result result = origins.compute(method);
+        Set<String> types = new LinkedHashSet<>();
+        boolean found = false;
+        for (InsnFact write : method.instructions()) {
+            if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
+                    || !sameField(write.fieldRef(), field)) {
+                continue;
+            }
+            ForwardOrigins.State state = result.stateBefore().get(write.offset());
+            if (state == null) {
+                return Set.of();
+            }
+            if (!field.isStatic()) {
+                Set<ValueOrigin> writerReceiver = fieldWriterReceiver(write, state);
+                if (writerReceiver.isEmpty() || !writerReceiver.contains(field.receiver())) {
+                    return Set.of();
+                }
+            }
+            if (state.stack().isEmpty()) {
+                return Set.of();
+            }
+            Set<String> valueTypes = concreteTypesOf(state.stack()
+                    .get(state.stack().size() - 1).origins(), method, write.offset());
+            if (valueTypes.isEmpty()) {
+                return Set.of();
+            }
+            found = true;
+            types.addAll(valueTypes);
+        }
+        return found ? Set.copyOf(types) : Set.of();
+    }
+
+    private Set<String> concreteTypesOf(Set<ValueOrigin> values, MethodInfo method,
+                                        int beforeOffset) {
+        if (values == null || values.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> result = new LinkedHashSet<>();
+        Set<ValueOrigin> visiting = new HashSet<>();
+        for (ValueOrigin value : values) {
+            String type = exactConcreteType(value, method, beforeOffset, visiting);
+            if (type == null) {
+                return Set.of();
+            }
+            result.add(type);
+        }
+        return Set.copyOf(result);
+    }
+
+    /**
+     * Prove the narrow, reusable "fresh platform field" pattern without pretending to do
+     * whole-program points-to analysis.  All receiver origins must be field reads, and every
+     * local write to each such field before the call must be a platform allocation, a known
+     * JDK collection factory, or null.  Parameter/alias/unknown writes invalidate the fact.
+     */
+    private boolean platformBoundReceiver(Set<ValueOrigin> receivers, MethodInfo method,
+                                          int beforeOffset) {
+        if (receivers == null || receivers.isEmpty()) {
+            return false;
+        }
+        boolean found = false;
+        for (ValueOrigin receiver : receivers) {
+            if (!(receiver instanceof ValueOrigin.FieldRead field)) {
+                return false;
+            }
+            if (!fieldValuePlatformBound(field, method, beforeOffset)) {
+                return false;
+            }
+            found = true;
+        }
+        return found;
+    }
+
+    private boolean fieldValuePlatformBound(ValueOrigin.FieldRead field, MethodInfo method,
+                                            int beforeOffset) {
+        ForwardOrigins.Result result = origins.compute(method);
+        boolean found = false;
+        for (InsnFact write : method.instructions()) {
+            if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
+                    || !sameField(write.fieldRef(), field)) {
+                continue;
+            }
+            if (!field.isStatic()) {
+                ForwardOrigins.State state = result.stateBefore().get(write.offset());
+                if (state == null) {
+                    return false;
+                }
+                Set<ValueOrigin> writerReceiver = fieldWriterReceiver(write, state);
+                if (writerReceiver.isEmpty() || !writerReceiver.contains(field.receiver())) {
+                    return false;
+                }
+            }
+            ForwardOrigins.State state = result.stateBefore().get(write.offset());
+            if (state == null || state.stack().isEmpty()
+                    || !platformProduced(state.stack().get(state.stack().size() - 1).origins(),
+                    method)) {
+                return false;
+            }
+            found = true;
+        }
+        return found;
+    }
+
+    private boolean platformProduced(Set<ValueOrigin> values, MethodInfo method) {
+        if (values == null || values.isEmpty()) {
+            return false;
+        }
+        for (ValueOrigin value : values) {
+            if (value instanceof ValueOrigin.Constant constant && constant.value() == null) {
+                continue;
+            }
+            if (value instanceof ValueOrigin.Insn instruction
+                    && instruction.offset() >= 0
+                    && instruction.offset() < method.instructions().size()) {
+                InsnFact insn = method.insnAt(instruction.offset());
+                if (insn.op() == Op.NEW && insn.typeRef() != null
+                        && isJdk(internalClassName(insn.typeRef().descriptor()))) {
+                    continue;
+                }
+            }
+            if (value instanceof ValueOrigin.CallResult callResult) {
+                Node call = callNodes.get(callResult.callNodeId());
+                if (call != null && knownPlatformFactory(call.owner(), call.name())) {
+                    continue;
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /** JDK methods whose returned object is a platform-owned wrapper/value by contract. */
+    private static boolean knownPlatformFactory(String owner, String name) {
+        return knownPlatformFactoryType(owner, name) != null;
+    }
+
+    private static String knownPlatformFactoryType(String owner, String name) {
+        if (owner == null || name == null) {
+            return null;
+        }
+        if ("java/util/Collections".equals(owner)) {
+            if ("emptyMap".equals(name) || name.startsWith("singletonMap")
+                    || name.startsWith("unmodifiableMap") || name.startsWith("synchronizedMap")
+                    || name.startsWith("checkedMap")) {
+                return "java/util/AbstractMap";
+            }
+            if ("emptySet".equals(name) || name.startsWith("singletonSet")
+                    || name.startsWith("unmodifiableSet") || name.startsWith("synchronizedSet")
+                    || name.startsWith("checkedSet") || "newSetFromMap".equals(name)) {
+                return "java/util/AbstractSet";
+            }
+            if ("emptyList".equals(name) || name.startsWith("singletonList")
+                    || name.startsWith("unmodifiableList") || name.startsWith("synchronizedList")
+                    || name.startsWith("checkedList")) {
+                return "java/util/AbstractList";
+            }
+            return null;
+        }
+        if ("java/util/Map".equals(owner) || "java/util/List".equals(owner)
+                || "java/util/Set".equals(owner)) {
+            return "of".equals(name) || "ofEntries".equals(name) || "copyOf".equals(name)
+                    ? owner : null;
+        }
+        return "java/util/Optional".equals(owner)
+                && ("empty".equals(name) || "of".equals(name) || "ofNullable".equals(name))
+                ? owner : null;
+    }
+
+    private String exactConcreteType(ValueOrigin value, MethodInfo method, int beforeOffset,
+                                     Set<ValueOrigin> visiting) {
+        if (value == null || !visiting.add(value)) {
+            return null;
+        }
+        try {
+            if (value instanceof ValueOrigin.Insn instruction) {
+                if (instruction.offset() < 0 || instruction.offset() >= method.instructions().size()) {
+                    return null;
+                }
+                InsnFact fact = method.insnAt(instruction.offset());
+                if (fact.op() == Op.NEW && fact.typeRef() != null) {
+                    return internalClassName(fact.typeRef().descriptor());
+                }
+                if (fact.op() == Op.CHECKCAST) {
+                    ForwardOrigins.State state = origins.compute(method).stateBefore()
+                            .get(instruction.offset());
+                    if (state == null || state.stack().isEmpty()) {
+                        return null;
+                    }
+                    Set<String> nested = exactConcreteTypes(state.stack()
+                            .get(state.stack().size() - 1).origins(), method,
+                            instruction.offset());
+                    return nested.size() == 1 ? nested.iterator().next() : null;
+                }
+                return null;
+            }
+            if (value instanceof ValueOrigin.Constant constant) {
+                Object literal = constant.value();
+                if (literal instanceof String) {
+                    return "java/lang/String";
+                }
+                if (literal instanceof Integer || literal instanceof Short
+                        || literal instanceof Byte || literal instanceof Boolean
+                        || literal instanceof Character) {
+                    return "java/lang/Integer";
+                }
+                return null;
+            }
+            if (value instanceof ValueOrigin.FieldRead field) {
+                return exactFieldValueType(field, method, beforeOffset);
+            }
+            if (value instanceof ValueOrigin.CallResult callResult
+                    && callResult.callNodeId() >= 0) {
+                Node call = callNodes.get(callResult.callNodeId());
+                if (call != null && "<init>".equals(call.name())) {
+                    return call.owner();
+                }
+                if (call != null) {
+                    String factoryType = knownPlatformFactoryType(call.owner(), call.name());
+                    if (factoryType != null) {
+                        return factoryType;
+                    }
+                }
+                ForwardOrigins.Result originResult = origins.compute(method);
+                Set<ValueOrigin> elements = originResult.arrayElements().get(value);
+                if (elements != null && !elements.isEmpty()) {
+                    Set<String> elementTypes = concreteTypesOf(elements, method, beforeOffset);
+                    return elementTypes.size() == 1 ? elementTypes.iterator().next() : null;
+                }
+            }
+            return null;
+        } finally {
+            visiting.remove(value);
+        }
+    }
+
+    /**
+     * Resolve a field's concrete value only for the safe local pattern:
+     * every reachable write to the same receiver before the read dominates the read,
+     * and every written value has one recoverable concrete allocation type.  A branch,
+     * alias, parameter write, or unknown value deliberately invalidates the fact.
+     */
+    private String exactFieldValueType(ValueOrigin.FieldRead field, MethodInfo method,
+                                       int beforeOffset) {
+        DominatorIndex dominators = dominatorIndex(method);
+        if (dominators == null) {
+            return null;
+        }
+        ForwardOrigins.Result result = origins.compute(method);
+        Set<String> types = new LinkedHashSet<>();
+        boolean found = false;
+        for (InsnFact write : method.instructions()) {
+            if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
+                    || !sameField(write.fieldRef(), field)) {
+                continue;
+            }
+            if (!dominators.reachable()[write.offset()]
+                    || !dominates(dominators, write.offset(), beforeOffset)) {
+                return null;
+            }
+            ForwardOrigins.State state = result.stateBefore().get(write.offset());
+            if (state == null || state.stack().isEmpty()) {
+                return null;
+            }
+            if (!field.isStatic()) {
+                Set<ValueOrigin> writerReceiver = fieldWriterReceiver(write, state);
+                if (writerReceiver.isEmpty() || !writerReceiver.contains(field.receiver())) {
+                    return null;
+                }
+            }
+            Set<ValueOrigin> values = state.stack().get(state.stack().size() - 1).origins();
+            Set<String> writeTypes = exactConcreteTypes(values, method, write.offset());
+            if (writeTypes.isEmpty()) {
+                return null;
+            }
+            found = true;
+            types.addAll(writeTypes);
+        }
+        return found && types.size() == 1 ? types.iterator().next() : null;
+    }
+
+    private Set<ValueOrigin> fieldWriterReceiver(InsnFact write, ForwardOrigins.State state) {
+        if (write.op() == Op.PUTSTATIC || state.stack().size() < 2) {
+            return Set.of();
+        }
+        return state.stack().get(state.stack().size() - 2).origins();
+    }
+
+    private DominatorIndex dominatorIndex(MethodInfo method) {
+        String key = methodKeyOf(method.owner(), method.name(), method.descriptor());
+        if (method.instructions().size() > DOMINATOR_METHOD_LIMIT) {
+            return null;
+        }
+        return fieldDominators.computeIfAbsent(key, ignored -> buildDominators(method));
+    }
+
+    private static DominatorIndex buildDominators(MethodInfo method) {
+        return buildDominators(method, true);
+    }
+
+    private static DominatorIndex buildDominators(MethodInfo method, boolean includeExceptions) {
+        int size = method.instructions().size();
+        Cfg.Indexed cfg = Cfg.computeIndexed(method);
+        List<List<Integer>> predecessors = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            predecessors.add(new ArrayList<>(2));
+        }
+        boolean[] reachable = new boolean[size];
+        Deque<Integer> queue = new ArrayDeque<>();
+        if (size > 0) {
+            reachable[0] = true;
+            queue.add(0);
+        }
+        while (!queue.isEmpty()) {
+            int current = queue.removeFirst();
+            for (CfgEdge edge : cfg.successorsAt(current)) {
+                if (!includeExceptions && edge.label() == CfgLabel.EXCEPTION) {
+                    continue;
+                }
+                int target = edge.targetOffset();
+                if (target < 0 || target >= size) {
+                    continue;
+                }
+                predecessors.get(target).add(current);
+                if (!reachable[target]) {
+                    reachable[target] = true;
+                    queue.addLast(target);
+                }
+            }
+        }
+        BitSet all = new BitSet(size);
+        all.set(0, size);
+        BitSet[] dominators = new BitSet[size];
+        for (int i = 0; i < size; i++) {
+            dominators[i] = new BitSet(size);
+            if (i == 0) {
+                dominators[i].set(0);
+            } else if (reachable[i]) {
+                dominators[i].or(all);
+            }
+        }
+        boolean changed;
+        do {
+            changed = false;
+            for (int i = 1; i < size; i++) {
+                if (!reachable[i]) {
+                    continue;
+                }
+                BitSet next = null;
+                for (int predecessor : predecessors.get(i)) {
+                    if (!reachable[predecessor]) {
+                        continue;
+                    }
+                    if (next == null) {
+                        next = (BitSet) dominators[predecessor].clone();
+                    } else {
+                        next.and(dominators[predecessor]);
+                    }
+                }
+                if (next == null) {
+                    next = new BitSet(size);
+                }
+                next.set(i);
+                if (!next.equals(dominators[i])) {
+                    dominators[i] = next;
+                    changed = true;
+                }
+            }
+        } while (changed);
+        return new DominatorIndex(dominators, reachable);
+    }
+
+    private static boolean dominates(DominatorIndex index, int writer, int read) {
+        return writer >= 0 && read >= 0 && read < index.dominators().length
+                && index.reachable()[writer] && index.reachable()[read]
+                && index.dominators()[read].get(writer);
+    }
 
     /**
      * catch 可达性守卫（可判定才剪；GadgetHunter Guard 约束静态子集 + Gleipner FP 陷阱语义）：
@@ -682,7 +1661,13 @@ public final class OriginSupport {
             if (!cce && !reflectiveChecked && !runtimeDeterministic) {
                 continue;
             }
-            if (sinkOffset < tc.handler() || sinkOffset > tc.handler() + 8) {
+            // A try/catch table can contain adjacent handlers, and javac commonly emits
+            // a short GOTO from one handler into the shared epilogue.  A fixed bytecode
+            // window (the old handler + 8 heuristic) therefore attributed a sink in the
+            // next handler to the first handler and could prove the wrong exception
+            // unreachable.  Resolve the actual handler region from control-flow
+            // terminators and the next distinct handler instead.
+            if (!sinkInHandlerRegion(method, tc, sinkOffset)) {
                 continue;
             }
             io.just.sast.model.InsnFact soleInvoke = null;
@@ -695,22 +1680,7 @@ public final class OriginSupport {
                 }
             }
             if (runtimeDeterministic) {
-                boolean anyThrower = invokeCount > 0;
-                if (!anyThrower) {
-                    for (int i = tc.start(); i < tc.end() && i < method.instructions().size(); i++) {
-                        var insn = method.instructions().get(i);
-                        var op = insn.op();
-                        if (op == io.just.sast.model.Op.AALOAD || op == io.just.sast.model.Op.IALOAD
-                                || op == io.just.sast.model.Op.AASTORE || op == io.just.sast.model.Op.IASTORE
-                                || op == io.just.sast.model.Op.ARRAYLENGTH || op == io.just.sast.model.Op.GETFIELD
-                                || op == io.just.sast.model.Op.IDIV || op == io.just.sast.model.Op.LDIV
-                                || op == io.just.sast.model.Op.IREM || op == io.just.sast.model.Op.LREM) {
-                            anyThrower = true;
-                            break;
-                        }
-                    }
-                }
-                if (!anyThrower) {
+                if (!runtimeExceptionCanReach(method, tc)) {
                     return true;
                 }
                 continue;
@@ -771,6 +1741,1152 @@ public final class OriginSupport {
         return false;
     }
 
+    /**
+     * Prove that a sink has no normal CFG path from the method entry using only exact local
+     * facts.  The ordinary taint engines intentionally merge both sides of branches; that is
+     * the right recall default, but it loses useful semantics for reflective guards and
+     * constant booleans.  This second, monotone pass removes an edge only when a JVM-level
+     * fact makes that edge impossible: a known conditional result, a guaranteed failed
+     * reflective lookup, or an incompatible exact CHECKCAST.  Unknown values and unresolved
+     * metadata keep both paths.
+     */
+    public boolean sinkPathProvablyUnreachable(MethodInfo method, int sinkOffset) {
+        if (method == null || sinkOffset < 0 || sinkOffset >= method.instructions().size()) {
+            return false;
+        }
+        CfgProofKey proofKey = new CfgProofKey(methodKey(method), sinkOffset);
+        Boolean cached = sinkPathCache.get(proofKey);
+        if (cached != null) {
+            return cached;
+        }
+        ConstantProofContext previous = constantProof.get();
+        constantProof.set(new ConstantProofContext());
+        try {
+            Cfg.Indexed cfg = Cfg.computeIndexed(method);
+            ForwardOrigins.Result result = origins.compute(method);
+            int size = method.instructions().size();
+            boolean[] canReachSink = new boolean[size];
+            canReachSink[sinkOffset] = true;
+            boolean changed;
+            do {
+                changed = false;
+                for (int source = size - 1; source >= 0; source--) {
+                    if (canReachSink[source]) {
+                        continue;
+                    }
+                    for (CfgEdge edge : cfg.successorsAt(source)) {
+                        if (edge.targetOffset() < 0 || edge.targetOffset() >= size
+                                || !feasibleCfgEdge(method, result, source, edge)) {
+                            continue;
+                        }
+                        if (canReachSink[edge.targetOffset()]) {
+                            canReachSink[source] = true;
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            } while (changed);
+            boolean unreachable = !canReachSink[0];
+            sinkPathCache.putIfAbsent(proofKey, unreachable);
+            return unreachable;
+        } finally {
+            if (previous == null) {
+                constantProof.remove();
+            } else {
+                constantProof.set(previous);
+            }
+        }
+    }
+
+    /** Whether the optional exact-constant refinement had to fail open on a budget. */
+    public boolean constantProofBudgetExceeded() {
+        return constantProofBudgetExceeded.get();
+    }
+
+    private boolean feasibleCfgEdge(MethodInfo method, ForwardOrigins.Result result,
+                                    int source, CfgEdge edge) {
+        InsnFact insn = method.insnAt(source);
+        if (insn.op().isCondJump()) {
+            Boolean branch = knownBranchResult(method, result, insn);
+            if (branch == null) {
+                return true;
+            }
+            if (edge.label() == CfgLabel.JUMP) {
+                return branch;
+            }
+            if (edge.label() == CfgLabel.FALSE) {
+                return !branch;
+            }
+        }
+        if (insn.op() == Op.CHECKCAST && edge.label() != CfgLabel.EXCEPTION
+                && castAlwaysFails(method, result, insn)) {
+            return false;
+        }
+        if (insn.op().isInvoke() && edge.label() != CfgLabel.EXCEPTION
+                && reflectiveLookupAlwaysFails(method, result, insn)) {
+            return false;
+        }
+        if (insn.op().isInvoke() && edge.label() != CfgLabel.EXCEPTION
+                && reflectiveInvocationAlwaysFails(method, result, insn)) {
+            return false;
+        }
+        return true;
+    }
+
+    /** A normal edge is impossible when a reflective lookup has an exact missing target. */
+    private boolean reflectiveLookupAlwaysFails(MethodInfo method, ForwardOrigins.Result result,
+                                                InsnFact insn) {
+        if (!insn.op().isInvoke() || insn.operands().isEmpty()
+                || !(insn.operands().get(0) instanceof MethodRef ref)
+                || !"java/lang/Class".equals(ref.owner())) {
+            return false;
+        }
+        if ("getMethod".equals(ref.name()) || "getDeclaredMethod".equals(ref.name())
+                || "getConstructor".equals(ref.name()) || "getDeclaredConstructor".equals(ref.name())) {
+            Node call = graph.findCallNode(methodKey(method), insn.offset());
+            if (call == null) {
+                return false;
+            }
+            Set<ValueOrigin> classes = argOriginAtOrdinal(call, -1, result);
+            String className = classLiteralName(classes);
+            Set<ValueOrigin> names = argOriginAtOrdinal(call, 0, result);
+            String name = stringLiteral(names);
+            String descriptor = reflectiveParameterDescriptor(method, insn, ref);
+            int parameterCount = descriptor == null
+                    ? reflectiveParameterCount(method, result, call, ref) : -1;
+            if (className == null || (name == null && parameterCount < 0)) {
+                return false;
+            }
+            boolean inherited = "getMethod".equals(ref.name());
+            boolean publicOnly = "getMethod".equals(ref.name())
+                    || "getConstructor".equals(ref.name());
+            String lookupName = ref.name().contains("Constructor") ? "<init>" : name;
+            if (descriptor != null) {
+                return !reflectiveMethodExists(className, lookupName, descriptor,
+                        inherited, publicOnly);
+            }
+            if (parameterCount < 0) {
+                return false;
+            }
+            if ("<init>".equals(lookupName)) {
+                return !reflectiveMethodExistsByArity(className, lookupName, parameterCount,
+                        inherited, publicOnly);
+            }
+            StringShape shape = stringShape(argOriginAtOrdinal(call, 0, result), method,
+                    result, new HashSet<>());
+            if (name != null) {
+                return !reflectiveMethodExistsByArity(className, name, parameterCount,
+                        inherited, publicOnly);
+            }
+            return shape != null && shape.prefix() != null
+                    && !reflectiveMethodNameStartsWith(className, shape.prefix(), parameterCount,
+                    inherited, publicOnly);
+        }
+        if ("getField".equals(ref.name()) || "getDeclaredField".equals(ref.name())) {
+            Node call = graph.findCallNode(methodKey(method), insn.offset());
+            if (call == null) {
+                return false;
+            }
+            String className = classLiteralName(argOriginAtOrdinal(call, -1, result));
+            String fieldName = stringLiteral(argOriginAtOrdinal(call, 0, result));
+            if (className == null || fieldName == null) {
+                return false;
+            }
+            ClassInfo target = hierarchy.classInfo(className);
+            if (target == null) {
+                return false;
+            }
+            if ("getDeclaredField".equals(ref.name())) {
+                return target.field(fieldName) == null;
+            }
+            return publicField(className, fieldName) == null;
+        }
+        return false;
+    }
+
+    /** A Method.invoke normal edge is impossible when its exact target cannot be applied. */
+    private boolean reflectiveInvocationAlwaysFails(MethodInfo host,
+                                                    ForwardOrigins.Result result,
+                                                    InsnFact insn) {
+        if (!insn.op().isInvoke() || insn.operands().isEmpty()
+                || !(insn.operands().get(0) instanceof MethodRef ref)
+                || !"java/lang/reflect/Method".equals(ref.owner())
+                || !"invoke".equals(ref.name())) {
+            return false;
+        }
+        Node invoke = graph.findCallNode(methodKey(host), insn.offset());
+        if (invoke == null) {
+            return false;
+        }
+        Set<ValueOrigin> methodValues = argOriginAtOrdinal(invoke, -1, result);
+        if (methodValues.size() != 1
+                || !(methodValues.iterator().next() instanceof ValueOrigin.CallResult lookupResult)) {
+            return false;
+        }
+        Node lookup = callNodes.get(lookupResult.callNodeId());
+        MethodInfo target = reflectiveLookupTarget(lookup, host, result);
+        if (target == null) {
+            return false;
+        }
+        if (!target.isStatic()) {
+            Set<ValueOrigin> receiver = argOriginAtOrdinal(invoke, 0, result);
+            if (receiver.size() == 1 && isNullConstant(receiver.iterator().next())) {
+                return true;
+            }
+        }
+        return !java.lang.reflect.Modifier.isPublic(target.access())
+                && !hasAccessibleOverride(host, invoke, methodValues, result);
+    }
+
+    /**
+     * Check the two runtime preconditions that are locally decidable for Method.invoke:
+     * instance methods need a non-null compatible receiver, and a non-public declared method
+     * needs a preceding setAccessible(true) on the same Method object.  Unknown receiver or
+     * metadata remains accepted so reflective application code is not under-reported.
+     */
+    public boolean reflectiveInvokeMayReach(MethodInfo target, Node invoke) {
+        if (target == null || invoke == null || !"java/lang/reflect/Method".equals(invoke.owner())
+                || !"invoke".equals(invoke.name())) {
+            return true;
+        }
+        MethodInfo host = enclosingMethod(invoke);
+        if (host == null) {
+            return true;
+        }
+        ForwardOrigins.Result result = origins.compute(host);
+        if (!target.isStatic()) {
+            Set<ValueOrigin> receivers = argOriginAtOrdinal(invoke, 0, result);
+            if (receivers.size() == 1 && isNullConstant(receivers.iterator().next())) {
+                return false;
+            }
+        }
+        if (java.lang.reflect.Modifier.isPublic(target.access())) {
+            return true;
+        }
+        Set<ValueOrigin> methodValues = argOriginAtOrdinal(invoke, -1, result);
+        for (ValueOrigin methodValue : methodValues) {
+            if (!(methodValue instanceof ValueOrigin.CallResult lookupResult)) {
+                continue;
+            }
+            Node lookup = callNodes.get(lookupResult.callNodeId());
+            if (lookup != null && "getDeclaredMethod".equals(lookup.name())
+                    && hasAccessibleOverride(host, invoke, Set.of(methodValue), result)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String stringLiteral(Set<ValueOrigin> values) {
+        if (values == null || values.size() != 1
+                || !(values.iterator().next() instanceof ValueOrigin.Constant constant)
+                || !(constant.value() instanceof String value)) {
+            return null;
+        }
+        return value;
+    }
+
+    /**
+     * A deliberately small string abstract value for reflective names.  Exact constants are
+     * preferred; when the suffix is attacker-controlled we still retain a proven prefix such
+     * as {@code "get"}.  This is enough to reject a lookup only when the target class has no
+     * matching method at all, while an unknown prefix remains fully conservative.
+     */
+    private record StringShape(String exact, String prefix) {
+        private static StringShape exact(String value) {
+            return new StringShape(value, value);
+        }
+
+        private static StringShape unknown() {
+            return new StringShape(null, "");
+        }
+    }
+
+    private StringShape stringShape(Set<ValueOrigin> values, MethodInfo method,
+                                    ForwardOrigins.Result result,
+                                    Set<ValueOrigin> visiting) {
+        if (values == null || values.size() != 1) {
+            return null;
+        }
+        return stringShape(values.iterator().next(), method, result, visiting);
+    }
+
+    private StringShape stringShape(ValueOrigin value, MethodInfo method,
+                                    ForwardOrigins.Result result,
+                                    Set<ValueOrigin> visiting) {
+        if (value == null || method == null || !visiting.add(value)) {
+            return null;
+        }
+        try {
+            if (value instanceof ValueOrigin.Constant constant
+                    && constant.value() instanceof String text) {
+                return StringShape.exact(text);
+            }
+            if (value instanceof ValueOrigin.Insn instruction
+                    && instruction.offset() >= 0
+                    && instruction.offset() < method.instructions().size()) {
+                InsnFact insn = method.insnAt(instruction.offset());
+                if (insn.op() == Op.NEW && insn.typeRef() != null) {
+                    String type = internalClassName(insn.typeRef().descriptor());
+                    if ("java/lang/StringBuilder".equals(type)
+                            || "java/lang/StringBuffer".equals(type)) {
+                        return StringShape.exact("");
+                    }
+                }
+                return null;
+            }
+            if (!(value instanceof ValueOrigin.CallResult callResult)
+                    || callResult.callNodeId() < 0) {
+                return null;
+            }
+            Node call = callNodes.get(callResult.callNodeId());
+            if (call == null) {
+                return null;
+            }
+            ForwardOrigins.Result callState = origins.compute(method);
+            String owner = call.owner();
+            if (isStringBuilderType(owner) && "toString".equals(call.name())) {
+                return stringShape(argOriginAtOrdinal(call, -1, callState), method,
+                        callState, visiting);
+            }
+            if (isStringBuilderType(owner) && call.name().startsWith("append")) {
+                StringShape receiver = stringShape(argOriginAtOrdinal(call, -1, callState),
+                        method, callState, visiting);
+                StringShape argument = stringShape(argOriginAtOrdinal(call, 0, callState),
+                        method, callState, visiting);
+                if (receiver == null) {
+                    return null;
+                }
+                if (argument == null) {
+                    return new StringShape(null, receiver.exact() != null
+                            ? receiver.exact() : receiver.prefix());
+                }
+                return appendShape(receiver, argument);
+            }
+            if ("java/lang/String".equals(owner) && "concat".equals(call.name())) {
+                StringShape receiver = stringShape(argOriginAtOrdinal(call, -1, callState),
+                        method, callState, visiting);
+                StringShape argument = stringShape(argOriginAtOrdinal(call, 0, callState),
+                        method, callState, visiting);
+                return receiver == null || argument == null ? null : appendShape(receiver, argument);
+            }
+            return null;
+        } finally {
+            visiting.remove(value);
+        }
+    }
+
+    private static boolean isStringBuilderType(String owner) {
+        return "java/lang/StringBuilder".equals(owner)
+                || "java/lang/StringBuffer".equals(owner)
+                || "java/lang/AbstractStringBuilder".equals(owner);
+    }
+
+    private static StringShape appendShape(StringShape left, StringShape right) {
+        if (left.exact() != null && right.exact() != null) {
+            return StringShape.exact(left.exact() + right.exact());
+        }
+        String leftPrefix = left.exact() != null ? left.exact() : left.prefix();
+        String rightPrefix = right.exact() != null ? right.exact() : right.prefix();
+        return new StringShape(null, leftPrefix + rightPrefix);
+    }
+
+    private String classLiteralName(Set<ValueOrigin> values) {
+        if (values == null || values.size() != 1
+                || !(values.iterator().next() instanceof ValueOrigin.Constant constant)
+                || !(constant.value() instanceof io.just.sast.model.TypeRef type)) {
+            return null;
+        }
+        return internalClassName(type.descriptor());
+    }
+
+    private int reflectiveParameterCount(MethodInfo method, ForwardOrigins.Result result,
+                                         Node call, MethodRef ref) {
+        int ordinal;
+        if ("getMethod".equals(ref.name()) || "getDeclaredMethod".equals(ref.name())) {
+            ordinal = 1;
+        } else if ("getConstructor".equals(ref.name()) || "getDeclaredConstructor".equals(ref.name())) {
+            ordinal = 0;
+        } else {
+            return -1;
+        }
+        Integer length = null;
+        for (ValueOrigin array : argOriginAtOrdinal(call, ordinal, result)) {
+            Integer candidate = arrayLength(array, method, result);
+            if (candidate == null || (length != null && !length.equals(candidate))) {
+                return -1;
+            }
+            length = candidate;
+        }
+        return length == null ? -1 : length;
+    }
+
+    private boolean reflectiveMethodExistsByArity(String owner, String name, int parameterCount,
+                                                   boolean includeInherited, boolean publicOnly) {
+        return reflectiveMethodMatches(owner, name, parameterCount, null,
+                includeInherited, publicOnly);
+    }
+
+    private boolean reflectiveMethodNameStartsWith(String owner, String prefix, int parameterCount,
+                                                   boolean includeInherited, boolean publicOnly) {
+        return reflectiveMethodMatches(owner, null, parameterCount, prefix,
+                includeInherited, publicOnly);
+    }
+
+    private boolean reflectiveMethodMatches(String owner, String exactName, int parameterCount,
+                                            String namePrefix, boolean includeInherited,
+                                            boolean publicOnly) {
+        if (owner == null || parameterCount < 0) {
+            return false;
+        }
+        Deque<String> work = new ArrayDeque<>();
+        Set<String> seen = new HashSet<>();
+        work.add(owner);
+        while (!work.isEmpty()) {
+            String current = work.removeFirst();
+            if (!seen.add(current)) {
+                continue;
+            }
+            ClassInfo cls = hierarchy.classInfo(current);
+            if (cls == null) {
+                continue;
+            }
+            for (MethodInfo candidate : cls.methods()) {
+                boolean nameMatches = exactName != null
+                        ? exactName.equals(candidate.name())
+                        : candidate.name().startsWith(namePrefix);
+                if (nameMatches && Descriptor.paramCount(candidate.descriptor()) == parameterCount
+                        && (!publicOnly || java.lang.reflect.Modifier.isPublic(candidate.access()))) {
+                    return true;
+                }
+            }
+            if (!includeInherited) {
+                continue;
+            }
+            if (cls.superName() != null) {
+                work.addLast(cls.superName());
+            }
+            work.addAll(cls.interfaces());
+        }
+        return false;
+    }
+
+    private io.just.sast.model.FieldInfo publicField(String owner, String name) {
+        Deque<String> work = new ArrayDeque<>();
+        Set<String> seen = new HashSet<>();
+        work.add(owner);
+        while (!work.isEmpty()) {
+            String current = work.removeFirst();
+            if (!seen.add(current)) {
+                continue;
+            }
+            ClassInfo cls = hierarchy.classInfo(current);
+            if (cls == null) {
+                continue;
+            }
+            io.just.sast.model.FieldInfo field = cls.field(name);
+            if (field != null && java.lang.reflect.Modifier.isPublic(field.access())) {
+                return field;
+            }
+            if (cls.superName() != null) {
+                work.addLast(cls.superName());
+            }
+            work.addAll(cls.interfaces());
+        }
+        return null;
+    }
+
+    private boolean castAlwaysFails(MethodInfo method, ForwardOrigins.Result result,
+                                    InsnFact insn) {
+        if (insn.typeRef() == null) {
+            return false;
+        }
+        ForwardOrigins.State state = result.stateBefore().get(insn.offset());
+        if (state == null || state.stack().isEmpty()) {
+            return false;
+        }
+        String target = internalClassName(insn.typeRef().descriptor());
+        if (target == null) {
+            return false;
+        }
+        Set<String> types = concreteTypesOf(state.stack().get(state.stack().size() - 1).origins(),
+                method, insn.offset());
+        if (types.isEmpty()) {
+            return false;
+        }
+        for (String type : types) {
+            if (type == null || hierarchy.isSubtypeOf(type, target)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Boolean knownBranchResult(MethodInfo method, ForwardOrigins.Result result,
+                                      InsnFact branch) {
+        ForwardOrigins.State state = result.stateBefore().get(branch.offset());
+        if (state == null || state.stack().isEmpty()) {
+            return null;
+        }
+        if (branch.op() == Op.IFNULL || branch.op() == Op.IFNONNULL) {
+            ValueOrigin value = state.stack().get(state.stack().size() - 1).origins()
+                    .stream().findFirst().orElse(null);
+            Boolean knownNull = knownNullness(value, method, result, new HashSet<>());
+            if (knownNull == null) {
+                return null;
+            }
+            return branch.op() == Op.IFNULL ? knownNull : !knownNull;
+        }
+        if (branch.op() == Op.IF_ACMPEQ || branch.op() == Op.IF_ACMPNE) {
+            if (state.stack().size() < 2) {
+                return null;
+            }
+            Set<ValueOrigin> left = state.stack().get(state.stack().size() - 2).origins();
+            Set<ValueOrigin> right = state.stack().get(state.stack().size() - 1).origins();
+            if (left.size() != 1 || right.size() != 1 || !left.equals(right)) {
+                return null;
+            }
+            return branch.op() == Op.IF_ACMPEQ;
+        }
+        Integer left;
+        Integer right = null;
+        if (branch.op() == Op.IF_ICMPEQ || branch.op() == Op.IF_ICMPNE
+                || branch.op() == Op.IF_ICMPLT || branch.op() == Op.IF_ICMPGE
+                || branch.op() == Op.IF_ICMPGT || branch.op() == Op.IF_ICMPLE) {
+            if (state.stack().size() < 2) {
+                return null;
+            }
+            left = knownInteger(state.stack().get(state.stack().size() - 2).origins(), method,
+                    result, new HashSet<>(), new HashSet<>());
+            right = knownInteger(state.stack().get(state.stack().size() - 1).origins(), method,
+                    result, new HashSet<>(), new HashSet<>());
+            if (left == null || right == null) {
+                return null;
+            }
+        } else {
+            left = knownInteger(state.stack().get(state.stack().size() - 1).origins(), method,
+                    result, new HashSet<>(), new HashSet<>());
+            if (left == null) {
+                return null;
+            }
+        }
+        return switch (branch.op()) {
+            case IFEQ -> left == 0;
+            case IFNE -> left != 0;
+            case IFLT -> left < 0;
+            case IFGE -> left >= 0;
+            case IFGT -> left > 0;
+            case IFLE -> left <= 0;
+            case IF_ICMPEQ -> left.equals(right);
+            case IF_ICMPNE -> !left.equals(right);
+            case IF_ICMPLT -> left < right;
+            case IF_ICMPGE -> left >= right;
+            case IF_ICMPGT -> left > right;
+            case IF_ICMPLE -> left <= right;
+            default -> null;
+        };
+    }
+
+    private Integer knownInteger(Set<ValueOrigin> values, MethodInfo method,
+                                 ForwardOrigins.Result result, Set<ValueOrigin> visiting,
+                                 Set<String> methods) {
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+        Integer resultValue = null;
+        for (ValueOrigin value : values) {
+            Integer candidate = knownInteger(value, method, result, visiting, methods);
+            if (candidate == null || (resultValue != null && !resultValue.equals(candidate))) {
+                return null;
+            }
+            resultValue = candidate;
+        }
+        return resultValue;
+    }
+
+    private Integer knownInteger(ValueOrigin value, MethodInfo method,
+                                 ForwardOrigins.Result result, Set<ValueOrigin> visiting,
+                                 Set<String> methods) {
+        if (value == null) {
+            return null;
+        }
+        ConstantProofContext context = constantProof.get();
+        ConstantFactKey factKey = context == null ? null
+                : new ConstantFactKey(method == null ? "<null>" : methodKey(method), value);
+        if (context != null) {
+            if (context.facts.containsKey(factKey)) {
+                return context.facts.get(factKey);
+            }
+            if (!context.consume()) {
+                constantProofBudgetExceeded.set(true);
+                return null;
+            }
+            if (!context.active.add(factKey)) {
+                return null;
+            }
+        }
+        if (!visiting.add(value)) {
+            if (context != null) {
+                context.active.remove(factKey);
+            }
+            return null;
+        }
+        Integer answer = null;
+        try {
+            answer = knownIntegerUncached(value, method, result, visiting, methods);
+            return answer;
+        } finally {
+            visiting.remove(value);
+            if (context != null) {
+                context.active.remove(factKey);
+                context.facts.put(factKey, answer);
+            }
+        }
+    }
+
+    private Integer knownIntegerUncached(ValueOrigin value, MethodInfo method,
+                                         ForwardOrigins.Result result, Set<ValueOrigin> visiting,
+                                         Set<String> methods) {
+        if (value instanceof ValueOrigin.Constant constant) {
+            return literalInteger(constant);
+        }
+        if (value instanceof ValueOrigin.FieldRead field && field.isStatic()) {
+            return staticFieldInteger(field);
+        }
+        if (value instanceof ValueOrigin.FieldRead field) {
+            return instanceFieldInteger(field, method, result, visiting, methods);
+        }
+        if (value instanceof ValueOrigin.Param param) {
+            return constantParameterValue(method, param.slot(), methods);
+        }
+        if (value instanceof ValueOrigin.Insn instruction
+                && instruction.offset() >= 0
+                && instruction.offset() < method.instructions().size()) {
+            InsnFact insn = method.insnAt(instruction.offset());
+            ForwardOrigins.State before = result.stateBefore().get(instruction.offset());
+            if (before == null) {
+                return null;
+            }
+            if (insn.op() == Op.ARRAYLENGTH && !before.stack().isEmpty()) {
+                return arrayLengthOf(before.stack().get(before.stack().size() - 1).origins(),
+                        method, result);
+            }
+            Integer unary = knownUnaryInteger(insn.op(), before, method, result,
+                    visiting, methods);
+            if (unary != null) {
+                return unary;
+            }
+            Integer binary = knownBinaryInteger(insn.op(), before, method, result,
+                    visiting, methods);
+            if (binary != null) {
+                return binary;
+            }
+            return null;
+        }
+        if (value instanceof ValueOrigin.CallResult callResult
+                && callResult.callNodeId() >= 0) {
+            Node call = callNodes.get(callResult.callNodeId());
+            if (call == null) {
+                return null;
+            }
+            ForwardOrigins.Result callResultState = origins.compute(method);
+            if ("booleanValue".equals(call.name()) && "java/lang/Boolean".equals(call.owner())) {
+                Set<ValueOrigin> receiver = argOriginAtOrdinal(call, -1, callResultState);
+                return knownInteger(receiver, method, callResultState, visiting, methods);
+            }
+            if (isIntegerWrapperFactory(call.owner(), call.name())) {
+                Set<ValueOrigin> argument = argOriginAtOrdinal(call, 0, callResultState);
+                return knownInteger(argument, method, callResultState, visiting, methods);
+            }
+            if (isIntegerWrapperValue(call.owner(), call.name())) {
+                Set<ValueOrigin> receiver = argOriginAtOrdinal(call, -1, callResultState);
+                return knownInteger(receiver, method, callResultState, visiting, methods);
+            }
+            if ("isAccessible".equals(call.name())
+                    && "java/lang/reflect/AccessibleObject".equals(call.owner())) {
+                Set<ValueOrigin> receiver = argOriginAtOrdinal(call, -1, callResultState);
+                return hasAccessibleOverride(method, call, receiver, callResultState) ? 1 : 0;
+            }
+            if ("isProxyClass".equals(call.name())
+                    && "java/lang/reflect/Proxy".equals(call.owner())) {
+                Set<ValueOrigin> classValues = argOriginAtOrdinal(call, 0, callResultState);
+                return proxyClassValue(classValues, method, callResultState) ? 1 : 0;
+            }
+            if ("java/lang/reflect/Method".equals(call.owner())
+                    && "invoke".equals(call.name())) {
+                Integer reflected = reflectiveInvokeInteger(call, method, callResultState,
+                        methods);
+                if (reflected != null) {
+                    return reflected;
+                }
+            }
+            MethodInfo callee = methodOf(call.owner(), call.name(), call.descriptor());
+            if (callee == null) {
+                return null;
+            }
+            return constantReturnValue(callee, methods);
+        }
+        return null;
+    }
+
+    private static boolean isIntegerWrapperFactory(String owner, String name) {
+        return "valueOf".equals(name) && ("java/lang/Boolean".equals(owner)
+                || "java/lang/Byte".equals(owner) || "java/lang/Short".equals(owner)
+                || "java/lang/Character".equals(owner) || "java/lang/Integer".equals(owner)
+                || "java/lang/Long".equals(owner));
+    }
+
+    private static boolean isIntegerWrapperValue(String owner, String name) {
+        return ("intValue".equals(name) || "byteValue".equals(name)
+                || "shortValue".equals(name) || "charValue".equals(name)
+                || "longValue".equals(name))
+                && ("java/lang/Byte".equals(owner) || "java/lang/Short".equals(owner)
+                || "java/lang/Character".equals(owner) || "java/lang/Integer".equals(owner)
+                || "java/lang/Long".equals(owner));
+    }
+
+    private boolean hasAccessibleOverride(MethodInfo host, Node query,
+                                           Set<ValueOrigin> receiver,
+                                           ForwardOrigins.Result result) {
+        for (Node candidate : graph.callsOfMethod(methodKey(host))) {
+            if (candidate.offset() >= query.offset()
+                    || !"setAccessible".equals(candidate.name())
+                    || !"java/lang/reflect/AccessibleObject".equals(candidate.owner())) {
+                continue;
+            }
+            Set<ValueOrigin> candidateReceiver = argOriginAtOrdinal(candidate, -1, result);
+            if (candidateReceiver.stream().noneMatch(receiver::contains)) {
+                continue;
+            }
+            Integer enabled = knownInteger(argOriginAtOrdinal(candidate, 0, result), host, result,
+                    new HashSet<>(), new HashSet<>());
+            if (enabled != null && enabled != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean proxyClassValue(Set<ValueOrigin> values, MethodInfo method,
+                                    ForwardOrigins.Result result) {
+        if (values == null || values.size() != 1
+                || !(values.iterator().next() instanceof ValueOrigin.CallResult classResult)) {
+            return false;
+        }
+        Node classCall = callNodes.get(classResult.callNodeId());
+        if (classCall == null || !"getClass".equals(classCall.name())) {
+            return false;
+        }
+        Set<ValueOrigin> receivers = argOriginAtOrdinal(classCall, -1, result);
+        for (ValueOrigin receiver : receivers) {
+            if (receiver instanceof ValueOrigin.CallResult objectResult) {
+                Node allocation = callNodes.get(objectResult.callNodeId());
+                if (allocation != null && "java/lang/reflect/Proxy".equals(allocation.owner())
+                        && "newProxyInstance".equals(allocation.name())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private Integer knownUnaryInteger(Op op, ForwardOrigins.State before, MethodInfo method,
+                                      ForwardOrigins.Result result, Set<ValueOrigin> visiting,
+                                      Set<String> methods) {
+        if (before.stack().isEmpty()) {
+            return null;
+        }
+        Integer value = knownInteger(before.stack().get(before.stack().size() - 1).origins(),
+                method, result, visiting, methods);
+        if (value == null) {
+            return null;
+        }
+        return op == Op.INEG ? -value : null;
+    }
+
+    private Integer knownBinaryInteger(Op op, ForwardOrigins.State before, MethodInfo method,
+                                       ForwardOrigins.Result result, Set<ValueOrigin> visiting,
+                                       Set<String> methods) {
+        if (before.stack().size() < 2) {
+            return null;
+        }
+        Integer right = knownInteger(before.stack().get(before.stack().size() - 1).origins(),
+                method, result, visiting, methods);
+        Integer left = knownInteger(before.stack().get(before.stack().size() - 2).origins(),
+                method, result, visiting, methods);
+        if (left == null || right == null) {
+            return null;
+        }
+        return switch (op) {
+            case IADD -> left + right;
+            case ISUB -> left - right;
+            case IMUL -> left * right;
+            case IDIV -> right == 0 ? null : left / right;
+            case IREM -> right == 0 ? null : left % right;
+            default -> null;
+        };
+    }
+
+    private Integer arrayLengthOf(Set<ValueOrigin> values, MethodInfo method,
+                                  ForwardOrigins.Result result) {
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+        Integer length = null;
+        for (ValueOrigin value : values) {
+            Integer candidate = arrayLength(value, method, result);
+            if (candidate == null || (length != null && !length.equals(candidate))) {
+                return null;
+            }
+            length = candidate;
+        }
+        return length;
+    }
+
+    private Boolean knownNullness(ValueOrigin value, MethodInfo method,
+                                  ForwardOrigins.Result result, Set<ValueOrigin> visiting) {
+        if (value instanceof ValueOrigin.Constant constant) {
+            return constant.value() == null || "ACONST_NULL".equals(constant.value());
+        }
+        if (value instanceof ValueOrigin.Insn instruction
+                && instruction.offset() >= 0 && instruction.offset() < method.instructions().size()) {
+            Op op = method.insnAt(instruction.offset()).op();
+            if (op == Op.NEW || op == Op.NEWARRAY || op == Op.ANEWARRAY
+                    || op == Op.MULTIANEWARRAY) {
+                return false;
+            }
+        }
+        if (value instanceof ValueOrigin.CallResult callResult
+                && callResult.callNodeId() >= 0) {
+            Node call = callNodes.get(callResult.callNodeId());
+            return call != null && "<init>".equals(call.name()) ? false : null;
+        }
+        return null;
+    }
+
+    private Integer constantParameterValue(MethodInfo method, int slot, Set<String> methods) {
+        if (method == null || slot <= 0 || !methods.add(methodKey(method))) {
+            return null;
+        }
+        try {
+            Node methodNode = graph.findMethodNodeKey(methodKey(method));
+            if (methodNode == null) {
+                return null;
+            }
+            Integer value = null;
+            int seen = 0;
+            for (Edge edge : methodNode.in()) {
+                if (edge.type() != EdgeType.INVOKES && edge.type() != EdgeType.DISPATCHES) {
+                    continue;
+                }
+                Node call = edge.from();
+                MethodInfo caller = enclosingMethod(call);
+                if (caller == null) {
+                    continue;
+                }
+                ForwardOrigins.Result callerResult = origins.compute(caller);
+                Set<ValueOrigin> values = argOriginAt(call, caller, slot, callerResult);
+                Integer candidate = knownInteger(values, caller, callerResult,
+                        new HashSet<>(), methods);
+                if (candidate == null) {
+                    return null;
+                }
+                if (value != null && !value.equals(candidate)) {
+                    return null;
+                }
+                value = candidate;
+                seen++;
+            }
+            // Reflection is deliberately not materialized as a blanket call-graph edge.  If
+            // the Method object has one exact Class.getMethod/getDeclaredMethod origin, the
+            // Object[] element at the target parameter ordinal is nevertheless a normal JVM
+            // value and can participate in the same constant proof as a direct invoke.
+            for (Node invoke : callNodes.values()) {
+                boolean methodInvoke = "java/lang/reflect/Method".equals(invoke.owner())
+                        && "invoke".equals(invoke.name());
+                boolean constructorInvoke = "java/lang/reflect/Constructor".equals(invoke.owner())
+                        && "newInstance".equals(invoke.name());
+                if (!methodInvoke && !constructorInvoke) {
+                    continue;
+                }
+                MethodInfo caller = enclosingMethod(invoke);
+                if (caller == null) {
+                    continue;
+                }
+                ForwardOrigins.Result callerResult = origins.compute(caller);
+                MethodInfo reflected;
+                if (methodInvoke) {
+                    Set<ValueOrigin> methodValues = argOriginAtOrdinal(invoke, -1, callerResult);
+                    if (methodValues.size() != 1
+                            || !(methodValues.iterator().next() instanceof ValueOrigin.CallResult lookupResult)) {
+                        continue;
+                    }
+                    reflected = reflectiveLookupTarget(callNodes.get(lookupResult.callNodeId()),
+                            caller, callerResult);
+                } else {
+                    reflected = reflectiveConstructorTarget(invoke, caller, callerResult);
+                }
+                if (reflected == null || !methodKey(reflected).equals(methodKey(method))) {
+                    continue;
+                }
+                Set<ValueOrigin> values = methodInvoke
+                        ? reflectiveMethodArgumentAt(invoke, reflected, slot, callerResult)
+                        : reflectiveConstructorArgumentAt(invoke, reflected, slot, callerResult);
+                Integer candidate = knownInteger(values, caller, callerResult,
+                        new HashSet<>(), methods);
+                if (candidate == null) {
+                    return null;
+                }
+                if (value != null && !value.equals(candidate)) {
+                    return null;
+                }
+                value = candidate;
+                seen++;
+            }
+            return seen == 0 ? null : value;
+        } finally {
+            methods.remove(methodKey(method));
+        }
+    }
+
+    private Set<ValueOrigin> reflectiveMethodArgumentAt(Node invoke, MethodInfo target, int slot,
+                                                        ForwardOrigins.Result callerResult) {
+        int ordinal = Descriptor.paramOrdinal(target.descriptor(), target.isStatic(), slot);
+        if (ordinal < 0) {
+            return Set.of();
+        }
+        Set<ValueOrigin> arrays = argOriginAtOrdinal(invoke, 1, callerResult);
+        Set<ValueOrigin> values = new LinkedHashSet<>();
+        boolean sawArray = false;
+        for (ValueOrigin array : arrays) {
+            sawArray = true;
+            Map<Integer, Set<ValueOrigin>> indexed = callerResult.indexedArrayElements().get(array);
+            if (indexed == null || !indexed.containsKey(ordinal)) {
+                return Set.of(new ValueOrigin.Unknown());
+            }
+            values.addAll(indexed.get(ordinal));
+        }
+        return sawArray && !values.isEmpty() ? values : Set.of(new ValueOrigin.Unknown());
+    }
+
+    private Set<ValueOrigin> reflectiveConstructorArgumentAt(Node invoke, MethodInfo target,
+                                                             int slot,
+                                                             ForwardOrigins.Result callerResult) {
+        int ordinal = Descriptor.paramOrdinal(target.descriptor(), target.isStatic(), slot);
+        if (ordinal < 0) {
+            return Set.of();
+        }
+        return arrayElementAt(argOriginAtOrdinal(invoke, 0, callerResult), ordinal,
+                callerResult);
+    }
+
+    private Set<ValueOrigin> arrayElementAt(Set<ValueOrigin> arrays, int ordinal,
+                                             ForwardOrigins.Result result) {
+        Set<ValueOrigin> values = new LinkedHashSet<>();
+        boolean sawArray = false;
+        for (ValueOrigin array : arrays) {
+            sawArray = true;
+            Map<Integer, Set<ValueOrigin>> indexed = result.indexedArrayElements().get(array);
+            if (indexed == null || !indexed.containsKey(ordinal)) {
+                return Set.of(new ValueOrigin.Unknown());
+            }
+            values.addAll(indexed.get(ordinal));
+        }
+        return sawArray && !values.isEmpty() ? values : Set.of(new ValueOrigin.Unknown());
+    }
+
+    /** Resolve an exact Constructor.newInstance target from its preceding Class.get* lookup. */
+    private MethodInfo reflectiveConstructorTarget(Node newInstance, MethodInfo host,
+                                                   ForwardOrigins.Result hostResult) {
+        if (newInstance == null || !"java/lang/reflect/Constructor".equals(newInstance.owner())
+                || !"newInstance".equals(newInstance.name())) {
+            return null;
+        }
+        Set<ValueOrigin> constructors = argOriginAtOrdinal(newInstance, -1, hostResult);
+        if (constructors.size() != 1
+                || !(constructors.iterator().next() instanceof ValueOrigin.CallResult lookupResult)) {
+            return null;
+        }
+        Node lookup = callNodes.get(lookupResult.callNodeId());
+        if (lookup == null || (!"getConstructor".equals(lookup.name())
+                && !"getDeclaredConstructor".equals(lookup.name()))) {
+            return null;
+        }
+        MethodInfo lookupHost = enclosingMethod(lookup);
+        if (lookupHost == null) {
+            return null;
+        }
+        ForwardOrigins.Result lookupResultState = origins.compute(lookupHost);
+        String className = classLiteralName(argOriginAtOrdinal(lookup, -1, lookupResultState));
+        if (className == null) {
+            return null;
+        }
+        InsnFact lookupInsn = lookupHost.insnAt(lookup.offset());
+        String descriptor = reflectiveParameterDescriptor(lookupHost, lookupInsn,
+                new MethodRef(lookup.owner(), lookup.name(), lookup.descriptor()));
+        if (descriptor == null) {
+            return null;
+        }
+        ClassInfo target = hierarchy.classInfo(className);
+        return target == null ? null : target.method("<init>", descriptor);
+    }
+
+    /** Exact instance-field value supplied by an exact reflective constructor or NEW call. */
+    private Integer instanceFieldInteger(ValueOrigin.FieldRead field, MethodInfo host,
+                                          ForwardOrigins.Result hostResult,
+                                          Set<ValueOrigin> visiting, Set<String> methods) {
+        MethodInfo constructor = null;
+        Node allocation = callProducer(field.receiver(), host, hostResult);
+        if (allocation != null) {
+            constructor = reflectiveConstructorTarget(allocation, host, hostResult);
+        }
+        if (constructor == null) {
+            return null;
+        }
+        ForwardOrigins.Result constructorResult = origins.compute(constructor);
+        Integer value = null;
+        int writes = 0;
+        for (InsnFact write : constructor.instructions()) {
+            if (write.op() != Op.PUTFIELD || !sameField(write.fieldRef(), field)) {
+                continue;
+            }
+            ForwardOrigins.State state = constructorResult.stateBefore().get(write.offset());
+            if (state == null || state.stack().isEmpty()) {
+                return null;
+            }
+            Integer candidate = knownInteger(state.stack().get(state.stack().size() - 1).origins(),
+                    constructor, constructorResult, visiting, methods);
+            if (candidate == null || (value != null && !value.equals(candidate))) {
+                return null;
+            }
+            value = candidate;
+            writes++;
+        }
+        return writes == 1 ? value : null;
+    }
+
+    /**
+     * Resolve a call result through a CHECKCAST without erasing its identity.  The forward
+     * origin transfer keeps casts as instruction origins so that incompatible casts can be
+     * distinguished during feasibility checks; exact reflective-field reasoning still needs
+     * to recover the producer behind a successful cast.
+     */
+    private Node callProducer(ValueOrigin value, MethodInfo method,
+                              ForwardOrigins.Result result) {
+        if (value instanceof ValueOrigin.CallResult callResult
+                && callResult.callNodeId() >= 0) {
+            return callNodes.get(callResult.callNodeId());
+        }
+        if (!(value instanceof ValueOrigin.Insn instruction)
+                || instruction.offset() < 0
+                || instruction.offset() >= method.instructions().size()
+                || method.insnAt(instruction.offset()).op() != Op.CHECKCAST) {
+            return null;
+        }
+        ForwardOrigins.State before = result.stateBefore().get(instruction.offset());
+        if (before == null || before.stack().isEmpty()) {
+            return null;
+        }
+        Set<ValueOrigin> producers = before.stack().get(before.stack().size() - 1).origins();
+        Node resolved = null;
+        for (ValueOrigin producer : producers) {
+            Node candidate = callProducer(producer, method, result);
+            if (candidate == null || (resolved != null && resolved != candidate)) {
+                return null;
+            }
+            resolved = candidate;
+        }
+        return resolved;
+    }
+
+    private Integer constantReturnValue(MethodInfo method, Set<String> methods) {
+        if (method == null || !methods.add(methodKey(method))) {
+            return null;
+        }
+        try {
+            ForwardOrigins.Result result = origins.compute(method);
+            Integer value = null;
+            int returns = 0;
+            for (InsnFact insn : method.instructions()) {
+                if (insn.op() != Op.IRETURN && insn.op() != Op.LRETURN
+                        && insn.op() != Op.FRETURN && insn.op() != Op.DRETURN) {
+                    continue;
+                }
+                ForwardOrigins.State state = result.stateBefore().get(insn.offset());
+                if (state == null || state.stack().isEmpty()) {
+                    return null;
+                }
+                Integer candidate = knownInteger(state.stack().get(state.stack().size() - 1).origins(),
+                        method, result, new HashSet<>(), methods);
+                if (candidate == null || (value != null && !value.equals(candidate))) {
+                    return null;
+                }
+                value = candidate;
+                returns++;
+            }
+            return returns == 0 ? null : value;
+        } finally {
+            methods.remove(methodKey(method));
+        }
+    }
+
+    /** Evaluate a Method.invoke result only when its Method object has an exact lookup fact. */
+    private Integer reflectiveInvokeInteger(Node invoke, MethodInfo host,
+                                            ForwardOrigins.Result hostResult,
+                                            Set<String> methods) {
+        Set<ValueOrigin> methodValues = argOriginAtOrdinal(invoke, -1, hostResult);
+        if (methodValues == null || methodValues.isEmpty()) {
+            return null;
+        }
+        Integer result = null;
+        for (ValueOrigin value : methodValues) {
+            if (!(value instanceof ValueOrigin.CallResult lookupResult)
+                    || lookupResult.callNodeId() < 0) {
+                return null;
+            }
+            Node lookup = callNodes.get(lookupResult.callNodeId());
+            MethodInfo target = reflectiveLookupTarget(lookup, host, hostResult);
+            Integer candidate = constantReturnValue(target, methods);
+            if (candidate == null || (result != null && !result.equals(candidate))) {
+                return null;
+            }
+            result = candidate;
+        }
+        return result;
+    }
+
+    private MethodInfo reflectiveLookupTarget(Node lookup, MethodInfo host,
+                                              ForwardOrigins.Result hostResult) {
+        if (lookup == null || !"java/lang/Class".equals(lookup.owner())
+                || (!"getMethod".equals(lookup.name())
+                && !"getDeclaredMethod".equals(lookup.name()))) {
+            return null;
+        }
+        Set<ValueOrigin> classValues = argOriginAtOrdinal(lookup, -1, hostResult);
+        String className = classLiteralName(classValues);
+        String name = stringLiteral(argOriginAtOrdinal(lookup, 0, hostResult));
+        if (className == null || name == null) {
+            return null;
+        }
+        Node lookupNode = graph.findCallNode(methodKey(host), (Integer) lookup.prop("offset"));
+        if (lookupNode == null) {
+            return null;
+        }
+        String descriptor = reflectiveParameterDescriptor(host,
+                host.insnAt((Integer) lookup.prop("offset")),
+                new MethodRef(lookup.owner(), lookup.name(), lookup.descriptor()));
+        if (descriptor == null) {
+            return null;
+        }
+        if ("getDeclaredMethod".equals(lookup.name())) {
+            ClassInfo cls = hierarchy.classInfo(className);
+            return cls == null ? null : cls.method(name, descriptor);
+        }
+        String owner = hierarchy.resolveMethod(className, name, descriptor);
+        return owner == null ? null : methodOf(owner, name, descriptor);
+    }
+
     /** A6: 确定性运行时异常——值依赖但可判定的子集。 */
     private static boolean isDeterministicRuntime(String type) {
         return "java/lang/ArithmeticException".equals(type)
@@ -778,7 +2894,820 @@ public final class OriginSupport {
                 || "java/util/EmptyStackException".equals(type)
                 || "java/lang/IndexOutOfBoundsException".equals(type)
                 || "java/lang/NegativeArraySizeException".equals(type)
-                || "java/lang/NullPointerException".equals(type);
+                || "java/lang/NullPointerException".equals(type)
+                || "java/util/NoSuchElementException".equals(type);
+    }
+
+    /**
+     * Determine whether a runtime-exception handler still has a feasible throw site.
+     *
+     * <p>The old guard treated every invocation inside a handler's protected interval as a
+     * possible thrower. That preserved recall, but it made guarded operations such as
+     * {@code if (iterator.hasNext()) iterator.next()} and {@code if (!stack.empty())
+     * stack.pop()} indistinguishable from their unsafe counterparts. This pass is deliberately
+     * a small, monotone proof layer: it only removes a handler when every relevant operation
+     * is either proven safe from bytecode/origin facts or protected by its immediately
+     * dominating boolean guard. Unknown calls, aliases, and values keep the chain.
+     */
+    private boolean runtimeExceptionCanReach(MethodInfo method, TryCatchFact tc) {
+        ForwardOrigins.Result result = origins.compute(method);
+        int start = Math.max(0, tc.start());
+        int end = Math.min(method.instructions().size(), tc.end());
+        for (int offset = start; offset < end; offset++) {
+            InsnFact insn = method.instructions().get(offset);
+            if (!potentialRuntimeThrower(tc.type(), insn)) {
+                continue;
+            }
+            if (runtimeInstructionMayThrow(method, result, tc.type(), offset)) {
+                return true;
+            }
+        }
+        // No instruction in the protected interval can produce this exception. The handler
+        // is then unreachable even when the surrounding method contains other calls.
+        return false;
+    }
+
+    private static boolean potentialRuntimeThrower(String type, InsnFact insn) {
+        Op op = insn.op();
+        return switch (type) {
+            case "java/lang/ArithmeticException" -> op == Op.IDIV || op == Op.LDIV
+                    || op == Op.IREM || op == Op.LREM;
+            case "java/lang/ArrayStoreException" -> op == Op.AASTORE
+                    || isReflectiveArraySet(insn);
+            case "java/util/EmptyStackException", "java/util/NoSuchElementException" ->
+                    op.isInvoke() || op == Op.ATHROW;
+            case "java/lang/IndexOutOfBoundsException" -> isArrayAccess(op)
+                    || op.isInvoke();
+            case "java/lang/NegativeArraySizeException" -> op == Op.NEWARRAY
+                    || op == Op.ANEWARRAY || op == Op.MULTIANEWARRAY;
+            case "java/lang/NullPointerException" -> op.isInvoke()
+                    || op == Op.GETFIELD || op == Op.PUTFIELD
+                    || isArrayAccess(op) || op == Op.ARRAYLENGTH
+                    || op == Op.MONITORENTER || op == Op.MONITOREXIT || op == Op.ATHROW;
+            default -> false;
+        };
+    }
+
+    private static boolean isReflectiveArraySet(InsnFact insn) {
+        if (!insn.op().isInvoke() || insn.operands().isEmpty()
+                || !(insn.operands().get(0) instanceof MethodRef ref)) {
+            return false;
+        }
+        return "java/lang/reflect/Array".equals(ref.owner()) && "set".equals(ref.name());
+    }
+
+    private static boolean isArrayAccess(Op op) {
+        return op == Op.IALOAD || op == Op.LALOAD || op == Op.FALOAD || op == Op.DALOAD
+                || op == Op.AALOAD || op == Op.BALOAD || op == Op.CALOAD || op == Op.SALOAD
+                || op == Op.IASTORE || op == Op.LASTORE || op == Op.FASTORE || op == Op.DASTORE
+                || op == Op.AASTORE || op == Op.BASTORE || op == Op.CASTORE || op == Op.SASTORE;
+    }
+
+    private boolean runtimeInstructionMayThrow(MethodInfo method, ForwardOrigins.Result result,
+                                               String type, int offset) {
+        InsnFact insn = method.instructions().get(offset);
+        ForwardOrigins.State state = result.stateBefore().get(offset);
+        if (state == null) {
+            return true;
+        }
+        return switch (type) {
+            case "java/lang/ArithmeticException" -> {
+                Set<ValueOrigin> divisor = state.stack().isEmpty() ? Set.of()
+                        : state.stack().get(state.stack().size() - 1).origins();
+                yield !definitelyNonZero(divisor, method);
+            }
+            case "java/lang/ArrayStoreException" -> insn.op() == Op.AASTORE
+                    ? arrayStoreMayThrow(method, result, state) : true;
+            case "java/util/EmptyStackException" -> collectionCallMayThrow(
+                    method, result, offset, "java/util/Stack", "pop", "peek");
+            case "java/util/NoSuchElementException" -> collectionCallMayThrow(
+                    method, result, offset, "java/util/Iterator", "next", "previous");
+            case "java/lang/IndexOutOfBoundsException" -> isArrayAccess(insn.op())
+                    ? arrayAccessMayThrow(method, result, state, insn.op()) : true;
+            case "java/lang/NegativeArraySizeException" -> arrayAllocationMayThrow(
+                    method, result, state, insn.op(), offset);
+            case "java/lang/NullPointerException" -> nullReceiverMayThrow(
+                    method, result, state, insn);
+            default -> true;
+        };
+    }
+
+    private boolean definitelyNonZero(Set<ValueOrigin> origins, MethodInfo method) {
+        Integer value = uniqueInteger(origins, method);
+        return value != null && value != 0;
+    }
+
+    private Integer uniqueInteger(Set<ValueOrigin> origins, MethodInfo method) {
+        if (origins == null || origins.isEmpty()) {
+            return null;
+        }
+        Integer value = null;
+        for (ValueOrigin origin : origins) {
+            Integer candidate = literalInteger(origin);
+            if (candidate == null && origin instanceof ValueOrigin.FieldRead field
+                    && field.isStatic()) {
+                candidate = staticFieldInteger(field);
+            }
+            if (candidate == null || (value != null && !value.equals(candidate))) {
+                return null;
+            }
+            value = candidate;
+        }
+        return value;
+    }
+
+    private static Integer literalInteger(ValueOrigin origin) {
+        if (!(origin instanceof ValueOrigin.Constant constant)) {
+            return null;
+        }
+        Object value = constant.value();
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof String opcode) {
+            return switch (opcode) {
+                case "ICONST_M1" -> -1;
+                case "ICONST_0" -> 0;
+                case "ICONST_1" -> 1;
+                case "ICONST_2" -> 2;
+                case "ICONST_3" -> 3;
+                case "ICONST_4" -> 4;
+                case "ICONST_5" -> 5;
+                default -> null;
+            };
+        }
+        return null;
+    }
+
+    private boolean arrayStoreMayThrow(MethodInfo method, ForwardOrigins.Result result,
+                                       ForwardOrigins.State state) {
+        if (state.stack().size() < 3) {
+            return true;
+        }
+        Set<ValueOrigin> arrays = state.stack().get(state.stack().size() - 3).origins();
+        Set<ValueOrigin> values = state.stack().get(state.stack().size() - 1).origins();
+        if (arrays.isEmpty() || values.isEmpty()) {
+            return true;
+        }
+        for (ValueOrigin array : arrays) {
+            String component = arrayComponentType(array, method);
+            if (component == null || !valueFitsArray(values, component, method)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean valueFitsArray(Set<ValueOrigin> values, String component, MethodInfo method) {
+        for (ValueOrigin value : values) {
+            if (isNullConstant(value)) {
+                continue;
+            }
+            String type = declaredTypeOf(Set.of(value), method);
+            if (type == null || !hierarchy.isSubtypeOf(type, component)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String arrayComponentType(ValueOrigin origin, MethodInfo method) {
+        if (origin instanceof ValueOrigin.Insn allocation
+                && allocation.offset() >= 0 && allocation.offset() < method.instructions().size()) {
+            InsnFact insn = method.insnAt(allocation.offset());
+            if (insn.op() == Op.ANEWARRAY && insn.typeRef() != null) {
+                return internalClassName(insn.typeRef().descriptor());
+            }
+        }
+        if (origin instanceof ValueOrigin.FieldRead field) {
+            String descriptor = fieldDescriptor(field);
+            if (descriptor != null && descriptor.startsWith("[L") && descriptor.endsWith(";")) {
+                return descriptor.substring(2, descriptor.length() - 1);
+            }
+        }
+        return null;
+    }
+
+    private boolean collectionCallMayThrow(MethodInfo method, ForwardOrigins.Result result,
+                                           int offset, String owner, String primary,
+                                           String secondary) {
+        InsnFact insn = method.instructions().get(offset);
+        if (!insn.op().isInvoke() || insn.operands().isEmpty()
+                || !(insn.operands().get(0) instanceof MethodRef ref)) {
+            return true;
+        }
+        if (owner.equals(ref.owner())) {
+            if (!primary.equals(ref.name()) && !secondary.equals(ref.name())) {
+                return false;
+            }
+            return !isGuardedCollectionCall(method, result, offset, ref, primary, secondary);
+        }
+        if (isPlatformOwner(ref.owner())) {
+            // A platform call with no matching thrower semantics cannot manufacture this
+            // collection-specific exception. Application calls remain conservative below.
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isGuardedCollectionCall(MethodInfo method, ForwardOrigins.Result result,
+                                            int throwerOffset, MethodRef thrower,
+                                            String primary, String secondary) {
+        for (int branchOffset = Math.max(1, throwerOffset - 4);
+             branchOffset < throwerOffset; branchOffset++) {
+            InsnFact branch = method.instructions().get(branchOffset);
+            if (branch.op() != Op.IFNE && branch.op() != Op.IFEQ
+                    || branchOffset + 1 >= throwerOffset) {
+                continue;
+            }
+            InsnFact predicate = method.instructions().get(branchOffset - 1);
+            if (!predicate.op().isInvoke() || predicate.operands().isEmpty()
+                    || !(predicate.operands().get(0) instanceof MethodRef guard)) {
+                continue;
+            }
+            boolean isEmptyGuard = "java/util/Stack".equals(guard.owner())
+                    && "empty".equals(guard.name()) && "pop".equals(primary);
+            boolean isIteratorGuard = "java/util/Iterator".equals(guard.owner())
+                    && "hasNext".equals(guard.name()) && "next".equals(primary);
+            if (!isEmptyGuard && !isIteratorGuard) {
+                continue;
+            }
+            if (!sameReceiver(method, result, predicate, throwerOffset)) {
+                continue;
+            }
+            // IFNE skips pop when empty()==true; IFEQ skips next when hasNext()==false.
+            boolean expectedOpcode = isEmptyGuard ? branch.op() == Op.IFNE
+                    : branch.op() == Op.IFEQ;
+            if (expectedOpcode && branch.jumpTarget() > throwerOffset
+                    && straightLineGuardPath(method, branchOffset, throwerOffset)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The bytecode normally reloads the receiver (and possibly arguments) between the
+     * conditional branch and the guarded invocation.  Require that this short path is the
+     * branch's unique normal fall-through, with no nested control transfer or alternate edge.
+     */
+    private static boolean straightLineGuardPath(MethodInfo method, int branchOffset,
+                                                  int throwerOffset) {
+        int previous = branchOffset;
+        for (int current = branchOffset + 1; current <= throwerOffset; current++) {
+            if (current < throwerOffset && (method.instructions().get(current).op().isCondJump()
+                    || method.instructions().get(current).op().isUncondJump()
+                    || method.instructions().get(current).op().isSwitch()
+                    || method.instructions().get(current).op().isReturn()
+                    || method.instructions().get(current).op() == Op.ATHROW)) {
+                return false;
+            }
+            if (!hasOnlyNormalPredecessor(method, current, previous)) {
+                return false;
+            }
+            previous = current;
+        }
+        return true;
+    }
+
+    private boolean sameReceiver(MethodInfo method, ForwardOrigins.Result result,
+                                 InsnFact guard, int throwerOffset) {
+        ForwardOrigins.State guardState = result.stateBefore().get(guard.offset());
+        ForwardOrigins.State throwerState = result.stateBefore().get(throwerOffset);
+        Set<ValueOrigin> guardReceiver = receiverOrigins(guard, guardState);
+        Set<ValueOrigin> throwerReceiver = receiverOrigins(method.insnAt(throwerOffset), throwerState);
+        if (guardReceiver.isEmpty() || throwerReceiver.isEmpty()) {
+            return false;
+        }
+        for (ValueOrigin origin : guardReceiver) {
+            if (throwerReceiver.contains(origin)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasOnlyNormalPredecessor(MethodInfo method, int target, int expected) {
+        Cfg.Indexed cfg = Cfg.computeIndexed(method);
+        for (int source = 0; source < method.instructions().size(); source++) {
+            for (CfgEdge edge : cfg.successorsAt(source)) {
+                if (edge.targetOffset() == target && edge.label() != CfgLabel.EXCEPTION
+                        && source != expected) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private Set<ValueOrigin> receiverOrigins(InsnFact insn, ForwardOrigins.State state) {
+        if (state == null || state.stack().isEmpty()) {
+            return Set.of();
+        }
+        int depth;
+        if (insn.op() == Op.GETFIELD || insn.op() == Op.ARRAYLENGTH
+                || insn.op() == Op.MONITORENTER || insn.op() == Op.MONITOREXIT) {
+            depth = state.stack().size() - 1;
+        } else if (insn.op() == Op.PUTFIELD) {
+            depth = state.stack().size() - 2;
+        } else if (insn.op().isInvoke()
+                && insn.op() != Op.INVOKESTATIC && insn.op() != Op.INVOKEDYNAMIC) {
+            depth = state.stack().size() - 1 - Descriptor.paramCount(insn.methodRef().descriptor());
+        } else {
+            return Set.of();
+        }
+        return depth >= 0 && depth < state.stack().size()
+                ? state.stack().get(depth).origins() : Set.of();
+    }
+
+    private boolean arrayAccessMayThrow(MethodInfo method, ForwardOrigins.Result result,
+                                        ForwardOrigins.State state, Op op) {
+        int indexDepth = (op == Op.IASTORE || op == Op.LASTORE || op == Op.FASTORE
+                || op == Op.DASTORE || op == Op.AASTORE || op == Op.BASTORE
+                || op == Op.CASTORE || op == Op.SASTORE) ? 2 : 1;
+        int arrayDepth = indexDepth + 1;
+        if (state.stack().size() < arrayDepth) {
+            return true;
+        }
+        Integer index = uniqueInteger(state.stack().get(state.stack().size() - indexDepth).origins(), method);
+        if (index == null) {
+            return true;
+        }
+        Set<ValueOrigin> arrays = state.stack().get(state.stack().size() - arrayDepth).origins();
+        if (arrays.isEmpty()) {
+            return true;
+        }
+        for (ValueOrigin array : arrays) {
+            Integer length = arrayLength(array, method, result);
+            if (length == null || index < 0 || index >= length) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean arrayAllocationMayThrow(MethodInfo method, ForwardOrigins.Result result,
+                                            ForwardOrigins.State state, Op op,
+                                            int allocationOffset) {
+        if (state.stack().isEmpty()) {
+            return true;
+        }
+        Integer size = uniqueInteger(state.stack().get(state.stack().size() - 1).origins(), method);
+        if (size != null) {
+            return size < 0;
+        }
+        if (op == Op.NEWARRAY || op == Op.ANEWARRAY) {
+            Set<ValueOrigin> sizes = state.stack().get(state.stack().size() - 1).origins();
+            for (ValueOrigin origin : sizes) {
+                if (origin instanceof ValueOrigin.FieldRead field && !field.isStatic()
+                        && definitelyNonNegativeField(method, result, field, allocationOffset)) {
+                    continue;
+                }
+                return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean isPlatformOwner(String owner) {
+        return owner != null && (owner.startsWith("java/") || owner.startsWith("javax/"));
+    }
+
+    private boolean definitelyNonNegativeField(MethodInfo method, ForwardOrigins.Result result,
+                                               ValueOrigin.FieldRead field, int allocationOffset) {
+        if (fieldDescriptor(field) == null) {
+            return false;
+        }
+        for (int branchOffset = 0; branchOffset < allocationOffset; branchOffset++) {
+            InsnFact branch = method.instructions().get(branchOffset);
+            if (branch.op() != Op.IFGE || branch.operands().isEmpty()) {
+                continue;
+            }
+            ForwardOrigins.State state = result.stateBefore().get(branchOffset);
+            if (state == null || state.stack().isEmpty()
+                    || !containsField(state.stack().get(state.stack().size() - 1).origins(), field)) {
+                continue;
+            }
+            int target = branch.jumpTarget();
+            if (target <= branchOffset || target > allocationOffset) {
+                continue;
+            }
+            boolean normalized = false;
+            for (int i = branchOffset + 1; i < target && i < method.instructions().size(); i++) {
+                InsnFact candidate = method.instructions().get(i);
+                if (candidate.op() == Op.PUTFIELD && sameField(candidate.fieldRef(), field)
+                        && multipliedByMinusOne(method, i, field)) {
+                    normalized = true;
+                    break;
+                }
+            }
+            if (!normalized || hasFieldWrite(method, target, allocationOffset, field)) {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean multipliedByMinusOne(MethodInfo method, int putOffset,
+                                                 ValueOrigin.FieldRead field) {
+        for (int i = Math.max(0, putOffset - 5); i < putOffset; i++) {
+            InsnFact insn = method.instructions().get(i);
+            if (insn.op() != Op.IMUL) {
+                continue;
+            }
+            boolean sawMinusOne = false;
+            boolean sawField = false;
+            for (int j = i - 1; j >= Math.max(0, i - 5); j--) {
+                InsnFact prior = method.instructions().get(j);
+                if (prior.op() == Op.GETFIELD && sameField(prior.fieldRef(), field)) {
+                    sawField = true;
+                }
+                if (isMinusOne(prior)) {
+                    sawMinusOne = true;
+                }
+            }
+            if (sawMinusOne && sawField) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isMinusOne(InsnFact insn) {
+        if (insn.op() == Op.ICONST_M1) {
+            return true;
+        }
+        return (insn.op() == Op.BIPUSH || insn.op() == Op.SIPUSH)
+                && !insn.operands().isEmpty() && insn.operands().get(0) instanceof Number n
+                && n.intValue() == -1;
+    }
+
+    private static boolean hasFieldWrite(MethodInfo method, int start, int end,
+                                         ValueOrigin.FieldRead field) {
+        for (int i = Math.max(0, start); i < Math.min(end, method.instructions().size()); i++) {
+            InsnFact insn = method.instructions().get(i);
+            if (insn.op().isFieldWrite() && sameField(insn.fieldRef(), field)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsField(Set<ValueOrigin> origins, ValueOrigin.FieldRead target) {
+        for (ValueOrigin origin : origins) {
+            if (origin instanceof ValueOrigin.FieldRead field && sameField(field, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean sameField(FieldRef ref, ValueOrigin.FieldRead field) {
+        return ref != null && ref.owner().equals(field.owner()) && ref.name().equals(field.field());
+    }
+
+    private static boolean sameField(ValueOrigin.FieldRead left, ValueOrigin.FieldRead right) {
+        return left.owner().equals(right.owner()) && left.field().equals(right.field())
+                && left.isStatic() == right.isStatic();
+    }
+
+    private boolean nullReceiverMayThrow(MethodInfo method, ForwardOrigins.Result result,
+                                         ForwardOrigins.State state, InsnFact insn) {
+        if (insn.op() == Op.ATHROW) {
+            return true;
+        }
+        Set<ValueOrigin> receivers = receiverOrigins(insn, state);
+        if (receivers.isEmpty()) {
+            return true;
+        }
+        for (ValueOrigin receiver : receivers) {
+            if (!definitelyNonNull(receiver, method, result)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean definitelyNonNull(ValueOrigin origin, MethodInfo method,
+                                      ForwardOrigins.Result result) {
+        if (isNullConstant(origin)) {
+            return false;
+        }
+        if (origin instanceof ValueOrigin.Constant) {
+            return true;
+        }
+        if (origin instanceof ValueOrigin.Insn allocation
+                && allocation.offset() >= 0 && allocation.offset() < method.instructions().size()) {
+            Op op = method.insnAt(allocation.offset()).op();
+            return op == Op.NEW || op == Op.NEWARRAY || op == Op.ANEWARRAY
+                    || op == Op.MULTIANEWARRAY;
+        }
+        if (origin instanceof ValueOrigin.CallResult call && call.callNodeId() >= 0) {
+            Node node = callNodes.get(call.callNodeId());
+            return node != null && "<init>".equals(node.strProp("name"));
+        }
+        if (origin instanceof ValueOrigin.FieldRead field && field.isStatic()) {
+            return staticFieldDefinitelyNonNull(field);
+        }
+        return false;
+    }
+
+    private static boolean isNullConstant(ValueOrigin origin) {
+        return origin instanceof ValueOrigin.Constant constant
+                && (constant.value() == null || "ACONST_NULL".equals(constant.value()));
+    }
+
+    private Integer arrayLength(ValueOrigin origin, MethodInfo method, ForwardOrigins.Result result) {
+        if (origin instanceof ValueOrigin.Insn allocation
+                && allocation.offset() >= 0 && allocation.offset() < method.instructions().size()) {
+            InsnFact insn = method.insnAt(allocation.offset());
+            if (insn.op() == Op.NEWARRAY || insn.op() == Op.ANEWARRAY) {
+                ForwardOrigins.State state = result.stateBefore().get(allocation.offset());
+                return state == null || state.stack().isEmpty() ? null
+                        : uniqueInteger(state.stack().get(state.stack().size() - 1).origins(), method);
+            }
+        }
+        if (origin instanceof ValueOrigin.FieldRead field && field.isStatic()) {
+            ClassInfo owner = hierarchy.classInfo(field.owner());
+            MethodInfo clinit = owner == null ? null : owner.method("<clinit>", "()V");
+            if (clinit == null) {
+                return null;
+            }
+            ForwardOrigins.Result clinitResult = origins.compute(clinit);
+            Set<ValueOrigin> writes = staticFieldWriteOrigins(field);
+            Integer length = null;
+            for (ValueOrigin value : writes) {
+                Integer candidate = arrayLength(value, clinit, clinitResult);
+                if (candidate == null || (length != null && !length.equals(candidate))) {
+                    return null;
+                }
+                length = candidate;
+            }
+            return length;
+        }
+        if (origin instanceof ValueOrigin.CallResult callResult
+                && callResult.callNodeId() >= 0) {
+            Node call = callNodes.get(callResult.callNodeId());
+            if (call != null && "java/lang/Class".equals(call.owner())) {
+                String className = classLiteralName(argOriginAtOrdinal(call, -1, result));
+                if (className != null) {
+                    return reflectiveArrayLength(className, call.name());
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Exact sizes for Class metadata arrays when the class model contains the target. */
+    private Integer reflectiveArrayLength(String className, String methodName) {
+        ClassInfo target = hierarchy.classInfo(className);
+        if (target == null) {
+            return null;
+        }
+        return switch (methodName) {
+            case "getInterfaces" -> target.interfaces().size();
+            case "getDeclaredFields" -> target.fields().size();
+            case "getDeclaredMethods" -> (int) target.methods().stream()
+                    .filter(m -> !"<init>".equals(m.name()) && !"<clinit>".equals(m.name()))
+                    .count();
+            case "getDeclaredConstructors" -> (int) target.methods().stream()
+                    .filter(m -> "<init>".equals(m.name())).count();
+            case "getConstructors" -> (int) target.methods().stream()
+                    .filter(m -> "<init>".equals(m.name())
+                            && java.lang.reflect.Modifier.isPublic(m.access())).count();
+            case "getFields" -> publicFieldCount(className);
+            case "getMethods" -> publicMethodCount(className);
+            case "getClasses", "getDeclaredClasses" -> nestedClassCount(className);
+            default -> null;
+        };
+    }
+
+    private int nestedClassCount(String className) {
+        int count = 0;
+        String prefix = className + "$";
+        Set<String> owners = new HashSet<>();
+        for (Node node : graph.nodesOfType(NodeType.METHOD)) {
+            String owner = node.strProp("owner");
+            if (owner != null && owner.startsWith(prefix)) {
+                owners.add(owner);
+            }
+        }
+        for (String owner : owners) {
+            ClassInfo nested = hierarchy.classInfo(owner);
+            if (nested != null && java.lang.reflect.Modifier.isPublic(nested.access())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private int publicFieldCount(String className) {
+        Set<String> signatures = new HashSet<>();
+        Deque<String> work = new ArrayDeque<>();
+        Set<String> seen = new HashSet<>();
+        work.add(className);
+        while (!work.isEmpty()) {
+            String current = work.removeFirst();
+            if (!seen.add(current)) {
+                continue;
+            }
+            ClassInfo cls = hierarchy.classInfo(current);
+            if (cls == null) {
+                continue;
+            }
+            for (io.just.sast.model.FieldInfo field : cls.fields()) {
+                if (java.lang.reflect.Modifier.isPublic(field.access())) {
+                    signatures.add(field.name());
+                }
+            }
+            if (cls.superName() != null) {
+                work.addLast(cls.superName());
+            }
+            work.addAll(cls.interfaces());
+        }
+        return signatures.size();
+    }
+
+    private int publicMethodCount(String className) {
+        Set<String> signatures = new HashSet<>();
+        Deque<String> work = new ArrayDeque<>();
+        Set<String> seen = new HashSet<>();
+        work.add(className);
+        while (!work.isEmpty()) {
+            String current = work.removeFirst();
+            if (!seen.add(current)) {
+                continue;
+            }
+            ClassInfo cls = hierarchy.classInfo(current);
+            if (cls == null) {
+                continue;
+            }
+            for (MethodInfo method : cls.methods()) {
+                if (java.lang.reflect.Modifier.isPublic(method.access())
+                        && !"<init>".equals(method.name()) && !"<clinit>".equals(method.name())) {
+                    signatures.add(method.name() + method.descriptor());
+                }
+            }
+            if (cls.superName() != null) {
+                work.addLast(cls.superName());
+            }
+            work.addAll(cls.interfaces());
+        }
+        return signatures.size();
+    }
+
+    private String fieldDescriptor(ValueOrigin.FieldRead field) {
+        String declaring = hierarchy.resolveField(field.owner(), field.field());
+        ClassInfo cls = hierarchy.classInfo(declaring == null ? field.owner() : declaring);
+        io.just.sast.model.FieldInfo info = cls == null ? null : cls.field(field.field());
+        return info == null ? null : info.descriptor();
+    }
+
+    private Integer staticFieldInteger(ValueOrigin.FieldRead field) {
+        Integer terminal = terminalStaticFieldInteger(field);
+        if (terminal != null) {
+            return terminal;
+        }
+        Integer value = null;
+        Set<ValueOrigin> writes = staticFieldWriteOrigins(field);
+        for (ValueOrigin origin : writes) {
+            Integer candidate = literalInteger(origin);
+            if (candidate == null || (value != null && !value.equals(candidate))) {
+                return null;
+            }
+            value = candidate;
+        }
+        if (writes.isEmpty()) {
+            String declaring = hierarchy.resolveField(field.owner(), field.field());
+            ClassInfo cls = hierarchy.classInfo(declaring == null ? field.owner() : declaring);
+            io.just.sast.model.FieldInfo info = cls == null ? null : cls.field(field.field());
+            if (info != null && info.constantValue() instanceof Number number) {
+                return number.intValue();
+            }
+            if (info != null && info.constantValue() instanceof Boolean bool) {
+                return bool ? 1 : 0;
+            }
+        }
+        return value;
+    }
+
+    /**
+     * Prefer a write that dominates every normal class-initializer exit.  Constant fields are
+     * often assigned more than once (default value, then the real initializer); unioning all
+     * writes would incorrectly turn the final value into "unknown".  A branch-specific final
+     * write does not dominate all exits and therefore still falls back conservatively.
+     */
+    private Integer terminalStaticFieldInteger(ValueOrigin.FieldRead field) {
+        ClassInfo owner = hierarchy.classInfo(field.owner());
+        MethodInfo clinit = owner == null ? null : owner.method("<clinit>", "()V");
+        if (clinit == null || clinit.instructions().size() > DOMINATOR_METHOD_LIMIT) {
+            return null;
+        }
+        // Class initializers often have an exception table covering constants and
+        // PUTSTATIC instructions. Those operations cannot throw the caught exception, so
+        // exceptional CFG edges for them must not obscure a normal final write.
+        DominatorIndex dominators = buildDominators(clinit, false);
+        ForwardOrigins.Result result = origins.compute(clinit);
+        List<Integer> exits = new ArrayList<>();
+        for (InsnFact insn : clinit.instructions()) {
+            if (insn.op().isReturn() && insn.op() != Op.ATHROW) {
+                exits.add(insn.offset());
+            }
+        }
+        if (exits.isEmpty()) {
+            return null;
+        }
+        InsnFact selected = null;
+        for (InsnFact write : clinit.instructions()) {
+            if (write.op() != Op.PUTSTATIC || !sameField(write.fieldRef(), field)) {
+                continue;
+            }
+            boolean dominatesAll = true;
+            for (Integer exit : exits) {
+                if (!dominates(dominators, write.offset(), exit)) {
+                    dominatesAll = false;
+                    break;
+                }
+            }
+            if (dominatesAll && (selected == null || write.offset() > selected.offset())) {
+                selected = write;
+            }
+        }
+        if (selected == null) {
+            return null;
+        }
+        ForwardOrigins.State state = result.stateBefore().get(selected.offset());
+        if (state == null || state.stack().isEmpty()) {
+            return null;
+        }
+        return uniqueInteger(state.stack().get(state.stack().size() - 1).origins(), clinit);
+    }
+
+    private boolean staticFieldDefinitelyNonNull(ValueOrigin.FieldRead field) {
+        Set<ValueOrigin> writes = staticFieldWriteOrigins(field);
+        if (writes.isEmpty()) {
+            return false;
+        }
+        for (ValueOrigin write : writes) {
+            if (isNullConstant(write)) {
+                return false;
+            }
+            if (write instanceof ValueOrigin.Insn allocation) {
+                ClassInfo owner = hierarchy.classInfo(field.owner());
+                MethodInfo clinit = owner == null ? null : owner.method("<clinit>", "()V");
+                if (clinit == null || allocation.offset() < 0
+                        || allocation.offset() >= clinit.instructions().size()) {
+                    return false;
+                }
+                Op op = clinit.insnAt(allocation.offset()).op();
+                if (op != Op.NEW && op != Op.NEWARRAY && op != Op.ANEWARRAY
+                        && op != Op.MULTIANEWARRAY) {
+                    return false;
+                }
+            } else if (!(write instanceof ValueOrigin.Constant)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Set<ValueOrigin> staticFieldWriteOrigins(ValueOrigin.FieldRead field) {
+        ClassInfo owner = hierarchy.classInfo(field.owner());
+        MethodInfo clinit = owner == null ? null : owner.method("<clinit>", "()V");
+        if (clinit == null) {
+            return Set.of();
+        }
+        ForwardOrigins.Result result = origins.compute(clinit);
+        Set<ValueOrigin> values = new HashSet<>();
+        for (InsnFact insn : clinit.instructions()) {
+            if (insn.op() != Op.PUTSTATIC || !sameField(insn.fieldRef(), field)) {
+                continue;
+            }
+            ForwardOrigins.State state = result.stateBefore().get(insn.offset());
+            if (state == null || state.stack().isEmpty()) {
+                return Set.of();
+            }
+            values.addAll(state.stack().get(state.stack().size() - 1).origins());
+        }
+        return values;
+    }
+
+    private static String internalClassName(String descriptor) {
+        if (descriptor == null) {
+            return null;
+        }
+        if (descriptor.startsWith("L") && descriptor.endsWith(";")) {
+            return descriptor.substring(1, descriptor.length() - 1);
+        }
+        // ASM TypeInsnNode/ANEWARRAY carries an internal name, while LDC and
+        // MultiANewArray use descriptors.  Accept both representations at the
+        // model boundary; rejecting the raw internal name loses array-store proofs.
+        if (descriptor.indexOf('/') >= 0 && !descriptor.startsWith("[")) {
+            return descriptor;
+        }
+        return null;
     }
 
     /** 该调用是否可能抛出 caughtType（受检反射族）。 */
@@ -840,8 +3769,15 @@ public final class OriginSupport {
             case "java/lang/ClassNotFoundException" ->
                     "forName".equals(ref.name()) && hierarchy.classInfo(lookupName.replace('.', '/')) != null;
             case "java/lang/NoSuchFieldException" -> target != null && target.field(lookupName) != null;
-            case "java/lang/NoSuchMethodException" ->
-                    target != null && target.methods().stream().anyMatch(m -> m.name().equals(lookupName));
+            case "java/lang/NoSuchMethodException" -> {
+                // Class.getMethod/getDeclaredMethod resolve by name *and parameter
+                // types*.  A name-only proof incorrectly removed the catch for
+                // getMethod("doMethod", String.class) when only doMethod(int) existed.
+                String parameterDescriptor = reflectiveParameterDescriptor(method, insn, ref);
+                yield target != null && parameterDescriptor != null
+                        && reflectiveMethodExists(classConst, lookupName, parameterDescriptor,
+                        "getMethod".equals(ref.name()), "getMethod".equals(ref.name()));
+            }
             case "java/lang/IllegalAccessException" -> {
                 if (target == null || !noSetAccessible || target.isInterface()
                         || !java.lang.reflect.Modifier.isPublic(target.access())) {
@@ -858,6 +3794,180 @@ public final class OriginSupport {
                             && !java.lang.reflect.Modifier.isAbstract(target.access());
             default -> false;
         };
+    }
+
+    /** Whether a sink offset belongs to this precise exception handler block. */
+    private static boolean sinkInHandlerRegion(MethodInfo method,
+                                               io.just.sast.model.TryCatchFact target,
+                                               int sinkOffset) {
+        int handler = target.handler();
+        if (sinkOffset < handler || handler < 0 || handler >= method.instructions().size()) {
+            return false;
+        }
+        int end = method.instructions().size();
+        for (io.just.sast.model.TryCatchFact other : method.tryCatch()) {
+            if (other.handler() > handler && other.handler() < end) {
+                end = other.handler();
+            }
+        }
+        for (int offset = handler; offset < end; offset++) {
+            Op op = method.instructions().get(offset).op();
+            if (offset > handler && (op == Op.GOTO || op.isReturn() || op == Op.ATHROW)) {
+                end = offset;
+                break;
+            }
+        }
+        return sinkOffset < end;
+    }
+
+    /** Exact Class[] argument descriptor for a Class reflective lookup. */
+    private String reflectiveParameterDescriptor(MethodInfo method,
+                                                 io.just.sast.model.InsnFact insn,
+                                                 io.just.sast.model.MethodRef ref) {
+        if (!"java/lang/Class".equals(ref.owner())) {
+            return null;
+        }
+        int ordinal;
+        if ("getMethod".equals(ref.name()) || "getDeclaredMethod".equals(ref.name())) {
+            ordinal = 1;
+        } else if ("getConstructor".equals(ref.name()) || "getDeclaredConstructor".equals(ref.name())) {
+            ordinal = 0;
+        } else {
+            return null;
+        }
+        Node call = graph.findCallNode(methodKey(method), insn.offset());
+        if (call == null) {
+            return null;
+        }
+        ForwardOrigins.Result result = origins.compute(method);
+        Set<ValueOrigin> arrays = argOriginAtOrdinal(call, ordinal, result);
+        for (ValueOrigin array : arrays) {
+            Map<Integer, Set<ValueOrigin>> indexed = result.indexedArrayElements().get(array);
+            if (indexed != null && !indexed.isEmpty()) {
+                int max = indexed.keySet().stream().mapToInt(Integer::intValue).max().orElse(-1);
+                StringBuilder descriptor = new StringBuilder("(");
+                for (int index = 0; index <= max; index++) {
+                    Set<ValueOrigin> values = indexed.get(index);
+                    if (values == null || values.size() != 1) {
+                        descriptor = null;
+                        break;
+                    }
+                    String type = classDescriptor(values.iterator().next());
+                    if (type == null) {
+                        descriptor = null;
+                        break;
+                    }
+                    descriptor.append(type);
+                }
+                if (descriptor != null) {
+                    return descriptor.append(")V").toString();
+                }
+            }
+            // new Class<?>[0] has no AASTORE entry.  Recover the zero-length
+            // signature from the allocation's exact pre-state without guessing
+            // non-zero lengths.
+            if (array instanceof ValueOrigin.Insn allocation) {
+                io.just.sast.model.InsnFact allocationInsn = method.insnAt(allocation.offset());
+                if (allocationInsn.op() == Op.ANEWARRAY || allocationInsn.op() == Op.NEWARRAY) {
+                    ForwardOrigins.State state = result.stateBefore().get(allocation.offset());
+                    Integer length = state == null || state.stack().isEmpty() ? null
+                            : constantInt(state.stack().get(state.stack().size() - 1).origins());
+                    if (length != null && length == 0) {
+                        return "()V";
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Resolve a Method by parameter types, optionally including inherited public methods. */
+    private boolean reflectiveMethodExists(String owner, String name, String parameterDescriptor,
+                                           boolean includeInherited, boolean publicOnly) {
+        if (owner == null || name == null || parameterDescriptor == null) {
+            return false;
+        }
+        Deque<String> work = new ArrayDeque<>();
+        Set<String> seen = new HashSet<>();
+        work.add(owner);
+        while (!work.isEmpty()) {
+            String current = work.removeFirst();
+            if (!seen.add(current)) {
+                continue;
+            }
+            ClassInfo cls = hierarchy.classInfo(current);
+            if (cls == null) {
+                continue;
+            }
+            for (MethodInfo candidate : cls.methods()) {
+                if (candidate.name().equals(name)
+                        && parameterPrefix(candidate.descriptor()).equals(parameterPrefix(parameterDescriptor))
+                        && (!publicOnly || java.lang.reflect.Modifier.isPublic(candidate.access()))) {
+                    return true;
+                }
+            }
+            if (!includeInherited) {
+                break;
+            }
+            if (cls.superName() != null) {
+                work.addLast(cls.superName());
+            }
+            work.addAll(hierarchy.transitiveInterfaces(current));
+        }
+        return false;
+    }
+
+    private static String parameterPrefix(String descriptor) {
+        int close = descriptor == null ? -1 : descriptor.indexOf(')');
+        return close < 0 ? "" : descriptor.substring(0, close + 1);
+    }
+
+    private static String classDescriptor(ValueOrigin origin) {
+        if (origin instanceof ValueOrigin.Constant constant
+                && constant.value() instanceof io.just.sast.model.TypeRef type) {
+            return type.descriptor();
+        }
+        if (origin instanceof ValueOrigin.FieldRead field && field.isStatic()
+                && "TYPE".equals(field.field())) {
+            return switch (field.owner()) {
+                case "java/lang/Boolean" -> "Z";
+                case "java/lang/Byte" -> "B";
+                case "java/lang/Character" -> "C";
+                case "java/lang/Short" -> "S";
+                case "java/lang/Integer" -> "I";
+                case "java/lang/Long" -> "J";
+                case "java/lang/Float" -> "F";
+                case "java/lang/Double" -> "D";
+                case "java/lang/Void" -> "V";
+                default -> null;
+            };
+        }
+        return null;
+    }
+
+    private static Integer constantInt(Set<ValueOrigin> origins) {
+        for (ValueOrigin origin : origins) {
+            if (!(origin instanceof ValueOrigin.Constant constant)) {
+                continue;
+            }
+            Object value = constant.value();
+            if (value instanceof Number number) {
+                return number.intValue();
+            }
+            if (value instanceof String opcode) {
+                return switch (opcode) {
+                    case "ICONST_M1" -> -1;
+                    case "ICONST_0" -> 0;
+                    case "ICONST_1" -> 1;
+                    case "ICONST_2" -> 2;
+                    case "ICONST_3" -> 3;
+                    case "ICONST_4" -> 4;
+                    case "ICONST_5" -> 5;
+                    default -> null;
+                };
+            }
+        }
+        return null;
     }
 
     /** 值来源集合的声明类型（一致时返回，分歧返回 null）。 */
@@ -978,8 +4088,8 @@ public final class OriginSupport {
 
     /** ObjectInputStream 读调用（反序列化数据源，无条件可控）。 */
     public static boolean isOisRead(Node call) {
-        String owner = call.strProp("owner");
-        String name = call.strProp("name");
+        String owner = call.owner();
+        String name = call.name();
         return "java/io/ObjectInputStream".equals(owner)
                 && (name.equals("readObject") || name.equals("readUnshared") || name.equals("readFields"));
     }
@@ -1006,7 +4116,7 @@ public final class OriginSupport {
 
     /** CALL 节点所在方法的键。 */
     public static String methodKey(Node call) {
-        return methodKeyOf(call.strProp("methodOwner"), call.strProp("methodName"), call.strProp("methodDesc"));
+        return methodKeyOf(call.methodOwner(), call.methodName(), call.methodDescriptor());
     }
 
     public static String methodKeyOf(String owner, String name, String desc) {

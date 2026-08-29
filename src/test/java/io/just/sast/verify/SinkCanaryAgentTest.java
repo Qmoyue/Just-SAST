@@ -45,6 +45,29 @@ class SinkCanaryAgentTest {
         return cw.toByteArray();
     }
 
+    /** 用 ASM 生成一个真实的 invokevirtual sink 调用点，覆盖应用类加载期插桩。 */
+    private byte[] callSiteClass(String internalName) {
+        ClassWriter cw = new ClassWriter(0);
+        cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, internalName, null,
+                "java/lang/Object", null);
+        var mv = cw.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "caller",
+                "()V", null, null);
+        mv.visitCode();
+        mv.visitTypeInsn(Opcodes.NEW, "javax/naming/InitialContext");
+        mv.visitInsn(Opcodes.DUP);
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "javax/naming/InitialContext", "<init>",
+                "()V", false);
+        mv.visitLdcInsn("CHAIN_OK");
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "javax/naming/InitialContext", "lookup",
+                "(Ljava/lang/String;)Ljava/lang/Object;", false);
+        mv.visitInsn(Opcodes.POP);
+        mv.visitInsn(Opcodes.RETURN);
+        mv.visitMaxs(2, 0);
+        mv.visitEnd();
+        cw.visitEnd();
+        return cw.toByteArray();
+    }
+
     /** 统计字节码中对 SinkCanaryGate.hit 的调用次数。 */
     private int gateCallCount(byte[] bytes) {
         AtomicBoolean found = new AtomicBoolean(false);
@@ -93,6 +116,18 @@ class SinkCanaryAgentTest {
                 simpleClass("t/Sink", "clean"));
         assertNotNull(rewritten);
         assertEquals(0, gateCallCount(rewritten), "非 sink 方法不得注入门卫调用");
+    }
+
+    @Test
+    void transformerInjectsGateAtApplicationCallSite() {
+        var transformer = new SinkCanaryAgent.CanaryTransformer(
+                Map.of("javax/naming/InitialContext",
+                        Set.of("lookup#(Ljava/lang/String;)Ljava/lang/Object;")));
+        byte[] injected = transformer.transform(null, "t/Caller", null, null,
+                callSiteClass("t/Caller"));
+
+        assertNotNull(injected, "应用类中的 sink 调用点应被插桩");
+        assertEquals(1, gateCallCount(injected), "InitialContext.lookup 调用点应有门卫调用");
     }
 
     @Test

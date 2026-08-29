@@ -25,13 +25,15 @@ class JrtExternalMountTest {
         ClassInfo object = jrt.load("java/lang/Object");
         assertNotNull(object, "外部挂载应能读 java/lang/Object");
         assertEquals("java/lang/Object", object.internalName());
+        assertNotNull(jrt.load("com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"),
+                "反序列化相关的 TemplatesImpl 位于 java.xml，模块切片不能遗漏");
         assertTrue(jrt.listAll(JrtClassSource.DESER_MODULES).size() > 1000,
                 "全量枚举模块类应达到千级");
     }
 
     @Test
     void crossVersionImageReflectsTargetNotRuntime() throws Exception {
-        // 例：-Djust.test.jdk=C:/Users/29263/.jabba/jdk/temurin@11.0.31
+        // 例：-Djust.test.jdk=C:/path/to/jdk/temurin@11.0.31
         String jdk = System.getProperty("just.test.jdk");
         Assumptions.assumeTrue(jdk != null, "仅当提供 -Djust.test.jdk 时验证跨版本挂载");
         Path home = Path.of(jdk);

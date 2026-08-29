@@ -101,6 +101,7 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                     chains += emitChains(sinkCall, machinery, callsByMethod);
                     if (chains >= MAX_CHAINS) {
                         JustLogger.info("OIS 回调：达到链数上限 {}", MAX_CHAINS);
+                        bb.markIncomplete("OIS_CALLBACK_CHAIN_CAP:" + MAX_CHAINS);
                         return;
                     }
                 }
@@ -112,7 +113,7 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
     /** 重写了回调方法的 OIS 子类（resolveMethod 指向子类自身）。 */
     private List<String> overriders(Callback callback) {
         List<String> result = new ArrayList<>();
-        for (String sub : bb.hierarchy().loadedSubtypes(OIS)) {
+        for (String sub : bb.hierarchy().transitiveSubtypes(OIS)) {
             if (sub.equals(bb.hierarchy().resolveMethod(sub, callback.name(), callback.desc()))) {
                 result.add(sub);
             }
@@ -271,6 +272,7 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
         Rule.SinkRule rule = bb.ruleEngine().matchingSink(sinkCall).orElseThrow();
         Node startNode = machineryStart();
         String readName = startNode.strProp("name");
+        String readDesc = startNode.strProp("desc");
         int produced = 0;
         Set<String> hosts = new HashSet<>();
         for (Edge edge : startNode.in()) {
@@ -282,6 +284,7 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                 continue;
             }
             if (hosts.size() > MAX_HOSTS_PER_RESOLVER) {
+                bb.markIncomplete("OIS_CALLBACK_HOST_CAP:" + MAX_HOSTS_PER_RESOLVER);
                 break;
             }
             if (inlinePlainStream(host, edge.from())) {
@@ -295,23 +298,28 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                         HopKind.DIRECT_CALL, null, "call", host.descriptor(), null));
             }
             forward.add(0, new ChainHop(host.owner(), host.name(), OIS, readName,
-                    HopKind.DIRECT_CALL, null, "call", "()Ljava/lang/Object;", null));
+                    HopKind.DIRECT_CALL, null, "call", readDesc, null));
             List<ChainHop> hops = new ArrayList<>(forward);
             java.util.Collections.reverse(hops);
             hops.add(new ChainHop(entry.owner(), entry.name(), entry.owner(), entry.name(),
                     HopKind.ENTRY, null, entry.kind(), entry.desc(), null));
             Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
                     entry.owner(), entry.name(), entry.kind(),
-                    sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0);
+                    sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"));
             produced += bb.addChain(chain) ? 1 : 0;
         }
         return produced;
     }
 
-    /** 机制起跳点：OIS.readObject（无则退 readUnshared）。 */
+    /** 机制起跳点：OIS.readObject（无则退 readUnshared/readFields）。 */
     private Node machineryStart() {
         Node read = bb.graph().findMethodNode(OIS, "readObject", "()Ljava/lang/Object;");
-        return read != null ? read : bb.graph().findMethodNode(OIS, "readUnshared", "()Ljava/lang/Object;");
+        if (read != null) {
+            return read;
+        }
+        read = bb.graph().findMethodNode(OIS, "readUnshared", "()Ljava/lang/Object;");
+        return read != null ? read : bb.graph().findMethodNode(OIS, "readFields",
+                "()Ljava/io/ObjectInputStream$GetField;");
     }
 
     private record EntryRef(String owner, String name, String kind, String desc) {}

@@ -115,6 +115,7 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                     chains++;
                     if (chains >= MAX_CHAINS) {
                         JustLogger.warn("框架桥接：达到链数上限 {}，剩余入口未处理", MAX_CHAINS);
+                        bb.markIncomplete("FRAMEWORK_CHAIN_CAP:" + MAX_CHAINS);
                         break outer;
                     }
                 }
@@ -153,6 +154,9 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                 }
             }
             depth++;
+        }
+        if (!work.isEmpty()) {
+            bb.markIncomplete("FRAMEWORK_DEPTH_CAP:" + MAX_DEPTH);
         }
         return null;
     }
@@ -228,7 +232,7 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                 HopKind.ENTRY, null, bridge, entryMethod.descriptor(), null));
         return new Chain(rule.id(), rule.category(), rule.severity(),
                 entryMethod.owner(), entryMethod.name(), bridge,
-                sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0);
+                sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"));
     }
 
     private static String packagePrefix(String internalName, int segments) {

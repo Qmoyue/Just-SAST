@@ -140,6 +140,34 @@ class EngineCapabilityTest {
     }
 
     @Test
+    void directCapturedLambdaCallReachesImplementation(@TempDir Path tmp) throws Exception {
+        String gadget = """
+                package app;
+                public class DirectLambdaGadget implements java.io.Serializable {
+                    private String cmd;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        java.util.function.Consumer<String> consumer = value -> {
+                            try {
+                                Runtime.getRuntime().exec(value);
+                            } catch (Exception ignored) {
+                            }
+                        };
+                        consumer.accept(this.cmd);
+                        in.defaultReadObject();
+                    }
+                }
+                """;
+        Path jar = compileToJar(tmp.resolve("direct-lambda.jar"),
+                Map.of("app.DirectLambdaGadget", gadget));
+        Path out = tmp.resolve("out");
+        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        String findings = Files.readString(out.resolve("findings.csv"));
+        assertTrue(findings.contains("app/DirectLambdaGadget,readObject")
+                        && findings.contains("java/lang/Runtime,exec"),
+                "直接调用捕获 this 的 lambda 时，污点应映射到 synthetic 实现方法:\n" + findings);
+    }
+
+    @Test
     void reflectiveLookupWithoutFrameworkKeepsNoPathPruning(@TempDir Path tmp) throws Exception {
         // 无框架类在 classpath：app 内的常量类反射查找不得触发"框架反射供给"（历史缺陷：门恒开，
         // 全应用 public 方法入闭包，NO_PATH 剪枝失效）

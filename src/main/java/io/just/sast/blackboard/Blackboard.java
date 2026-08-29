@@ -16,6 +16,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 黑板 = CPG 图 + 链产物 + 校准记录 + 链注释 + 事件队列。
@@ -27,9 +28,19 @@ public final class Blackboard {
 
     /** 扫描输入（管线编排期注入；知识源经黑板读取，无全局属性通道）。 */
     public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                             int verifyBudget) {
+                             int verifyBudget, Path jdkHome, int targetMajorVersion) {
+        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
+                          int verifyBudget) {
+            this(target, deps, fast, verify, verifyBudget, null, 0);
+        }
+
+        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
+                          int verifyBudget, Path jdkHome) {
+            this(target, deps, fast, verify, verifyBudget, jdkHome, 0);
+        }
+
         public static ScanInputs fastDefault(Path target) {
-            return new ScanInputs(target, List.of(), true, true, 20);
+            return new ScanInputs(target, List.of(), true, true, 20, null, 0);
         }
     }
 
@@ -52,6 +63,12 @@ public final class Blackboard {
     private final Map<String, String> chainCalibrations = new HashMap<>();
     /** 链级注释（按链 key 归属，如 gadget 模式标注），报告层输出。 */
     private final Map<String, List<String>> chainNotes = new HashMap<>();
+    /** 扫描完整性边界：分析器触顶/跳过的稳定原因码，供统计与报告层消费。 */
+    private final Set<String> completenessReasons = ConcurrentHashMap.newKeySet();
+    /** 动态验证能力的实际状态；不把“请求了验证”冒充成“子 JVM 已安全启动”。 */
+    private volatile String verificationStatus = "NOT_RUN";
+    /** 动态验证正式产物；报告层不得从 stderr 重新推断验证结果。 */
+    private volatile VerificationSummary verificationSummary = VerificationSummary.empty("NOT_RUN", 0);
     private final Deque<Event> queue = new ArrayDeque<>();
 
     public Blackboard(Graph graph, ClassHierarchy hierarchy, FieldWriterIndex fieldWriters,
@@ -110,8 +127,17 @@ public final class Blackboard {
         return false;
     }
 
-    public List<Chain> chains() {
-        return chains;
+    public synchronized List<Chain> chains() {
+        return List.copyOf(chains);
+    }
+
+    /**
+     * Freeze the insertion-order race from parallel analysis before a later phase consumes
+     * chains.  Analysis workers may discover equivalent paths in different orders, while
+     * composition/calibration have finite caps and therefore need one stable input order.
+     */
+    synchronized void sortChainsForPhase() {
+        chains.sort(java.util.Comparator.comparing(Chain::key));
     }
 
     // ---- sink 裁决 ----
@@ -121,7 +147,7 @@ public final class Blackboard {
     }
 
     public Map<Long, SinkOutcome> sinkOutcomes() {
-        return sinkOutcomes;
+        return Map.copyOf(sinkOutcomes);
     }
 
     // ---- 校准与注释 ----
@@ -135,11 +161,40 @@ public final class Blackboard {
     }
 
     public Map<String, String> chainCalibrations() {
-        return chainCalibrations;
+        return Map.copyOf(chainCalibrations);
     }
 
     public int calibrationCount() {
         return chainCalibrations.size();
+    }
+
+    /** 记录一次可能导致结果欠完备的分析边界；同一原因只保留一次。 */
+    public void markIncomplete(String reason) {
+        if (reason != null && !reason.isBlank()) {
+            completenessReasons.add(reason);
+        }
+    }
+
+    public Set<String> completenessReasons() {
+        return Set.copyOf(completenessReasons);
+    }
+
+    public void setVerificationStatus(String status) {
+        verificationStatus = status == null || status.isBlank() ? "UNKNOWN" : status;
+    }
+
+    public String verificationStatus() {
+        return verificationStatus;
+    }
+
+    public void setVerificationSummary(VerificationSummary summary) {
+        verificationSummary = summary == null
+                ? VerificationSummary.empty(verificationStatus, scanInputs.verifyBudget()) : summary;
+        verificationStatus = verificationSummary.capability();
+    }
+
+    public VerificationSummary verificationSummary() {
+        return verificationSummary;
     }
 
     /** 链级注释（gadget 模式标注等），附着到具体链 key。 */
@@ -149,7 +204,7 @@ public final class Blackboard {
 
     public List<String> chainNotesOf(String chainKey) {
         List<String> list = chainNotes.get(chainKey);
-        return list != null ? list : List.of();
+        return list != null ? List.copyOf(list) : List.of();
     }
 
     // ---- 事件 ----

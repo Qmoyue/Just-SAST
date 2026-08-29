@@ -7,7 +7,16 @@ just-out/
 *.log
 dependency-reduced-pom.xml
 benchmark/
+# Local development notes are not release documentation.
 docs/development.md
 .agents/
 /just-sast-*.jar
 just-fragments.ser
+
+# Local evaluator snapshots and one-off scan evidence.
+/*-current.txt
+/*.eval.txt
+*.hprof
+*.jfr
+*.dump
+*.pid

@@ -486,6 +486,19 @@ rules:
       call: { owner: "java/util/List", name: "get" }
     actions: { return: [this] }
 
+  # Deque/LinkedList end extraction is a common object-graph carrier.  The type-based
+  # matcher also covers concrete implementations without enumerating library classes.
+  - id: MODEL-DEQUE-GETLAST
+    kind: model
+    match:
+      call: { owner: "java/util/Deque", name: "getLast" }
+    actions: { return: [this] }
+  - id: MODEL-DEQUE-PEEKLAST
+    kind: model
+    match:
+      call: { owner: "java/util/Deque", name: "peekLast" }
+    actions: { return: [this] }
+
   - id: MODEL-SET-ADD
     kind: model
     match:

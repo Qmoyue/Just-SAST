@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -59,12 +60,15 @@ public final class SarifReporter {
         sb.append("    \"results\": [");
         List<String> results = new ArrayList<>();
         Set<String> seen = new HashSet<>();
-        for (Chain chain : chains) {
+        List<Chain> orderedChains = new ArrayList<>(chains);
+        orderedChains.sort(Comparator.comparingInt((Chain c) -> hasConfirmedNote(notes, c) ? 0 : 1)
+                .thenComparingInt(c -> c.hops().size()).thenComparing(Chain::key));
+        for (Chain chain : orderedChains) {
             if (calibrations.containsKey(chain.key())) {
                 continue;
             }
             String ruleId = chain.ruleId() != null ? chain.ruleId() : "unknown";
-            if (!seen.add(ruleId + "|" + chain.entryClass() + "|" + chain.sinkClass())) {
+            if (!seen.add(resultIdentity(chain, ruleId))) {
                 continue; // 同组变体只报一次（与 findings.csv 折叠口径一致）
             }
             List<String> chainNotes = notes.getOrDefault(chain.key(), List.of());
@@ -73,6 +77,9 @@ public final class SarifReporter {
             String message = escape(chain.entryKind() + " → " + chain.sinkClass().replace('/', '.')
                     + "." + chain.sinkMethod());
             String props = "\"confidence\":\"" + escape(confidence) + "\""
+                    + ",\"entry_kind\":\"" + escape(chain.entryKind()) + "\""
+                    + ",\"entry_descriptor\":\"" + escape(entryDescriptor(chain)) + "\""
+                    + ",\"sink_descriptor\":\"" + escape(sinkDescriptor(chain)) + "\""
                     + ",\"unresolved_hops\":" + chain.unresolvedHops()
                     + ",\"chain_length\":" + chain.hops().size();
             if (!chainNotes.isEmpty()) {
@@ -80,7 +87,7 @@ public final class SarifReporter {
             }
             results.add("\n      {\n"
                     + "        \"ruleId\": \"" + escape(ruleId) + "\",\n"
-                    + "        \"level\": \"" + ("HIGH".equals(chain.severity()) ? "error" : "warning") + "\",\n"
+                    + "        \"level\": \"" + ("HIGH".equals(chain.severity()) || "CRITICAL".equals(chain.severity()) ? "error" : "warning") + "\",\n"
                     + "        \"message\": {\"text\": \"" + message + "\"},\n"
                     + "        \"locations\": [{\n"
                     + "          \"physicalLocation\": {\n"
@@ -119,7 +126,7 @@ public final class SarifReporter {
 
     /** PR 去重指纹：rule×入口×sink 的稳定摘要（路径变体不产生新指纹）。 */
     private static String fingerprint(Chain chain, String ruleId) {
-        String src = ruleId + "|" + chain.entryClass() + "|" + chain.sinkClass();
+        String src = resultIdentity(chain, ruleId);
         try {
             byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
                     .digest(src.getBytes(StandardCharsets.UTF_8));
@@ -151,8 +158,45 @@ public final class SarifReporter {
     }
 
     private static String escape(String s) {
+        if (s == null) {
+            return "";
+        }
         return s.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+    }
+
+    private static boolean hasConfirmedNote(Map<String, List<String>> notes, Chain chain) {
+        return notes.getOrDefault(chain.key(), List.of()).stream()
+                .anyMatch(n -> n.startsWith("verify:confirmed") || n.equals("verify:segment-confirmed"));
+    }
+
+    private static String resultIdentity(Chain chain, String ruleId) {
+        return ruleId + "|" + chain.category() + "|" + chain.entryClass() + "|" + chain.entryMethod()
+                + "|" + entryDescriptor(chain) + "|" + chain.entryKind()
+                + "|" + chain.sinkClass() + "|" + chain.sinkMethod()
+                + "|" + sinkDescriptor(chain);
+    }
+
+    private static String entryDescriptor(Chain chain) {
+        for (ChainHop hop : chain.hops()) {
+            if (hop.kind() == HopKind.ENTRY && hop.desc() != null) {
+                return hop.desc();
+            }
+        }
+        return "";
+    }
+
+    private static String sinkDescriptor(Chain chain) {
+        if (chain.sinkDescriptor() != null && !chain.sinkDescriptor().isEmpty()) {
+            return chain.sinkDescriptor();
+        }
+        for (ChainHop hop : chain.hops()) {
+            if (chain.sinkClass().equals(hop.toOwner()) && chain.sinkMethod().equals(hop.toName())
+                    && hop.desc() != null && !hop.desc().isEmpty()) {
+                return hop.desc();
+            }
+        }
+        return "";
     }
 
     private static String jsonArray(List<String> items) {

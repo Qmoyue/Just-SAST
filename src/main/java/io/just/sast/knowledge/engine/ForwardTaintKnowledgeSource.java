@@ -1,5 +1,6 @@
 package io.just.sast.knowledge.engine;
 
+import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
@@ -43,5 +44,8 @@ public final class ForwardTaintKnowledgeSource implements KnowledgeSource {
         ForwardEngine engine = new ForwardEngine(bb);
         engine.run(ForwardEngine.Options.coarse());
         engine.run(ForwardEngine.Options.refined());
+        if (bb.originSupport().constantProofBudgetExceeded()) {
+            bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
+        }
     }
 }

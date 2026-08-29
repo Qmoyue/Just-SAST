@@ -38,30 +38,54 @@ public final class ClassHierarchy {
             new java.util.concurrent.ConcurrentHashMap<>();
     /** 传递子类型闭包缓存（调用图与引擎侧展开共用同一来源，避免直接/传递口径分叉）。 */
     private final Map<String, List<String>> transitiveSubtypesCache = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 类的传递接口缓存；同一类的每个方法都会查询一次接口反向分发，必须跨方法复用。 */
+    private final Map<String, List<String>> transitiveInterfacesCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 单调层次版本：JDK 懒加载补充一个类型后，调用方缓存的分派候选必须重新验证。
+     * 初始目标类集合是冻结的，因而只有成功懒加载时才递增。
+     */
+    private volatile long revision;
 
     public ClassHierarchy(Map<String, ClassInfo> initial, JdkClassSource jdk) {
         this.classes = new java.util.concurrent.ConcurrentHashMap<>(initial);
         this.jdk = jdk;
-        for (ClassInfo c : initial.values()) {
-            indexSubtypes(c);
-        }
+        // The input map is often a LinkedHashMap, but tests and extension points are free to
+        // provide a HashMap.  Subtype indexing is semantically a set operation; making its
+        // seed order explicit prevents HashMap iteration order from leaking into dispatch
+        // candidates and, ultimately, finite path budgets.
+        initial.values().stream()
+                .sorted(java.util.Comparator.comparing(ClassInfo::internalName))
+                .forEach(this::indexSubtypes);
     }
 
     private void indexSubtypes(ClassInfo c) {
         if (c.superName() != null) {
-            directSubtypes.computeIfAbsent(c.superName(),
-                    k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c.internalName());
+            addDirectSubtype(c.superName(), c.internalName());
         }
         for (String itf : c.interfaces()) {
-            directSubtypes.computeIfAbsent(itf,
-                    k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c.internalName());
+            addDirectSubtype(itf, c.internalName());
+        }
+    }
+
+    /**
+     * Initial hierarchy construction is ordered and lazy JDK loading is serialized by the
+     * ClassHierarchy monitor.  A synchronized ArrayList therefore gives readers a stable
+     * snapshot without CopyOnWriteArrayList's full-array copy on every subtype insertion;
+     * the latter created a large transient allocation cliff for generated polymorphism jars.
+     */
+    private void addDirectSubtype(String parent, String child) {
+        List<String> children = directSubtypes.computeIfAbsent(parent,
+                ignored -> new ArrayList<>());
+        synchronized (children) {
+            children.add(child);
         }
     }
 
     /** 取类信息，未知类走 JDK 懒加载；确认缺失的类负缓存（来源集合不变，结果稳定）。懒加载段同步（并发下防重复探测/结构破坏）。 */
     public ClassInfo classInfo(String internalName) {
         ClassInfo c = classes.get(internalName);
-        if (c != null || jdk == null || !unresolvable.add(internalName)) {
+        if (c != null || jdk == null) {
             return c;
         }
         synchronized (this) {
@@ -69,23 +93,35 @@ public final class ClassHierarchy {
             if (c != null) {
                 return c;
             }
+            // 负缓存的检查和 JDK 加载必须在同一临界区内完成。否则第二个并发
+            // 调用者会看到 add=false 并直接返回 null，而第一个调用者仍在加载。
+            if (!unresolvable.add(internalName)) {
+                return null;
+            }
             c = jdk.load(internalName);
             if (c != null) {
                 classes.put(internalName, c);
                 indexSubtypes(c);
                 unresolvable.remove(internalName);
-                // B4 增量失效：只清除包含新类名的条目（大语料懒加载时避免全量清缓存 O(n^2)）
-                String newName = c.internalName();
-                subtypeCache.keySet().removeIf(k -> k.contains(newName));
-                resolveCache.keySet().removeIf(k -> k.contains(newName));
-                implementersCache.keySet().removeIf(k -> k.interfaceName().contains(newName));
-                // 传递闭包缓存：新类的全部祖先的闭包获得新成员——按祖先键失效
-                for (String anc : ancestorsOf(newName)) {
-                    transitiveSubtypesCache.remove(anc);
-                }
+                // JDK 懒加载会改变整个可解析关系图：新类既可能是已知类型的子类，
+                // 也可能补齐一个此前不可解析的父类/接口。仅按 key 字符串做局部失效
+                // 会漏掉“已缓存的负 resolve/subtype 结果”（例如 Child -> MissingBase），
+                // 进而把合法分派链永久当成不存在。扫描构建阶段只会加载有限的 JDK
+                // 切片；这里选择一次性清除所有派生缓存，以完整性优先，避免陈旧快照。
+                subtypeCache.clear();
+                resolveCache.clear();
+                implementersCache.clear();
+                transitiveSubtypesCache.clear();
+                transitiveInterfacesCache.clear();
+                revision++;
             }
         }
         return c;
+    }
+
+    /** 当前类层次快照版本；用于跨调用点复用分派候选而不读取陈旧的懒加载结果。 */
+    public long revision() {
+        return revision;
     }
 
     public int classCount() {
@@ -95,7 +131,18 @@ public final class ClassHierarchy {
     /** 已加载类中 name 的直接子类型。 */
     public List<String> loadedSubtypes(String internalName) {
         List<String> list = directSubtypes.get(internalName);
-        return list != null ? list : List.of();
+        if (list == null || list.isEmpty()) {
+            return List.of();
+        }
+        List<String> stable;
+        synchronized (list) {
+            if (list.size() == 1) {
+                return List.copyOf(list);
+            }
+            stable = new ArrayList<>(list);
+        }
+        stable.sort(String::compareTo);
+        return List.copyOf(stable);
     }
 
     /**
@@ -121,7 +168,9 @@ public final class ClassHierarchy {
                 work.add(sub);
             }
         }
-        List<String> frozen = List.copyOf(result);
+        List<String> frozen = new ArrayList<>(result);
+        frozen.sort(String::compareTo);
+        frozen = List.copyOf(frozen);
         transitiveSubtypesCache.put(internalName, frozen);
         return frozen;
     }
@@ -130,10 +179,7 @@ public final class ClassHierarchy {
     private java.util.Set<String> ancestorsOf(String internalName) {
         java.util.Set<String> result = new HashSet<>();
         Deque<String> queue = new ArrayDeque<>();
-        ClassInfo ci = internalName.equals("") ? null : classes.get(internalName);
-        if (ci == null) {
-            ci = jdk != null ? jdk.load(internalName) : null;
-        }
+        ClassInfo ci = internalName.equals("") ? null : classInfo(internalName);
         if (ci != null) {
             if (ci.superName() != null) {
                 queue.add(ci.superName());
@@ -145,10 +191,7 @@ public final class ClassHierarchy {
             if (!result.add(cur)) {
                 continue;
             }
-            ClassInfo c = classes.get(cur);
-            if (c == null && jdk != null) {
-                c = jdk.load(cur);
-            }
+            ClassInfo c = classInfo(cur);
             if (c == null) {
                 continue;
             }
@@ -162,6 +205,10 @@ public final class ClassHierarchy {
 
     /** 类的传递接口（含父类继承），供接口反向分发使用。 */
     public List<String> transitiveInterfaces(String internalName) {
+        List<String> cached = transitiveInterfacesCache.get(internalName);
+        if (cached != null) {
+            return cached;
+        }
         List<String> result = new ArrayList<>();
         Deque<String> queue = new ArrayDeque<>();
         Set<String> visited = new HashSet<>();
@@ -185,7 +232,10 @@ public final class ClassHierarchy {
                 queue.add(ci.superName());
             }
         }
-        return result;
+        result.sort(String::compareTo);
+        List<String> frozen = List.copyOf(result);
+        transitiveInterfacesCache.put(internalName, frozen);
+        return frozen;
     }
 
     /** a 是否为 b 的子类型（沿父类 + 传递接口）。 */
@@ -263,17 +313,22 @@ public final class ClassHierarchy {
      * （同包判定以声明类为基准，非调用点静态类型）。FLASH (USENIX'25) 可见性剪枝的 JVM 语义实现。
      */
     public boolean isOverridableDispatchTarget(String declared, String candidate, String name, String desc) {
-        int access = methodAccess(candidate, name, desc);
+        // candidate 往往继承 declared 的方法，并不在 candidate.methods() 中直接出现。
+        // 先按 JVM 方法解析找到真正的声明类，再读取其 access；否则 final native
+        // Object.getClass 等方法会因“候选类未直接声明”被错误地当成可覆写目标。
+        String resolvedOwner = resolveMethod(candidate, name, desc);
+        int access = resolvedOwner == null ? methodAccess(candidate, name, desc)
+                : methodAccess(resolvedOwner, name, desc);
         if (access < 0) {
             return true; // 不可解析：保守视为可
         }
-        if (Modifier.isPrivate(access) || Modifier.isStatic(access)) {
+        if (Modifier.isPrivate(access) || Modifier.isStatic(access) || Modifier.isFinal(access)) {
             return false;
         }
         if (Modifier.isPublic(access) || Modifier.isProtected(access)) {
             return true;
         }
-        return packageOf(candidate).equals(packageOf(declared));
+        return packageOf(resolvedOwner == null ? candidate : resolvedOwner).equals(packageOf(declared));
     }
 
     private static String packageOf(String internalName) {
@@ -378,6 +433,9 @@ public final class ClassHierarchy {
                     queue.add(sub);
                 } else {
                     result.add(sub);
+                    // 具体类也可能还有覆写它的子类；接口实现闭包必须继续穿过
+                    // 实现类，而不能只枚举“直接实现者”。
+                    queue.add(sub);
                     if (result.size() > cap) {
                         implementersCache.put(key, Optional.empty());
                         return null;
@@ -385,6 +443,7 @@ public final class ClassHierarchy {
                 }
             }
         }
+        result.sort(String::compareTo);
         List<String> frozen = List.copyOf(result);
         implementersCache.put(key, Optional.of(frozen));
         return frozen;

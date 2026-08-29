@@ -50,7 +50,7 @@ public final class FactsExtractor {
         }
         List<FieldInfo> fields = new ArrayList<>(node.fields.size());
         for (FieldNode f : node.fields) {
-            fields.add(new FieldInfo(node.name, f.name, f.desc, f.access));
+            fields.add(new FieldInfo(node.name, f.name, f.desc, f.access, f.value));
         }
         return new ClassInfo(node.name, node.superName, List.copyOf(node.interfaces),
                 node.access, List.copyOf(methods), List.copyOf(fields));

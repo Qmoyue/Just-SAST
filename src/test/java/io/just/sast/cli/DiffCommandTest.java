@@ -18,18 +18,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class DiffCommandTest {
 
     private static final String HEADER = "chain_id,rule_id,category,severity,confidence,confidence_score,quality,"
-            + "entry_class,entry_method,entry_descriptor,entry_kind,sink_class,sink_method,sink_kind,"
+            + "entry_class,entry_method,entry_descriptor,entry_kind,sink_class,sink_method,sink_kind,sink_descriptor,"
             + "chain_length,unresolved_hops,variant_count,patterns,path,evidence,verify";
 
     /** 一行真实形态的 findings 数据：path/evidence 含逗号与引号（RFC 4180 转义）。 */
     private static final String ROW_A = "R-0001,JUST-SINK-COMMAND-EXEC-RUNTIME,COMMAND_EXEC,HIGH,"
             + "FEASIBLE,8,COMPLETE,app/Gadget,readObject,(Ljava/io/ObjectInputStream;)V,readObject,"
-            + "java/lang/Runtime,exec,COMMAND_EXEC,2,0,1,,"
+            + "java/lang/Runtime,exec,COMMAND_EXEC,([Ljava/lang/String;)V,2,0,1,,"
             + "\"app/Gadget.readObject -> java/lang/Runtime.exec\",\"direct=2+2, entry:readObject+2\","
             + "\"CONFIRMED;vars:rule=JUST-SINK-COMMAND-EXEC-RUNTIME;flow:fields=[cmd]\"";
     private static final String ROW_B = "R-0002,JUST-SINK-JNDI,JNDI,HIGH,"
             + "FEASIBLE,6,COMPLETE,app/Lookup,readObject,(Ljava/io/ObjectInputStream;)V,readObject,"
-            + "javax/naming/Context,lookup,JNDI,3,0,1,,"
+            + "javax/naming/Context,lookup,JNDI,(Ljava/lang/String;)Ljava/lang/Object;,3,0,1,,"
             + "\"app/Lookup.readObject -> javax/naming/Context.lookup\",\"entry:readObject+2\","
             + "\"vars:rule=JUST-SINK-JNDI;flow:fields=[]\"";
 
@@ -60,7 +60,7 @@ class DiffCommandTest {
         List<String> row = DiffCommand.parseCsvLine("a,\"b,c\",\"say \"\"hi\"\"\",plain");
         assertEquals(List.of("a", "b,c", "say \"hi\"", "plain"), row);
         // 行内引号字段里包含 RFC 4180 逐字节转义的 findings 行必须完整还原 21 列
-        assertEquals(21, DiffCommand.parseCsvLine(ROW_A).size(),
+        assertEquals(22, DiffCommand.parseCsvLine(ROW_A).size(),
                 "带引号/逗号的行按 RFC 4180 解析后列数应与表头一致");
         assertEquals(DiffCommand.parseCsvLine(HEADER).size(), DiffCommand.parseCsvLine(ROW_A).size());
     }

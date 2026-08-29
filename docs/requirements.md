@@ -1,58 +1,131 @@
-# Just — 需求文档
+# Just 需求与验收
 
-## 1. 概述
+本文件定义 Just 作为 Java 反序列化 gadget 链扫描器的用户可见契约、质量门槛和已知边界。实现可以演进，但不能静默改变这些契约；如果一次扫描不完整，必须把原因写入报告。
 
-轻量 Java SAST：对 JAR/WAR 挖掘反序列化 gadget 链。覆盖原生 OIS + 12+ 替代框架。
+## 1. 产品范围
 
-交付：单 CLI JAR，六格式输出，`--jdk-home` 精确匹配。
+Just 面向两类输入：
+
+1. 真实开源 JAR/WAR 的依赖与代码审计；
+2. CTF/研究语料中的反序列化入口、gadget 链和安全验证校准。
+
+交付形态是单 CLI JAR。核心流程是字节码分析、规则驱动的链发现、可解释校准和安全 canary 验证。它不承担运行时防护、任意应用动态 fuzz 或可直接武器化 payload 生成。
 
 ## 2. 功能需求
 
-| 编号 | 需求 |
-|---|---|
-| FR1 | 输入：JAR/WAR/目录 + `--deps`；嵌套 jar 递归（深度 4） |
-| FR2 | ASM 解析为自研 model（不依赖 ASM 传播到分析层） |
-| FR3 | 轻量代码图：CHA 调用图 + 可见性剪枝 + 构建后冻结 |
-| FR4 | 类层次：Serializable 判定 + 懒加载 + 增量缓存失效 |
-| FR5 | 调用图：传递子类型分发（ClassHierarchy 记忆化闭包，引擎侧展开与调用图同源）+ 反射跳边 + JavaBean 跳 + DISPATCH_CAP 闭包展开；JSR/RET 子程序语义（JSR 有 fall-through 后继，RET 无后继） |
-| FR6 | 反向污点：sink 回溯 + 入口距离调度 + per-sink 并行 + 段级记忆化（按 sink×段去重，捷径短路）；死胡同记忆化排除深度/预算截断结论 |
-| FR7 | 前向污点：粗扫+精扫单引擎 + MODEL 规则消费 + origin-guided 精度 + 数组元素流（AASTORE/AALOAD 经 param/field 粒度跨方法）+ lambda 经函数式接口分发（receiver 为 indy 结果时沿 LAMBDA 边到实现方法）+ 调用图后序 worklist（去重 + 可达集限定） |
-| FR8 | OIS 回调：resolveClass/resolveProxyClass + readUnshared 双起跳 |
-| FR9 | 框架桥接：12+ marshaller + safe-config 偏移序抑制 |
-| FR10 | 对象图扩散：字段类型含数组 + readResolve 重根 |
-| FR11 | 片段合成：chain-fragment 规则（后缀匹配） |
-| FR12 | 语义链组装：INVOKE/TRIGGER/TEMPLATE/DESER 四桥（TRIGGER 桥带 key/元素槽位类型校验：有序容器 TreeMap/TreeSet/PriorityQueue 要求后段入口类 Comparable） |
-| FR13 | 链校验：PASM + 类型流（非 final 参与）+ 序列化 + 约束图矛盾 + catch 可达性守卫 |
-| FR14 | 链剪枝：触发上下文 + 深链结构门 + 软预算机制去重 |
-| FR15 | 模式识别：集合包含判定 + patterns 列 + 证据加分 |
-| FR16 | 动态验证：反射构造可行性 + 子进程链级验证（对象图构造、入口类去重 ≤2、预算 `--verify-budget` 可配置默认 20、失败重试一次）。触发忠实模式：hashCode 经 HashMap.put、compareTo 经 TreeSet.add、equals 经 List.contains、readObject 族经序列化往返。集合布局构造：Map/Set/List 字段按声明类型实例化并放入链接目标。sink canary 插桩：子 JVM 以 -javaagent + ASM 在本链 sink 方法入口注入门卫调用，调用栈存在链入口帧才抛 SinkReachedError（Error 穿透 gadget 的 catch(Exception)），java.base 核心 sink 经 retransformClasses 补插桩；判定：canary 标记 > 栈帧级精确匹配（均要求入口帧归因）；命中的 sink 方法体不执行；FAILED 为弱否定证据（降级不否决）。子进程隔离：fork-per-chain + 隔离工作目录/tmpdir + 内存上限；classpath 含目标 jar + 全部 `--deps`。不可构造类按原因类别聚合报告。`--no-verify` 可关闭；验证子进程以当前用户权限真实执行入口方法，不可信工件应在隔离环境扫描 |
-| FR17 | 规则系统：5 种类型改 YAML 零代码；装载校验（未知 kind/缺失 id/重复 id/缺 match 均报错） |
-| FR18 | 输出：CSV 四表（流式写出）+ SARIF（driver.rules/level 映射/startLine/partialFingerprints）+ JSON/HTML/Markdown；CONFIRMED 链置顶 |
-| FR19 | CLI：scan + diff 子命令；退出码 0/2/3。diff 按 RFC4180 解析（表头驱动列定位），链身份键与组序号无关；findings.csv 缺失时报错退出 2 |
-| FR20 | JDK 版本：major version 提取；--jdk-home Java 8/9+ 真挂载 |
-| FR21 | 并行：ANALYSIS 并行派发 + backward 16 worker。并发契约：跨线程共享的可变状态为并发容器或参数传递；探索期环守卫按探索私有 |
-| FR22 | 阶段内 priority 显式排序；事件跨阶段延迟投递 |
+### 2.1 输入与前端
 
-## 3. 非功能
+| ID | 需求 |
+| --- | --- |
+| FR-01 | 接受 JAR、WAR 和 class 目录，并支持 `--deps` 补充依赖 |
+| FR-02 | 解析 Spring Boot `BOOT-INF`、WAR `WEB-INF` 和嵌套 JAR；展开有深度、条目数和条目大小上限 |
+| FR-03 | ASM 只在 frontend 使用，输出稳定的 Just model；模型包含类、方法、字段、调用、指令、异常表、lambda 和行号事实 |
+| FR-04 | 通过 `--jdk-home` 按目标 major version 选择 JDK；Java 8 使用 `rt.jar`，Java 9+ 使用 `jrt-fs` |
+| FR-05 | 缺失类、字节码错误、JDK 未挂载和嵌套工件失败必须诊断并进入完整性状态 |
 
-| 编号 | 需求 |
-|---|---|
-| NFR1 | 运行时依赖仅 ASM（BSD-3）/picocli（Apache-2.0）/SnakeYAML（Apache-2.0）——全部 GPLv3 兼容 |
-| NFR2 | 内存可控：4GB 堆 <1 万类 |
-| NFR3 | ASM 仅 frontend；知识源互不直接调用 |
-| NFR4 | ServiceLoader 注册可扩展 |
-| NFR5 | worker 自适应核数（≤16） |
-| NFR6 | 不得 benchmark 特判 |
-| NFR7 | 双层回归：`mvn test` + Gleipner evaluator |
-| NFR8 | 扫描确定性：同一输入在预算内多次扫描输出一致（事实替换按「链长 + 跳序列规范形」全序取最小） |
-| NFR9 | 工具自身不引入反序列化攻击面：不使用原生 ObjectInputStream 读取任何工作目录/旁车文件；无跨扫描持久化缓存 |
+### 2.2 图与数据流
 
-## 4. 验收
+| ID | 需求 |
+| --- | --- |
+| FR-06 | 建立冻结的调用/分发/lambda/字段索引和类层次；方法 CFG 按需计算 |
+| FR-07 | 支持可见性、传递子类型、接口、lambda、异常边、JSR/RET 和反射目标约束 |
+| FR-08 | 支持前向方法摘要不动点和后向 sink 导向回溯；数组元素、字段、返回值、receiver 和调用点来源必须可传播 |
+| FR-09 | 预算、分发上限、路径上限和证明上限必须有界；截断不能伪装成完整扫描，也不能污染不相容上下文的缓存 |
+| FR-10 | 规则和图事实合并必须确定性：同一输入、JDK、规则和预算下链身份、规则归因和排序稳定 |
 
-| 项 | 标准 |
-|---|---|
-| Gleipner | 链覆盖 TP ≥100, FP ≤25（当前 106/22；evaluator 块计数 148/22） |
-| 语料 | 9 语料锚点全过（demo/demo2/Unictf/java-quote/Remo/warmup/javamix/n1cat/qiao） |
-| 测试 | 70 全绿 |
-| 耗时 | 典型 Spring Boot 应用（~11000 类）60-90s（177 条规则全量） |
-| 大语料 | 4 万+ 类语料默认堆可完成 |
+### 2.3 反序列化与框架语义
+
+| ID | 需求 |
+| --- | --- |
+| FR-11 | 覆盖 `ObjectInputStream`、`readObject`、`readObjectNoData`、`readExternal`、`readResolve`、`resolveClass`、`resolveProxyClass` 和 `readUnshared` |
+| FR-12 | 通过 YAML source 规则支持替代反序列化框架；安全配置只在调用点实参满足声明值时抑制 |
+| FR-13 | 支持集合触发、字段依赖、JavaBean setter、动态代理 handler、反射 Method/Constructor、模板/类加载、JNI/native 和 JRMP/RMI 边界 |
+| FR-14 | 代理、反射、框架桥接和 CHA 扩展必须使用 receiver、类型、方法签名或规则来源约束；未知目标只能形成不确定证据，不能泛化为任意调用 |
+| FR-15 | 支持 `chain-fragment` 声明式片段，并将入口、桥接机制、gadget 和 sink 组装为可读路径 |
+
+### 2.4 校准、验证与报告
+
+| ID | 需求 |
+| --- | --- |
+| FR-16 | 链校准包含类型流、PASM、序列化可行性、catch 可达性、字段依赖和约束矛盾检查；校准不能替代静态证据 |
+| FR-17 | 动态验证默认开启，采用 fork-per-chain 子 JVM、对象图构造、真实触发模式和 sink canary；`--no-verify` 显式关闭 |
+| FR-18 | 动态状态至少区分 `CONFIRMED`、`EXECUTED`、`PARTIAL`、`FAILED`、`UNTESTABLE`；`CONFIRMED` 必须有入口归因的 canary/精确 sink 栈证据 |
+| FR-19 | 动态验证必须持久化候选选择、能力、状态、证据、尝试次数、耗时和失败原因；静态候选不能因动态失败而消失 |
+| FR-20 | 输出 CSV、JSON、SARIF 2.1.0、HTML、Markdown、扫描元数据、动态汇总和不可直接执行的 payload plan |
+| FR-21 | `diff` 依据规则、入口和 sink 的语义身份比较扫描，不依赖并行顺序和变体编号 |
+| FR-22 | 退出码为：`0` 成功，`2` 参数/输入错误，`3` 扫描内部错误 |
+
+## 3. 规则与扩展契约
+
+默认规则文件为 `src/main/resources/rules/default-rules.yaml`，规则类型固定为：
+
+- `sink`：危险能力和 tainted 参数；
+- `magic-entry`：原生序列化和特殊回调入口；
+- `source`：替代反序列化框架和安全配置；
+- `model`：参数、返回值、receiver 和容器传播；
+- `chain-fragment`：公开、可复用的链片段。
+
+需要新的程序语义时，实现 `KnowledgeSource`，声明 `phase`、`priority` 和 `interests`，用 Blackboard 事实/事件通信并通过 ServiceLoader 注册。知识源不得直接调用其它知识源，不得按题目名、JAR 名、包名、类名、规则编号或 WP 文本特判。
+
+## 4. 非功能需求
+
+| ID | 需求 |
+| --- | --- |
+| NFR-01 | 默认交付不依赖外部服务；运行时依赖保持为 ASM、picocli、SnakeYAML |
+| NFR-02 | 大工件采用流式读取、原始字节早释放、冻结只读索引、惰性 CFG 和有界缓存；必须同时记录报告时 live heap 与完整性边界 |
+| NFR-03 | `heap_used_mb` 明确表示报告时 JVM live heap，不得冒充 OS RSS 峰值；真实内存门槛须用外部采样验证 |
+| NFR-04 | 并行采用有界、自适应 worker 和局部结果合并，保留桌面资源；线程数不是性能验收指标 |
+| NFR-05 | 性能优化不得牺牲扫描深度、规则覆盖、链身份、规则归因或确定性；没有 profile 和等价回归不得默认引入 GPU |
+| NFR-06 | 动态验证使用最小 JVM 权限和独立进程；生产不可信工件必须叠加 OS/容器/虚拟机、低权限和无网络边界 |
+| NFR-07 | 工具本身不通过原生 `ObjectInputStream` 读取旁车文件，不把动态验证结果跨扫描隐式缓存 |
+| NFR-08 | 日志走 stderr；正常结果文件不混入调试输出；临时报告、JVM dump 和 evaluator 快照不进入版本库 |
+| NFR-09 | 测试优先保护 CLI、报告、确定性、完整性、动态安全和扩展边界，不为偶然内部实现形状建立脆弱断言 |
+
+## 5. 输出与状态语义
+
+扫描输出目录至少包含：
+
+```text
+findings.csv             折叠后的主链
+chains.csv               所有路径变体
+edges.csv                逐跳关系
+sinks.csv                sink 裁决
+calibrations.csv         校准拒绝/降级原因
+findings.json            机器消费的链数据
+findings.sarif           SARIF 2.1.0
+findings.html / .md      人工审查报告
+scan-metadata.json       输入、JDK、阶段、预算和完整性
+dynamic-verification.json 动态候选、状态和证据
+payload-plan.json       安全、确定性的对象图/字段依赖计划
+dormant.md               可达但未成链的入口
+```
+
+`COMPLETE`/`PARTIAL` 表示扫描覆盖；`FEASIBLE`/`DEGRADED`/`NOT_FEASIBLE` 表示静态校准；动态状态表示运行时证据。三套状态必须同时保留，不能互相覆盖。
+
+## 6. 安全边界
+
+验证器中的 deny-by-default 权限门、临时目录、超时、内存上限和 sink canary 是 Java 层的风险降低措施，不是 OS 沙箱。JDK 24+ 不能假设 Security Manager 提供有效隔离。探针在 canary 命中后不进入危险 sink 方法体，不加载 native、不连接远程服务、不执行命令；生产环境必须由外部隔离层兜底。
+
+payload writer 只输出构造计划和证据，不生成可直接投递的攻击字节流。任何面向具体框架的后续适配器都必须单独定义授权边界、输入约束和安全测试。
+
+## 7. 当前验收基线
+
+截至当前代码：
+
+- `mvn test`：143 项通过，0 失败，2 项环境跳过；
+- Gleipner 全量：块级 `TP=219, FP=22`，入口去重 `TP=126, FP=17`；
+- 默认全量校准语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 具备静态证据和安全动态确认；
+- `javamix` 当前工件缺少 WP 文档所述 `InternalDataServiceImpl.processTask`，因此不将其它工件的 WP 结果代入；
+- Windows Gleipner JNI 块缺少 evaluator 对应的 native `.eval.txt`，按环境限制处理；
+- 大型工件的真实 RSS 峰值尚未建立可复现的外部采样基线，不能宣称严格低内存目标已经达成。
+
+## 8. 发布检查清单
+
+发布前必须完成：
+
+1. `mvn test` 和 `mvn package -DskipTests`；
+2. 检查 `git diff --check`，确认无临时文件、日志、构建目录、JDK 路径和本地 evaluator 输出；
+3. 用目标 JDK 对代表性 JAR/WAR 做默认扫描，确认完整性、动态汇总和报告文件存在；
+4. 运行完整 Gleipner evaluator，逐块记录 TP/FP/跳过或截断原因；
+5. 在容器/低权限/无网络环境执行不可信工件的动态验证；
+6. 检查新增规则/知识源没有目标特判，更新本文件和 README 的用户可见契约。

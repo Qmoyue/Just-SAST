@@ -13,6 +13,7 @@ import java.util.List;
  * 入口：readObject/readResolve/readObjectNoData/readExternal/writeReplace/hashCode/proxyInvoke +2；
  *       equals/compareTo/compare/toString/finalize +1；deserialization/serialize（框架源）+1
  * 严重度：HIGH +1
+ * 框架对象绑定边界：ENTRY reason=framework-bean-input +2
  * 模式：每个命中的 gadget 模式 +2（notes 中 "pattern:" 前缀计数的实现侧约定）
  * 惩罚：unresolved × 2
  * 分桶（V2 四级判定，GadgetHunter schema）：
@@ -27,6 +28,8 @@ public final class ConfidenceScorer {
     public static final int CONFIRMED_BONUS = 4;
     /** 段归因确认（完整链的内段被子进程证实）加分。 */
     public static final int SEGMENT_CONFIRMED_BONUS = 2;
+    /** bridge=deserialize 对 JavaBean setter 参数的外部输入边界证据。 */
+    public static final int FRAMEWORK_BEAN_INPUT_BONUS = 2;
 
     private ConfidenceScorer() {}
 
@@ -36,6 +39,13 @@ public final class ConfidenceScorer {
                 .filter(n -> n.startsWith("degrade:")).toList();
         if (r == 2 || chain.unresolvedHops() * 2 > evidenceScore(chain, notes)) {
             return "NOT_FEASIBLE";
+        }
+        // A sink canary is stronger evidence than a probe-side construction warning:
+        // the target method actually reached the modeled sink in the isolated child JVM.
+        // Keep the construction limitation in the verification summary/notes, but do not
+        // let it demote a directly confirmed path in the primary finding ranking.
+        if (notes != null && notes.stream().anyMatch("verify:confirmed"::equals)) {
+            return "FEASIBLE";
         }
         if (!degradations.isEmpty()) {
             return "DEGRADED(" + degradations.get(0).substring("degrade:".length()) + ")";
@@ -49,12 +59,15 @@ public final class ConfidenceScorer {
         for (ChainHop hop : chain.hops()) {
             points += switch (hop.kind()) {
                 case DIRECT_CALL, FIELD_FLOW -> 1;
-                case VIRTUAL_DISPATCH, LAMBDA, ENTRY -> 0;
+                case VIRTUAL_DISPATCH, LAMBDA, NATIVE_CALLBACK, ENTRY -> 0;
             };
         }
         points += entryWeight(chain.entryKind());
         if ("HIGH".equals(chain.severity())) {
             points += 1;
+        }
+        if (hasFrameworkBeanInput(chain)) {
+            points += FRAMEWORK_BEAN_INPUT_BONUS;
         }
         points -= chain.unresolvedHops() * 2;
         if (notes != null) {
@@ -81,6 +94,7 @@ public final class ConfidenceScorer {
     public static String evidenceDecomposition(Chain chain, List<String> notes) {
         int direct = 0;
         int virtual = 0;
+        int nativeCallbacks = 0;
         int fieldFlows = 0;
         StringBuilder fields = new StringBuilder();
         for (ChainHop hop : chain.hops()) {
@@ -88,6 +102,8 @@ public final class ConfidenceScorer {
                 direct++;
             } else if (hop.kind() == HopKind.VIRTUAL_DISPATCH) {
                 virtual++;
+            } else if (hop.kind() == HopKind.NATIVE_CALLBACK) {
+                nativeCallbacks++;
             } else if (hop.kind() == HopKind.FIELD_FLOW) {
                 fieldFlows++;
                 if (hop.field() != null) {
@@ -100,6 +116,7 @@ public final class ConfidenceScorer {
         StringBuilder sb = new StringBuilder();
         sb.append("hops:direct=").append(direct).append("+").append(direct)
                 .append(",virtual=").append(virtual).append("+0")
+                .append(",native=").append(nativeCallbacks).append("+0")
                 .append(",field=").append(fieldFlows).append("+").append(fieldFlows);
         if (!fieldNames.isEmpty()) {
             sb.append("(").append(fieldNames).append(")");
@@ -108,6 +125,10 @@ public final class ConfidenceScorer {
                 .append("+").append(entryWeight(chain.entryKind()));
         if ("HIGH".equals(chain.severity())) {
             sb.append(";sev:HIGH+1");
+        }
+        if (hasFrameworkBeanInput(chain)) {
+            sb.append(";source-boundary:framework-bean-input+")
+                    .append(FRAMEWORK_BEAN_INPUT_BONUS);
         }
         if (chain.unresolvedHops() > 0) {
             sb.append(";unresolved:").append(chain.unresolvedHops())
@@ -134,5 +155,11 @@ public final class ConfidenceScorer {
             case "equals", "compareTo", "compare", "toString", "finalize" -> 1;
             default -> 1; // deserialization / serialize（框架桥源）
         };
+    }
+
+    private static boolean hasFrameworkBeanInput(Chain chain) {
+        return chain.hops().stream()
+                .anyMatch(hop -> hop.kind() == HopKind.ENTRY
+                        && "framework-bean-input".equals(hop.reason()));
     }
 }

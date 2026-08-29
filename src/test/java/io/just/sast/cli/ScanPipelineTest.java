@@ -18,6 +18,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -25,6 +26,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 覆盖：readObject 入口链检出、equals 无触发链被剪枝、框架桥接中间路径、SafeConfig 顺序抑制。
  */
 class ScanPipelineTest {
+
+    @Test
+    void invalidTargetIsReportedAsUsageErrorBeforeAnalysis() {
+        assertThrows(ScanPipeline.UsageException.class, () -> ScanPipeline.run(
+                Path.of("target", "definitely-missing-input.jar"), List.of(),
+                Path.of("target", "just-test-output"), null,
+                false, true, null, false, 0));
+    }
 
     /** 内存 Java 源。 */
     private static final class Source extends SimpleJavaFileObject {
@@ -122,6 +131,112 @@ class ScanPipelineTest {
     }
 
     @Test
+    void deserializeSourceReturnSeedsForwardTaint(@TempDir Path tmp) throws Exception {
+        String parser = """
+                package app;
+                public class Parser {
+                    public static String parse(String value) { return value; }
+                }
+                """;
+        String app = """
+                package app;
+                public class SourceApp {
+                    public static void run() throws Exception {
+                        String command = Parser.parse("echo");
+                        Runtime.getRuntime().exec(command);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-SOURCE
+                    kind: source
+                    bridge: deserialize
+                    match:
+                      call: { owner: "app/Parser", name: "parse" }
+                  - id: T-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "java/lang/Runtime", name: "exec" }
+                    tainted: [{arg: 0}]
+                """;
+        Path jar = compileToJar(tmp.resolve("source.jar"),
+                Map.of("app.Parser", parser, "app.SourceApp", app));
+        Path rulesFile = tmp.resolve("source-rules.yaml");
+        Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
+        Path out = tmp.resolve("out");
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        String findings = Files.readString(out.resolve("findings.csv"));
+        assertTrue(findings.contains("app/SourceApp,run")
+                        && findings.contains("java/lang/Runtime,exec"),
+                "deserialize source 的返回值应作为前向污点入口闭合到 sink:\n" + findings);
+    }
+
+    @Test
+    void deserializeSourceModelsGenericBeanSetterInputWithoutOpeningEveryPublicMethod(@TempDir Path tmp)
+            throws Exception {
+        String parser = """
+                package fake;
+                public class Parser {
+                    public static Object parse(String value) { return value; }
+                }
+                """;
+        String api = """
+                package app;
+                public class Api {
+                    public static Object parse(String value) { return fake.Parser.parse(value); }
+                }
+                """;
+        String bean = """
+                package app;
+                public class Bean {
+                    public void setCommand(String command) throws Exception {
+                        Runtime.getRuntime().exec(command);
+                    }
+                }
+                """;
+        String unrelated = """
+                package app;
+                public class Unrelated {
+                    public void run(String command) throws Exception {
+                        Runtime.getRuntime().exec(command);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-BEAN-SOURCE
+                    kind: source
+                    bridge: deserialize
+                    match:
+                      call: { owner: "fake/Parser", name: "parse" }
+                  - id: T-RUNTIME-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "java/lang/Runtime", name: "exec" }
+                    tainted: [{arg: 0}]
+                """;
+        Path jar = compileToJar(tmp.resolve("bean.jar"), Map.of(
+                "fake.Parser", parser, "app.Api", api, "app.Bean", bean, "app.Unrelated", unrelated));
+        Path rulesFile = tmp.resolve("bean-rules.yaml");
+        Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings.csv"));
+        assertTrue(findings.contains("app/Bean,setCommand")
+                        && findings.contains("java/lang/Runtime,exec"),
+                "deserialize source 应建立通用 setter 输入边界：\n" + findings);
+        assertFalse(findings.contains("app/Unrelated,run"),
+                "普通公共方法不能仅因存在 source 就被泛化为外部输入：\n" + findings);
+    }
+
+    @Test
     void frameworkBridgeKeepsPipelineHopsAndSafeConfigSuppressesInOrder(@TempDir Path tmp) throws Exception {
         String fw = """
                 package fake;
@@ -203,5 +318,10 @@ class ScanPipelineTest {
                 false, true, null, true, 20);
         assertTrue(result.exitCode() == 0);
         assertFalse(result.chains().isEmpty());
+        String metadata = Files.readString(tmp.resolve("out").resolve("scan-metadata.json"));
+        assertTrue(metadata.contains("\"completeness\"")
+                        && metadata.contains("\"verification\":\"")
+                        && metadata.contains("\"phase_ms\""),
+                "扫描元数据必须公开完整性、验证模式和阶段耗时：\n" + metadata);
     }
 }

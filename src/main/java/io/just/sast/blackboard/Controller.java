@@ -51,8 +51,10 @@ public final class Controller {
         // ANALYSIS 并行：每个知识源一个任务（自足契约，合成事件直调不经队列），异常隔离，join 屏障
         dispatched += dispatchParallel(subsByPhase.getOrDefault(Phase.ANALYSIS, Map.of()));
         // COMPOSITION / CALIBRATION 串行（priority 序，跨源数据依赖）
+        blackboard.sortChainsForPhase();
         blackboard.publish(Event.of(EventType.SCAN_ANALYZED, -1, null));
         dispatched += drain(subsByPhase.getOrDefault(Phase.COMPOSITION, Map.of()));
+        blackboard.sortChainsForPhase();
         blackboard.publish(Event.of(EventType.SCAN_COMPLETE, -1, null));
         dispatched += drain(subsByPhase.getOrDefault(Phase.CALIBRATION, Map.of()));
         JustLogger.info("黑板分析完成：分发事件 {} 次，链 {} 条（校准拒绝 {} 条）",
@@ -62,8 +64,10 @@ public final class Controller {
     /** ANALYSIS 并行派发：各知识源（去重）并发响应阶段起始事件一次，join 后丢弃队列残余（无订阅者的 CHAIN_FOUND）。 */
     private int dispatchParallel(Map<EventType, List<KnowledgeSource>> subs) {
         java.util.Set<KnowledgeSource> started = new java.util.LinkedHashSet<>();
-        for (List<KnowledgeSource> ksList : subs.values()) {
-            started.addAll(ksList);
+        // 只启动声明订阅 SCAN_START 的知识源；按 phase 聚合的其他 interests
+        // （例如仅订阅 SCAN_ANALYZED 的扩展源）不能被错误地当成 start 回调。
+        for (KnowledgeSource ks : subs.getOrDefault(EventType.SCAN_START, List.of())) {
+            started.add(ks);
         }
         if (started.isEmpty()) {
             blackboard.clearEvents();
@@ -78,9 +82,6 @@ public final class Controller {
                     dispatched.incrementAndGet();
                 } catch (Throwable t) {
                     JustLogger.error("知识源 {} ANALYSIS 并行执行失败（已隔离）: {}", ks.id(), t.toString());
-                    if (JustLogger.isDebug()) {
-                        t.printStackTrace();
-                    }
                 } finally {
                     done.countDown();
                 }
@@ -106,6 +107,7 @@ public final class Controller {
         while (blackboard.hasEvents()) {
             if (dispatched >= MAX_DISPATCH) {
                 JustLogger.warn("事件派生超上限 {}，本阶段提前结束", MAX_DISPATCH);
+                blackboard.markIncomplete("EVENT_DISPATCH_CAP:" + MAX_DISPATCH);
                 blackboard.clearEvents();
                 break;
             }
@@ -129,9 +131,6 @@ public final class Controller {
                     dispatched++;
                 } catch (Throwable e) {
                     JustLogger.error("知识源 {} 处理事件 {} 失败（已隔离）: {}", ks.id(), event.type(), e.toString());
-                    if (JustLogger.isDebug()) {
-                        e.printStackTrace();
-                    }
                 }
             }
         }

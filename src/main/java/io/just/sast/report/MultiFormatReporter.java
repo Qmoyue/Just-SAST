@@ -1,6 +1,7 @@
 package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
+import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.chain.ConfidenceScorer;
 
 import java.io.IOException;
@@ -9,6 +10,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.Comparator;
 
 /**
  * E1-E3: 多格式报告输出——JSON（机器消费）、HTML（可视化）、Markdown（PR comment）。
@@ -18,12 +21,97 @@ public final class MultiFormatReporter {
 
     public void write(Path outDir, List<Chain> chains,
                       Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
+        List<Chain> orderedChains = new ArrayList<>(chains);
+        orderedChains.sort(Comparator.comparing(Chain::key));
         // E1: JSON
-        writeJson(outDir.resolve("findings.json"), chains, calibrations, notes);
+        writeJson(outDir.resolve("findings.json"), orderedChains, calibrations, notes);
         // E2: HTML
-        writeHtml(outDir.resolve("findings.html"), chains, calibrations, notes);
+        writeHtml(outDir.resolve("findings.html"), orderedChains, calibrations, notes);
         // E3: Markdown
-        writeMarkdown(outDir.resolve("findings.md"), chains, calibrations, notes);
+        writeMarkdown(outDir.resolve("findings.md"), orderedChains, calibrations, notes);
+    }
+
+    /** 扫描元数据旁车文件：不破坏 findings.json 数组契约，同时公开完整性和性能边界。 */
+    public void writeMetadata(Path outDir, ScanStatistics stats) throws IOException {
+        Files.createDirectories(outDir);
+        StringBuilder sb = new StringBuilder("{\n")
+                .append("  \"files_scanned\":").append(stats.filesScanned())
+                .append(",\"classes_loaded\":").append(stats.classesLoaded())
+                .append(",\"diagnostics\":").append(stats.diagnostics())
+                .append(",\"sinks_marked\":").append(stats.sinksMarked())
+                .append(",\"magic_entries\":").append(stats.magicEntries())
+                .append(",\"chains_found\":").append(stats.chainsFound())
+                .append(",\"elapsed_ms\":").append(stats.elapsedMs())
+                .append(",\"heap_used_mb\":").append(stats.heapUsedMb())
+                .append(",\"completeness\":\"").append(escJson(stats.completeness())).append("\"")
+                .append(",\"verification\":\"").append(escJson(stats.verification())).append("\"")
+                .append(",\"completeness_reasons\":[");
+        for (int i = 0; i < stats.completenessReasons().size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append('"').append(escJson(stats.completenessReasons().get(i))).append('"');
+        }
+        sb.append("],\"phase_ms\":{");
+        List<Map.Entry<String, Long>> phases = new ArrayList<>(stats.phaseMs().entrySet());
+        phases.sort(Map.Entry.comparingByKey());
+        for (int i = 0; i < phases.size(); i++) {
+            if (i > 0) sb.append(',');
+            Map.Entry<String, Long> phase = phases.get(i);
+            sb.append('"').append(escJson(phase.getKey())).append("\":").append(phase.getValue());
+        }
+        sb.append("},\"dynamic_verification\":");
+        appendVerificationJson(sb, stats.dynamicVerification());
+        sb.append("\n}\n");
+        Files.write(outDir.resolve("scan-metadata.json"), sb.toString().getBytes(StandardCharsets.UTF_8));
+        StringBuilder dynamic = new StringBuilder();
+        appendVerificationJson(dynamic, stats.dynamicVerification());
+        dynamic.append('\n');
+        Files.write(outDir.resolve("dynamic-verification.json"),
+                dynamic.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void appendVerificationJson(StringBuilder sb, VerificationSummary summary) {
+        sb.append('{')
+                .append("\"capability\":\"").append(escJson(summary.capability())).append("\"")
+                .append(",\"budget\":").append(summary.budget())
+                .append(",\"constructible\":").append(summary.constructible())
+                .append(",\"rejected\":").append(summary.rejected())
+                .append(",\"selected\":").append(summary.selected())
+                .append(",\"status_counts\":");
+        appendCounts(sb, summary.statusCounts());
+        sb.append(",\"detail_counts\":");
+        appendCounts(sb, summary.detailCounts());
+        sb.append(",\"results\":[");
+        for (int i = 0; i < summary.results().size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            VerificationSummary.ChainResult result = summary.results().get(i);
+            sb.append('{')
+                    .append("\"rank\":").append(result.rank())
+                    .append(",\"chain_key\":\"").append(escJson(result.chainKey())).append("\"")
+                    .append(",\"status\":\"").append(escJson(result.status())).append("\"")
+                    .append(",\"detail\":\"").append(escJson(result.detail())).append("\"")
+                    .append(",\"confidence\":\"").append(escJson(result.confidence())).append("\"")
+                    .append(",\"confidence_score\":").append(result.confidenceScore())
+                    .append(",\"attempt\":").append(result.attempt())
+                    .append(",\"duration_ms\":").append(result.durationMs())
+                    .append('}');
+        }
+        sb.append("]}");
+    }
+
+    private static void appendCounts(StringBuilder sb, Map<String, Integer> counts) {
+        sb.append('{');
+        List<Map.Entry<String, Integer>> entries = new ArrayList<>(counts.entrySet());
+        entries.sort(Map.Entry.comparingByKey());
+        for (int i = 0; i < entries.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            Map.Entry<String, Integer> entry = entries.get(i);
+            sb.append('"').append(escJson(entry.getKey())).append("\":").append(entry.getValue());
+        }
+        sb.append('}');
     }
 
     private void writeJson(Path path, List<Chain> chains,
@@ -49,6 +137,7 @@ public final class MultiFormatReporter {
                     .append("\",\"entry_method\":\"").append(escJson(c.entryMethod()))
                     .append("\",\"sink_class\":\"").append(escJson(c.sinkClass().replace('/', '.')))
                     .append("\",\"sink_method\":\"").append(escJson(c.sinkMethod()))
+                    .append("\",\"sink_descriptor\":\"").append(escJson(c.sinkDescriptor()))
                     .append("\",\"chain_length\":").append(c.hops().size())
                     .append(",\"unresolved_hops\":").append(c.unresolvedHops())
                     .append(",\"path\":\"").append(escJson(CsvReporter.pathSummary(c)))

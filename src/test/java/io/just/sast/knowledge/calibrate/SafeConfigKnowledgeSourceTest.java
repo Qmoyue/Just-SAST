@@ -25,6 +25,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * SafeConfig 契约（两个历史 bug 的回归）：
@@ -45,6 +46,10 @@ class SafeConfigKnowledgeSourceTest {
     }
 
     private static Blackboard blackboardWith(MethodInfo... methods) {
+        return blackboardWith(null, methods);
+    }
+
+    private static Blackboard blackboardWith(Boolean safeValue, MethodInfo... methods) {
         Graph graph = new Graph();
         java.util.Map<String, ClassInfo> classes = new java.util.HashMap<>();
         for (MethodInfo m : methods) {
@@ -54,7 +59,7 @@ class SafeConfigKnowledgeSourceTest {
         }
         Rule.SourceRule source = new Rule.SourceRule("T-SOURCE", "deserialize",
                 new Rule.CallMatcher(Match.of("fake/Fw"), Match.of("load"), null),
-                new Rule.SafeConfigDecl(Match.of("fake/Fw"), Set.of("lock"), null));
+                new Rule.SafeConfigDecl(Match.of("fake/Fw"), Set.of("lock"), safeValue));
         return new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(classes, null),
                 new io.just.sast.cpg.build.FieldWriterIndex(),
@@ -88,5 +93,46 @@ class SafeConfigKnowledgeSourceTest {
         ks.init(bb);
         ks.onEvent(bb, Event.of(EventType.SCAN_COMPLETE, -1, null));
         assertNull(bb.calibrationOf(chain.key()), "先 load 后 lock（配置晚于入口）不抑制");
+    }
+
+    @Test
+    void unknownSafeValueDoesNotSuppress() {
+        Blackboard bb = blackboardWith(true, invokeSeq("fake/App3", "run", "lock", "load"));
+        Chain chain = chainWithEntry("fake/App3", "run");
+        bb.addChain(chain);
+        SafeConfigKnowledgeSource ks = new SafeConfigKnowledgeSource();
+        ks.init(bb);
+        ks.onEvent(bb, Event.of(EventType.SCAN_COMPLETE, -1, null));
+        assertNull(bb.calibrationOf(chain.key()),
+                "声明 safe-value 时，无法从字节码求出配置值不得按安全配置抑制");
+    }
+
+    @Test
+    void interfaceFieldCanCarrySerializableProxy() {
+        Graph graph = new Graph();
+        graph.methodNode("app/Handler", "readObject", "()V", false);
+        ClassInfo serializable = new ClassInfo("app/Handler", "java/lang/Object",
+                List.of("java/io/Serializable"), Modifier.PUBLIC,
+                new java.util.ArrayList<>(), List.of(new io.just.sast.model.FieldInfo(
+                        "app/Handler", "factory", "Lapp/Factory;", Modifier.PRIVATE)));
+        ClassInfo factory = new ClassInfo("app/Factory", "java/lang/Object", List.of(),
+                Modifier.PUBLIC | Modifier.INTERFACE, new java.util.ArrayList<>(), List.of());
+        Blackboard bb = new Blackboard(graph,
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(
+                        "app/Handler", serializable, "app/Factory", factory), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
+                Blackboard.ScanInputs.fastDefault(java.nio.file.Path.of(".")));
+        Chain chain = new Chain("T-PROXY", "CODE_EXEC", "HIGH",
+                "app/Handler", "readObject", "readObject", "app/Sink", "run",
+                List.of(new ChainHop("app/Handler", "readObject", "app/Handler", "readObject",
+                                HopKind.FIELD_FLOW, "factory", "field-read", "", null),
+                        new ChainHop("app/Handler", "readObject", "app/Handler", "readObject",
+                                HopKind.ENTRY, null, "readObject", "()V", null)), 0);
+        bb.addChain(chain);
+        ChainValidatorKnowledgeSource validator = new ChainValidatorKnowledgeSource();
+        validator.init(bb);
+        validator.onEvent(bb, Event.of(EventType.SCAN_COMPLETE, -1, null));
+        assertTrue(bb.calibrationOf(chain.key()) == null,
+                "interface 字段可能持有可序列化动态代理，不能因声明接口未 extends Serializable 而拒绝");
     }
 }

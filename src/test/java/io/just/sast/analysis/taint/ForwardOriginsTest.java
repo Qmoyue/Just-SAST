@@ -2,20 +2,28 @@ package io.just.sast.analysis.taint;
 
 import io.just.sast.frontend.asm.FactsExtractor;
 import io.just.sast.model.MethodInfo;
+import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
 import org.junit.jupiter.api.Test;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TryCatchBlockNode;
+import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 /**
  * 过程内 origin 分析契约（栈语义精度根基）：
@@ -98,5 +106,72 @@ class ForwardOriginsTest {
         assertEquals(1, handlerState.stack().size(), "异常 handler 入口栈深为 1");
         ValueOrigin origin = handlerState.stack().get(0).origins().iterator().next();
         assertEquals(new ValueOrigin.Unknown(), origin, "handler 栈顶是 Unknown 异常对象");
+    }
+
+    @Test
+    void concurrentComputeHasOneCachedResult() throws Exception {
+        MethodNode m = new MethodNode(0, "run", "()V", null, null);
+        m.instructions.add(new InsnNode(Op.RETURN.code()));
+        MethodInfo method = extract(m);
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try {
+            Future<ForwardOrigins.Result> first = pool.submit(() -> origins.compute(method));
+            Future<ForwardOrigins.Result> second = pool.submit(() -> origins.compute(method));
+            assertSame(first.get(), second.get(),
+                    "同一方法的并发 compute 必须复用同一个抽象解释结果");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void emptyAbstractOrNativeMethodHasNoSyntheticOffset() {
+        MethodInfo method = extract(new MethodNode(0, "empty", "()V", null, null));
+        ForwardOrigins.Result result = origins.compute(method);
+
+        assertTrue(result.stateBefore().isEmpty());
+        assertTrue(result.arrayElements().isEmpty());
+    }
+
+    @Test
+    void reflectiveArraySetAndGetPreserveIndexedElementOrigin() {
+        MethodNode m = new MethodNode(8, "run", "(Ljava/lang/Object;)Ljava/lang/Object;",
+                null, null);
+        m.instructions.add(new InsnNode(Op.ICONST_1.code()));
+        m.instructions.add(new TypeInsnNode(Op.ANEWARRAY.code(), "java/lang/Object"));
+        m.instructions.add(new VarInsnNode(Op.ASTORE.code(), 1));
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        m.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        m.instructions.add(new MethodInsnNode(Op.INVOKESTATIC.code(), "java/lang/reflect/Array",
+                "set", "(Ljava/lang/Object;ILjava/lang/Object;)V", false));
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        m.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        m.instructions.add(new MethodInsnNode(Op.INVOKESTATIC.code(), "java/lang/reflect/Array",
+                "get", "(Ljava/lang/Object;I)Ljava/lang/Object;", false));
+        m.instructions.add(new InsnNode(Op.ARETURN.code()));
+
+        MethodInfo method = extract(m);
+        Map<String, Long> callIds = new HashMap<>();
+        long nextId = 100;
+        for (var insn : method.instructions()) {
+            if (!insn.op().isInvoke()) {
+                continue;
+            }
+            MethodRef ref = insn.methodRef();
+            callIds.put(ForwardOrigins.CfgKey.of(method) + "@" + insn.offset(), nextId++);
+        }
+        ForwardOrigins.Result result = new ForwardOrigins(callIds).compute(method);
+        long getId = callIds.entrySet().stream()
+                .filter(entry -> entry.getKey().endsWith("@9"))
+                .mapToLong(Map.Entry::getValue)
+                .findFirst()
+                .orElseThrow();
+
+        assertEquals(Set.of(new ValueOrigin.Param(0)),
+                result.arrayElements().get(new ValueOrigin.CallResult(getId)));
+        assertTrue(result.indexedArrayElements().values().stream()
+                .anyMatch(indexed -> indexed.values().stream()
+                        .anyMatch(values -> values.contains(new ValueOrigin.Param(0)))));
     }
 }

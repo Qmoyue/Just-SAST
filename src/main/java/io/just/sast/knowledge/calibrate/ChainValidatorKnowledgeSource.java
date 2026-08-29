@@ -361,6 +361,17 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
         serializablePossible.put(type, Boolean.FALSE);
         boolean result = bb.hierarchy().isSubtypeOf(type, "java/io/Serializable");
         if (!result) {
+            // The declared type is not the runtime type.  java.lang.reflect.Proxy is
+            // Serializable, so any interface-typed field may legally carry a serializable
+            // proxy when its InvocationHandler is serializable.  This is a possibility
+            // proof, not a claim that every implementation is serializable; rejecting the
+            // whole chain here would turn ordinary framework proxy gadgets into false
+            // negatives (the dynamic verifier remains responsible for the concrete value).
+            ClassInfo declared = bb.hierarchy().classInfo(type);
+            if (declared != null && declared.isInterface()) {
+                serializablePossible.put(type, Boolean.TRUE);
+                return true;
+            }
             if (ancestorChainUnresolvable(type)) {
                 serializablePossible.put(type, Boolean.TRUE);
                 return true;

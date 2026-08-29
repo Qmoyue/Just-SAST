@@ -9,7 +9,6 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 置信度契约（javadoc 公开计分规则）：逐跳/入口/严重度/模式加分/惩罚与 evidence 因子分解。 */
 class ConfidenceScorerTest {
@@ -82,5 +81,27 @@ class ConfidenceScorerTest {
         // writeReplace 序列化侧入口权重 2（本轮新增契约）
         Chain c = chain(List.of(entry("app/A", "writeReplace")), "writeReplace", "LOW", 0);
         assertEquals(2, ConfidenceScorer.evidenceScore(c, null));
+    }
+
+    @Test
+    void frameworkBeanInputIsPositiveEvidence() {
+        Chain c = chain(List.of(
+                        new ChainHop("app/Bean", "setCommand", "app/Bean", "setCommand",
+                                HopKind.ENTRY, null, "framework-bean-input", "(Ljava/lang/String;)V", null)),
+                "deserialize", "HIGH", 0);
+        assertEquals(1 + 1 + ConfidenceScorer.FRAMEWORK_BEAN_INPUT_BONUS,
+                ConfidenceScorer.evidenceScore(c, null));
+        assertTrue(ConfidenceScorer.evidenceDecomposition(c, null)
+                .contains("source-boundary:framework-bean-input+2"));
+    }
+
+    @Test
+    void directSinkConfirmationSupersedesProbeConstructionWarning() {
+        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
+                "readObject", "HIGH", 0);
+        assertEquals("FEASIBLE", ConfidenceScorer.score(c,
+                List.of("degrade:partial-construct", "verify:confirmed")));
+        assertTrue(ConfidenceScorer.evidenceScore(c,
+                List.of("degrade:partial-construct", "verify:confirmed")) >= 5);
     }
 }

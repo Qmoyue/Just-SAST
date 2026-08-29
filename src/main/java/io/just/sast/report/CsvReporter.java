@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -46,14 +47,15 @@ public final class CsvReporter {
             }
             groups.computeIfAbsent(pairKey(chain), k -> new ArrayList<>()).add(chain);
         }
+        for (List<Chain> group : groups.values()) {
+            group.sort(chainOrder());
+        }
         // 高可用链置顶：置信度 → 质量（无未解析） → 链长 → 变体数
         List<List<Chain>> sortedGroups = new ArrayList<>(groups.values());
         sortedGroups.sort((a, b) -> compareGroups(a, b, chainNotes));
         int seq = 0;
         for (List<Chain> group : sortedGroups) {
-            Chain representative = group.stream()
-                    .min(java.util.Comparator.comparingInt(c -> c.hops().size()))
-                    .orElseThrow();
+            Chain representative = group.get(0);
             String chainId = ChainIds.id(representative.key()) + "-" + String.format("%04d", ++seq);
             // 收集组内全部变体的注释（verify 标注可能在非 representative 变体上）
             List<String> groupNotes = new ArrayList<>();
@@ -65,11 +67,15 @@ public final class CsvReporter {
             edges.addAll(edgeRows(chainId, representative));
         }
         List<Row> sinks = new ArrayList<>();
-        for (SinkOutcome outcome : outcomes.values()) {
+        List<SinkOutcome> orderedOutcomes = new ArrayList<>(outcomes.values());
+        orderedOutcomes.sort(Comparator.comparing(CsvReporter::sinkKey));
+        for (SinkOutcome outcome : orderedOutcomes) {
             sinks.add(sinkRow(outcome));
         }
         List<Row> calibrationRows = new ArrayList<>();
-        for (Map.Entry<String, String> e : calibrations.entrySet()) {
+        List<Map.Entry<String, String>> orderedCalibrations = new ArrayList<>(calibrations.entrySet());
+        orderedCalibrations.sort(Map.Entry.comparingByKey());
+        for (Map.Entry<String, String> e : orderedCalibrations) {
             calibrationRows.add(new Row(e.getKey(), e.getValue()));
         }
         // chains.csv：全变体链表（同 entry/sink 折叠组内的每条路径独立成行——变体路径对分析者有价值）
@@ -78,7 +84,7 @@ public final class CsvReporter {
             for (Chain variant : group) {
                 allChains.add(new Row(ChainIds.id(variant.key()), variant.ruleId(),
                         variant.entryClass(), variant.entryMethod(), entryDescriptor(variant), variant.entryKind(),
-                        variant.sinkClass(), variant.sinkMethod(),
+                        variant.sinkClass(), variant.sinkMethod(), sinkDescriptor(variant),
                         String.valueOf(regions.crossings(variant)), pathSummary(variant)));
             }
         }
@@ -106,15 +112,17 @@ public final class CsvReporter {
     }
 
     private static String pairKey(Chain chain) {
-        return chain.entryClass() + "#" + chain.entryMethod() + "|"
-                + chain.sinkClass() + "#" + chain.sinkMethod() + "|" + chain.category();
+        return chain.ruleId() + "|" + chain.entryClass() + "#" + chain.entryMethod()
+                + "|" + entryDescriptor(chain) + "|"
+                + chain.sinkClass() + "#" + chain.sinkMethod() + "|" + sinkDescriptor(chain)
+                + "|" + chain.category();
     }
 
     /** 组排序：CONFIRMED 链置顶 → 证据分值降序 → 链长（短优先） → 变体数（多优先）。 */
     private static int compareGroups(List<Chain> g1, List<Chain> g2,
                                      Map<String, List<String>> chainNotes) {
-        Chain c1 = g1.stream().min(java.util.Comparator.comparingInt(c -> c.hops().size())).orElseThrow();
-        Chain c2 = g2.stream().min(java.util.Comparator.comparingInt(c -> c.hops().size())).orElseThrow();
+        Chain c1 = g1.get(0);
+        Chain c2 = g2.get(0);
         // CONFIRMED 优先（子进程验证为真的链排最前）
         boolean confirmed1 = hasConfirmedNote(g1, chainNotes);
         boolean confirmed2 = hasConfirmedNote(g2, chainNotes);
@@ -137,9 +145,23 @@ public final class CsvReporter {
         return pairKey(c1).compareTo(pairKey(c2));
     }
 
+    private static Comparator<Chain> chainOrder() {
+        return Comparator.comparingInt((Chain c) -> c.hops().size()).thenComparing(Chain::key);
+    }
+
+    private static String sinkKey(SinkOutcome outcome) {
+        return String.join("|", nullToEmpty(outcome.ruleId()), nullToEmpty(outcome.category()),
+                nullToEmpty(outcome.sinkOwner()), nullToEmpty(outcome.sinkMethod()),
+                nullToEmpty(outcome.enclosingClass()), nullToEmpty(outcome.enclosingMethod()));
+    }
+
+    private static String nullToEmpty(String value) {
+        return value == null ? "" : value;
+    }
+
     private static final String FINDINGS_HEADER = "chain_id,rule_id,category,severity,confidence,confidence_score,quality,"
             + "entry_class,entry_method,entry_descriptor,entry_kind,sink_class,sink_method,sink_kind,"
-            + "chain_length,unresolved_hops,variant_count,patterns,path,evidence,verify";
+            + "sink_descriptor,chain_length,unresolved_hops,variant_count,patterns,path,evidence,verify";
 
     private static final String EDGES_HEADER = "chain_id,step,from_class,from_method,to_class,to_method,"
             + "edge_kind,field,reason";
@@ -151,7 +173,7 @@ public final class CsvReporter {
     private static final String CALIBRATIONS_HEADER = "chain_key,reject_reason";
 
     private static final String CHAINS_HEADER = "variant_id,rule_id,entry_class,entry_method,entry_descriptor,entry_kind,"
-            + "sink_class,sink_method,region_crossings,path";
+            + "sink_class,sink_method,sink_descriptor,region_crossings,path";
 
     private Row sinkRow(SinkOutcome outcome) {
         return new Row(outcome.ruleId(), outcome.category(),
@@ -176,7 +198,7 @@ public final class CsvReporter {
         return new Row(chainId, chain.ruleId(), chain.category(), chain.severity(), confidence,
                 String.valueOf(ConfidenceScorer.evidenceScore(chain, notes)), quality,
                 chain.entryClass(), chain.entryMethod(), entryDescriptor(chain), chain.entryKind(),
-                chain.sinkClass(), chain.sinkMethod(), chain.category(),
+                chain.sinkClass(), chain.sinkMethod(), chain.category(), sinkDescriptor(chain),
                 String.valueOf(chain.hops().size()), String.valueOf(chain.unresolvedHops()),
                 String.valueOf(variantCount), patterns, path, evidence, verifySummary(chain, notes));
     }
@@ -215,6 +237,20 @@ public final class CsvReporter {
     private static String entryDescriptor(Chain chain) {
         for (ChainHop hop : chain.hops()) {
             if (hop.kind() == HopKind.ENTRY && hop.desc() != null) {
+                return hop.desc();
+            }
+        }
+        return "";
+    }
+
+    /** sink 调用描述符（不同重载不能合并；旧构造的 Chain 仍可从 hop 回退推断）。 */
+    private static String sinkDescriptor(Chain chain) {
+        if (chain.sinkDescriptor() != null && !chain.sinkDescriptor().isEmpty()) {
+            return chain.sinkDescriptor();
+        }
+        for (ChainHop hop : chain.hops()) {
+            if (chain.sinkClass().equals(hop.toOwner()) && chain.sinkMethod().equals(hop.toName())
+                    && hop.desc() != null && !hop.desc().isEmpty()) {
                 return hop.desc();
             }
         }
@@ -263,6 +299,7 @@ public final class CsvReporter {
             case DIRECT_CALL -> "DIRECT_CALL";
             case VIRTUAL_DISPATCH -> "VIRTUAL_DISPATCH";
             case LAMBDA -> "LAMBDA";
+            case NATIVE_CALLBACK -> "NATIVE_CALLBACK";
             case FIELD_FLOW -> "FIELD_FLOW";
             case ENTRY -> "ENTRY";
         };
@@ -274,9 +311,8 @@ public final class CsvReporter {
         private io.just.sast.analysis.taint.RegionMap map;
 
         void attach(io.just.sast.cpg.graph.Graph graph) {
-            if (graph != null && map == null) {
-                map = new io.just.sast.analysis.taint.RegionMap(graph);
-            }
+            // Reporter 可在同一 JVM 中复用；每次写出都必须绑定当前图，不能沿用上次扫描的 region。
+            map = graph == null ? null : new io.just.sast.analysis.taint.RegionMap(graph);
         }
 
         int crossings(Chain chain) {

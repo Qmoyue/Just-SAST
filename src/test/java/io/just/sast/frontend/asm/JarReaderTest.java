@@ -8,6 +8,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.function.Function;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -57,5 +59,25 @@ class JarReaderTest {
         List<String> names = classes.stream().map(ClassBytes::className).toList();
         assertTrue(names.contains("com/app/App"), "顶层 class 在: " + names);
         assertTrue(names.contains("deep/Secret"), "二层嵌套 jar 的 class 也应被解析: " + names);
+    }
+
+    @Test
+    void streamingKeepsOrderAndReportsTheSameEntries(@TempDir Path tmp) throws Exception {
+        byte[] nested = zip(Map.of("lib/Dependency.class", JarReaderTest::markerClass));
+        Path jar = tmp.resolve("stream.jar");
+        Map<String, Function<String, byte[]>> root = new LinkedHashMap<>();
+        root.put("BOOT-INF/classes/com/app/Main.class", JarReaderTest::markerClass);
+        root.put("BOOT-INF/lib/dependency.jar", ignored -> nested);
+        Files.write(jar, zip(root));
+
+        List<String> names = new ArrayList<>();
+        JarReader.StreamResult result = new JarReader().streamDetailed(jar,
+                bytes -> names.add(bytes.className()));
+        List<String> compatibilityNames = new JarReader().read(jar).stream()
+                .map(ClassBytes::className).toList();
+
+        assertEquals(2, result.classesEmitted());
+        assertEquals(compatibilityNames, names);
+        assertTrue(result.completenessReasons().isEmpty());
     }
 }

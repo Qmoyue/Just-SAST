@@ -16,7 +16,6 @@ import io.just.sast.util.JustLogger;
 
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -79,9 +78,10 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
         if (event.type() != EventType.SCAN_ANALYZED) {
             return;
         }
+        JustLogger.info("对象图入口开始：当前链 {}", bb.chains().size());
         // 字段容器索引：声明类型 → (所在类, 字段名)，仅 Serializable 类的非 transient/static 引用字段
-        Map<String, List<String[]>> containersByType = new HashMap<>();
-        Set<String> owners = new HashSet<>();
+        Map<String, List<String[]>> containersByType = new java.util.TreeMap<>();
+        Set<String> owners = new java.util.TreeSet<>();
         for (Node m : bb.graph().nodesOfType(NodeType.METHOD)) {
             owners.add(m.strProp("owner"));
         }
@@ -105,6 +105,14 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
                         .add(new String[] {owner, f.name()});
             }
         }
+        for (List<String[]> containers : containersByType.values()) {
+            containers.sort(java.util.Comparator
+                    .comparing((String[] container) -> container[0])
+                    .thenComparing(container -> container[1]));
+        }
+        JustLogger.info("对象图字段索引：容器类型 {}，容器字段 {}",
+                containersByType.size(), containersByType.values().stream()
+                        .mapToInt(List::size).sum());
         // validateObject 注册核验：类 readObject 体内调用 OIS.registerValidation 才会被机制回调
         Set<String> validationRegistered = new HashSet<>();
         for (Node call : bb.graph().nodesOfType(NodeType.CALL)) {
@@ -114,8 +122,11 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
             }
         }
         int rerooted = 0;
-        for (Chain chain : List.copyOf(bb.chains())) {
+        List<Chain> chains = new ArrayList<>(bb.chains());
+        chains.sort(java.util.Comparator.comparing(Chain::key));
+        for (Chain chain : chains) {
             if (rerooted >= MAX_REROOTED) {
+                bb.markIncomplete("OBJECT_GRAPH_REROOT_CAP:" + MAX_REROOTED);
                 break;
             }
             if (!mechanismInvoked(chain.entryKind(), chain.entryClass(), validationRegistered)) {
@@ -126,6 +137,9 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
             for (String ancestor : ancestors(chain.entryClass())) {
                 for (String[] container : containersByType.getOrDefault(ancestor, List.of())) {
                     if (per >= MAX_PER_CHAIN || rerooted >= MAX_REROOTED) {
+                        if (rerooted >= MAX_REROOTED) {
+                            bb.markIncomplete("OBJECT_GRAPH_REROOT_CAP:" + MAX_REROOTED);
+                        }
                         break;
                     }
                     Chain merged = reroot(chain, container[0], container[1]);
@@ -182,7 +196,7 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
         }
         return new Chain(chain.ruleId(), chain.category(), chain.severity(),
                 entry[0], entry[1], entry[2],
-                chain.sinkClass(), chain.sinkMethod(), hops, chain.unresolvedHops());
+                chain.sinkClass(), chain.sinkMethod(), hops, chain.unresolvedHops(), chain.sinkDescriptor());
     }
 
     /** 类的第一个机制回调入口（owner, method, entryKind）；无则 null。 */
@@ -231,6 +245,7 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
             }
             queue.addAll(ci.interfaces());
         }
+        result.sort(String::compareTo);
         return result;
     }
 }

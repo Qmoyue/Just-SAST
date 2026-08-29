@@ -17,6 +17,10 @@ public final class ConsoleSummary {
                 stats.elapsedMs(), stats.heapUsedMb());
         JustLogger.info("sink {} 个，magic entry {} 个，候选链 {} 条",
                 stats.sinksMarked(), stats.magicEntries(), stats.chainsFound());
+        JustLogger.info("完整性 {}（{}），动态验证 {}，阶段耗时 {}",
+                stats.completeness(), stats.completenessReasons().isEmpty()
+                        ? "无截断/诊断" : String.join(",", stats.completenessReasons()),
+                stats.verification(), stats.phaseMs());
         Map<String, int[]> byRule = new LinkedHashMap<>();
         for (SinkOutcome outcome : outcomes.values()) {
             int[] counters = byRule.computeIfAbsent(outcome.ruleId(), k -> new int[2]);

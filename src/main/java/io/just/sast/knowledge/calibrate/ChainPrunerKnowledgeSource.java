@@ -21,7 +21,6 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -30,7 +29,7 @@ import java.util.Set;
  * 链剪枝知识源（CALIBRATION 阶段）。
  * 两层剪枝：
  * 1. 触发上下文：hashCode/equals/compareTo/compare/toString 入口须有反序列化可达触发者
- * 2. 机制去重：同机制尾按入口家族留 ≤5 条代表
+ * 2. 机制去重：只在同一入口签名内合并重复变体
  * 依赖：ChainValidator 先执行（priority 100 < 本源 200），被拒绝的链不再参与去重。
  * 入口下游闭包与反向污点引擎共享同一份（黑板 OriginSupport 分发）。
  */
@@ -42,9 +41,6 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
 
     private static final Set<String> TRIGGER_REQUIRED = Set.of(
             "hashCode", "equals", "compareTo", "compare", "toString");
-    /** 同机制保留的入口类代表上限。家族 = 入口类本身（不同类即不同发现；同类变体仍被去重）。 */
-    private static final int MAX_FAMILIES = 8;
-
     private Blackboard bb;
 
     @Override
@@ -131,27 +127,20 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
                     .thenComparingInt(c -> c.hops().size())
                     .thenComparingInt(c -> -ConfidenceScorer.evidenceScore(c, null))
                     .thenComparing(Chain::key));
-            // V3 Flash 式多样性预算：前 MAX_FAMILIES 个家族保留；超出的高证据链保留（DEGRADED 标注），
-            // 低证据链淘汰——多样性有预算但不硬切
-            Set<String> keptFamilies = new LinkedHashSet<>();
-            int overflow = 0;
+            // 机制去重不能跨入口签名折叠：两个不同的可触发入口即使最终调用
+            // 同一个 sink，也可能对应不同的反序列化对象图和不同的可利用条件。
+            // mechanismKey 已把入口 kind/class/method/descriptor 纳入分组，因此
+            // 同一组只保留排序后的首个完整变体；不再使用固定的入口家族/溢出预算，
+            // 避免在大图上静默淘汰真实链。预算应由上游有界探索与报告分页承担，
+            // 而不是由校准阶段制造欠完备结果。
+            boolean kept = false;
             for (Chain chain : group) {
-                String family = entryFamily(chain.entryClass());
-                if (keptFamilies.contains(family)) {
-                    bb.calibrateChain(chain.key(), "mechanism-duplicate");
-                    dedup++;
-                } else if (keptFamilies.size() >= MAX_FAMILIES) {
-                    // 软预算：高证据链保留但降级
-                    if (ConfidenceScorer.evidenceScore(chain, null) >= 4 && overflow < 3) {
-                        overflow++;
-                        bb.chainNote(chain.key(), "degrade:overflow");
-                    } else {
-                        bb.calibrateChain(chain.key(), "mechanism-duplicate");
-                        dedup++;
-                    }
-                } else {
-                    keptFamilies.add(family);
+                if (!kept) {
+                    kept = true;
+                    continue;
                 }
+                bb.calibrateChain(chain.key(), "mechanism-duplicate");
+                dedup++;
             }
         }
         JustLogger.info("链剪枝：无触发拒绝 {}，机制内部类 {}，机制去重 {}（共 {} 条）",
@@ -231,7 +220,11 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
     private static String mechanismKey(Chain chain) {
         StringBuilder sb = new StringBuilder();
         sb.append(chain.sinkClass()).append('.').append(chain.sinkMethod())
-                .append('|').append(chain.category()).append('|');
+                .append('|').append(chain.category()).append('|')
+                .append(chain.entryKind()).append('|')
+                .append(chain.entryClass()).append('|')
+                .append(chain.entryMethod()).append('|')
+                .append(entryDescriptor(chain)).append('|');
         List<ChainHop> hops = chain.hops();
         for (int i = 1; i < hops.size(); i++) {
             ChainHop hop = hops.get(i);
@@ -244,9 +237,12 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         return sb.toString();
     }
 
-    /** 入口家族 = 入口类本身：跨类多样性是不同发现，不应被包级家族折叠（历史 bug：包前两段折叠把
-     *  单包语料/单包应用的全部分析发现折叠成 1 条）。 */
-    private static String entryFamily(String entryClass) {
-        return entryClass;
+    private static String entryDescriptor(Chain chain) {
+        for (ChainHop hop : chain.hops()) {
+            if (hop.kind() == HopKind.ENTRY && hop.desc() != null) {
+                return hop.desc();
+            }
+        }
+        return "";
     }
 }

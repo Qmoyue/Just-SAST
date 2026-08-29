@@ -9,6 +9,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 调度器契约：阶段边界、priority 同阶段排序、异常隔离。 */
 class ControllerTest {
@@ -108,5 +109,23 @@ class ControllerTest {
                 java.util.List.of(producer, chainConsumer)).run();
         assertFalse(received.isEmpty(), "CALIBRATION 订阅者应收到 ANALYSIS 期的 CHAIN_FOUND");
     }
-}
 
+    @Test
+    void analysisSourceWithoutScanStartInterestIsNotCalledWithWrongEvent() {
+        List<String> log = new ArrayList<>();
+        // 精确模拟只订阅 SCAN_ANALYZED 的扩展点。
+        KnowledgeSource source = new KnowledgeSource() {
+            @Override public String id() { return "analyzed-only"; }
+            @Override public Set<EventType> interests() { return Set.of(EventType.SCAN_ANALYZED); }
+            @Override public Phase phase() { return Phase.ANALYSIS; }
+            @Override public int priority() { return 100; }
+            @Override public void init(Blackboard bb) { }
+            @Override public void onEvent(Blackboard bb, Event event) { log.add(event.type().name()); }
+        };
+        new Controller(new Blackboard(new io.just.sast.cpg.graph.Graph(),
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(java.util.Map.of(), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), io.just.sast.config.RuleSet.EMPTY, 20,
+                Blackboard.ScanInputs.fastDefault(Path.of("."))), List.of(source)).run();
+        assertTrue(log.isEmpty(), "未订阅 SCAN_START 的分析源不得收到错误事件");
+    }
+}

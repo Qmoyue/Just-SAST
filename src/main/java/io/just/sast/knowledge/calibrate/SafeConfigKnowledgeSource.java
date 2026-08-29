@@ -118,7 +118,9 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
                         // （如 Kryo.setRegistrationRequired(false) 是关闭安全模式，不是加固）
                         Boolean actual = pushedBooleanValue(info.instructions(), idx);
                         Boolean expected = src.safeConfig().safeValue();
-                        boolean safe = expected == null || actual == null || actual.equals(expected);
+                        // 声明了 safe-value 时，未知值不能证明已经进入安全模式；
+                        // 将 unknown 当安全会把动态/字段传入的 false 误抑制。
+                        boolean safe = expected == null || (actual != null && actual.equals(expected));
                         if (safe) {
                             pair[0] = Math.min(pair[0], insn.offset());
                         }
@@ -139,7 +141,10 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
     }
 
     private static boolean isSafeConfigCall(io.just.sast.config.Rule.SafeConfigDecl safe, String owner, String name) {
-        return owner.startsWith(safe.owner().pattern()) && safe.methods().contains(name);
+        boolean ownerMatches = safe.owner().isRegex()
+                ? safe.owner().matches(owner)
+                : owner.equals(safe.owner().pattern()) || owner.startsWith(safe.owner().pattern() + "/");
+        return ownerMatches && safe.methods().contains(name);
     }
 
     /** 调用点前最近的一条整型常量推送（≤6 条内）：ICONST/BIPUSH/SIPUSH/LDC-int。无法判定为 null。 */

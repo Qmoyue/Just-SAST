@@ -55,4 +55,17 @@ class CfgTest {
         // GOTO 后继里不得出现 fall-through（offset 1）
         assertFalse(edges.get(0).stream().anyMatch(e -> e.targetOffset() == 1));
     }
+
+    @Test
+    void indexedViewKeepsLegacySuccessorSemantics() {
+        MethodInfo m = method(
+                insn(0, Op.JSR, 2),
+                insn(1, Op.RETURN),
+                insn(2, Op.RET, 3));
+        var sparse = Cfg.compute(m);
+        var indexed = Cfg.computeIndexed(m);
+        assertEquals(sparse.get(0), indexed.successorsAt(0));
+        assertEquals(List.of(), indexed.successorsAt(2));
+        assertEquals(List.of(), indexed.successorsAt(-1));
+    }
 }

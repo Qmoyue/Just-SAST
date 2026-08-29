@@ -5,6 +5,7 @@ public enum HopKind {
     DIRECT_CALL,
     VIRTUAL_DISPATCH,
     LAMBDA,
+    NATIVE_CALLBACK,
     FIELD_FLOW,
     ENTRY
 }

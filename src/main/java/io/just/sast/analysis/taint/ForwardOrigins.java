@@ -9,12 +9,16 @@ import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
-import io.just.sast.util.JustLogger;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.AbstractMap;
+import java.util.AbstractSet;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -37,31 +41,106 @@ public final class ForwardOrigins {
     public record Slot(Set<ValueOrigin> origins, boolean cat2) {}
 
     /** 某点的值来源状态。 */
-    public record State(List<Slot> stack, List<Set<ValueOrigin>> locals) {
+    public static final class State {
+        /*
+         * A state exists for every reachable instruction.  Keeping two ArrayList objects
+         * (and their backing arrays) in every state made large methods disproportionately
+         * expensive.  The public List accessors remain for compatibility, while the retained
+         * representation is two compact arrays.  Views are created only when a caller asks
+         * for them and are never used by the transfer hot path.
+         */
+        private final Slot[] stack;
+        private final Set<ValueOrigin>[] locals;
+        private transient List<Slot> stackView;
+        private transient List<Set<ValueOrigin>> localsView;
+
+        @SuppressWarnings("unchecked")
+        public State(List<Slot> stack, List<Set<ValueOrigin>> locals) {
+            this.stack = stack == null ? new Slot[0] : stack.toArray(new Slot[0]);
+            this.locals = locals == null ? new Set[0] : locals.toArray(new Set[0]);
+        }
+
+        private State(Slot[] stack, Set<ValueOrigin>[] locals) {
+            this.stack = stack;
+            this.locals = locals;
+        }
+
+        public List<Slot> stack() {
+            List<Slot> view = stackView;
+            if (view != null) {
+                return view;
+            }
+            view = stack.length == 0 ? List.of()
+                    : Collections.unmodifiableList(Arrays.asList(stack));
+            stackView = view;
+            return view;
+        }
+
+        public List<Set<ValueOrigin>> locals() {
+            List<Set<ValueOrigin>> view = localsView;
+            if (view != null) {
+                return view;
+            }
+            view = locals.length == 0 ? List.of()
+                    : Collections.unmodifiableList(Arrays.asList(locals));
+            localsView = view;
+            return view;
+        }
+
+        private Slot[] stackArray() {
+            return stack;
+        }
+
+        private Set<ValueOrigin>[] localsArray() {
+            return locals;
+        }
 
         public State merge(State other) {
-            if (stack.size() != other.stack.size() && JustLogger.isDebug()) {
-                JustLogger.debug("origin 栈高不一致合并：{} vs {}（保守截断到公共高度）",
-                        stack.size(), other.stack.size());
+            if (equals(other)) {
+                return this;
             }
             List<Slot> mergedStack = new ArrayList<>();
-            int depth = Math.min(stack.size(), other.stack.size());
+            int depth = Math.min(stack.length, other.stack.length);
             for (int i = 0; i < depth; i++) {
-                Slot a = stack.get(i);
-                Slot b = other.stack.get(i);
+                Slot a = stack[i];
+                Slot b = other.stack[i];
                 mergedStack.add(new Slot(union(a.origins(), b.origins()), a.cat2() || b.cat2()));
             }
-            List<Set<ValueOrigin>> mergedLocals = new ArrayList<>(locals.size());
-            for (int i = 0; i < locals.size(); i++) {
-                mergedLocals.add(union(locals.get(i), other.locals.get(i)));
+            int localCount = Math.min(locals.length, other.locals.length);
+            List<Set<ValueOrigin>> mergedLocals = new ArrayList<>(localCount);
+            for (int i = 0; i < localCount; i++) {
+                mergedLocals.add(union(locals[i], other.locals[i]));
             }
             return new State(mergedStack, mergedLocals);
+        }
+
+        @Override
+        public boolean equals(Object object) {
+            if (this == object) {
+                return true;
+            }
+            if (!(object instanceof State other)) {
+                return false;
+            }
+            return Arrays.equals(stack, other.stack) && Arrays.equals(locals, other.locals);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * Arrays.hashCode(stack) + Arrays.hashCode(locals);
         }
     }
 
     /** 方法级结果。 */
     public record Result(Map<Integer, State> stateBefore,
-                         Map<ValueOrigin, Set<ValueOrigin>> arrayElements) {}
+                         Map<ValueOrigin, Set<ValueOrigin>> arrayElements,
+                         Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements) {
+
+        public Result(Map<Integer, State> stateBefore,
+                      Map<ValueOrigin, Set<ValueOrigin>> arrayElements) {
+            this(stateBefore, arrayElements, Map.of());
+        }
+    }
 
     private static final Slot UNKNOWN_SLOT = new Slot(Set.of(new ValueOrigin.Unknown()), false);
 
@@ -74,17 +153,20 @@ public final class ForwardOrigins {
 
     public Result compute(MethodInfo method) {
         String key = CfgKey.of(method);
-        Result cached = cache.get(key);
-        if (cached != null) {
-            return cached;
-        }
-        Result result = analyze(method);
-        cache.put(key, result);
-        return result;
+        // computeIfAbsent 是分析结果的 single owner：反向 sink 并行时同一方法只允许
+        // 有一个 CFG/抽象解释任务，避免旧的 get→analyze→put 竞态把最热方法重复算 N 次。
+        return cache.computeIfAbsent(key, ignored -> analyze(method));
     }
 
     private Result analyze(MethodInfo method) {
-        Map<Integer, List<CfgEdge>> cfg = Cfg.compute(method);
+        // Abstract/native methods can be present in the resolved class model and be reachable
+        // through a declaration edge, but they have no bytecode body. There is no offset 0 to
+        // interpret; an empty immutable result is the precise summary and keeps callers from
+        // manufacturing a synthetic instruction state.
+        if (method.instructions().isEmpty()) {
+            return new Result(Map.of(), Map.of(), Map.of());
+        }
+        Cfg.Indexed cfg = Cfg.computeIndexed(method);
         int maxLocals = maxLocals(method);
         List<Set<ValueOrigin>> initLocals = new ArrayList<>(maxLocals);
         for (int i = 0; i < maxLocals; i++) {
@@ -97,31 +179,37 @@ public final class ForwardOrigins {
             slot += width;
         }
 
-        Map<Integer, State> before = new HashMap<>();
+        State[] before = new State[method.instructions().size()];
         Map<ValueOrigin, Set<ValueOrigin>> arrayElements = new HashMap<>();
+        Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements = new HashMap<>();
         Deque<Integer> worklist = new ArrayDeque<>();
         State entry = new State(new ArrayList<>(), initLocals);
-        before.put(0, entry);
+        before[0] = entry;
         worklist.add(0);
         while (!worklist.isEmpty()) {
             int offset = worklist.poll();
-            State state = before.get(offset);
+            State state = offset >= 0 && offset < before.length ? before[offset] : null;
             if (state == null) {
                 continue;
             }
-            State out = transfer(method, method.insnAt(offset), state, arrayElements);
-            for (CfgEdge edge : cfg.getOrDefault(offset, List.of())) {
+            State out = transfer(method, method.insnAt(offset), state, arrayElements,
+                    indexedArrayElements);
+            for (CfgEdge edge : cfg.successorsAt(offset)) {
                 // 异常边：进入 handler 时 JVM 清空栈并压入异常对象，locals 保留
                 State incoming = edge.label() == CfgLabel.EXCEPTION ? exceptionState(out) : out;
-                State old = before.get(edge.targetOffset());
+                int target = edge.targetOffset();
+                if (target < 0 || target >= before.length) {
+                    continue;
+                }
+                State old = before[target];
                 State merged = old == null ? incoming : old.merge(incoming);
                 if (!merged.equals(old)) {
-                    before.put(edge.targetOffset(), merged);
-                    worklist.add(edge.targetOffset());
+                    before[target] = merged;
+                    worklist.add(target);
                 }
             }
         }
-        return new Result(before, arrayElements);
+        return new Result(new DenseStateMap(before), arrayElements, indexedArrayElements);
     }
 
     private int maxLocals(MethodInfo method) {
@@ -137,9 +225,10 @@ public final class ForwardOrigins {
     }
 
     private State transfer(MethodInfo method, InsnFact insn, State in,
-                           Map<ValueOrigin, Set<ValueOrigin>> arrayElements) {
-        List<Slot> stack = new ArrayList<>(in.stack());
-        List<Set<ValueOrigin>> locals = new ArrayList<>(in.locals());
+                           Map<ValueOrigin, Set<ValueOrigin>> arrayElements,
+                           Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements) {
+        List<Slot> stack = new ArrayList<>(Arrays.asList(in.stackArray()));
+        List<Set<ValueOrigin>> locals = new ArrayList<>(Arrays.asList(in.localsArray()));
         Op op = insn.op();
         switch (op) {
             case NOP, GOTO, RET -> {
@@ -150,8 +239,10 @@ public final class ForwardOrigins {
                     push(stack, new Slot(Set.of(new ValueOrigin.Constant("jsr-address")), false));
             case TABLESWITCH, LOOKUPSWITCH -> pop(stack); // 弹出 switch key
             case ACONST_NULL, ICONST_M1, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5,
-                    FCONST_0, FCONST_1, FCONST_2, BIPUSH, SIPUSH ->
+                    FCONST_0, FCONST_1, FCONST_2 ->
                     push(stack, new Slot(Set.of(new ValueOrigin.Constant(op.name())), false));
+            case BIPUSH, SIPUSH ->
+                    push(stack, new Slot(Set.of(new ValueOrigin.Constant(insn.operands().get(0))), false));
             case LCONST_0, LCONST_1, DCONST_0, DCONST_1 ->
                     push(stack, new Slot(Set.of(new ValueOrigin.Constant(op.name())), true));
             case LDC -> push(stack, new Slot(Set.of(new ValueOrigin.Constant(insn.constant())),
@@ -184,6 +275,16 @@ public final class ForwardOrigins {
             }
             case INVOKESTATIC, INVOKEVIRTUAL, INVOKESPECIAL, INVOKEINTERFACE, INVOKEDYNAMIC -> {
                 int argc = callArgCount(insn, op);
+                MethodRef methodRef = op == Op.INVOKEDYNAMIC || insn.operands().isEmpty()
+                        ? null : insn.methodRef();
+                if (op != Op.INVOKEDYNAMIC && isReflectiveArraySet(methodRef)) {
+                    recordReflectiveArrayWrite(stack, indexedArrayElements, arrayElements);
+                }
+                Long callId = callIdByKey.get(CfgKey.of(method) + "@" + insn.offset());
+                ValueOrigin.CallResult result = new ValueOrigin.CallResult(callId == null ? -1 : callId);
+                if (op != Op.INVOKEDYNAMIC && isReflectiveArrayGet(methodRef)) {
+                    recordReflectiveArrayRead(stack, result, indexedArrayElements, arrayElements);
+                }
                 for (int i = 0; i < argc; i++) {
                     pop(stack);
                 }
@@ -191,9 +292,13 @@ public final class ForwardOrigins {
                         ? Descriptor.returnType(insn.operands().isEmpty() ? "()V"
                                 : ((InvokeDynamicRef) insn.operands().get(0)).descriptor())
                         : Descriptor.returnType(insn.methodRef().descriptor());
-                Long callId = callIdByKey.get(CfgKey.of(method) + "@" + insn.offset());
-                push(stack, new Slot(Set.of(new ValueOrigin.CallResult(callId == null ? -1 : callId)),
-                        isCat2(returnDesc)));
+                // A void invocation produces no stack value.  Keeping a synthetic result
+                // here shifts every later receiver/argument slot and makes constructor
+                // initialized fields look unknown (NEW; DUP; <init>; PUTSTATIC is the
+                // smallest visible example).
+                if (!"V".equals(returnDesc)) {
+                    push(stack, new Slot(Set.of(result), isCat2(returnDesc)));
+                }
             }
             case NEW, NEWARRAY, ANEWARRAY, MULTIANEWARRAY -> {
                 int pops = op == Op.NEW ? 0 : op == Op.MULTIANEWARRAY ? (Integer) insn.operands().get(1) : 1;
@@ -214,10 +319,16 @@ public final class ForwardOrigins {
             }
             case IASTORE, LASTORE, FASTORE, DASTORE, AASTORE, BASTORE, CASTORE, SASTORE -> {
                 Set<ValueOrigin> value = pop(stack).origins();
-                pop(stack);
+                Set<ValueOrigin> index = pop(stack).origins();
                 Set<ValueOrigin> array = pop(stack).origins();
                 for (ValueOrigin arr : array) {
                     arrayElements.computeIfAbsent(arr, k -> new LinkedHashSet<>()).addAll(value);
+                    Integer constantIndex = constantIndex(index);
+                    if (constantIndex != null) {
+                        indexedArrayElements.computeIfAbsent(arr, k -> new HashMap<>())
+                                .computeIfAbsent(constantIndex, k -> new LinkedHashSet<>())
+                                .addAll(value);
+                    }
                 }
             }
             case ARRAYLENGTH, CHECKCAST, INSTANCEOF -> {
@@ -286,6 +397,97 @@ public final class ForwardOrigins {
             }
         }
         return new State(stack, locals);
+    }
+
+    private static Integer constantIndex(Set<ValueOrigin> origins) {
+        for (ValueOrigin origin : origins) {
+            if (!(origin instanceof ValueOrigin.Constant constant)) {
+                continue;
+            }
+            Object value = constant.value();
+            if (value instanceof Number number) {
+                return number.intValue();
+            }
+            if (value instanceof String opcode) {
+                return switch (opcode) {
+                    case "ICONST_M1" -> -1;
+                    case "ICONST_0" -> 0;
+                    case "ICONST_1" -> 1;
+                    case "ICONST_2" -> 2;
+                    case "ICONST_3" -> 3;
+                    case "ICONST_4" -> 4;
+                    case "ICONST_5" -> 5;
+                    default -> null;
+                };
+            }
+        }
+        return null;
+    }
+
+    /**
+     * java.lang.reflect.Array mutates arrays through ordinary calls rather than AASTORE.
+     * Treating these calls as opaque loses the element identity used by reflection-heavy
+     * gadgets; the summary is still monotone (writes are unioned), so unknown aliases remain
+     * conservative instead of being overwritten.
+     */
+    private static boolean isReflectiveArraySet(MethodRef ref) {
+        return ref != null && "java/lang/reflect/Array".equals(ref.owner())
+                && "set".equals(ref.name())
+                && "(Ljava/lang/Object;ILjava/lang/Object;)V".equals(ref.descriptor());
+    }
+
+    private static boolean isReflectiveArrayGet(MethodRef ref) {
+        return ref != null && "java/lang/reflect/Array".equals(ref.owner())
+                && "get".equals(ref.name())
+                && "(Ljava/lang/Object;I)Ljava/lang/Object;".equals(ref.descriptor());
+    }
+
+    private static void recordReflectiveArrayWrite(List<Slot> stack,
+                                                   Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexed,
+                                                   Map<ValueOrigin, Set<ValueOrigin>> aggregate) {
+        if (stack.size() < 3) {
+            return;
+        }
+        Set<ValueOrigin> arrays = stack.get(stack.size() - 3).origins();
+        Set<ValueOrigin> indices = stack.get(stack.size() - 2).origins();
+        Set<ValueOrigin> values = stack.get(stack.size() - 1).origins();
+        Integer index = constantIndex(indices);
+        for (ValueOrigin array : arrays) {
+            aggregate.computeIfAbsent(array, ignored -> new LinkedHashSet<>()).addAll(values);
+            if (index != null) {
+                indexed.computeIfAbsent(array, ignored -> new HashMap<>())
+                        .computeIfAbsent(index, ignored -> new LinkedHashSet<>())
+                        .addAll(values);
+            }
+        }
+    }
+
+    private static void recordReflectiveArrayRead(List<Slot> stack, ValueOrigin.CallResult result,
+                                                  Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexed,
+                                                  Map<ValueOrigin, Set<ValueOrigin>> aggregate) {
+        if (stack.size() < 2 || result.callNodeId() < 0) {
+            return;
+        }
+        Set<ValueOrigin> arrays = stack.get(stack.size() - 2).origins();
+        Set<ValueOrigin> indices = stack.get(stack.size() - 1).origins();
+        Integer index = constantIndex(indices);
+        Set<ValueOrigin> values = new LinkedHashSet<>();
+        for (ValueOrigin array : arrays) {
+            Map<Integer, Set<ValueOrigin>> byIndex = indexed.get(array);
+            if (index != null && byIndex != null && byIndex.containsKey(index)) {
+                values.addAll(byIndex.get(index));
+            } else {
+                values.addAll(aggregate.getOrDefault(array, Set.of()));
+            }
+            // A serialized/externally supplied array has no local element map. Its
+            // container is still the conservative origin of an unknown element.
+            if (values.isEmpty()) {
+                values.add(array);
+            }
+        }
+        if (!values.isEmpty()) {
+            aggregate.computeIfAbsent(result, ignored -> new LinkedHashSet<>()).addAll(values);
+        }
     }
 
     /** 异常边目标状态：栈 = [异常对象]，locals 保留。 */
@@ -374,12 +576,96 @@ public final class ForwardOrigins {
         if (a.isEmpty()) {
             return b;
         }
-        if (b.isEmpty() || a.equals(b)) {
+        // 保留 a 的 LinkedHashSet 顺序；来源遍历顺序参与稳定代表路径选择。
+        // 只有 b 没有引入新来源时才直接复用 a，避免无意义的集合分配。
+        if (b.isEmpty() || a.equals(b) || a.containsAll(b)) {
             return a;
         }
         LinkedHashSet<ValueOrigin> merged = new LinkedHashSet<>(a);
         merged.addAll(b);
         return merged;
+    }
+
+    /**
+     * Dense offset lookup for stateBefore.  CFG offsets are normalized to dense instruction
+     * indices by the frontend contract, so a HashMap<Integer,State> only adds boxed keys and
+     * table entries without adding lookup semantics.  entrySet is retained for compatibility
+     * with diagnostic consumers, but the analysis hot path uses get(offset).
+     */
+    private static final class DenseStateMap extends AbstractMap<Integer, State> {
+        private final State[] states;
+        private final int size;
+
+        private DenseStateMap(State[] states) {
+            this.states = states;
+            int count = 0;
+            for (State state : states) {
+                if (state != null) {
+                    count++;
+                }
+            }
+            this.size = count;
+        }
+
+        @Override
+        public State get(Object key) {
+            if (!(key instanceof Number number)) {
+                return null;
+            }
+            int offset = number.intValue();
+            return offset >= 0 && offset < states.length ? states[offset] : null;
+        }
+
+        @Override
+        public boolean containsKey(Object key) {
+            if (!(key instanceof Number number)) {
+                return false;
+            }
+            int offset = number.intValue();
+            return offset >= 0 && offset < states.length && states[offset] != null;
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public Set<Entry<Integer, State>> entrySet() {
+            return new AbstractSet<>() {
+                @Override
+                public Iterator<Entry<Integer, State>> iterator() {
+                    return new Iterator<>() {
+                        private int next = find(0);
+
+                        private int find(int start) {
+                            int index = start;
+                            while (index < states.length && states[index] == null) {
+                                index++;
+                            }
+                            return index;
+                        }
+
+                        @Override
+                        public boolean hasNext() {
+                            return next < states.length;
+                        }
+
+                        @Override
+                        public Entry<Integer, State> next() {
+                            int current = next;
+                            next = find(current + 1);
+                            return Map.entry(current, states[current]);
+                        }
+                    };
+                }
+
+                @Override
+                public int size() {
+                    return DenseStateMap.this.size;
+                }
+            };
+        }
     }
 
     /** 方法缓存键。 */

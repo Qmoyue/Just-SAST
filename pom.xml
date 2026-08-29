@@ -19,7 +19,15 @@
   </licenses>
 
   <properties>
-    <maven.compiler.release>17</maven.compiler.release>
+    <!--
+      Keep source/target instead of the release flag. The Jabba JDKs used by the
+      supported development environment return a spurious compiler-resource
+      failure after successfully writing classes when the release flag is present.
+      The project requires JDK 17 at runtime, and the verifier source below is
+      checked separately for Java 8 bytecode/API compatibility.
+    -->
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <asm.version>9.8</asm.version>
     <picocli.version>4.7.7</picocli.version>
@@ -61,6 +69,72 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.13.0</version>
+        <executions>
+          <execution>
+            <id>compile-java8-verifier</id>
+            <phase>compile</phase>
+            <goals>
+              <goal>compile</goal>
+            </goals>
+            <configuration>
+              <source>8</source>
+              <target>8</target>
+              <compileSourceRoots>
+                <compileSourceRoot>${project.basedir}/src/verify8/java</compileSourceRoot>
+              </compileSourceRoots>
+              <outputDirectory>${project.build.directory}/verify8-classes</outputDirectory>
+              <useIncrementalCompilation>false</useIncrementalCompilation>
+              <!-- main uses the Java 17 release in a separate compiler invocation. Reusing
+                   the same javac file manager across the release/output switch triggers
+                   "cannot close compiler resources" on Windows JDK 17. Keep the
+                   compatibility artifact isolated without changing production classes. -->
+              <compilerReuseStrategy>reuseNone</compilerReuseStrategy>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.1</version>
+        <executions>
+          <execution>
+            <id>unpack-asm-for-java8-verifier</id>
+            <phase>process-classes</phase>
+            <goals>
+              <goal>unpack-dependencies</goal>
+            </goals>
+            <configuration>
+              <includeArtifactIds>asm</includeArtifactIds>
+              <includeScope>runtime</includeScope>
+              <outputDirectory>${project.build.directory}/verify8-classes</outputDirectory>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.2</version>
+        <executions>
+          <execution>
+            <id>package-java8-verifier</id>
+            <phase>package</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+            <configuration>
+              <classifier>verify8</classifier>
+              <classesDirectory>${project.build.directory}/verify8-classes</classesDirectory>
+              <archive>
+                <manifestEntries>
+                  <Premain-Class>io.just.sast.verify.legacy.LegacySinkCanaryAgent</Premain-Class>
+                  <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                </manifestEntries>
+              </archive>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>

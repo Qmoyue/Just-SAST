@@ -14,6 +14,7 @@ public final class SinkCanaryGate {
 
     private static volatile String entryClass;
     private static volatile String entryMethod;
+    private static volatile boolean reached;
 
     private SinkCanaryGate() {
     }
@@ -22,6 +23,7 @@ public final class SinkCanaryGate {
     public static void setEntry(String dottedClass, String method) {
         entryClass = dottedClass;
         entryMethod = method;
+        reached = false;
     }
 
     /** sink 入口调用：栈上存在入口帧 → 抛标记；否则放行。 */
@@ -36,8 +38,24 @@ public final class SinkCanaryGate {
         for (int i = 1; i < stack.length; i++) {
             StackTraceElement frame = stack[i];
             if (ec.equals(frame.getClassName()) && em.equals(frame.getMethodName())) {
+                reached = true;
                 throw new SinkReachedError(spec);
             }
         }
+    }
+
+    /**
+     * Reflection wraps Errors thrown by an instrumented sink in InvocationTargetException;
+     * a gadget may then catch that checked wrapper and hide the marker from the probe. Keep a
+     * one-bit bootstrap-visible latch so the child can classify an already reached sink after
+     * the target's own catch block returns. The bit is reset for every forked chain.
+     */
+    public static boolean wasReached() {
+        return reached;
+    }
+
+    /** JDK 24+ 无 SecurityManager 时的第二道 Java 级能力门；目标代码调用危险 API 时直接失败。 */
+    public static void deny(String capability) {
+        throw new SecurityException("dynamic sandbox denied: " + capability);
     }
 }
