@@ -15,7 +15,6 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
-import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Collections;
@@ -26,7 +25,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Pattern;
 
 /**
  * 为完整扫描规划 JDK 类的最小安全闭包。
@@ -46,6 +44,15 @@ public final class JdkClassSelector {
     public record EntrySeed(String namePattern, boolean nameRegex,
                             String descriptorPattern, boolean descriptorRegex,
                             boolean privateOnly, String implementsType, String entryKind) {
+    }
+
+    /**
+     * 按内部名取得一个 JDK class。实现方可以从 jrt-fs 或 rt.jar 读取；选择器不依赖
+     * 具体容器，因此完整扫描不必先把整个 JDK 的 class bytes 搬进堆。
+     */
+    @FunctionalInterface
+    public interface ClassBytesLoader {
+        ClassBytes load(String internalName);
     }
 
     /** 不含方法体的 class header，仅供闭包规划与层次判断。 */
@@ -182,78 +189,106 @@ public final class JdkClassSelector {
                 initialSeeds, implicitEntrySeeds, selected.size());
     }
 
-    private static boolean matchesEntry(ClassHeader header, List<CompiledEntrySeed> seeds,
-                                        Map<String, ClassHeader> knownHeaders) {
-        if (seeds == null || seeds.isEmpty()) {
-            return false;
+    /**
+     * Demand-driven variant used by the production pipeline. The legacy list-based API above
+     * remains for extensions and tests, but it necessarily materializes every candidate class.
+     * This variant reads only names referenced by the application/rules and their structural
+     * ancestors. A malformed selected class is still returned so the normal frontend records a
+     * diagnostic instead of silently changing completeness.
+     *
+     * <p>The closure is intentionally the same structural closure as {@link #selectDetailed}:
+     * no method body is followed and no platform implementation is made a global root. The
+     * loader is called in sorted name order and the final bytes are sorted again, making class
+     * source iteration order irrelevant to CPG node IDs and report determinism.</p>
+     */
+    public static Selection selectDemandDriven(ClassBytesLoader loader, int availableClasses,
+                                               Map<String, ClassInfo> initial,
+                                               Set<String> typeSeeds,
+                                               List<EntrySeed> entrySeeds) {
+        if (loader == null) {
+            return new Selection(List.of(), Math.max(-1, availableClasses), 0, 0, 0, 0);
         }
-        for (CompiledEntrySeed seed : seeds) {
-            for (MethodHeader method : header.methods()) {
-                if (!seed.matchesName(method.name()) || !seed.matchesDescriptor(method.descriptor())) {
-                    continue;
-                }
-                if (seed.privateOnly() && !Modifier.isPrivate(method.access())) {
-                    continue;
-                }
-                if (seed.implementsType() == null
-                        || isSubtype(header.name(), seed.implementsType(), knownHeaders)) {
-                    return true;
-                }
+        Map<String, ClassHeader> knownHeaders = new LinkedHashMap<>();
+        if (initial != null) {
+            initial.values().stream()
+                    .sorted(java.util.Comparator.comparing(ClassInfo::internalName))
+                    .forEach(info -> knownHeaders.put(info.internalName(), headerOf(info)));
+        }
+
+        Map<String, ClassBytes> selected = new LinkedHashMap<>();
+        Map<String, ClassHeader> selectedHeaders = new LinkedHashMap<>();
+        Set<String> unavailable = new HashSet<>();
+        Set<String> seeds = new LinkedHashSet<>();
+        if (typeSeeds != null) {
+            seeds.addAll(typeSeeds);
+        }
+        if (initial != null) {
+            for (ClassInfo info : initial.values()) {
+                seeds.addAll(referencesOf(info));
             }
         }
-        return false;
-    }
+        List<String> orderedSeeds = seeds.stream()
+                .filter(name -> name != null && !name.isEmpty())
+                .sorted()
+                .toList();
+        for (String seed : orderedSeeds) {
+            enqueueDemand(seed, loader, selected, selectedHeaders, unavailable);
+        }
+        knownHeaders.putAll(selectedHeaders);
+        int initialSeeds = selected.size();
 
-    /**
-     * 只有 JVM/序列化机制会隐式调用的 entry 才需要在没有应用类型引用时全局入队。
-     * equals/hashCode/compare/toString 等普通虚方法仍按应用实际引用进入闭包；它们的
-     * JDK 实现不可能凭空成为链入口，遍历所有平台实现只会重建原来的图爆炸。
-     */
-    private static boolean matchesImplicitEntry(ClassHeader header,
-                                                List<CompiledEntrySeed> seeds,
-                                                Map<String, ClassHeader> knownHeaders) {
-        for (CompiledEntrySeed seed : seeds) {
-            if (!isImplicitEntry(seed.entryKind()) || !matchesEntry(header, List.of(seed), knownHeaders)) {
+        Deque<String> structural = new ArrayDeque<>(selected.keySet());
+        while (!structural.isEmpty()) {
+            String name = structural.removeFirst();
+            ClassHeader header = knownHeaders.get(name);
+            if (header == null) {
+                header = selectedHeaders.get(name);
+                if (header != null) {
+                    knownHeaders.put(name, header);
+                }
+            }
+            if (header == null) {
                 continue;
             }
-            return true;
+            if (header.superName() != null
+                    && enqueueDemand(header.superName(), loader, selected, selectedHeaders, unavailable)) {
+                structural.addLast(header.superName());
+                knownHeaders.putIfAbsent(header.superName(), selectedHeaders.get(header.superName()));
+            }
+            for (String itf : header.interfaces()) {
+                if (enqueueDemand(itf, loader, selected, selectedHeaders, unavailable)) {
+                    structural.addLast(itf);
+                    knownHeaders.putIfAbsent(itf, selectedHeaders.get(itf));
+                }
+            }
         }
-        return false;
+
+        List<ClassBytes> result = new ArrayList<>(selected.values());
+        result.sort(java.util.Comparator.comparing(ClassBytes::className));
+        return new Selection(List.copyOf(result), availableClasses, selectedHeaders.size(),
+                initialSeeds, 0, selected.size());
     }
 
-    private static boolean isImplicitEntry(String entryKind) {
-        return "readObject".equals(entryKind)
-                || "readObjectNoData".equals(entryKind)
-                || "readExternal".equals(entryKind)
-                || "readResolve".equals(entryKind)
-                || "proxyInvoke".equals(entryKind)
-                || "validateObject".equals(entryKind);
-    }
-
-    private static List<CompiledEntrySeed> compileEntrySeeds(List<EntrySeed> seeds) {
-        if (seeds == null || seeds.isEmpty()) {
-            return List.of();
+    private static boolean enqueueDemand(String name, ClassBytesLoader loader,
+                                         Map<String, ClassBytes> selected,
+                                         Map<String, ClassHeader> headers,
+                                         Set<String> unavailable) {
+        if (name == null || name.isEmpty() || selected.containsKey(name)
+                || unavailable.contains(name)) {
+            return false;
         }
-        List<CompiledEntrySeed> result = new ArrayList<>(seeds.size());
-        for (EntrySeed seed : seeds) {
-            result.add(new CompiledEntrySeed(
-                    seed.nameRegex() ? null : seed.namePattern(),
-                    seed.nameRegex() ? Pattern.compile(regexBody(seed.namePattern())) : null,
-                    seed.descriptorPattern() == null || !seed.descriptorRegex()
-                            ? seed.descriptorPattern() : null,
-                    seed.descriptorPattern() != null && seed.descriptorRegex()
-                            ? Pattern.compile(regexBody(seed.descriptorPattern())) : null,
-                    seed.privateOnly(), seed.implementsType(), seed.entryKind()));
+        ClassBytes bytes = loader.load(name);
+        if (bytes == null) {
+            unavailable.add(name);
+            return false;
         }
-        return List.copyOf(result);
-    }
-
-    private static String regexBody(String pattern) {
-        if (pattern == null) {
-            return "";
+        selected.put(name, bytes);
+        try {
+            headers.put(name, readHeader(bytes.bytes()));
+        } catch (RuntimeException ignored) {
+            // Keep the bytes for the full frontend so it can publish the real parse diagnostic.
         }
-        return pattern.startsWith("~") ? "^(?:" + pattern.substring(1) + ")$" :
-                "^(?:" + Pattern.quote(pattern) + ")$";
+        return true;
     }
 
     private static void enqueue(String name, Map<String, ClassBytes> bytesByName,
@@ -269,37 +304,6 @@ public final class JdkClassSelector {
             return false;
         }
         return selected.add(name);
-    }
-
-    private static boolean isSubtype(String name, String expected,
-                                     Map<String, ClassHeader> headers) {
-        if (name == null || expected == null) {
-            return false;
-        }
-        if (name.equals(expected)) {
-            return true;
-        }
-        Deque<String> work = new ArrayDeque<>();
-        Set<String> visited = new HashSet<>();
-        work.add(name);
-        while (!work.isEmpty()) {
-            String current = work.removeFirst();
-            if (!visited.add(current)) {
-                continue;
-            }
-            ClassHeader header = headers.get(current);
-            if (header == null) {
-                continue;
-            }
-            if (expected.equals(header.superName()) || header.interfaces().contains(expected)) {
-                return true;
-            }
-            if (header.superName() != null) {
-                work.addLast(header.superName());
-            }
-            work.addAll(header.interfaces());
-        }
-        return false;
     }
 
     private static ClassHeader readHeader(byte[] bytes) {
@@ -418,17 +422,4 @@ public final class JdkClassSelector {
         }
     }
 
-    private record CompiledEntrySeed(String nameLiteral, Pattern namePattern,
-                                     String descriptorLiteral, Pattern descriptorPattern,
-                                     boolean privateOnly, String implementsType, String entryKind) {
-        private boolean matchesName(String value) {
-            return namePattern != null ? namePattern.matcher(value).matches()
-                    : nameLiteral == null || nameLiteral.equals(value);
-        }
-
-        private boolean matchesDescriptor(String value) {
-            return descriptorPattern != null ? descriptorPattern.matcher(value).matches()
-                    : descriptorLiteral == null || descriptorLiteral.equals(value);
-        }
-    }
 }

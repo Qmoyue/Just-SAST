@@ -225,23 +225,24 @@ rules:
 
 仓库当前回归基线：
 
-- `mvn test`：146 项通过，0 失败，2 项环境跳过；
-- Gleipner 全量：基于 `evidence/chains.csv` 的全变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重为 `TP=126, FP=17`；JNI 块在 Windows evaluator 上受 native 加载路径限制，按环境限制记录；
+- `mvn test`：153 项通过，0 失败，2 项环境跳过（本轮最终回归）；
+- Gleipner 全量：30 个 block 均完成扫描和转换，29 个可评测 block 的全变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重基线为 `TP=126, FP=17`；JNI block 在 Windows evaluator 上受 native 加载路径限制，按环境限制记录；
 - 默认完整校准语料的实际动态结果如下（列顺序为 `SINK_BLOCKED / CONCRETE_REACHED+EXECUTED / PARTIAL`）：
 
-  | 语料 | 静态候选链 | 动态结果 | 扫描耗时 |
-  | --- | ---: | --- | ---: |
-  | `demo` | 8,310 | `2 / 3 / 15` | 54.7 s |
-  | `demo2` | 8,313 | `2 / 3 / 15` | 54.3 s |
-  | `babychain` | 8,964 | `1 / 0 / 19` | 58.7 s |
-  | `javamix`（当前 JAR） | 21,544 | `0 / 0 / 20` | 133.7 s |
-  | `n1cat` | 6,084 | `1 / 0 / 19` | 35.2 s |
-  | `qiao` | 2,826 | `3 / 0 / 17` | 50.2 s |
+  | 语料 | 静态候选链 | 动态结果 |
+  | --- | ---: | --- |
+  | `demo` | 8,368 | `2 / 3 / 15` |
+  | `demo2` | 8,373 | `2 / 3 / 15` |
+  | `babychain` | 9,036 | `2 / 2 / 16` |
+  | `javamix`（当前 JAR） | 21,635 | `0 / 0 / 20` |
+  | `n1cat` | 6,137 | `1 / 0 / 19` |
+  | `qiao`（JDK 21） | 2,841 | `2 / 0 / 18` |
 
 - `demo`、`demo2`、`babychain`、`n1cat`、`qiao` 均有静态证据和安全动态 sink-boundary 证据；`javamix` 当前 JAR 不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，20 条动态候选均为 `PARTIAL`，因此不伪造 WP 确认结果；
-- 报告中的 `heap_used_mb` 是 JVM 报告时 live heap，不是 OS RSS 峰值，大型工件的内存优化仍需独立峰值采样验证。
+- 上述六个样本均按默认完整扫描执行；`qiao` 显式使用仓库中的 Jabba JDK 21，未通过 `--fast` 或 `--no-verify` 降级；扫描耗时会随 JVM、磁盘、并行度和系统负载变化，不将单次耗时写成性能承诺；
+- 报告中的 `heap_used_mb` 是 JVM 报告时 live heap，`heap_peak_mb` 是 JVM heap pool 峰值，不是 OS RSS 峰值；大型工件的真实 RSS 仍需独立采样验证。
 
-Gleipner 本地基准和 CTF 语料属于开发者本地资产，不随仓库发布。Windows 上 native evaluator 缺失对应 `.eval.txt` 时，结果会如实标记为环境限制。
+Gleipner 本地基准和 CTF 语料属于开发者本地资产，不随仓库发布。Windows 上 native evaluator 缺失对应 `.eval.txt` 时，结果会如实标记为环境限制；本机 WSL 不可用，因此没有把 Linux evaluator 结果当作本轮通过项。
 
 ## 已知边界
 

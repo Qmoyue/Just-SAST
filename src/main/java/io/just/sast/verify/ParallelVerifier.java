@@ -5,6 +5,7 @@ import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,6 +31,22 @@ import io.just.sast.util.AdaptiveParallelism;
  */
 public final class ParallelVerifier {
 
+    /** Closed verifier lifecycle; the serialized string remains for report compatibility. */
+    public enum VerifyStatus {
+        SINK_BLOCKED, CONCRETE_REACHED, EXECUTED, PARTIAL, FAILED, TIMEOUT, UNTESTABLE, UNKNOWN;
+
+        static VerifyStatus from(String value) {
+            if (value == null) {
+                return UNKNOWN;
+            }
+            try {
+                return valueOf(value);
+            } catch (IllegalArgumentException ignored) {
+                return UNKNOWN;
+            }
+        }
+    }
+
     public record VerifyResult(String chainKey, String status, String detail,
                                int attempt, long durationMs, String evidence) {
         public VerifyResult(String chainKey, String status, String detail) {
@@ -51,16 +68,22 @@ public final class ParallelVerifier {
                     ? defaultEvidence(status, detail) : evidence;
         }
 
+        public VerifyStatus statusCode() {
+            return VerifyStatus.from(status);
+        }
+
         private static String defaultEvidence(String status, String detail) {
-            return switch (status == null ? "" : status) {
-                case "SINK_BLOCKED" -> "SINK_CANARY_BOUNDARY";
-                case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER";
-                case "EXECUTED" -> "ENTRY_RETURNED";
-                case "PARTIAL" -> "PARTIAL_PATH";
-                case "TIMEOUT" -> "PROCESS_TIMEOUT";
-                case "UNTESTABLE" -> detail != null && detail.startsWith("SANDBOX_UNAVAILABLE")
-                        ? "SANDBOX_UNAVAILABLE" : "VERIFIER_CAPABILITY_LIMIT";
-                case "FAILED" -> "NO_TRIGGER";
+            return switch (VerifyStatus.from(status)) {
+                case SINK_BLOCKED -> "SINK_CANARY_BOUNDARY";
+                case CONCRETE_REACHED -> "CONCRETE_TRIGGER";
+                case EXECUTED -> "ENTRY_RETURNED";
+                case PARTIAL -> "PARTIAL_PATH";
+                case TIMEOUT -> "PROCESS_TIMEOUT";
+                case UNTESTABLE -> detail != null && detail.startsWith("SANDBOX_UNAVAILABLE")
+                        ? "SANDBOX_UNAVAILABLE"
+                        : detail != null && detail.startsWith("CANARY_ARTIFACT_MISSING")
+                        ? "VERIFIER_ARTIFACT_MISSING" : "VERIFIER_CAPABILITY_LIMIT";
+                case FAILED -> "NO_TRIGGER";
                 default -> "UNKNOWN";
             };
         }
@@ -466,7 +489,7 @@ public final class ParallelVerifier {
             if (result == null) {
                 continue;
             }
-            if (!"UNTESTABLE".equals(result.status())) {
+            if (result.statusCode() != VerifyStatus.UNTESTABLE) {
                 // A child that reached PARTIAL/FAILED/TIMEOUT crossed the sandbox
                 // installation point; the result is evidence about the target run.
                 capability = "JVM_SANDBOX";
@@ -478,7 +501,8 @@ public final class ParallelVerifier {
             }
             if (detail.contains("no-compatible-jdk")
                     || detail.contains("runtime-jdk-too-old")
-                    || detail.contains("verifier-artifact-missing")) {
+                    || detail.contains("verifier-artifact-missing")
+                    || detail.contains("CANARY_ARTIFACT_MISSING")) {
                 runtimeUnavailable = true;
             }
         }
@@ -492,8 +516,8 @@ public final class ParallelVerifier {
     }
 
     private static boolean retryable(VerifyResult result) {
-        return result != null && ("TIMEOUT".equals(result.status())
-                || ("UNTESTABLE".equals(result.status())
+        return result != null && (result.statusCode() == VerifyStatus.TIMEOUT
+                || (result.statusCode() == VerifyStatus.UNTESTABLE
                 && "verification-future-timeout".equals(result.detail())));
     }
 
@@ -601,6 +625,15 @@ public final class ParallelVerifier {
             String javaExec = javaExecPath.toString();
             String cp = runtimeClasspath(runtime.probeJar()).stream().map(Path::toString)
                     .collect(java.util.stream.Collectors.joining(File.pathSeparator));
+            Path canaryBootstrap = runtime.feature() < 17
+                    ? legacyBootstrapCanaryJar(runtime.probeJar()) : bootstrapCanaryJar();
+            if (!Files.isRegularFile(canaryBootstrap)) {
+                // A passive fallback would turn a missing canary artifact into an apparently
+                // successful child run. Dynamic verification is evidence-producing, so fail
+                // closed before any target class is loaded when the exact boundary is absent.
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "CANARY_ARTIFACT_MISSING:" + canaryBootstrap);
+            }
 
             // sink canary 插桩：本链 sink 方法入口注入门卫调用（见 SinkCanaryAgent）；
             // 门卫按调用栈判定，JVM/探针基础设施的同名调用被放行
@@ -643,15 +676,20 @@ public final class ParallelVerifier {
             command.add("-Djava.util.prefs.systemRoot=" + isoDir.resolve("system-prefs"));
             command.add("-Djava.awt.headless=true");
             command.add("-Djava.net.useSystemProxies=false");
+            // The probe jar must remain in the launcher loader for the agent/main class, but
+            // target classes are loaded through a separate URLClassLoader. Tell the probe which
+            // classpath entry to omit so target code cannot resolve Just helper classes through
+            // its context loader.
+            command.add("-Djust.verify.probe-jar=" + runtime.probeJar().toAbsolutePath());
             if (runtime.feature() < 17) {
                 // The Java 17 scanner jar cannot be loaded by an old target JVM. The separate
                 // verifier8 artifact contains only Java 8-compatible probe/agent classes.
                 command.add("-javaagent:" + runtime.probeJar().toAbsolutePath()
-                        + "=" + legacyBootstrapCanaryJar(runtime.probeJar()) + "|"
+                        + "=" + canaryBootstrap + "|"
                         + entrySpec + "|" + agentSpec);
             } else {
                 command.add("-javaagent:" + runtime.probeJar().toAbsolutePath() + "="
-                        + bootstrapCanaryJar() + "|" + entrySpec + "|" + agentSpec);
+                        + canaryBootstrap + "|" + entrySpec + "|" + agentSpec);
             }
             command.add("-cp");
             command.add(cp);
@@ -1058,6 +1096,21 @@ public final class ParallelVerifier {
         }
         try {
             ProcessHandle root = process.toHandle();
+            // ProcessHandle.descendants() is a snapshot and can miss a child that is being
+            // spawned during timeout cleanup. Windows' built-in tree termination closes that
+            // race for the root PID; the ProcessHandle path remains the portable fallback.
+            if (isWindows()) {
+                try {
+                    Process taskkill = new ProcessBuilder("taskkill", "/PID",
+                            Long.toString(root.pid()), "/T", "/F")
+                            .redirectErrorStream(true).start();
+                    taskkill.waitFor(1, TimeUnit.SECONDS);
+                } catch (IOException | InterruptedException ignored) {
+                    if (ignored instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
             root.descendants().forEach(child -> {
                 try {
                     child.destroyForcibly();
@@ -1078,6 +1131,11 @@ public final class ParallelVerifier {
             } catch (RuntimeException ignoredAgain) {
             }
         }
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "")
+                .toLowerCase(Locale.ROOT).contains("win");
     }
 
     /** 有界 stdout/stderr 收集器：持续排空管道，避免恶意目标通过输出造成阻塞。 */
@@ -1142,7 +1200,7 @@ public final class ParallelVerifier {
                 try (var in = ParallelVerifier.class.getResourceAsStream(marker);
                      var gin = ParallelVerifier.class.getResourceAsStream(gate)) {
                     if (in == null || gin == null) {
-                        // 资源缺失（异常构建）：返回不存在路径，agent 挂载退化为被动判定
+                        // 资源缺失（异常构建）：返回不存在路径，由调用方 fail closed
                         return Path.of(System.getProperty("java.io.tmpdir"), "just-missing-boot.jar");
                     }
                     Path out = Files.createTempFile("just-canary-boot-", ".jar");

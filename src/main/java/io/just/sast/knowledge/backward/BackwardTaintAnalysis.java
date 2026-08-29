@@ -38,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 反向污点引擎（独立知识源，ANALYSIS 阶段）。
@@ -154,8 +155,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         AdaptiveParallelism.Decision decision = AdaptiveParallelism.choose(sinks.size(), MAX_WORKERS);
         AdaptiveParallelism.Lease lease = AdaptiveParallelism.reserve(decision);
         int workerCount = Math.max(1, lease.workers());
-        int perSinkBudget = sinks.isEmpty() ? 0
-                : Math.min(stepBudgetAdjusted, Math.max(1, GLOBAL_BUDGET / sinks.size()));
+        FairBudgetAllocator budgetAllocator = new FairBudgetAllocator(
+                GLOBAL_BUDGET, stepBudgetAdjusted, sinks.size());
         Runnable worker = () -> {
             while (true) {
                 int i = cursor.getAndIncrement();
@@ -163,6 +164,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     return;
                 }
                 SinkTask task = sinks.get(i);
+                int perSinkBudget = budgetAllocator.claim(i);
                 localDeadEnds.get().clear();
                 try {
                     analyzeSink(task.callId(), task.mark(), perSinkBudget);
@@ -198,9 +200,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         if (support.constantProofBudgetExceeded()) {
             bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
         }
+        if (budgetAllocator.exhausted()) {
+            bb.markIncomplete("BACKWARD_GLOBAL_BUDGET");
+        }
         JustLogger.info("反向污点[{} workers/{}]：{} ms（总步数 {}，每 sink 上限 {}）",
                 workerCount, decision.reason(), System.currentTimeMillis() - startTime,
-                totalSteps.sum(), perSinkBudget);
+                totalSteps.sum(), stepBudgetAdjusted);
     }
 
     private void analyzeSink(long callNodeId, SinkMark mark, int stepBudget) {
@@ -283,6 +288,48 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         totalSteps.add(trace.steps);
         localDeadEnds.get().clear();
         bb.recordOutcome(callNodeId, outcome(call, mark, produced, trace.steps, trace.unresolved, trace.tooLong, verdict));
+    }
+
+    /**
+     * Fair, deterministic-by-input-order allocation of the global backward budget. A fixed
+     * GLOBAL_BUDGET/sink division starves the useful tail when the sink population changes;
+     * this allocator gives every sink a bounded minimum share where the global budget permits
+     * it, then distributes the remainder. Allocation is a pure function of the sorted sink
+     * index, so worker scheduling cannot change the analysis depth or chain set.
+     */
+    private static final class FairBudgetAllocator {
+        private final long totalBudget;
+        private final int sinkCount;
+        private final int maxPerSink;
+        private final int minimumPerSink;
+
+        private FairBudgetAllocator(long totalBudget, int maxPerSink, int sinkCount) {
+            this.totalBudget = Math.max(0L, totalBudget);
+            this.sinkCount = Math.max(0, sinkCount);
+            this.maxPerSink = Math.max(1, maxPerSink);
+            this.minimumPerSink = Math.min(2_048, this.maxPerSink);
+        }
+
+        private int claim(int sinkIndex) {
+            if (sinkCount == 0 || sinkIndex < 0 || sinkIndex >= sinkCount) {
+                return 0;
+            }
+            long usable = Math.min(totalBudget, (long) maxPerSink * sinkCount);
+            long share;
+            long guaranteed = (long) minimumPerSink * sinkCount;
+            if (usable >= guaranteed) {
+                long extra = usable - guaranteed;
+                share = minimumPerSink + extra / sinkCount
+                        + (sinkIndex < extra % sinkCount ? 1L : 0L);
+            } else {
+                share = usable / sinkCount + (sinkIndex < usable % sinkCount ? 1L : 0L);
+            }
+            return (int) Math.min(maxPerSink, share);
+        }
+
+        private boolean exhausted() {
+            return sinkCount > 0 && totalBudget <= (long) maxPerSink * sinkCount;
+        }
     }
 
     /** 返回：该值可控所产出的链数。 */

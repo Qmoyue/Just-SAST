@@ -63,22 +63,24 @@ public final class BytecodeFrontend {
      * fat jar 原始 byte[] 的存活时间，也避免为每个 class 提交一个长期挂起的 Future。
      */
     public LoadResult loadStreaming(List<Path> targets) {
-        StreamingAccumulator accumulator = new StreamingAccumulator();
-        if (targets == null) {
+        try (ParsingSession session = new ParsingSession()) {
+            StreamingAccumulator accumulator = new StreamingAccumulator(session);
+            if (targets == null) {
+                return accumulator.result();
+            }
+            for (Path target : targets) {
+                try {
+                    JarReader.StreamResult stream = jarReader.streamDetailed(target,
+                            accumulator::accept);
+                    accumulator.addReasons(stream.completenessReasons());
+                } catch (IOException e) {
+                    accumulator.diagnostics.add(new ParseDiagnostic(target.toString(), e.getMessage()));
+                    JustLogger.error("读取输入失败 {}: {}", target, e.getMessage());
+                }
+            }
+            accumulator.flush();
             return accumulator.result();
         }
-        for (Path target : targets) {
-            try {
-                JarReader.StreamResult stream = jarReader.streamDetailed(target,
-                        accumulator::accept);
-                accumulator.addReasons(stream.completenessReasons());
-            } catch (IOException e) {
-                accumulator.diagnostics.add(new ParseDiagnostic(target.toString(), e.getMessage()));
-                JustLogger.error("读取输入失败 {}: {}", target, e.getMessage());
-            }
-        }
-        accumulator.flush();
-        return accumulator.result();
     }
 
     /** 读取输入文件但不解析，供调用方在不重复读取/解析目标的情况下规划外部类切片。 */
@@ -147,17 +149,8 @@ public final class BytecodeFrontend {
     }
 
     private List<ParsedClass> parse(List<ClassBytes> inputs) {
-        if (inputs.isEmpty()) {
-            return List.of();
-        }
-        int available = Math.max(1, Runtime.getRuntime().availableProcessors());
-        int cap = Math.min(MAX_PARSE_WORKERS, available);
-        AdaptiveParallelism.Decision decision = AdaptiveParallelism.choose(inputs.size(), cap);
-        try (AdaptiveParallelism.Lease lease = AdaptiveParallelism.reserve(decision)) {
-            if (inputs.size() < PARALLEL_PARSE_THRESHOLD || lease.workers() <= 1) {
-                return parseSequential(inputs);
-            }
-            return parseParallel(inputs, lease.workers());
+        try (ParsingSession session = new ParsingSession()) {
+            return session.parse(inputs);
         }
     }
 
@@ -169,31 +162,25 @@ public final class BytecodeFrontend {
         return result;
     }
 
-    private List<ParsedClass> parseParallel(List<ClassBytes> inputs, int workers) {
-        ThreadFactory factory = new NamedThreadFactory("just-frontend-");
-        ExecutorService executor = Executors.newFixedThreadPool(workers, factory);
+    private List<ParsedClass> parseParallel(List<ClassBytes> inputs, ExecutorService executor) {
         List<Future<ParsedClass>> futures = new ArrayList<>(inputs.size());
-        try {
-            for (int i = 0; i < inputs.size(); i++) {
-                final int index = i;
-                futures.add(executor.submit(() -> parseOne(inputs.get(index))));
-            }
-            List<ParsedClass> result = new ArrayList<>(inputs.size());
-            for (Future<ParsedClass> future : futures) {
-                try {
-                    result.add(future.get());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException("前端解析被中断", e);
-                } catch (ExecutionException e) {
-                    Throwable cause = e.getCause() != null ? e.getCause() : e;
-                    throw new IllegalStateException("前端解析 worker 失败", cause);
-                }
-            }
-            return result;
-        } finally {
-            executor.shutdownNow();
+        for (int i = 0; i < inputs.size(); i++) {
+            final int index = i;
+            futures.add(executor.submit(() -> parseOne(inputs.get(index))));
         }
+        List<ParsedClass> result = new ArrayList<>(inputs.size());
+        for (Future<ParsedClass> future : futures) {
+            try {
+                result.add(future.get());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("前端解析被中断", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                throw new IllegalStateException("前端解析 worker 失败", cause);
+            }
+        }
+        return result;
     }
 
     private ParsedClass parseOne(ClassBytes bytes) {
@@ -208,12 +195,17 @@ public final class BytecodeFrontend {
 
     /** 单个扫描的有界前端累加器；flush 后立即丢弃本批次原始 bytes。 */
     private final class StreamingAccumulator {
+        private final ParsingSession parsingSession;
         private final Map<String, ClassInfo> classes = new LinkedHashMap<>();
         private final List<ParseDiagnostic> diagnostics = new ArrayList<>();
         private final LinkedHashSet<String> completenessReasons = new LinkedHashSet<>();
         private final List<ClassBytes> batch = new ArrayList<>(STREAM_BATCH_SIZE);
         private int filesScanned;
         private int maxMajor;
+
+        private StreamingAccumulator(ParsingSession parsingSession) {
+            this.parsingSession = parsingSession;
+        }
 
         private void accept(ClassBytes bytes) {
             batch.add(bytes);
@@ -233,7 +225,7 @@ public final class BytecodeFrontend {
             if (batch.isEmpty()) {
                 return;
             }
-            for (ParsedClass parsed : parse(batch)) {
+            for (ParsedClass parsed : parsingSession.parse(batch)) {
                 if (parsed.diagnostic() != null) {
                     diagnostics.add(parsed.diagnostic());
                     continue;
@@ -247,6 +239,64 @@ public final class BytecodeFrontend {
         private LoadResult result() {
             return new LoadResult(classes, List.copyOf(diagnostics), filesScanned, maxMajor,
                     List.copyOf(completenessReasons));
+        }
+    }
+
+    /**
+     * One parsing session owns one adaptive lease and, when useful, one executor. Streaming
+     * input still flushes bounded batches so raw class bytes do not accumulate, but the
+     * scheduler must not recreate threads for every flush. The session is scoped to one
+     * frontend operation and is closed before analysis starts.
+     */
+    private final class ParsingSession implements AutoCloseable {
+        private AdaptiveParallelism.Lease lease;
+        private ExecutorService executor;
+        private int workers = 1;
+
+        private List<ParsedClass> parse(List<ClassBytes> inputs) {
+            if (inputs == null || inputs.isEmpty()) {
+                return List.of();
+            }
+            ensureParallelism(inputs.size());
+            if (executor == null || workers <= 1 || inputs.size() < PARALLEL_PARSE_THRESHOLD) {
+                return parseSequential(inputs);
+            }
+            return parseParallel(inputs, executor);
+        }
+
+        private void ensureParallelism(int taskCount) {
+            if (executor != null || taskCount < PARALLEL_PARSE_THRESHOLD) {
+                return;
+            }
+            int available = Math.max(1, Runtime.getRuntime().availableProcessors());
+            int cap = Math.min(MAX_PARSE_WORKERS, available);
+            AdaptiveParallelism.Decision decision = AdaptiveParallelism.choose(taskCount, cap);
+            lease = AdaptiveParallelism.reserve(decision);
+            workers = lease.workers();
+            if (workers > 1) {
+                executor = Executors.newFixedThreadPool(workers,
+                        new NamedThreadFactory("just-frontend-"));
+            }
+        }
+
+        @Override
+        public void close() {
+            if (executor != null) {
+                executor.shutdown();
+                try {
+                    if (!executor.awaitTermination(1, java.util.concurrent.TimeUnit.SECONDS)) {
+                        executor.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    executor.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+                executor = null;
+            }
+            if (lease != null) {
+                lease.close();
+                lease = null;
+            }
         }
     }
 

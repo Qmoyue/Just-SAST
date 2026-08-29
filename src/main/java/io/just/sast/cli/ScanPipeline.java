@@ -58,6 +58,7 @@ public final class ScanPipeline {
                                  int verifyBudget) throws Exception {
         long start = System.currentTimeMillis();
         Map<String, Long> phaseMs = new java.util.LinkedHashMap<>();
+        resetHeapPeaks();
 
         validatePath(target, "扫描目标", true);
         if (deps != null) {
@@ -190,16 +191,56 @@ public final class ScanPipeline {
                 sinkCount, entryCount, blackboard.chains().size(),
                 System.currentTimeMillis() - start,
                 (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1024 / 1024,
+                heapPeakMb(),
                 completenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
-                completenessReasons, phaseMs, verify ? blackboard.verificationStatus() : "DISABLED",
+                completenessReasons, phaseMs, scanMetrics(cpg, blackboard),
+                verify ? blackboard.verificationStatus() : "DISABLED",
                 verify ? blackboard.verificationSummary()
-                        : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget));
+                        : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget),
+                chainProofCompleteness(blackboard.chains(), outcomes));
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
         if (stats) {
             ConsoleSummary.print(scanStats, outcomes);
         }
+        // Reports no longer need CFGs. Clear the per-scan cache before returning so callers
+        // retaining ScanResult do not accidentally retain every materialized method graph.
+        cpg.index().clearCfgCache();
         return new ScanResult(ExitCode.OK.code(), blackboard.chains(), scanStats);
+    }
+
+    private static void resetHeapPeaks() {
+        try {
+            for (java.lang.management.MemoryPoolMXBean pool
+                    : java.lang.management.ManagementFactory.getMemoryPoolMXBeans()) {
+                if (pool.getType() == java.lang.management.MemoryType.HEAP) {
+                    pool.resetPeakUsage();
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Peak telemetry is diagnostic only; scan semantics must not depend on MXBeans.
+        }
+    }
+
+    /** JVM heap-pool peak, not OS RSS; used as a comparable in-process telemetry signal. */
+    private static long heapPeakMb() {
+        long bytes = 0L;
+        try {
+            for (java.lang.management.MemoryPoolMXBean pool
+                    : java.lang.management.ManagementFactory.getMemoryPoolMXBeans()) {
+                if (pool.getType() != java.lang.management.MemoryType.HEAP) {
+                    continue;
+                }
+                java.lang.management.MemoryUsage usage = pool.getPeakUsage();
+                if (usage != null && usage.getUsed() > 0L) {
+                    bytes += usage.getUsed();
+                }
+            }
+        } catch (RuntimeException ignored) {
+            return (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory())
+                    / 1024 / 1024;
+        }
+        return bytes / 1024 / 1024;
     }
 
     private static LoadResult loadApplication(BytecodeFrontend frontend, List<Path> targets) {
@@ -207,30 +248,33 @@ public final class ScanPipeline {
     }
 
     /**
-     * Keep the complete JDK source list alive only during closure planning.  The selected
-     * bytes are the only external input that the next parse phase needs; putting this scope
-     * in a helper also gives the GC/JIT a clear lifetime boundary for large target JDKs.
+     * Keep only the demand-driven JDK closure alive during frontend construction. The selected
+     * bytes are the only external input that the next parse phase needs; this avoids reading an
+     * entire JDK image merely to decide that most of it is irrelevant to the target.
      */
     private static LoadResult loadWithJdkSlice(BytecodeFrontend frontend, LoadResult application,
                                                 JdkClassSource jdkSource, RuleSet rules)
             throws IOException {
-        List<ClassBytes> selected;
         JdkClassSelector.Selection selection;
-        {
-            List<ClassBytes> availableJdk;
-            if (jdkSource instanceof TargetJdkSource targetJdk) {
-                availableJdk = targetJdk.listAll();
-            } else {
-                availableJdk = ((JrtClassSource) jdkSource).listAll(JrtClassSource.DESER_MODULES);
-            }
+        if (jdkSource instanceof TargetJdkSource targetJdk) {
+            selection = JdkClassSelector.selectDemandDriven(targetJdk::loadBytes, -1,
+                    application.classes(), jdkTypeSeeds(rules), jdkEntrySeeds(rules));
+        } else if (jdkSource instanceof JrtClassSource jrt) {
+            selection = JdkClassSelector.selectDemandDriven(jrt::loadBytes, -1,
+                    application.classes(), jdkTypeSeeds(rules), jdkEntrySeeds(rules));
+        } else {
+            // The current pipeline only creates TargetJdkSource/JrtClassSource. Keep the
+            // legacy path for third-party JdkClassSource implementations without widening the
+            // model interface or changing their extension contract.
+            List<ClassBytes> availableJdk = List.of();
             selection = JdkClassSelector.selectDetailed(availableJdk,
                     application.classes(), jdkTypeSeeds(rules), jdkEntrySeeds(rules));
-            selected = selection.classes();
         }
-        JustLogger.info("JDK 类切片：可用 {} 个，header {} 个，初始种子 {} 个，隐式 entry 新增 {} 个，闭包物化 {} 个",
-                selection.availableClasses(), selection.headerClasses(), selection.initialSeeds(),
+        String available = selection.availableClasses() < 0 ? "按需未知" : String.valueOf(selection.availableClasses());
+        JustLogger.info("JDK 类切片：候选 {}，header {} 个，初始种子 {} 个，隐式 entry 新增 {} 个，闭包物化 {} 个",
+                available, selection.headerClasses(), selection.initialSeeds(),
                 selection.implicitEntrySeeds(), selection.closureClasses());
-        return frontend.load(application, selected);
+        return frontend.load(application, selection.classes());
     }
 
     /** 将“没有发现”与“分析曾触顶/跳过内容”区分开，原因使用稳定类别而不泄漏路径。 */
@@ -265,6 +309,31 @@ public final class ScanPipeline {
             }
         }
         return List.copyOf(reasons);
+    }
+
+    private static String chainProofCompleteness(List<Chain> chains,
+                                                 Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes) {
+        if (chains == null || chains.isEmpty()) {
+            return "NO_SURVIVING_CHAIN";
+        }
+        boolean partialChain = chains.stream().anyMatch(chain -> chain.unresolvedHops() > 0);
+        boolean partialSink = outcomes != null && outcomes.values().stream().anyMatch(outcome ->
+                "TRUNCATED".equals(outcome.verdict()) || "TOO_LONG".equals(outcome.verdict())
+                        || "UNRESOLVED".equals(outcome.verdict()) || "NO_STATE".equals(outcome.verdict()));
+        return partialChain || partialSink ? "PARTIAL" : "COMPLETE";
+    }
+
+    private static Map<String, Long> scanMetrics(BuiltCpg cpg, Blackboard blackboard) {
+        Map<String, Long> metrics = new java.util.LinkedHashMap<>();
+        metrics.put("graph_nodes", (long) cpg.graph().nodeCount());
+        metrics.put("graph_edges", (long) cpg.graph().edgeCount());
+        metrics.put("cpg_methods", (long) cpg.index().methodCount());
+        metrics.put("cpg_cfg_builds", cpg.index().cfgBuilds());
+        metrics.put("cpg_cfg_cache_hits", cpg.index().cfgCacheHits());
+        metrics.put("cpg_cfg_cache_size", (long) cpg.index().cfgCacheSize());
+        metrics.put("blackboard_chains", (long) blackboard.chains().size());
+        metrics.put("blackboard_calibrations", (long) blackboard.calibrationCount());
+        return metrics;
     }
 
     private static void validatePath(Path path, String label, boolean allowDirectory)

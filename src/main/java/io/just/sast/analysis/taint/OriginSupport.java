@@ -3,7 +3,6 @@ package io.just.sast.analysis.taint;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.config.RuleEngine;
 import io.just.sast.cpg.build.Cfg;
-import io.just.sast.cpg.build.CfgEdge;
 import io.just.sast.cpg.build.CfgLabel;
 import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.cpg.graph.Edge;
@@ -18,6 +17,7 @@ import io.just.sast.model.InsnFact;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
+import io.just.sast.model.TypeRef;
 import io.just.sast.model.TryCatchFact;
 import io.just.sast.util.JustLogger;
 
@@ -286,6 +286,11 @@ public final class OriginSupport {
                         .thenComparing(Node::name)
                         .thenComparing(Node::descriptor))
                 .toList();
+        Map<String, List<Node>> candidatesByOwner = new HashMap<>();
+        for (Node candidate : callbackCandidates) {
+            candidatesByOwner.computeIfAbsent(candidate.owner(), ignored -> new ArrayList<>())
+                    .add(candidate);
+        }
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             if (isJdk(call.owner()) || "STATIC".equals(call.invokeKind())
                     || "DYNAMIC".equals(call.invokeKind())) {
@@ -296,14 +301,15 @@ public final class OriginSupport {
                 continue;
             }
             List<Node> targets = new ArrayList<>();
-            for (Node candidate : callbackCandidates) {
+            List<Node> candidatePool = nativeCallbackCandidates(call, callbackCandidates,
+                    candidatesByOwner);
+            for (Node candidate : candidatePool) {
                 MethodInfo target = methodOf(candidate.owner(), candidate.name(), candidate.descriptor());
-                if (target == null || !nativeCallbackCompatible(call, target)) {
-                    continue;
+                if (target != null && nativeCallbackCompatible(call, target)) {
+                    targets.add(candidate);
+                    nativeCallbackSitesByTarget.computeIfAbsent(methodKey(target), ignored -> new ArrayList<>(1))
+                            .add(call);
                 }
-                targets.add(candidate);
-                nativeCallbackSitesByTarget.computeIfAbsent(methodKey(target), ignored -> new ArrayList<>(1))
-                        .add(call);
             }
             if (!targets.isEmpty()) {
                 targets.sort(java.util.Comparator.comparing(n -> methodKeyOf(n.owner(), n.name(), n.descriptor())));
@@ -320,6 +326,28 @@ public final class OriginSupport {
             JustLogger.debug("JNI 同接收者回调索引：{} 个 native 位点，{} 个目标方法",
                     nativeCallbackTargetsBySite.size(), nativeCallbackSitesByTarget.size());
         }
+    }
+
+    /**
+     * Resolve the candidate owner family once per native owner instead of comparing every
+     * native call with every application method. If the owner itself is unavailable, retain
+     * the old conservative all-candidate scan: unknown hierarchy information must not become
+     * a false negative.
+     */
+    private List<Node> nativeCallbackCandidates(Node nativeCall, List<Node> allCandidates,
+                                                 Map<String, List<Node>> candidatesByOwner) {
+        if (hierarchy.classInfo(nativeCall.owner()) == null) {
+            return allCandidates;
+        }
+        Set<String> owners = new java.util.LinkedHashSet<>();
+        owners.add(nativeCall.owner());
+        owners.addAll(hierarchy.transitiveSubtypes(nativeCall.owner()));
+        List<Node> result = new ArrayList<>();
+        for (String owner : owners) {
+            result.addAll(candidatesByOwner.getOrDefault(owner, List.of()));
+        }
+        result.sort(java.util.Comparator.comparing(n -> methodKeyOf(n.owner(), n.name(), n.descriptor())));
+        return result;
     }
 
     private boolean nativeCallbackCompatible(Node nativeCall, MethodInfo target) {
@@ -342,6 +370,7 @@ public final class OriginSupport {
     /** 在 invoke 宿主方法体内找 `C.class.getXxxMethod(name, ...)` 模式（窗口式近似，窗口内常量配对）。 */
     private void scanReflectiveLookup(MethodInfo host, Node invokeSite) {
         var insns = host.instructions();
+        ForwardOrigins.Result originResult = origins.compute(host);
         for (int i = 0; i < insns.size(); i++) {
             var insn = insns.get(i);
             if (!insn.op().isInvoke() || insn.operands().isEmpty()
@@ -350,21 +379,15 @@ public final class OriginSupport {
                     || !("getMethod".equals(ref.name()) || "getDeclaredMethod".equals(ref.name()))) {
                 continue;
             }
-            // 向前小窗口找 LDC 类常量与 LDC 字符串常量
-            String classConst = null;
-            String nameConst = null;
-            for (int w = Math.max(0, i - 15); w < i; w++) {
-                var prev = insns.get(w);
-                if (prev.op() == io.just.sast.model.Op.LDC && !prev.operands().isEmpty()) {
-                    Object cst = prev.operands().get(0);
-                    if (cst instanceof io.just.sast.model.TypeRef t && classConst == null) {
-                        classConst = t.descriptor().startsWith("L") && t.descriptor().endsWith(";")
-                                ? t.descriptor().substring(1, t.descriptor().length() - 1)
-                                : t.descriptor();
-                    } else if (cst instanceof String n && nameConst == null) {
-                        nameConst = n;
-                    }
-                }
+            // 优先使用调用前的栈来源；这能跨越局部变量和非线性 bytecode，避免把窗口内
+            // 不相关的两个 LDC 错配。只有状态不可证明时才回退到旧的有限窗口，并保持保守。
+            ReflectiveConstants dataflowConstants = reflectiveConstants(originResult.stateBefore().get(i));
+            String classConst = dataflowConstants.className();
+            String nameConst = dataflowConstants.methodName();
+            if (classConst == null) {
+                ReflectiveConstants windowConstants = reflectiveWindowConstants(insns, i);
+                classConst = windowConstants.className();
+                nameConst = windowConstants.methodName();
             }
             if (classConst == null) {
                 continue;
@@ -375,6 +398,76 @@ public final class OriginSupport {
                 reflectiveInvokeByMethod.putIfAbsent(classConst + "#" + nameConst, invokeSite);
             }
         }
+    }
+
+    private record ReflectiveConstants(String className, String methodName) {
+    }
+
+    /** Recover Class/name arguments from the abstract stack immediately before getMethod. */
+    private static ReflectiveConstants reflectiveConstants(ForwardOrigins.State state) {
+        if (state == null || state.stack().size() < 3) {
+            return new ReflectiveConstants(null, null);
+        }
+        List<ForwardOrigins.Slot> stack = state.stack();
+        String className = singleClassConstant(stack.get(stack.size() - 3).origins());
+        String methodName = singleStringConstant(stack.get(stack.size() - 2).origins());
+        return new ReflectiveConstants(className, methodName);
+    }
+
+    /** Bounded compatibility fallback for malformed/unknown stack states. */
+    private static ReflectiveConstants reflectiveWindowConstants(List<InsnFact> insns, int invokeIndex) {
+        String className = null;
+        String methodName = null;
+        for (int w = Math.max(0, invokeIndex - 15); w < invokeIndex; w++) {
+            InsnFact previous = insns.get(w);
+            if (previous.op() != Op.LDC || previous.operands().isEmpty()) {
+                continue;
+            }
+            Object constant = previous.operands().get(0);
+            if (constant instanceof TypeRef type && className == null) {
+                className = className(type);
+            } else if (constant instanceof String value && methodName == null) {
+                methodName = value;
+            }
+        }
+        return new ReflectiveConstants(className, methodName);
+    }
+
+    private static String singleClassConstant(Set<ValueOrigin> origins) {
+        String result = null;
+        for (ValueOrigin origin : origins) {
+            if (!(origin instanceof ValueOrigin.Constant constant)
+                    || !(constant.value() instanceof TypeRef type)) {
+                return null;
+            }
+            String value = className(type);
+            if (result != null && !result.equals(value)) {
+                return null;
+            }
+            result = value;
+        }
+        return result;
+    }
+
+    private static String singleStringConstant(Set<ValueOrigin> origins) {
+        String result = null;
+        for (ValueOrigin origin : origins) {
+            if (!(origin instanceof ValueOrigin.Constant constant)
+                    || !(constant.value() instanceof String value)) {
+                return null;
+            }
+            if (result != null && !result.equals(value)) {
+                return null;
+            }
+            result = value;
+        }
+        return result;
+    }
+
+    private static String className(TypeRef type) {
+        String descriptor = type.descriptor();
+        return descriptor.startsWith("L") && descriptor.endsWith(";")
+                ? descriptor.substring(1, descriptor.length() - 1) : descriptor;
     }
 
     /**
@@ -1597,11 +1690,12 @@ public final class OriginSupport {
         }
         while (!queue.isEmpty()) {
             int current = queue.removeFirst();
-            for (CfgEdge edge : cfg.successorsAt(current)) {
-                if (!includeExceptions && edge.label() == CfgLabel.EXCEPTION) {
+            for (int edgeIndex = cfg.edgeStart(current); edgeIndex < cfg.edgeEnd(current); edgeIndex++) {
+                CfgLabel edgeLabel = cfg.labelAt(edgeIndex);
+                if (!includeExceptions && edgeLabel == CfgLabel.EXCEPTION) {
                     continue;
                 }
-                int target = edge.targetOffset();
+                int target = cfg.targetAt(edgeIndex);
                 if (target < 0 || target >= size) {
                     continue;
                 }
@@ -1791,12 +1885,14 @@ public final class OriginSupport {
                     if (canReachSink[source]) {
                         continue;
                     }
-                    for (CfgEdge edge : cfg.successorsAt(source)) {
-                        if (edge.targetOffset() < 0 || edge.targetOffset() >= size
-                                || !feasibleCfgEdge(method, result, source, edge)) {
+                    for (int edgeIndex = cfg.edgeStart(source); edgeIndex < cfg.edgeEnd(source); edgeIndex++) {
+                        int target = cfg.targetAt(edgeIndex);
+                        CfgLabel label = cfg.labelAt(edgeIndex);
+                        if (target < 0 || target >= size
+                                || !feasibleCfgEdge(method, result, source, label)) {
                             continue;
                         }
-                        if (canReachSink[edge.targetOffset()]) {
+                        if (canReachSink[target]) {
                             canReachSink[source] = true;
                             changed = true;
                             break;
@@ -1822,29 +1918,29 @@ public final class OriginSupport {
     }
 
     private boolean feasibleCfgEdge(MethodInfo method, ForwardOrigins.Result result,
-                                    int source, CfgEdge edge) {
+                                    int source, CfgLabel label) {
         InsnFact insn = method.insnAt(source);
         if (insn.op().isCondJump()) {
             Boolean branch = knownBranchResult(method, result, insn);
             if (branch == null) {
                 return true;
             }
-            if (edge.label() == CfgLabel.JUMP) {
+            if (label == CfgLabel.JUMP) {
                 return branch;
             }
-            if (edge.label() == CfgLabel.FALSE) {
+            if (label == CfgLabel.FALSE) {
                 return !branch;
             }
         }
-        if (insn.op() == Op.CHECKCAST && edge.label() != CfgLabel.EXCEPTION
+        if (insn.op() == Op.CHECKCAST && label != CfgLabel.EXCEPTION
                 && castAlwaysFails(method, result, insn)) {
             return false;
         }
-        if (insn.op().isInvoke() && edge.label() != CfgLabel.EXCEPTION
+        if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
                 && reflectiveLookupAlwaysFails(method, result, insn)) {
             return false;
         }
-        if (insn.op().isInvoke() && edge.label() != CfgLabel.EXCEPTION
+        if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
                 && reflectiveInvocationAlwaysFails(method, result, insn)) {
             return false;
         }
@@ -3207,8 +3303,8 @@ public final class OriginSupport {
     private boolean hasOnlyNormalPredecessor(MethodInfo method, int target, int expected) {
         Cfg.Indexed cfg = cfg(method);
         for (int source = 0; source < method.instructions().size(); source++) {
-            for (CfgEdge edge : cfg.successorsAt(source)) {
-                if (edge.targetOffset() == target && edge.label() != CfgLabel.EXCEPTION
+            for (int edgeIndex = cfg.edgeStart(source); edgeIndex < cfg.edgeEnd(source); edgeIndex++) {
+                if (cfg.targetAt(edgeIndex) == target && cfg.labelAt(edgeIndex) != CfgLabel.EXCEPTION
                         && source != expected) {
                     return false;
                 }

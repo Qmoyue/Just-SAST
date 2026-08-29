@@ -12,6 +12,8 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -25,6 +27,7 @@ import java.util.Set;
 public final class LegacyChainVerifyProbe {
 
     private static final int MAX_SERIALIZED_BYTES = 8 * 1024 * 1024;
+    private static ClassLoader applicationLoader;
 
     private LegacyChainVerifyProbe() {
     }
@@ -53,6 +56,7 @@ public final class LegacyChainVerifyProbe {
         String sinkDescriptor = sink[2];
 
         try {
+            installApplicationLoader();
             LegacySandboxSecurityManager.install(Paths.get(System.getProperty("java.io.tmpdir", ".")));
             // Keep stack formatting and collection initialization outside the gadget call. Some
             // old runtimes initialize these classes lazily and can otherwise obscure the result.
@@ -312,7 +316,7 @@ public final class LegacyChainVerifyProbe {
             Object proxy;
             try {
                 proxy = java.lang.reflect.Proxy.newProxyInstance(
-                        LegacyChainVerifyProbe.class.getClassLoader(), new Class[]{Runnable.class},
+                        applicationLoader, new Class[]{Runnable.class},
                         (java.lang.reflect.InvocationHandler) entry);
             } finally {
                 LegacySandboxSecurityManager.endProxyBootstrap();
@@ -479,7 +483,51 @@ public final class LegacyChainVerifyProbe {
     }
 
     private static Class<?> load(String name) throws ClassNotFoundException {
-        return ClassLoader.getSystemClassLoader().loadClass(name);
+        ClassLoader loader = applicationLoader != null
+                ? applicationLoader : Thread.currentThread().getContextClassLoader();
+        if (loader == null) {
+            throw new ClassNotFoundException(name);
+        }
+        return loader.loadClass(name);
+    }
+
+    /** Keep the legacy probe/agent loader out of the target application loader. */
+    private static void installApplicationLoader() {
+        if (applicationLoader != null) {
+            return;
+        }
+        List<URL> urls = new ArrayList<URL>();
+        String classPath = System.getProperty("java.class.path", "");
+        String probeJar = System.getProperty("just.verify.probe-jar", "");
+        String normalizedProbe = probeJar.length() == 0 ? ""
+                : Paths.get(probeJar).toAbsolutePath().normalize().toString();
+        String[] entries = classPath.split(java.util.regex.Pattern.quote(
+                java.io.File.pathSeparator));
+        for (String entry : entries) {
+            if (entry.length() == 0) {
+                continue;
+            }
+            try {
+                Path normalized = Paths.get(entry).toAbsolutePath().normalize();
+                if (normalizedProbe.length() > 0 && normalized.toString().equals(normalizedProbe)) {
+                    continue;
+                }
+                urls.add(normalized.toUri().toURL());
+            } catch (RuntimeException | java.net.MalformedURLException ignored) {
+                // A malformed optional entry must not widen the target loader.
+            }
+        }
+        ClassLoader parent = ClassLoader.getSystemClassLoader().getParent();
+        if (urls.isEmpty()) {
+            applicationLoader = parent;
+            return;
+        }
+        try {
+            applicationLoader = new URLClassLoader(urls.toArray(new URL[urls.size()]), parent);
+            Thread.currentThread().setContextClassLoader(applicationLoader);
+        } catch (RuntimeException ignored) {
+            applicationLoader = parent;
+        }
     }
 
     private static Field findField(Class<?> type, String name) {

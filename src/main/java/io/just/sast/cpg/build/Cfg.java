@@ -23,14 +23,107 @@ public final class Cfg {
      * HashMap lookup per instruction and one HashMap allocation per method. The legacy Map
      * view remains available for callers and tests that need sparse iteration.
      */
-    public record Indexed(List<List<CfgEdge>> successors) {
-        public Indexed {
-            successors = successors == null ? List.of() : List.copyOf(successors);
+    public static final class Indexed {
+        /*
+         * CSR-style storage: one offset array and two primitive edge arrays. The old public
+         * successorsAt/successors views are materialized only for compatibility callers; the
+         * analysis hot path uses edgeStart/edgeEnd/targetAt/labelAt without allocating a list or
+         * a CfgEdge object for every instruction visit.
+         */
+        private final int instructionCount;
+        private final int[] edgeOffsets;
+        private final int[] targets;
+        private final byte[] labels;
+        private static final CfgLabel[] LABELS = CfgLabel.values();
+        private volatile List<List<CfgEdge>> legacyView;
+
+        public Indexed(List<List<CfgEdge>> successors) {
+            List<List<CfgEdge>> safe = successors == null ? List.of() : successors;
+            this.instructionCount = safe.size();
+            this.edgeOffsets = new int[instructionCount + 1];
+            int edgeCount = 0;
+            for (int i = 0; i < instructionCount; i++) {
+                List<CfgEdge> edges = safe.get(i);
+                edgeCount += edges == null ? 0 : edges.size();
+                edgeOffsets[i + 1] = edgeCount;
+            }
+            this.targets = new int[edgeCount];
+            this.labels = new byte[edgeCount];
+            int cursor = 0;
+            for (int i = 0; i < instructionCount; i++) {
+                List<CfgEdge> edges = safe.get(i);
+                if (edges == null) {
+                    continue;
+                }
+                for (CfgEdge edge : edges) {
+                    targets[cursor] = edge.targetOffset();
+                    labels[cursor++] = labelCode(edge.label());
+                }
+            }
+        }
+
+        private Indexed(int instructionCount, int[] edgeOffsets,
+                        int[] targets, byte[] labels) {
+            this.instructionCount = instructionCount;
+            this.edgeOffsets = edgeOffsets;
+            this.targets = targets;
+            this.labels = labels;
+        }
+
+        public int instructionCount() {
+            return instructionCount;
+        }
+
+        public int edgeCount() {
+            return targets.length;
+        }
+
+        public int edgeStart(int offset) {
+            return offset >= 0 && offset < instructionCount ? edgeOffsets[offset] : 0;
+        }
+
+        public int edgeEnd(int offset) {
+            return offset >= 0 && offset < instructionCount ? edgeOffsets[offset + 1] : 0;
+        }
+
+        public int targetAt(int edgeIndex) {
+            return targets[edgeIndex];
+        }
+
+        public CfgLabel labelAt(int edgeIndex) {
+            return LABELS[labels[edgeIndex]];
         }
 
         public List<CfgEdge> successorsAt(int offset) {
-            return offset >= 0 && offset < successors.size()
-                    ? successors.get(offset) : List.of();
+            int start = edgeStart(offset);
+            int end = edgeEnd(offset);
+            if (start == end) {
+                return List.of();
+            }
+            List<CfgEdge> result = new ArrayList<>(end - start);
+            for (int i = start; i < end; i++) {
+                result.add(new CfgEdge(targets[i], labelAt(i)));
+            }
+            return List.copyOf(result);
+        }
+
+        /** Compatibility view; analyses should use the primitive accessors above. */
+        public List<List<CfgEdge>> successors() {
+            List<List<CfgEdge>> view = legacyView;
+            if (view != null) {
+                return view;
+            }
+            List<List<CfgEdge>> result = new ArrayList<>(instructionCount);
+            for (int i = 0; i < instructionCount; i++) {
+                result.add(successorsAt(i));
+            }
+            view = List.copyOf(result);
+            legacyView = view;
+            return view;
+        }
+
+        private static byte labelCode(CfgLabel label) {
+            return (byte) (label == null ? CfgLabel.SEQ.ordinal() : label.ordinal());
         }
     }
 
@@ -49,11 +142,27 @@ public final class Cfg {
     /** Dense successor table used by ForwardOrigins; semantics are identical to compute(). */
     public static Indexed computeIndexed(MethodInfo method) {
         Mutable mutable = buildMutable(method);
-        List<List<CfgEdge>> frozen = new ArrayList<>(mutable.edges.size());
-        for (List<CfgEdge> edges : mutable.edges) {
-            frozen.add(edges == null || edges.isEmpty() ? List.of() : List.copyOf(edges));
+        int instructionCount = mutable.edges.size();
+        int[] edgeOffsets = new int[instructionCount + 1];
+        int edgeCount = 0;
+        for (int i = 0; i < instructionCount; i++) {
+            List<CfgEdge> edges = mutable.edges.get(i);
+            edgeCount += edges == null ? 0 : edges.size();
+            edgeOffsets[i + 1] = edgeCount;
         }
-        return new Indexed(frozen);
+        int[] targets = new int[edgeCount];
+        byte[] labels = new byte[edgeCount];
+        int cursor = 0;
+        for (List<CfgEdge> edges : mutable.edges) {
+            if (edges == null) {
+                continue;
+            }
+            for (CfgEdge edge : edges) {
+                targets[cursor] = edge.targetOffset();
+                labels[cursor++] = Indexed.labelCode(edge.label());
+            }
+        }
+        return new Indexed(instructionCount, edgeOffsets, targets, labels);
     }
 
     private static Mutable buildMutable(MethodInfo method) {
@@ -93,13 +202,16 @@ public final class Cfg {
                 succ.add(new CfgEdge(offset + 1, CfgLabel.SEQ));
             }
         }
-        // 异常边
+        // 异常边：只把可能抛出异常的指令连到 handler。未知指令仍保守保留，
+        // 已知不会抛异常的常量/局部/纯算术指令不再制造无意义的 handler 合流。
         for (TryCatchFact tc : method.tryCatch()) {
             for (int offset = tc.start(); offset < tc.end() && offset < insns.size(); offset++) {
                 if (tc.handler() >= insns.size()) {
                     continue;
                 }
-                mutable.at(offset).add(new CfgEdge(tc.handler(), CfgLabel.EXCEPTION));
+                if (insns.get(offset).op().mayThrow()) {
+                    mutable.at(offset).add(new CfgEdge(tc.handler(), CfgLabel.EXCEPTION));
+                }
             }
         }
         return mutable;

@@ -201,10 +201,11 @@ public final class ForwardOrigins {
             }
             State out = transfer(method, method.insnAt(offset), state, arrayElements,
                     indexedArrayElements);
-            for (CfgEdge edge : cfg.successorsAt(offset)) {
+            for (int edgeIndex = cfg.edgeStart(offset); edgeIndex < cfg.edgeEnd(offset); edgeIndex++) {
+                CfgLabel edgeLabel = cfg.labelAt(edgeIndex);
                 // 异常边：进入 handler 时 JVM 清空栈并压入异常对象，locals 保留
-                State incoming = edge.label() == CfgLabel.EXCEPTION ? exceptionState(out) : out;
-                int target = edge.targetOffset();
+                State incoming = edgeLabel == CfgLabel.EXCEPTION ? exceptionState(out) : out;
+                int target = cfg.targetAt(edgeIndex);
                 if (target < 0 || target >= before.length) {
                     continue;
                 }

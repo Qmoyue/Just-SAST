@@ -43,8 +43,6 @@ public final class CsvReporter {
         regions.attach(cpgGraph);
         Files.createDirectories(layout.findings());
         Files.createDirectories(layout.evidence());
-        List<Row> findings = new ArrayList<>();
-        List<Row> edges = new ArrayList<>();
         // 按 (entry, sink, category) 折叠：代表链取最短路径，其余计入 variant_count
         Map<String, List<Chain>> groups = new java.util.LinkedHashMap<>();
         for (Chain chain : chains) {
@@ -59,46 +57,85 @@ public final class CsvReporter {
         // 高可用链置顶：置信度 → 质量（无未解析） → 链长 → 变体数
         List<List<Chain>> sortedGroups = new ArrayList<>(groups.values());
         sortedGroups.sort((a, b) -> compareGroups(a, b, chainNotes));
-        int seq = 0;
-        for (List<Chain> group : sortedGroups) {
-            Chain representative = group.get(0);
-            String chainId = ChainIds.id(representative.key()) + "-" + String.format("%04d", ++seq);
-            // 收集组内全部变体的注释（verify 标注可能在非 representative 变体上）
-            List<String> groupNotes = new ArrayList<>();
-            for (Chain variant : group) {
-                groupNotes.addAll(chainNotes.getOrDefault(variant.key(), List.of()));
-            }
-            findings.add(findingRow(chainId, representative, group.size(),
-                    Map.of(representative.key(), groupNotes)));
-            edges.addAll(edgeRows(chainId, representative));
-        }
-        List<Row> sinks = new ArrayList<>();
         List<SinkOutcome> orderedOutcomes = new ArrayList<>(outcomes.values());
         orderedOutcomes.sort(Comparator.comparing(CsvReporter::sinkKey));
-        for (SinkOutcome outcome : orderedOutcomes) {
-            sinks.add(sinkRow(outcome));
-        }
-        List<Row> calibrationRows = new ArrayList<>();
         List<Map.Entry<String, String>> orderedCalibrations = new ArrayList<>(calibrations.entrySet());
         orderedCalibrations.sort(Map.Entry.comparingByKey());
-        for (Map.Entry<String, String> e : orderedCalibrations) {
-            calibrationRows.add(new Row(e.getKey(), e.getValue()));
-        }
-        // chains.csv：全变体链表（同 entry/sink 折叠组内的每条路径独立成行——变体路径对分析者有价值）
-        List<Row> allChains = new ArrayList<>();
-        for (List<Chain> group : sortedGroups) {
-            for (Chain variant : group) {
-                allChains.add(new Row(ChainIds.id(variant.key()), variant.ruleId(),
-                        variant.entryClass(), variant.entryMethod(), entryDescriptor(variant), variant.entryKind(),
-                        variant.sinkClass(), variant.sinkMethod(), sinkDescriptor(variant),
-                        String.valueOf(regions.crossings(variant)), pathSummary(variant)));
+        // Keep only the grouped Chain objects in memory. Rows are encoded directly into each
+        // file; materializing findings + edges + every variant duplicated large strings and
+        // made reporting a second memory peak after analysis had already completed.
+        writeFindings(layout.findings().resolve("findings.csv"), sortedGroups, chainNotes);
+        writeEdges(layout.evidence().resolve("edges.csv"), sortedGroups);
+        writeChains(layout.evidence().resolve("chains.csv"), sortedGroups);
+        writeSinks(layout.evidence().resolve("sinks.csv"), orderedOutcomes);
+        writeCalibrations(layout.evidence().resolve("calibrations.csv"), orderedCalibrations);
+    }
+
+    private void writeFindings(Path file, List<List<Chain>> groups,
+                               Map<String, List<String>> chainNotes) throws IOException {
+        try (java.io.BufferedWriter writer = openCsv(file, FINDINGS_HEADER)) {
+            for (int i = 0; i < groups.size(); i++) {
+                List<Chain> group = groups.get(i);
+                Chain representative = group.get(0);
+                List<String> groupNotes = new ArrayList<>();
+                for (Chain variant : group) {
+                    groupNotes.addAll(chainNotes.getOrDefault(variant.key(), List.of()));
+                }
+                String chainId = groupId(representative, i + 1);
+                writeRow(writer, findingRow(chainId, representative, group.size(),
+                        Map.of(representative.key(), groupNotes)));
             }
         }
-        writeCsv(layout.evidence().resolve("chains.csv"), CHAINS_HEADER, allChains);
-        writeCsv(layout.findings().resolve("findings.csv"), FINDINGS_HEADER, findings);
-        writeCsv(layout.evidence().resolve("edges.csv"), EDGES_HEADER, edges);
-        writeCsv(layout.evidence().resolve("sinks.csv"), SINKS_HEADER, sinks);
-        writeCsv(layout.evidence().resolve("calibrations.csv"), CALIBRATIONS_HEADER, calibrationRows);
+    }
+
+    private void writeEdges(Path file, List<List<Chain>> groups) throws IOException {
+        try (java.io.BufferedWriter writer = openCsv(file, EDGES_HEADER)) {
+            for (int i = 0; i < groups.size(); i++) {
+                List<Chain> group = groups.get(i);
+                String chainId = groupId(group.get(0), i + 1);
+                for (Row row : edgeRows(chainId, group.get(0))) {
+                    writeRow(writer, row);
+                }
+            }
+        }
+    }
+
+    private void writeChains(Path file, List<List<Chain>> groups) throws IOException {
+        try (java.io.BufferedWriter writer = openCsv(file, CHAINS_HEADER)) {
+            for (List<Chain> group : groups) {
+                for (Chain variant : group) {
+                    writeRow(writer, new Row(ChainIds.id(variant.key()), variant.ruleId(),
+                            variant.entryClass(), variant.entryMethod(), entryDescriptor(variant), variant.entryKind(),
+                            variant.sinkClass(), variant.sinkMethod(), sinkDescriptor(variant),
+                            String.valueOf(regions.crossings(variant)), pathSummary(variant)));
+                }
+            }
+        }
+    }
+
+    private static void writeSinks(Path file, List<SinkOutcome> outcomes) throws IOException {
+        try (java.io.BufferedWriter writer = openCsv(file, SINKS_HEADER)) {
+            for (SinkOutcome outcome : outcomes) {
+                writeRow(writer, new Row(outcome.ruleId(), outcome.category(),
+                        outcome.sinkOwner(), outcome.sinkMethod(), outcome.enclosingClass(),
+                        outcome.enclosingMethod(), outcome.verdict(),
+                        String.valueOf(outcome.chainsFound()), String.valueOf(outcome.steps()),
+                        String.valueOf(outcome.unresolved()), String.valueOf(outcome.tooLong())));
+            }
+        }
+    }
+
+    private static void writeCalibrations(Path file, List<Map.Entry<String, String>> calibrations)
+            throws IOException {
+        try (java.io.BufferedWriter writer = openCsv(file, CALIBRATIONS_HEADER)) {
+            for (Map.Entry<String, String> calibration : calibrations) {
+                writeRow(writer, new Row(calibration.getKey(), calibration.getValue()));
+            }
+        }
+    }
+
+    private static String groupId(Chain chain, int sequence) {
+        return ChainIds.id(chain.key()) + "-" + String.format("%04d", sequence);
     }
 
     /** 组内任一变体有 verify:confirmed 注释。 */
@@ -181,15 +218,6 @@ public final class CsvReporter {
 
     private static final String CHAINS_HEADER = "variant_id,rule_id,entry_class,entry_method,entry_descriptor,entry_kind,"
             + "sink_class,sink_method,sink_descriptor,region_crossings,path";
-
-    private Row sinkRow(SinkOutcome outcome) {
-        return new Row(outcome.ruleId(), outcome.category(),
-                outcome.sinkOwner(), outcome.sinkMethod(),
-                outcome.enclosingClass(), outcome.enclosingMethod(),
-                outcome.verdict(), String.valueOf(outcome.chainsFound()),
-                String.valueOf(outcome.steps()), String.valueOf(outcome.unresolved()),
-                String.valueOf(outcome.tooLong()));
-    }
 
     private Row findingRow(String chainId, Chain chain, int variantCount, Map<String, List<String>> chainNotes) {
         List<String> notes = chainNotes.getOrDefault(chain.key(), List.of());
@@ -350,21 +378,22 @@ public final class CsvReporter {
     }
 
     /** 流式写出（大语料 10 万+ 链不能整表拼 String——堆峰值会翻倍）。 */
-    private static void writeCsv(Path file, String header, List<Row> rows) throws IOException {
-        try (java.io.BufferedWriter w = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
-            w.write('\uFEFF');
-            w.write(header);
-            w.write("\r\n");
-            for (Row row : rows) {
-                for (int i = 0; i < row.cells().size(); i++) {
-                    if (i > 0) {
-                        w.write(',');
-                    }
-                    w.write(escape(row.cells().get(i)));
-                }
-                w.write("\r\n");
+    private static java.io.BufferedWriter openCsv(Path file, String header) throws IOException {
+        java.io.BufferedWriter writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8);
+        writer.write('\uFEFF');
+        writer.write(header);
+        writer.write("\r\n");
+        return writer;
+    }
+
+    private static void writeRow(java.io.BufferedWriter writer, Row row) throws IOException {
+        for (int i = 0; i < row.cells().size(); i++) {
+            if (i > 0) {
+                writer.write(',');
             }
+            writer.write(escape(row.cells().get(i)));
         }
+        writer.write("\r\n");
     }
 
     private static String escape(String value) {

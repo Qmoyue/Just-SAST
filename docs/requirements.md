@@ -114,11 +114,12 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 
 截至当前代码：
 
-- `mvn test`：146 项通过，0 失败，2 项环境跳过；
-- Gleipner 全量（`evidence/chains.csv` 全路径变体）：块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载失败作为环境限制；
-- 默认全量校准语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 的安全动态结果分别为 `2/3/15`、`2/3/15`、`1/0/19`、`1/0/19`、`3/0/17`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；
+- `mvn test`：153 项通过，0 失败，2 项环境跳过（本轮最终回归）；
+- Gleipner 全量完成 30 个 block 的扫描和转换，29 个 block 完成 evaluator：全路径变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重基线 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载失败作为环境限制；
+- 默认全量校准语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 的安全动态结果分别为 `2/3/15`、`2/3/15`、`2/2/16`、`1/0/19`、`2/0/18`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；qiao 使用 Jabba JDK 21；
 - `javamix` 当前工件缺少 WP 文档所述 `InternalDataServiceImpl.processTask`，动态选择的 20 条候选均为 `PARTIAL`，因此不将其它工件的 WP 结果代入；
 - Windows Gleipner JNI 块缺少 evaluator 对应的 native `.eval.txt`，按环境限制处理；
+- 本机 WSL 不可用，未宣称 Linux evaluator 分数；跨平台验证仍是发布前环境门槛；
 - 大型工件的真实 RSS 峰值尚未建立可复现的外部采样基线，不能宣称严格低内存目标已经达成。
 
 ## 8. 发布检查清单
@@ -131,3 +132,14 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 4. 运行完整 Gleipner evaluator，逐块记录 TP/FP/跳过或截断原因；
 5. 在容器/低权限/无网络环境执行不可信工件的动态验证；
 6. 检查新增规则/知识源没有目标特判，更新本文件和 README 的用户可见契约。
+
+## 9. 本轮优化验收要求
+
+| ID | 要求 |
+| --- | --- |
+| NFR-09 | 前端并行资源按扫描会话复用；并行度变化只影响调度，不改变静态链集合、规则归因、链身份或排序 |
+| NFR-10 | CPG/CFG 的紧凑表示必须保留调用、字段、控制流、异常、lambda、分发和完整性语义；所有删除的冗余结构有等价回归 |
+| NFR-11 | 分析预算必须按 sink/阶段记录消耗和截断；`COMPLETE` 不得由单条链状态推导，扫描覆盖、链证明和动态能力必须独立输出 |
+| NFR-12 | 动态验证必须 fail closed，结构化记录精确 JDK、sandbox/canary 能力、终止原因、子进程清理和 native 状态；不执行最终危险 sink |
+| NFR-13 | 报告格式从同一规范化结果模型派生，支持大工件流式写出和稳定 schema；人读 Markdown 与 agent JSON 不得各自重新推导结论 |
+| NFR-14 | 测试覆盖真实子进程边界、跨 JDK/平台、敌意 Jar、确定性、超时/OOM/输出溢出和性能退化；benchmark 语料只作为外部校准，不进入生产特判 |

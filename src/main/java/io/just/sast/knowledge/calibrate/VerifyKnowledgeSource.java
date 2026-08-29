@@ -158,39 +158,39 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                 for (int i = 0; i < results.size(); i++) {
                     ParallelVerifier.VerifyResult result = results.get(i);
                     Chain chain = topChains.get(i);
-                    switch (result.status()) {
-                        case "SINK_BLOCKED" -> {
+                    switch (result.statusCode()) {
+                        case SINK_BLOCKED -> {
                             bb.chainNote(chain.key(), "verify:sink-blocked");
                             confirmed++;
                         }
                         // 真实触发前缀完成但未到达精确 sink 边界：保留为低于 sink 的正向证据。
-                        case "CONCRETE_REACHED" -> {
+                        case CONCRETE_REACHED -> {
                             bb.chainNote(chain.key(), "verify:concrete-reached");
                             executed++;
                         }
                         // 入口真实执行但未证实 sink：兼容 direct/source 旧探针结果。
-                        case "EXECUTED" -> {
+                        case EXECUTED -> {
                             bb.chainNote(chain.key(), "verify:executed");
                             executed++;
                         }
-                        case "PARTIAL" -> {
+                        case PARTIAL -> {
                             bb.chainNote(chain.key(), "degrade:partial-path");
                             verificationDetails.merge(detailKey(result.detail()), 1, Integer::sum);
                             partial++;
                         }
                         // 探针 FAILED 是弱否定证据（可能源于依赖缺失/构造限制等探针自身局限）：
                         // 降级保留，不一票否决
-                        case "FAILED" -> {
+                        case FAILED -> {
                             bb.chainNote(chain.key(), "degrade:verify-failed");
                             verificationDetails.merge(detailKey(result.detail()), 1, Integer::sum);
                             failed++;
                         }
-                        case "TIMEOUT" -> {
+                        case TIMEOUT -> {
                             bb.chainNote(chain.key(), "degrade:verify-timeout");
                             verificationDetails.merge(detailKey(result.detail()), 1, Integer::sum);
                             timeout++;
                         }
-                        case "UNTESTABLE" -> {
+                        case UNTESTABLE -> {
                             bb.chainNote(chain.key(), "degrade:verify-untestable");
                             verificationDetails.merge(detailKey(result.detail()), 1, Integer::sum);
                             untestable++;

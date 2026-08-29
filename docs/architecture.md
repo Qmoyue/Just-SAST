@@ -236,14 +236,34 @@ rules:
 
 需要新的分析语义时，实现 `KnowledgeSource` 并声明 `phase()`、`priority()`、`interests()`；用 Blackboard 事实和事件通信，通过 ServiceLoader 注册。不要在 CLI、报告器或其它 knowledge source 中硬编码攻击面，也不要为单个工件写条件分支。
 
+## 10.1 本轮优化计划与设计决策（2026-08-30）
+
+本轮目标不是降低扫描深度换取更短耗时，而是在相同规则、JDK、预算和输入下减少调度、对象和重复查询开销，并让所有降级都成为可审计证据。实施顺序固定为：
+
+1. **性能基线与前端调度**：记录阶段耗时、类/方法/节点/边数量、CFG 命中、分析预算和动态验证能力；前端扫描会话复用并行 worker，禁止按小批次反复创建线程池。
+2. **紧凑图与 CFG**：保持现有 CPG 查询契约，逐步以稳定整数 offset/id 和压缩邻接关系承载热路径；先保证 CFG 标签、异常语义和结果排序等价，再删除重复对象。大型图不能以完整指令对象图为默认存储。
+3. **按需精度与公平预算**：在 sink 附近引入可解释的局部上下文/receiver 约束，优化反射/JNI 候选索引和异常边；全局预算采用每个 sink 的最低保障与剩余预算公平分配，不能由固定遍历顺序决定谁被扫描。
+4. **动态安全与证据**：动态验证保持 fork-per-chain 和 sink canary 边界；加入结构化状态、精确 JDK/能力/原因，子进程只获得最小环境。Java 层权限门不宣称为 OS 沙箱；JDK 24+ 若无法启用等价能力必须 fail closed。
+5. **报告与测试**：以规范化验证结果生成 JSON/JSONL、Markdown、CSV、SARIF，分离扫描完整性、链证明完整性和动态能力；补充子进程 E2E、跨 JDK/平台、恶意工件边界、确定性和性能回归。
+
+研究取舍：CPG 论文证明 AST/CFG/PDG 的联合查询适合漏洞路径表达，但 Just 面向无源码 JAR，因此采用字节码语义 CPG，不物化无用 AST 节点；Qilin 的细粒度上下文敏感和增量 worklist 支持“局部按需”而非全程序重型 points-to；FLASH 的反序列化引导调用图支持优先分析可控 receiver；JDD 的动态对象构造思想用于验证真实前置链。上述资料只作为通用设计依据，规则和代码不依赖任何 benchmark 名称或 WP 结构。
+
+本轮验收条件：
+
+- 同一输入、JDK、规则和预算下，串行/并行结果链身份、规则归因、完整性原因一致；
+- 不因前端批处理或图存储优化跳过 class、method、sink、异常边或规则；
+- 所有预算、能力、fallback、超时、native 缺失和解析失败均进入结构化报告；
+- 动态验证只能证明真实触发前缀到达 canary 边界，不能把 sink body 执行或 payload bytes 写入产物；
+- 六个校准语料、Gleipner 和 Maven 全量测试已完成；Linux/WSL evaluator 在本机不可用，因此不把未执行的跨平台分数写成通过项，保留为发布前环境验收项。
+
 ## 11. 当前验证与已知限制
 
 当前仓库验证基线：
 
-- `mvn test`：146 项通过，0 失败，2 项环境跳过；
-- Gleipner 全量使用 `evidence/chains.csv` 的全路径变体：块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载路径限制单独记录，不折算成扫描器分数；
-- 指定 WP 语料的安全动态结果为：`demo=2/3/15`、`demo2=2/3/15`、`babychain=1/0/19`、`n1cat=1/0/19`、`qiao=3/0/17`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；
-- `javamix` 当前工件产生 21,544 条静态候选，动态选择 20 条且均为 `PARTIAL`；它不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，不能用另一份工件的结果替代；
+- `mvn test`：153 项通过，0 失败，2 项环境跳过（本轮最终回归）；
+- Gleipner 全量完成 30 个 block 的扫描和转换，其中 29 个 block 完成 evaluator：全路径变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重基线为 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载路径限制单独记录，不折算成扫描器分数；
+- 指定语料的安全动态结果为：`demo=2/3/15`、`demo2=2/3/15`、`babychain=2/2/16`、`n1cat=1/0/19`、`qiao=2/0/18`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；qiao 运行时使用 Jabba JDK 21；
+- `javamix` 当前工件产生 21,635 条静态候选，动态选择 20 条且均为 `PARTIAL`；它不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，不能用另一份工件的结果替代；
 - 大型工件的 live heap 仍然较高，不能宣称已经满足严格低内存发布门槛；
 - 复杂框架真实输入、代理、JNI/JRMP 和 JDK 版本差异仍可能产生 `PARTIAL`/`UNTESTABLE`；
 - 安全 payload plan、JVM 权限门和 canary 都不等价于生产级 exploit runner 或 OS sandbox。

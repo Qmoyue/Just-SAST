@@ -87,14 +87,14 @@ class ForwardOriginsTest {
 
     @Test
     void exceptionEdgeClearsStackAndPushesUnknown() {
-        // try { ICONST_1; ICONST_1 } catch(E) → ASTORE 1
+        // try { INVOKESTATIC } catch(E) → ASTORE 1；调用指令可能抛出异常，常量指令则不会
         MethodNode m = new MethodNode(0, "run", "()V", null, null);
         LabelNode start = new LabelNode();
         LabelNode end = new LabelNode();
         LabelNode handler = new LabelNode();
         m.instructions.add(start);
-        m.instructions.add(new InsnNode(Op.ICONST_1.code()));
-        m.instructions.add(new InsnNode(Op.ICONST_1.code()));
+        m.instructions.add(new MethodInsnNode(Op.INVOKESTATIC.code(), "T", "mayThrow", "()V", false));
+        m.instructions.add(new InsnNode(Op.RETURN.code()));
         m.instructions.add(end);
         m.instructions.add(handler);
         m.instructions.add(new VarInsnNode(Op.ASTORE.code(), 1));

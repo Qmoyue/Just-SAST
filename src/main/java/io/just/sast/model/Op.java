@@ -106,4 +106,22 @@ public enum Op {
     public boolean isStore() {
         return this == ISTORE || this == LSTORE || this == FSTORE || this == DSTORE || this == ASTORE;
     }
+
+    /**
+     * Conservative JVM exception classification for CFG handler edges. The classification is
+     * deliberately instruction-level: unresolved calls and UNKNOWN remain throwing, while
+     * constants, local moves and pure arithmetic do not create fake exceptional joins.
+     */
+    public boolean mayThrow() {
+        return switch (this) {
+            case IALOAD, LALOAD, FALOAD, DALOAD, AALOAD, BALOAD, CALOAD, SALOAD,
+                    IASTORE, LASTORE, FASTORE, DASTORE, AASTORE, BASTORE, CASTORE, SASTORE,
+                    IDIV, LDIV, IREM, LREM,
+                    GETSTATIC, PUTSTATIC, GETFIELD, PUTFIELD,
+                    INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE, INVOKEDYNAMIC,
+                    NEW, NEWARRAY, ANEWARRAY, MULTIANEWARRAY, ARRAYLENGTH,
+                    ATHROW, CHECKCAST, INSTANCEOF, LDC, MONITORENTER, MONITOREXIT, UNKNOWN -> true;
+            default -> false;
+        };
+    }
 }

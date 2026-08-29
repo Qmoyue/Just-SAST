@@ -68,4 +68,41 @@ class CfgTest {
         assertEquals(List.of(), indexed.successorsAt(2));
         assertEquals(List.of(), indexed.successorsAt(-1));
     }
+
+    @Test
+    void indexedStorageExposesPrimitiveEdgeContract() {
+        MethodInfo m = method(
+                insn(0, Op.GOTO, 2),
+                insn(1, Op.NOP),
+                insn(2, Op.RETURN));
+        var indexed = Cfg.computeIndexed(m);
+        assertEquals(3, indexed.instructionCount());
+        assertEquals(2, indexed.edgeCount(), "offset 1 的 NOP 仍有一条顺序边");
+        assertEquals(0, indexed.edgeStart(0));
+        assertEquals(1, indexed.edgeEnd(0));
+        assertEquals(2, indexed.targetAt(0));
+        assertEquals(CfgLabel.JUMP, indexed.labelAt(0));
+    }
+
+    @Test
+    void knownNonThrowingInstructionsDoNotCreateExceptionalJoin() {
+        MethodInfo m = new MethodInfo("T", "m", "()V", Modifier.PUBLIC,
+                List.of(insn(0, Op.ICONST_0), insn(1, Op.ISTORE, 0), insn(2, Op.RETURN)),
+                List.of(new io.just.sast.model.TryCatchFact(0, 2, 2, "java/lang/Exception")), false);
+        var indexed = Cfg.computeIndexed(m);
+        assertTrue(indexed.successorsAt(0).stream().noneMatch(e -> e.label() == CfgLabel.EXCEPTION));
+        assertTrue(indexed.successorsAt(1).stream().noneMatch(e -> e.label() == CfgLabel.EXCEPTION));
+    }
+
+    @Test
+    void classResolutionInstructionsRemainConservativeForHandlers() {
+        MethodInfo m = new MethodInfo("T", "m", "()V", Modifier.PUBLIC,
+                List.of(insn(0, Op.LDC, new io.just.sast.model.TypeRef("Ljava/lang/String;")),
+                        insn(1, Op.INSTANCEOF, new io.just.sast.model.TypeRef("Ljava/lang/Object;")),
+                        insn(2, Op.RETURN)),
+                List.of(new io.just.sast.model.TryCatchFact(0, 2, 2, "java/lang/LinkageError")), false);
+        var indexed = Cfg.computeIndexed(m);
+        assertTrue(indexed.successorsAt(0).stream().anyMatch(e -> e.label() == CfgLabel.EXCEPTION));
+        assertTrue(indexed.successorsAt(1).stream().anyMatch(e -> e.label() == CfgLabel.EXCEPTION));
+    }
 }

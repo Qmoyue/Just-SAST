@@ -195,14 +195,14 @@ public final class ForwardEngine {
             List<InsnFact> effects = new ArrayList<>();
             CpgIndex.MethodSlice slice = support.cpgIndex().slice(key);
             if (slice != null) {
-                for (int offset : slice.fieldReadOffsets()) {
+                slice.forEachFieldReadOffset(offset -> {
                     InsnFact insn = info.insnAt(offset);
                     fieldReaders.computeIfAbsent(insn.fieldRef().owner() + "#" + insn.fieldRef().name(),
                             k -> new HashSet<>()).add(key);
-                }
-                for (int offset : slice.effectOffsets()) {
+                });
+                slice.forEachEffectOffset(offset -> {
                     effects.add(info.insnAt(offset));
-                }
+                });
             } else {
                 // Direct Blackboard construction remains supported for extensions/tests
                 // that do not have a frontend-produced CpgIndex.
@@ -1820,15 +1820,17 @@ public final class ForwardEngine {
                 ProxyValue condition = flow.stack().isEmpty()
                         ? ProxyValue.UNKNOWN : flow.stack().get(flow.stack().size() - 1);
                 ProxyFlow next = proxyTransfer(flow, insn, requestedName);
-                for (CfgEdge edge : cfg.successorsAt(offset)) {
-                    if (edge.label() == CfgLabel.EXCEPTION || !proxyBranchAllowed(insn.op(),
-                            condition, edge.label())) {
+                for (int edgeIndex = cfg.edgeStart(offset); edgeIndex < cfg.edgeEnd(offset); edgeIndex++) {
+                    CfgLabel edgeLabel = cfg.labelAt(edgeIndex);
+                    if (edgeLabel == CfgLabel.EXCEPTION || !proxyBranchAllowed(insn.op(),
+                            condition, edgeLabel)) {
                         continue;
                     }
-                    if (edge.targetOffset() < 0 || edge.targetOffset() >= method.instructions().size()) {
+                    int targetOffset = cfg.targetAt(edgeIndex);
+                    if (targetOffset < 0 || targetOffset >= method.instructions().size()) {
                         continue;
                     }
-                    Set<ProxyFlow> target = states.computeIfAbsent(edge.targetOffset(),
+                    Set<ProxyFlow> target = states.computeIfAbsent(targetOffset,
                             ignored -> new LinkedHashSet<>());
                     // Unknown bytecode can otherwise create a state cross-product in a large
                     // handler. Capping states affects only metadata feasibility, not the core
@@ -1836,7 +1838,7 @@ public final class ForwardEngine {
                     if (target.size() >= 96 || !target.add(next)) {
                         continue;
                     }
-                    work.addLast(edge.targetOffset());
+                    work.addLast(targetOffset);
                 }
             }
         }

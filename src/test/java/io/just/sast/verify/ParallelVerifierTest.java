@@ -20,6 +20,20 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 class ParallelVerifierTest {
 
     @Test
+    void verificationStatusIsClosedAndUnknownValuesAreNotPositiveEvidence() {
+        ParallelVerifier.VerifyResult blocked = new ParallelVerifier.VerifyResult(
+                "chain", "SINK_BLOCKED", "boundary");
+        ParallelVerifier.VerifyResult unknown = new ParallelVerifier.VerifyResult(
+                "chain", "new-status-from-future", "detail");
+
+        assertEquals(ParallelVerifier.VerifyStatus.SINK_BLOCKED, blocked.statusCode());
+        assertEquals("SINK_CANARY_BOUNDARY", blocked.evidence());
+        assertEquals(ParallelVerifier.VerifyStatus.UNKNOWN, unknown.statusCode());
+        assertEquals("UNKNOWN", unknown.evidence(),
+                "未知状态不得被当作动态正向证据");
+    }
+
+    @Test
     void childEnvironmentDoesNotInheritSecretsOrJVMInjection() {
         Path javaHome = Path.of("C:/jdk");
         Path isoDir = Path.of("C:/isolated");

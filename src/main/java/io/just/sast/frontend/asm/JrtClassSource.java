@@ -91,6 +91,20 @@ public final class JrtClassSource implements JdkClassSource {
 
     @Override
     public ClassInfo load(String internalName) {
+        ClassBytes bytes = loadBytes(internalName);
+        if (bytes == null) {
+            return null;
+        }
+        try {
+            return reader.read(bytes.bytes());
+        } catch (Exception e) {
+            JustLogger.debug("JDK 类加载失败 {}: {}", internalName, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 按内部名读取原始 class，仅供 frontend 的按需闭包规划使用。 */
+    public ClassBytes loadBytes(String internalName) {
         try {
             String module = moduleOf(internalName);
             if (module == null) {
@@ -100,7 +114,7 @@ public final class JrtClassSource implements JdkClassSource {
             if (!Files.exists(classFile)) {
                 return null;
             }
-            return reader.read(Files.readAllBytes(classFile));
+            return new ClassBytes(internalName, Files.readAllBytes(classFile), "jdk:/" + module);
         } catch (Exception e) {
             JustLogger.debug("JDK 类加载失败 {}: {}", internalName, e.getMessage());
             return null;

@@ -52,8 +52,9 @@ public final class ChainVerifyProbe {
      * The launcher system loader is normally sufficient, but fat JAR/WAR verification has
      * class-path entries materialized immediately before the child is started.  Keep an
      * explicit read-only application loader as the context loader so lookup does not depend on
-     * launcher-specific wildcard/manifest behavior.  Its parent remains the system loader,
-     * preserving the probe and platform classes without duplicating them.
+     * launcher-specific wildcard/manifest behavior. Its parent is the platform loader,
+     * preserving JDK classes without exposing the scanner application loader to target code.
+     * The verifier loader contains the probe jar and target/dependency entries itself.
      */
     private static ClassLoader applicationLoader;
 
@@ -1226,41 +1227,50 @@ public final class ChainVerifyProbe {
     }
 
     /**
-     * Build the application context before the deny-by-default manager is installed.  The
-     * URLs are exactly the child JVM's class path, so this is a loader boundary, not an
-     * additional filesystem capability.  Failure is harmless: load() still tries the
-     * launcher loader below and reports a normal partial path when neither can resolve a
-     * class.
+     * Build the application context before the deny-by-default manager is installed. The
+     * URLs are the target/dependency portion of the child JVM class path; the probe JAR is
+     * deliberately excluded. This is a loader boundary, not an additional filesystem
+     * capability. Failure is harmless: load() reports a normal partial path when the isolated
+     * application loader cannot resolve a class.
      */
     private static void installApplicationLoader() {
         if (applicationLoader != null) {
             return;
         }
-        ClassLoader system = ClassLoader.getSystemClassLoader();
         List<URL> urls = new ArrayList<>();
         String classPath = System.getProperty("java.class.path", "");
+        String probeJar = System.getProperty("just.verify.probe-jar", "");
+        String normalizedProbe = probeJar.isBlank() ? ""
+                : Path.of(probeJar).toAbsolutePath().normalize().toString();
         for (String entry : classPath.split(java.util.regex.Pattern.quote(
                 java.io.File.pathSeparator))) {
             if (entry.isBlank()) {
                 continue;
             }
             try {
-                urls.add(Path.of(entry).toAbsolutePath().normalize().toUri().toURL());
+                Path normalized = Path.of(entry).toAbsolutePath().normalize();
+                if (!normalizedProbe.isEmpty() && normalized.toString().equals(normalizedProbe)) {
+                    continue;
+                }
+                urls.add(normalized.toUri().toURL());
             } catch (Exception ignored) {
                 // A malformed optional entry must not widen the probe or abort other entries.
             }
         }
         if (urls.isEmpty()) {
-            applicationLoader = system;
+            // An empty application class path cannot resolve the target entry. Keep the
+            // platform loader as the boundary; falling back to the launcher system loader
+            // would expose scanner classes and dependencies to target code.
+            applicationLoader = ClassLoader.getPlatformClassLoader();
             return;
         }
         try {
             URLClassLoader loader = new URLClassLoader(
-                    urls.toArray(URL[]::new), system);
+                    urls.toArray(URL[]::new), ClassLoader.getPlatformClassLoader());
             applicationLoader = loader;
             Thread.currentThread().setContextClassLoader(loader);
         } catch (RuntimeException ignored) {
-            applicationLoader = system;
+            applicationLoader = ClassLoader.getPlatformClassLoader();
         }
     }
 
@@ -1268,7 +1278,6 @@ public final class ChainVerifyProbe {
     private static Class<?> load(String name) throws ClassNotFoundException {
         ClassLoader context = applicationLoader != null
                 ? applicationLoader : Thread.currentThread().getContextClassLoader();
-        ClassLoader system = ClassLoader.getSystemClassLoader();
         ClassNotFoundException first = null;
         if (context != null) {
             try {
@@ -1277,20 +1286,9 @@ public final class ChainVerifyProbe {
                 first = failure;
             }
         }
-        if (system != null && system != context) {
-            try {
-                return system.loadClass(name);
-            } catch (ClassNotFoundException failure) {
-                if (first == null) {
-                    first = failure;
-                }
-            }
-        }
         boolean resourcePresent = false;
         String resourceName = name.replace('.', '/') + ".class";
         if (context != null && context.getResource(resourceName) != null) {
-            resourcePresent = true;
-        } else if (system != null && system.getResource(resourceName) != null) {
             resourcePresent = true;
         }
         throw new ClassNotFoundException(name + " [resource="
@@ -1512,9 +1510,14 @@ public final class ChainVerifyProbe {
                     return input;
                 }
             }
-            if (type.isInstance(triggerInstance)
-                    || java.util.Collection.class.isAssignableFrom(type)) {
-                return new SourceTriggerCollection(triggerInstance, trigger.callbackKind());
+            if (type == Object.class || java.util.Collection.class.isAssignableFrom(type)) {
+                Object collection = sourceCollection(triggerInstance, trigger.callbackKind());
+                if (type.isInstance(collection)) {
+                    return collection;
+                }
+            }
+            if (type.isInstance(triggerInstance)) {
+                return triggerInstance;
             }
         }
         return sourceValue(type);
@@ -1579,7 +1582,10 @@ public final class ChainVerifyProbe {
         try {
             java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
             try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
-                output.writeObject(new SourceTriggerCollection(value, callbackKind));
+                // Keep the stream class graph inside the JDK and the target application.  A
+                // probe-private collection would be resolved by the target's application
+                // loader during readObject and turn a valid source check into ClassNotFoundException.
+                output.writeObject(sourceCollection(value, callbackKind));
             }
             byte[] payload = bytes.toByteArray();
             if (payload.length > 8 * 1024 * 1024) {
@@ -1589,6 +1595,22 @@ public final class ChainVerifyProbe {
         } finally {
             SandboxSecurityManager.endSerializationBootstrap();
         }
+    }
+
+    /**
+     * Build a source container whose callback, when possible, is performed by the target JVM's
+     * own collection deserialization.  This is deliberately shape-based: it uses only the
+     * callback category recovered from the chain and never names a benchmark or gadget class.
+     */
+    private static Object sourceCollection(Object value, String callbackKind) throws IOException {
+        return switch (callbackKind) {
+            case "hashCode" -> rawHashSet(value);
+            case "equals" -> {
+                Object peer = duplicateWithoutConstructor(value);
+                yield peer == null ? rawHashSet(value) : rawHashSet(value, peer);
+            }
+            default -> new java.util.ArrayList<>(java.util.List.of(value));
+        };
     }
 
     /** Serialize an inert container through the target's Kryo implementation. */
@@ -1711,14 +1733,21 @@ public final class ChainVerifyProbe {
                 set.add(value);
                 yield set;
             }
-            case "hashCode", "equals" -> rawHashMap(value);
+            case "hashCode" -> rawHashMap(value);
+            case "equals" -> {
+                Object peer = duplicateWithoutConstructor(value);
+                yield peer == null ? rawHashMap(value) : rawHashMap(value, peer);
+            }
             default -> new java.util.ArrayList<>(java.util.List.of(value));
         };
     }
 
-    /** Build one HashMap entry without calling the target key's hashCode in the probe. */
-    private static Object rawHashMap(Object key) throws IOException {
+    /** Build raw HashMap entries without calling target callbacks while preparing the probe. */
+    private static Object rawHashMap(Object... keys) throws IOException {
         try {
+            if (keys == null || keys.length == 0) {
+                throw new IllegalArgumentException("at least one key is required");
+            }
             Object unsafe = probeUnsafe();
             Class<?> unsafeType = unsafe.getClass();
             Class<?> nodeType;
@@ -1727,22 +1756,53 @@ public final class ChainVerifyProbe {
             } catch (ClassNotFoundException unavailable) {
                 nodeType = Class.forName("java.util.HashMap$Entry", false, null);
             }
-            Object node = invokeUnsafe(unsafeType, unsafe, "allocateInstance",
-                    new Class<?>[]{Class.class}, new Object[]{nodeType});
-            unsafePutInt(unsafeType, unsafe, nodeType, node, "hash", 0);
-            unsafePutObject(unsafeType, unsafe, nodeType, node, "key", key);
-            unsafePutObject(unsafeType, unsafe, nodeType, node, "value", "CHAIN_OK");
-            unsafePutObject(unsafeType, unsafe, nodeType, node, "next", null);
+            Object head = null;
+            for (int i = keys.length - 1; i >= 0; i--) {
+                Object node = invokeUnsafe(unsafeType, unsafe, "allocateInstance",
+                        new Class<?>[]{Class.class}, new Object[]{nodeType});
+                unsafePutInt(unsafeType, unsafe, nodeType, node, "hash", 0);
+                unsafePutObject(unsafeType, unsafe, nodeType, node, "key", keys[i]);
+                unsafePutObject(unsafeType, unsafe, nodeType, node, "value", "CHAIN_OK");
+                unsafePutObject(unsafeType, unsafe, nodeType, node, "next", head);
+                head = node;
+            }
 
             java.util.HashMap<Object, Object> map = new java.util.HashMap<>();
             Object table = java.lang.reflect.Array.newInstance(nodeType, 1);
-            java.lang.reflect.Array.set(table, 0, node);
+            java.lang.reflect.Array.set(table, 0, head);
             unsafePutObject(unsafeType, unsafe, java.util.HashMap.class, map, "table", table);
-            unsafePutInt(unsafeType, unsafe, java.util.HashMap.class, map, "size", 1);
+            unsafePutInt(unsafeType, unsafe, java.util.HashMap.class, map, "size", keys.length);
             return map;
         } catch (ReflectiveOperationException | LinkageError | RuntimeException e) {
             throw new IOException("hash callback adapter unavailable: "
                     + e.getClass().getSimpleName(), e);
+        }
+    }
+
+    /** Turn the raw map into a JDK HashSet so target readObject invokes key callbacks. */
+    private static Object rawHashSet(Object... keys) throws IOException {
+        try {
+            Object unsafe = probeUnsafe();
+            Class<?> unsafeType = unsafe.getClass();
+            java.util.HashSet<Object> set = new java.util.HashSet<>();
+            unsafePutObject(unsafeType, unsafe, java.util.HashSet.class, set, "map",
+                    rawHashMap(keys));
+            return set;
+        } catch (ReflectiveOperationException | LinkageError | RuntimeException e) {
+            throw new IOException("hash-set callback adapter unavailable: "
+                    + e.getClass().getSimpleName(), e);
+        }
+    }
+
+    /** Create an inert second instance without running target constructors for equals probes. */
+    private static Object duplicateWithoutConstructor(Object value) {
+        if (!(value instanceof java.io.Serializable)) {
+            return null;
+        }
+        try {
+            return allocateWithoutConstructor(value.getClass());
+        } catch (Exception | LinkageError ignored) {
+            return null;
         }
     }
 
@@ -1927,72 +1987,6 @@ public final class ChainVerifyProbe {
         } catch (ClassNotFoundException | LinkageError | RuntimeException ignored) {
             // Optional JDK implementation detail; a failed warmup must remain a normal
             // partial verification result rather than widening the sandbox.
-        }
-    }
-
-    /** Serializable adapter that models the callback edge without a weaponized payload. */
-    private static final class SourceTriggerCollection extends ArrayList<Object> {
-        private final String callbackKind;
-
-        private SourceTriggerCollection(Object value, String callbackKind) {
-            this.callbackKind = callbackKind;
-            super.add(value);
-        }
-
-        @Override
-        public java.util.Iterator<Object> iterator() {
-            java.util.Iterator<Object> delegate = super.iterator();
-            return new java.util.Iterator<>() {
-                private boolean triggered;
-
-                @Override
-                public boolean hasNext() {
-                    return delegate.hasNext();
-                }
-
-                @Override
-                public Object next() {
-                    Object value = delegate.next();
-                    if (!triggered) {
-                        triggered = true;
-                        invokeCallback(value, callbackKind);
-                    }
-                    return value;
-                }
-
-                @Override
-                public void remove() {
-                    delegate.remove();
-                }
-            };
-        }
-
-        private static void invokeCallback(Object value, String kind) {
-            if (value == null) {
-                return;
-            }
-            switch (kind) {
-                case "hashCode" -> value.hashCode();
-                case "toString" -> value.toString();
-                case "equals" -> value.equals(new Object());
-                case "compareTo" -> {
-                    if (value instanceof Comparable<?> comparable) {
-                        @SuppressWarnings("unchecked")
-                        Comparable<Object> ordered = (Comparable<Object>) comparable;
-                        ordered.compareTo(value);
-                    }
-                }
-                case "compare" -> {
-                    if (value instanceof java.util.Comparator<?> comparator) {
-                        @SuppressWarnings("unchecked")
-                        java.util.Comparator<Object> ordered =
-                                (java.util.Comparator<Object>) comparator;
-                        ordered.compare("CHAIN_LEFT", "CHAIN_RIGHT");
-                    }
-                }
-                default -> {
-                }
-            }
         }
     }
 

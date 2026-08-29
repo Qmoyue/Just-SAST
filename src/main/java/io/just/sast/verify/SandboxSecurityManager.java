@@ -132,7 +132,7 @@ public final class SandboxSecurityManager extends SecurityManager {
         }
         if (permission instanceof RuntimePermission runtime) {
             String name = runtime.getName();
-                if (name.equals("setSecurityManager")
+            if (name.equals("setSecurityManager")
                     || name.startsWith("loadLibrary")
                     || name.startsWith("getenv.")
                     || name.equals("createNativeThread")

@@ -26,6 +26,7 @@ public final class TargetJdkSource implements JdkClassSource {
     /** 内部名 → 所在 jar 路径（Java 8 模式） */
     private final Map<String, Path> classToJar = new HashMap<>();
     private final List<Path> coreJars = new ArrayList<>();
+    private boolean legacyIndexBuilt;
     /** Java 9+ 模式的目标镜像 */
     private final JrtClassSource jrtDelegate;
     private final String jdkDescription;
@@ -70,8 +71,22 @@ public final class TargetJdkSource implements JdkClassSource {
 
     @Override
     public ClassInfo load(String internalName) {
+        ClassBytes bytes = loadBytes(internalName);
+        if (bytes == null) {
+            return null;
+        }
+        try {
+            return reader.read(bytes.bytes());
+        } catch (Exception e) {
+            JustLogger.debug("目标 JDK 类加载失败 {}: {}", internalName, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 按内部名读取原始 class，避免完整模式预先 materialize 整个 JDK。 */
+    public ClassBytes loadBytes(String internalName) {
         if (jrtDelegate != null) {
-            return jrtDelegate.load(internalName);
+            return jrtDelegate.loadBytes(internalName);
         }
         // Java 8 模式：从 classToJar 索引（懒构建）或遍历 jar 查找
         Path jarPath = classToJar.get(internalName);
@@ -87,7 +102,8 @@ public final class TargetJdkSource implements JdkClassSource {
             if (entry == null) {
                 return null;
             }
-            return reader.read(zip.getInputStream(entry).readAllBytes());
+            return new ClassBytes(internalName, zip.getInputStream(entry).readAllBytes(),
+                    "jdk:" + jarPath.getFileName());
         } catch (Exception e) {
             JustLogger.debug("目标 JDK 类加载失败 {}: {}", internalName, e.getMessage());
             return null;
@@ -117,6 +133,9 @@ public final class TargetJdkSource implements JdkClassSource {
                 }
             }
         }
+        if (jrtDelegate == null) {
+            legacyIndexBuilt = true;
+        }
         return result;
     }
 
@@ -125,16 +144,36 @@ public final class TargetJdkSource implements JdkClassSource {
     }
 
     private Path findInJars(String internalName) {
+        ensureLegacyIndex();
+        return classToJar.get(internalName);
+    }
+
+    /**
+     * Build only the Java 8 central-directory index once. The old path reopened every core
+     * jar for every unresolved reference during closure planning; this is metadata-only and
+     * avoids retaining any class bytes while removing that repeated disk scan.
+     */
+    private synchronized void ensureLegacyIndex() {
+        if (legacyIndexBuilt) {
+            return;
+        }
         for (Path jar : coreJars) {
             try (ZipFile zip = new ZipFile(jar.toFile())) {
-                if (zip.getEntry(internalName + ".class") != null) {
-                    return jar;
+                var entries = zip.entries();
+                while (entries.hasMoreElements()) {
+                    ZipEntry entry = entries.nextElement();
+                    String name = entry.getName();
+                    if (entry.isDirectory() || !name.endsWith(".class")
+                            || name.startsWith("META-INF/versions/")) {
+                        continue;
+                    }
+                    classToJar.putIfAbsent(name.substring(0, name.length() - 6), jar);
                 }
             } catch (IOException e) {
-                continue;
+                JustLogger.debug("目标 JDK 索引构建失败 {}: {}", jar, e.getMessage());
             }
         }
-        return null;
+        legacyIndexBuilt = true;
     }
 
     /** 从 $jdkHome/release 或目录名推断版本描述。 */

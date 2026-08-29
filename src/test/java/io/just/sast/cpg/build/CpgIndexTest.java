@@ -70,5 +70,25 @@ class CpgIndexTest {
 
         assertSame(index.cfg(method), index.cfg(method));
         assertEquals(1, index.cfgCacheSize());
+        assertEquals(1, index.cfgBuilds());
+        assertEquals(1, index.cfgCacheHits());
+        index.clearCfgCache();
+        assertEquals(0, index.cfgCacheSize());
+    }
+
+    @Test
+    void semanticOffsetsCanBeConsumedWithoutExposingBackingArrays() {
+        MethodInfo method = new MethodInfo("T", "run", "()V", Modifier.PUBLIC,
+                List.of(new InsnFact(0, Op.GETFIELD,
+                        List.of(new io.just.sast.model.FieldRef("T", "value", "I")))),
+                List.of(), false);
+        CpgIndex.Builder builder = CpgIndex.builder();
+        CpgIndex.Builder.MethodSliceBuilder slice = builder.start(method);
+        method.instructions().forEach(slice::accept);
+        slice.finish();
+        CpgIndex.MethodSlice result = builder.build().slice("T#run()V");
+        java.util.List<Integer> offsets = new java.util.ArrayList<>();
+        result.forEachFieldReadOffset(offsets::add);
+        assertEquals(List.of(0), offsets);
     }
 }

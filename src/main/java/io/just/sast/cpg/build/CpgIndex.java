@@ -8,6 +8,8 @@ import io.just.sast.model.TryCatchFact;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.function.IntConsumer;
 
 /**
  * 紧凑的字节码语义 CPG 索引。
@@ -63,20 +65,41 @@ public final class CpgIndex {
             return callOffsets.clone();
         }
 
+        /** Allocation-free traversal for analysis consumers; the array remains encapsulated. */
+        public void forEachCallOffset(IntConsumer consumer) {
+            forEach(callOffsets, consumer);
+        }
+
         public int[] fieldReadOffsets() {
             return fieldReadOffsets.clone();
+        }
+
+        public void forEachFieldReadOffset(IntConsumer consumer) {
+            forEach(fieldReadOffsets, consumer);
         }
 
         public int[] fieldWriteOffsets() {
             return fieldWriteOffsets.clone();
         }
 
+        public void forEachFieldWriteOffset(IntConsumer consumer) {
+            forEach(fieldWriteOffsets, consumer);
+        }
+
         public int[] controlOffsets() {
             return controlOffsets.clone();
         }
 
+        public void forEachControlOffset(IntConsumer consumer) {
+            forEach(controlOffsets, consumer);
+        }
+
         public int[] allocationOffsets() {
             return allocationOffsets.clone();
+        }
+
+        public void forEachAllocationOffset(IntConsumer consumer) {
+            forEach(allocationOffsets, consumer);
         }
 
         public int[] exceptionHandlerOffsets() {
@@ -88,6 +111,10 @@ public final class CpgIndex {
             return effectOffsets.clone();
         }
 
+        public void forEachEffectOffset(IntConsumer consumer) {
+            forEach(effectOffsets, consumer);
+        }
+
         public boolean hasCalls() {
             return callOffsets.length != 0;
         }
@@ -95,11 +122,25 @@ public final class CpgIndex {
         public boolean hasControlFlow() {
             return controlOffsets.length != 0 || exceptionHandlerOffsets.length != 0;
         }
+
+        private static void forEach(int[] offsets, IntConsumer consumer) {
+            if (consumer == null) {
+                return;
+            }
+            for (int offset : offsets) {
+                consumer.accept(offset);
+            }
+        }
     }
 
     private final Map<String, MethodSlice> slices;
     /** CFG is a value object and is safe to share between read-only analysis consumers. */
-    private final ConcurrentHashMap<String, Cfg.Indexed> cfgCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<MethodKey, Cfg.Indexed> cfgCache = new ConcurrentHashMap<>();
+    private final LongAdder cfgCacheHits = new LongAdder();
+    private final LongAdder cfgBuilds = new LongAdder();
+
+    private record MethodKey(String owner, String name, String descriptor) {
+    }
 
     private CpgIndex(Map<String, MethodSlice> slices) {
         this.slices = Map.copyOf(slices);
@@ -126,8 +167,16 @@ public final class CpgIndex {
         if (method == null || method.instructions().isEmpty()) {
             return new Cfg.Indexed(java.util.List.of());
         }
-        String key = method.owner() + "#" + method.name() + method.descriptor();
-        return cfgCache.computeIfAbsent(key, ignored -> Cfg.computeIndexed(method));
+        MethodKey key = new MethodKey(method.owner(), method.name(), method.descriptor());
+        Cfg.Indexed cached = cfgCache.get(key);
+        if (cached != null) {
+            cfgCacheHits.increment();
+            return cached;
+        }
+        return cfgCache.computeIfAbsent(key, ignored -> {
+            cfgBuilds.increment();
+            return Cfg.computeIndexed(method);
+        });
     }
 
     public int methodCount() {
@@ -136,6 +185,19 @@ public final class CpgIndex {
 
     public int cfgCacheSize() {
         return cfgCache.size();
+    }
+
+    public long cfgCacheHits() {
+        return cfgCacheHits.sum();
+    }
+
+    public long cfgBuilds() {
+        return cfgBuilds.sum();
+    }
+
+    /** Release method CFGs before a long-lived caller retains the report result. */
+    public void clearCfgCache() {
+        cfgCache.clear();
     }
 
     /** Single-owner builder used while CpgBuilder already walks each method. */
@@ -222,10 +284,14 @@ public final class CpgIndex {
     }
 
     private static final class IntCollector {
-        private int[] values = new int[8];
+        private static final int[] EMPTY = new int[0];
+        private int[] values;
         private int size;
 
         private void add(int value) {
+            if (values == null) {
+                values = new int[8];
+            }
             if (size == values.length) {
                 int[] expanded = new int[values.length << 1];
                 System.arraycopy(values, 0, expanded, 0, values.length);
@@ -235,6 +301,9 @@ public final class CpgIndex {
         }
 
         private int[] toArray() {
+            if (size == 0) {
+                return EMPTY;
+            }
             int[] result = new int[size];
             System.arraycopy(values, 0, result, 0, size);
             return result;
