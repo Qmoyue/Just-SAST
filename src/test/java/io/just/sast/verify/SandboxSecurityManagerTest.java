@@ -29,14 +29,14 @@ class SandboxSecurityManagerTest {
                 new FilePermission(Path.of(System.getProperty("user.dir")).resolve("outside.txt").toString(), "read")));
         assertThrows(SecurityException.class, () -> manager.checkPermission(
                 new SocketPermission("example.invalid", "connect")));
-        // URLClassPath uses this non-network permission while opening jar resources. It
-        // must remain available for framework classes to initialize; actual socket and
-        // URL-handler installation permissions stay denied.
-        assertDoesNotThrow(() -> manager.checkPermission(
+        // URLClassPath may use this permission during trusted probe bootstrap, but an
+        // arbitrary target frame must not be able to install a handler under the same JVM.
+        assertThrows(SecurityException.class, () -> manager.checkPermission(
                 new NetPermission("specifyStreamHandler")));
         assertThrows(SecurityException.class, () -> manager.checkPermission(
                 new NetPermission("setProxySelector")));
         assertThrows(SecurityException.class, () -> manager.checkExec("echo"));
+        assertThrows(SecurityException.class, () -> manager.checkLink("target.dll"));
     }
 
     @Test

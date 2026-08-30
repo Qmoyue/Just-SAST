@@ -79,7 +79,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private int stepBudgetAdjusted = STEP_BUDGET;
     /** 每个 sink 独立的死胡同缓存；不能跨 sink 复用，因为路径跳数、预算和规则上下文不同。 */
     private record DeadKey(String methodKey, ValueOrigin origin) {}
-    private record CallerSites(List<Node> sites, boolean merged) {}
+    private record CallerSite(Node call, MethodInfo caller, String methodKey) {}
+    private record CallerSites(List<CallerSite> sites, boolean merged) {}
 
     private final ThreadLocal<Set<DeadKey>> localDeadEnds = ThreadLocal.withInitial(java.util.HashSet::new);
     /** 方法/入口槽的调用者列表只依赖冻结图，按方法缓存后不再为每个 sink 重建和排序。 */
@@ -404,23 +405,24 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         // 调用点收集：自身入边；为空时并入祖先类型（传递接口/父类链）上同名方法的入边
         // （接口实现数超 CHA 上限时分发边未物化，具体实现类须经祖先方法节点反查调用点——同前向引擎语义）
         CallerSites callerSites = callerSitesOf(method, methodNode);
-        List<Node> callSites = callerSites.sites();
+        List<CallerSite> callSites = callerSites.sites();
         boolean merged = callerSites.merged();
         int callerCap = merged ? MAX_MERGED_CALLERS : MAX_CALLERS;
         int produced = 0;
         int callers = 0;
         // 入口距离优先（JDD bottom-up / FLASH 入口导向的探索序）：离反序列化入口近的调用者先走，
         // 链在预算内更快闭合——预算截断下的可复现优先级，替代边序的随机性
-        for (Node callerCall : callSites) {
+        for (CallerSite callerSite : callSites) {
             if (callers >= callerCap || trace.produced >= MAX_CHAINS_PER_SINK) {
                 break;
             }
-            MethodInfo callerMethod = support.enclosingMethod(callerCall);
+            Node callerCall = callerSite.call();
+            MethodInfo callerMethod = callerSite.caller();
             if (callerMethod == null) {
                 trace.unresolved++;
                 continue;
             }
-            if (!entryReaching.contains(OriginSupport.methodKey(callerMethod))) {
+            if (!entryReaching.contains(callerSite.methodKey())) {
                 continue; // 调用者祖先链不可达入口：可证明无链，剪枝
             }
             // An argument reaching a virtual/interface call does not make every
@@ -729,7 +731,13 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                         return caller != null ? support.entryDepthOf(OriginSupport.methodKey(caller)) : Integer.MAX_VALUE;
                     })
                     .thenComparingLong(Node::id));
-            return new CallerSites(List.copyOf(ordered), merged);
+            List<CallerSite> prepared = new ArrayList<>(ordered.size());
+            for (Node site : ordered) {
+                MethodInfo caller = support.enclosingMethod(site);
+                prepared.add(new CallerSite(site, caller,
+                        caller == null ? "" : OriginSupport.methodKey(caller)));
+            }
+            return new CallerSites(List.copyOf(prepared), merged);
         });
     }
 

@@ -5,7 +5,9 @@ import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 链的不可变字段依赖计划：把分析产出的 FIELD_FLOW 统一提供给探针、报告和未来 payload writer。
@@ -25,7 +27,17 @@ public record FieldDependencyPlan(
     }
 
     public FieldDependencyPlan {
-        fields = fields == null ? List.of() : List.copyOf(fields);
+        if (fields == null || fields.isEmpty()) {
+            fields = List.of();
+        } else {
+            Set<FieldLink> unique = new LinkedHashSet<>();
+            for (FieldLink field : fields) {
+                if (field != null) {
+                    unique.add(field);
+                }
+            }
+            fields = List.copyOf(unique);
+        }
         sinkDescriptor = sinkDescriptor == null ? "" : sinkDescriptor;
     }
 
@@ -58,6 +70,27 @@ public record FieldDependencyPlan(
                     .append('=').append(link.toOwner());
         }
         return result.toString();
+    }
+
+    /**
+     * Delimiter-safe internal encoding for the child probe. JVM field names normally avoid
+     * separators, but class files are not limited to Java source identifiers. Length-prefixing
+     * keeps a malformed or unusual artifact from changing the object-plan parse shape.
+     * The human/report form remains encodedFields().
+     */
+    public String encodedFieldsForProbe() {
+        StringBuilder result = new StringBuilder("v2;");
+        for (FieldLink link : fields) {
+            appendLengthPrefixed(result, link.fromOwner());
+            appendLengthPrefixed(result, link.field());
+            appendLengthPrefixed(result, link.toOwner());
+        }
+        return result.toString();
+    }
+
+    private static void appendLengthPrefixed(StringBuilder out, String value) {
+        String safe = value == null ? "" : value;
+        out.append(safe.length()).append(':').append(safe);
     }
 
     /** 反向链中的字段跳没有单独的 points-to 类型；向入口方向取最近的具体对象类型。 */

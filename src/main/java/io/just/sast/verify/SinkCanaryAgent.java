@@ -16,7 +16,7 @@ import java.util.Set;
 
 /**
  * sink canary 插桩代理（与扫描器同一 shaded jar，经 -javaagent 自挂载）：
- * 在链 sink 方法入口注入 {@code SinkCanaryGate.hit("内部类名#方法名#描述符")}——
+ * 在链 sink 方法入口注入带本次子进程 token 的 {@code SinkCanaryGate.hit(..., token)}——
  * 门卫按调用栈判定：存在链入口帧才抛 {@code SinkReachedError}（见 SinkCanaryGate）。
  * 判定从"异常栈帧被动检测"升级为"主动命中检测"；Error 语义穿透 gadget 的 catch(Exception)；
  * 命中的 sink 真实方法体不再执行，exec / defineClass / connect 类危险副作用被天然解除。
@@ -39,11 +39,12 @@ public final class SinkCanaryAgent {
         if (args == null) {
             return;
         }
-        String[] parts = args.split("\\|", 3);
-        if (parts.length < 3) {
+        String[] parts = args.split("\\|", 4);
+        if (parts.length < 4 || parts[3].isEmpty()) {
             return;
         }
         String bootJar = parts[0];
+        String token = parts[3];
         int h = parts[1].indexOf('#');
         Map<String, Set<String>> sinks = new HashMap<>();
         for (String spec : parts[2].split(",")) {
@@ -63,12 +64,12 @@ public final class SinkCanaryAgent {
             // loader. Configure that same class identity; using the agent/application loader
             // here creates a second gate whose latch is invisible to the transformed method.
             Class<?> gate = Class.forName(GATE_INTERNAL.replace('/', '.'), true, null);
-            gate.getDeclaredMethod("setEntry", String.class, String.class)
-                    .invoke(null, parts[1].substring(0, h), parts[1].substring(h + 1));
+            gate.getDeclaredMethod("setEntry", String.class, String.class, String.class)
+                    .invoke(null, parts[1].substring(0, h), parts[1].substring(h + 1), token);
         } catch (Throwable ignored) {
             // canary 不可用时仍保留子 JVM 权限门；安全失败不能降级成任意执行。
         }
-        inst.addTransformer(new CanaryTransformer(sinks), true);
+        inst.addTransformer(new CanaryTransformer(sinks, token), true);
         for (String name : sinks.keySet()) {
             try {
                 Class<?> c = Class.forName(name.replace('/', '.'), false,
@@ -93,16 +94,22 @@ public final class SinkCanaryAgent {
     static final class CanaryTransformer implements ClassFileTransformer {
 
         private final Map<String, Set<String>> sinks;
+        private final String token;
 
         /** Compatibility constructor for direct transformer tests and callers that only want canaries. */
         CanaryTransformer(Map<String, Set<String>> sinks) {
+            this(sinks, "");
+        }
+
+        CanaryTransformer(Map<String, Set<String>> sinks, String token) {
             this.sinks = sinks;
+            this.token = token == null ? "" : token;
         }
 
         @Override
         public byte[] transform(ClassLoader loader, String className, Class<?> beingDefined,
                                 ProtectionDomain pd, byte[] bytes) {
-            if (bytes == null || className == null) {
+            if (bytes == null || className == null || token.isEmpty()) {
                 return null;
             }
             Set<String> entryMethods = sinks.get(className);
@@ -129,8 +136,9 @@ public final class SinkCanaryAgent {
                                 super.visitCode();
                                 if (injectable) {
                                     visitLdcInsn(className + "#" + name + "#" + desc);
+                                    visitLdcInsn(token);
                                     visitMethodInsn(Opcodes.INVOKESTATIC, GATE_INTERNAL,
-                                            "hit", "(Ljava/lang/String;)V", false);
+                                            "hit", "(Ljava/lang/String;Ljava/lang/String;)V", false);
                                     changed[0] = true;
                                 }
                             }
@@ -143,8 +151,9 @@ public final class SinkCanaryAgent {
                                         && (callMethods.contains(calledName)
                                         || callMethods.contains(calledName + "#" + calledDesc))) {
                                     visitLdcInsn(owner + "#" + calledName + "#" + calledDesc);
+                                    visitLdcInsn(token);
                                     visitMethodInsn(Opcodes.INVOKESTATIC, GATE_INTERNAL,
-                                            "hit", "(Ljava/lang/String;)V", false);
+                                            "hit", "(Ljava/lang/String;Ljava/lang/String;)V", false);
                                     changed[0] = true;
                                 }
                                 super.visitMethodInsn(opcode, owner, calledName, calledDesc,

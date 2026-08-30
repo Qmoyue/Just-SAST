@@ -48,6 +48,9 @@ public final class ChainVerifyProbe {
     private static final int MAX_GRAPH_OBJECTS = 128;
     private static final int MAX_PROXY_INTERFACES = 64;
     private static final int MAX_PROXY_METHODS = 128;
+    /** Parent/child result channel version. Plain target stdout is never a result channel. */
+    private static final String PROTOCOL_PREFIX = "JUST_VERIFY_V1:";
+    private static String protocolToken = "";
     /**
      * The launcher system loader is normally sufficient, but fat JAR/WAR verification has
      * class-path entries materialized immediately before the child is started.  Keep an
@@ -80,21 +83,10 @@ public final class ChainVerifyProbe {
         String entryMethod = entryParts[1];
         String mode = entryParts.length > 2 ? entryParts[2] : "DIRECT";
         String entryDescriptor = entryParts.length > 3 ? entryParts[3] : "";
+        protocolToken = args.length > 5 ? args[5] : "";
 
         // 解析链跳
-        List<String[]> fieldLinks = new ArrayList<>(); // [fromOwner, fieldName, toClassName]
-        if (args.length > 1 && !args[1].isEmpty()) {
-            for (String hop : args[1].split(",")) {
-                // format: fromOwner.fieldName=toClassName
-                int eq = hop.indexOf('=');
-                if (eq < 0) continue;
-                String left = hop.substring(0, eq);
-                String toClass = hop.substring(eq + 1);
-                int dot = left.lastIndexOf('.');
-                if (dot < 0) continue;
-                fieldLinks.add(new String[]{left.substring(0, dot), left.substring(dot + 1), toClass});
-            }
-        }
+        List<String[]> fieldLinks = parseFieldLinks(args.length > 1 ? args[1] : "");
 
         // sink 目标：方法名不能含 '.'，最后一个 '.' 前是类名（方法名参与判定——只匹配类会把
         // 路过 sink 类任意方法的堆栈都算触发）
@@ -122,13 +114,20 @@ public final class ChainVerifyProbe {
                 SandboxSecurityManager.install(java.nio.file.Path.of(
                         System.getProperty("java.io.tmpdir", ".")));
             } catch (Throwable sandboxFailure) {
-                System.out.println("SANDBOX_UNAVAILABLE: "
-                        + sandboxFailure.getClass().getSimpleName());
+                emit("SANDBOX_UNAVAILABLE: " + sandboxFailure.getClass().getSimpleName());
                 System.exit(3);
                 return;
             }
             // 0. 创建所有类的实例（自底向上）；无无参构造时回退到参数最少的构造器并按类型填默认值。
             //    类加载走 loadClass（非 Class.forName）——探针自身的类解析不得踩中 Class#forName canary
+            // Target class initialization can perform a loader/resource lookup before the
+            // entry method is invoked. Warm JDK protocol machinery before that first target
+            // frame so the sandbox does not mistake lazy JDK linking for target capability use.
+            if ("SOURCE".equals(mode)) {
+                warmRuntimeSupport(sinkClassDotted);
+            } else {
+                warmJdkRuntimeLinkage();
+            }
             Map<String, Object> instances = new HashMap<>();
             Class<?> entryCls = load(entryClass);
             boolean serializationSemantics = "SERIAL".equals(mode) || isTriggerMode(mode);
@@ -153,12 +152,7 @@ public final class ChainVerifyProbe {
             Object sourceTriggerInstance = null;
             if (sourceTrigger != null) {
                 try {
-                    String triggerName = sourceTrigger.entryClass().replace('/', '.');
-                    sourceTriggerInstance = instances.get(triggerName);
-                    if (sourceTriggerInstance == null) {
-                        sourceTriggerInstance = newInstance(load(triggerName), true);
-                        instances.put(triggerName, sourceTriggerInstance);
-                    }
+                    sourceTriggerInstance = newSourceTriggerInstance(sourceTrigger, instances);
                 } catch (Exception | LinkageError ignored) {
                     // The source adapter remains a normal bounded source probe when the
                     // semantic trigger class is unavailable on the target classpath.
@@ -408,7 +402,7 @@ public final class ChainVerifyProbe {
             }
 
             if (!unlinkedFields.isEmpty()) {
-                System.out.println("PARTIAL_PATH: field-unlinked=" + unlinkedFields.size());
+                emit("PARTIAL_PATH: field-unlinked=" + unlinkedFields.size());
                 System.exit(0);
             }
 
@@ -417,8 +411,8 @@ public final class ChainVerifyProbe {
                 case "TRIGGER_HASH" -> {
                     // hashCode 入口的真实触发：对象作为 HashMap 的 key 被放入
                     new java.util.HashMap<Object, Object>().put(entryInstance, "echo CHAIN_OK");
-                    if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("CONCRETE_REACHED: " + mode);
+                    if (reportLatchedCanary(sinkClassDotted, sinkMethod, protocolToken)) return;
+                    emit("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "TRIGGER_COMPARETO" -> {
@@ -427,15 +421,15 @@ public final class ChainVerifyProbe {
                     java.util.TreeSet<Object> set = new java.util.TreeSet<>();
                     set.add(newInstance(entryCls, serializationSemantics));
                     set.add(entryInstance);
-                    if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("CONCRETE_REACHED: " + mode);
+                    if (reportLatchedCanary(sinkClassDotted, sinkMethod, protocolToken)) return;
+                    emit("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "TRIGGER_COMPARATOR" -> {
                     // Comparator 入口不是 Comparable 入口：把入口对象作为 TreeMap comparator，
                     // 两个不同 key 才会触发 Comparator.compare。
                     if (!(entryInstance instanceof java.util.Comparator<?>)) {
-                        System.out.println("PARTIAL_PATH: entry-not-comparator");
+                        emit("PARTIAL_PATH: entry-not-comparator");
                         System.exit(0);
                     }
                     @SuppressWarnings("unchecked")
@@ -443,8 +437,8 @@ public final class ChainVerifyProbe {
                     java.util.TreeMap<Object, Object> map = new java.util.TreeMap<>(c);
                     map.put("CHAIN_LEFT", "left");
                     map.put("CHAIN_RIGHT", "right");
-                    if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("CONCRETE_REACHED: " + mode);
+                    if (reportLatchedCanary(sinkClassDotted, sinkMethod, protocolToken)) return;
+                    emit("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "TRIGGER_CONTAINS" -> {
@@ -452,13 +446,13 @@ public final class ChainVerifyProbe {
                     java.util.List<Object> l = new java.util.ArrayList<>();
                     l.add(new Object());
                     l.contains(entryInstance);
-                    if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("CONCRETE_REACHED: " + mode);
+                    if (reportLatchedCanary(sinkClassDotted, sinkMethod, protocolToken)) return;
+                    emit("CONCRETE_REACHED: " + mode);
                     System.exit(0);
                 }
                 case "PROXY" -> {
                     if (!java.lang.reflect.InvocationHandler.class.isAssignableFrom(entryCls)) {
-                        System.out.println("PARTIAL_PATH: entry-not-handler");
+                        emit("PARTIAL_PATH: entry-not-handler");
                         System.exit(0);
                     }
                     triggerProxyInterfaces(entryCls, (InvocationHandler) entryInstance);
@@ -493,17 +487,11 @@ public final class ChainVerifyProbe {
                 }
                 case "SOURCE" -> {
                     if (selectedEntry == null) {
-                        System.out.println("PARTIAL_PATH: entry-method-missing");
+                        emit("PARTIAL_PATH: entry-method-missing");
                         System.exit(0);
                     }
-                    // Framework source methods often instantiate ObjectInputStream inside
-                    // target code. Warm its JDK bootstrap while the trusted probe frame is
-                    // still the permission boundary; otherwise Java 17's lambda/accessor
-                    // initialization is attributed to the target frame and the sandbox
-                    // rejects the source before the serialized callback can run.
                     SandboxSecurityManager.beginSerializationBootstrap();
                     try {
-                        warmRuntimeSupport(sinkClassDotted);
                         invokeEntry(selectedEntry, entryInstance, true, sourceTrigger,
                                 sourceTriggerInstance);
                     } finally {
@@ -514,8 +502,8 @@ public final class ChainVerifyProbe {
                     // Check the process-wide canary latch before treating the wrapper as a
                     // partial source failure; otherwise a real source-to-trigger path is
                     // systematically downgraded even though the sink was reached.
-                    if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
-                    System.out.println("CONCRETE_REACHED: source-entry-returned");
+                    if (reportLatchedCanary(sinkClassDotted, sinkMethod, protocolToken)) return;
+                    emit("CONCRETE_REACHED: source-entry-returned");
                     System.exit(0);
                 }
                 default -> {
@@ -523,7 +511,7 @@ public final class ChainVerifyProbe {
                             : findMethod(entryCls, entryMethod, "");
                     if (m == null) {
                         // 入口方法在目标类上不可解析：探针无法触发——不是"链执行完成"
-                        System.out.println("PARTIAL_PATH: entry-method-missing");
+                        emit("PARTIAL_PATH: entry-method-missing");
                         System.exit(0);
                     }
                     m.setAccessible(true);
@@ -531,11 +519,11 @@ public final class ChainVerifyProbe {
                 }
             }
 
-            if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
+            if (reportLatchedCanary(sinkClassDotted, sinkMethod, protocolToken)) return;
             if ("SERIAL".equals(mode) || "PROXY".equals(mode) || isTriggerMode(mode)) {
-                System.out.println("CONCRETE_REACHED: " + mode);
+                emit("CONCRETE_REACHED: " + mode);
             } else {
-                System.out.println("EXECUTED");
+                emit("EXECUTED");
             }
             System.exit(0);
 
@@ -544,14 +532,14 @@ public final class ChainVerifyProbe {
             // it reaches this boundary.  The bootstrap canary latch is deliberately checked
             // before inspecting the wrapper cause, so a target catch/unwrap path cannot erase
             // an otherwise valid source-to-sink observation.
-            if (reportLatchedCanary(sinkClassDotted, sinkMethod)) return;
+            if (reportLatchedCanary(sinkClassDotted, sinkMethod, protocolToken)) return;
             // 优先：sink canary 主动命中（插桩 sink 入口抛出的标记 Error，穿透 gadget 的
             // catch(Exception)）。命中须同时满足：标记 spec == 本链 sink 且栈中存在
             // 链入口方法帧（在 sink 帧之下）——排除探针自身基础设施误踩 sink。
             String marker = markerSpec(t);
             if (marker != null && sameSink(marker, sinkClassDotted, sinkMethod, sinkDescriptor)
                     && entryReached(t, entryClass, entryMethod)) {
-                System.out.println("SINK_BLOCKED: " + sinkClassDotted);
+                emit("SINK_BLOCKED: " + sinkClassDotted);
                 System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
                         + " (canary)");
                 System.exit(1);
@@ -559,7 +547,7 @@ public final class ChainVerifyProbe {
             // 次选：栈帧级全等匹配（类名 + 方法名），含 cause 链——同样要求入口帧在场
             if (sinkDescriptor.isEmpty() && reachesSink(t, sinkClassDotted, sinkMethod)
                     && entryReached(t, entryClass, entryMethod)) {
-                System.out.println("UNTESTABLE: sink-frame-without-canary");
+                emit("UNTESTABLE: sink-frame-without-canary");
                 System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
                         + " without canary (not confirmed)");
                 System.exit(0);
@@ -573,11 +561,56 @@ public final class ChainVerifyProbe {
             String detail = detailCause.getMessage();
             String cause = detailCause == t ? ""
                     : " cause=" + detailCause.getClass().getSimpleName();
-            System.out.println("PARTIAL_PATH: " + t.getClass().getSimpleName() + cause
+            emit("PARTIAL_PATH: " + t.getClass().getSimpleName() + cause
                     + (detail != null ? ": " + detail.split("\\R")[0].transform(
                         s -> s.length() > 120 ? s.substring(0, 120) : s) : ""));
             System.exit(0); // 正常退出 = 未到达 sink
         }
+    }
+
+    private static List<String[]> parseFieldLinks(String encoded) {
+        List<String[]> result = new ArrayList<>(); // [fromOwner, fieldName, toClassName]
+        if (encoded == null || encoded.isEmpty()) {
+            return result;
+        }
+        if (encoded.startsWith("v2;")) {
+            int cursor = 3;
+            while (cursor < encoded.length()) {
+                String[] values = new String[3];
+                for (int i = 0; i < values.length; i++) {
+                    int colon = encoded.indexOf(':', cursor);
+                    if (colon <= cursor) {
+                        return List.of();
+                    }
+                    int length;
+                    try {
+                        length = Integer.parseInt(encoded.substring(cursor, colon));
+                    } catch (NumberFormatException malformed) {
+                        return List.of();
+                    }
+                    int start = colon + 1;
+                    int end = start + length;
+                    if (length < 0 || end < start || end > encoded.length()) {
+                        return List.of();
+                    }
+                    values[i] = encoded.substring(start, end);
+                    cursor = end;
+                }
+                result.add(values);
+            }
+            return result;
+        }
+        // Compatibility with hand-launched probes and pre-v2 callers.
+        for (String hop : encoded.split(",")) {
+            int eq = hop.indexOf('=');
+            if (eq < 0) continue;
+            String left = hop.substring(0, eq);
+            String toClass = hop.substring(eq + 1);
+            int dot = left.lastIndexOf('.');
+            if (dot < 0) continue;
+            result.add(new String[]{left.substring(0, dot), left.substring(dot + 1), toClass});
+        }
+        return result;
     }
 
     /** Return an already-created object satisfying the field's declared JVM type. */
@@ -626,7 +659,7 @@ public final class ChainVerifyProbe {
 
     private static List<Class<?>> discoverApplicationHandlers(ClassLoader loader) {
         TreeSet<String> names = new TreeSet<>();
-        String classPath = System.getProperty("java.class.path", "");
+        String classPath = targetClassPath();
         for (String entry : classPath.split(java.util.regex.Pattern.quote(
                 java.io.File.pathSeparator))) {
             if (entry.isBlank()) {
@@ -786,7 +819,7 @@ public final class ChainVerifyProbe {
 
     private static List<Class<?>> discoverApplicationInterfaces(ClassLoader loader) {
         TreeSet<String> names = new TreeSet<>();
-        String classPath = System.getProperty("java.class.path", "");
+        String classPath = targetClassPath();
         for (String entry : classPath.split(java.util.regex.Pattern.quote(
                 java.io.File.pathSeparator))) {
             if (entry.isBlank()) {
@@ -854,13 +887,22 @@ public final class ChainVerifyProbe {
     }
 
 
-    private static boolean reportLatchedCanary(String sinkClass, String sinkMethod) {
+    private static boolean reportLatchedCanary(String sinkClass, String sinkMethod, String token) {
         if (!io.just.sast.verify.boot.SinkCanaryGate.wasReached()) {
             return false;
         }
-        System.out.println("SINK_BLOCKED: " + sinkClass);
+        emit(token, "SINK_BLOCKED: " + sinkClass);
         System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod + " (canary-latched)");
         return true;
+    }
+
+    /** Emit only a probe-owned, per-attempt result marker; target output remains diagnostic. */
+    private static void emit(String status) {
+        emit(protocolToken, status);
+    }
+
+    private static void emit(String token, String status) {
+        System.out.println(PROTOCOL_PREFIX + (token == null ? "" : token) + ":" + status);
     }
 
     /** 沿异常 cause 链（≤6 层）查找 SinkReachedError 标记，返回其 spec（无则 null）。 */
@@ -1238,7 +1280,7 @@ public final class ChainVerifyProbe {
             return;
         }
         List<URL> urls = new ArrayList<>();
-        String classPath = System.getProperty("java.class.path", "");
+        String classPath = targetClassPath();
         String probeJar = System.getProperty("just.verify.probe-jar", "");
         String normalizedProbe = probeJar.isBlank() ? ""
                 : Path.of(probeJar).toAbsolutePath().normalize().toString();
@@ -1272,6 +1314,16 @@ public final class ChainVerifyProbe {
         } catch (RuntimeException ignored) {
             applicationLoader = ClassLoader.getPlatformClassLoader();
         }
+    }
+
+    private static String targetClassPath() {
+        String classPath = System.getProperty("just.verify.target-cp", "");
+        if (classPath.isBlank()) {
+            // Compatibility for an explicitly/manual launched probe. Production children use
+            // the target-only property, keeping the system loader limited to the probe jar.
+            return System.getProperty("java.class.path", "");
+        }
+        return classPath;
     }
 
     /** 类加载统一走显式应用 classloader：探针自身解析不触发 Class#forName canary。 */
@@ -1479,7 +1531,7 @@ public final class ChainVerifyProbe {
     private static Object sourceValue(Class<?> type, SourceTrigger trigger,
                                       Object triggerInstance, byte[] adaptedPayload)
             throws IOException {
-        if (adaptedPayload != null && trigger != null && triggerInstance != null) {
+        if (adaptedPayload != null && trigger != null) {
             byte[] payload = adaptedPayload;
             if (type == String.class || type == CharSequence.class) {
                 return java.util.Base64.getEncoder().encodeToString(payload);
@@ -1511,12 +1563,14 @@ public final class ChainVerifyProbe {
                 }
             }
             if (type == Object.class || java.util.Collection.class.isAssignableFrom(type)) {
-                Object collection = sourceCollection(triggerInstance, trigger.callbackKind());
+                Object seed = triggerInstance != null
+                        ? triggerInstance : inertCallbackSeed(trigger.callbackKind());
+                Object collection = sourceCollection(seed, trigger.callbackKind());
                 if (type.isInstance(collection)) {
                     return collection;
                 }
             }
-            if (type.isInstance(triggerInstance)) {
+            if (triggerInstance != null && type.isInstance(triggerInstance)) {
                 return triggerInstance;
             }
         }
@@ -1525,16 +1579,140 @@ public final class ChainVerifyProbe {
 
     private static byte[] sourcePayload(SourceTrigger trigger, Object triggerInstance)
             throws IOException {
-        if (trigger == null || triggerInstance == null) {
+        if (trigger == null) {
             return null;
         }
+        Object seed = triggerInstance != null
+                ? triggerInstance : inertCallbackSeed(trigger.callbackKind());
         if (isObjectInputSource(trigger)) {
-            return serializeSourceCollection(triggerInstance, trigger.callbackKind());
+            return serializeSourceCollection(seed, trigger.callbackKind());
         }
         if (isKryoSource(trigger)) {
-            return serializeKryoSource(triggerInstance, trigger.callbackKind());
+            return serializeKryoSource(seed, trigger.callbackKind());
         }
         return null;
+    }
+
+    /**
+     * Allocate the callback receiver without running target constructors. Abstract receiver
+     * types are common in CHA paths (for example a collection base class); recover a concrete
+     * sibling only from the target class path and only when the JVM type relation agrees.
+     * This is an optional, bounded adapter aid, not a benchmark-specific class lookup.
+     */
+    private static Object newSourceTriggerInstance(SourceTrigger trigger,
+                                                   Map<String, Object> instances)
+            throws ClassNotFoundException {
+        String triggerName = trigger.entryClass().replace('/', '.');
+        Object existing = instances.get(triggerName);
+        if (existing != null) {
+            return existing;
+        }
+        Class<?> requested = load(triggerName);
+        boolean requiresSerializable = isObjectInputSource(trigger);
+        Object result = allocateCallbackObject(requested, requiresSerializable);
+        if (result == null && (requested.isInterface() || Modifier.isAbstract(requested.getModifiers()))) {
+            String packageName = requested.getPackageName();
+            String prefix = packageName.isBlank() ? "" : packageName + ".";
+            for (String name : discoverApplicationClassNames(prefix)) {
+                try {
+                    Class<?> candidate = Class.forName(name, false, applicationLoader);
+                    if (!requested.isAssignableFrom(candidate)) {
+                        continue;
+                    }
+                    result = allocateCallbackObject(candidate, requiresSerializable);
+                    if (result != null) {
+                        break;
+                    }
+                } catch (ClassNotFoundException | LinkageError | SecurityException ignored) {
+                    // One optional subtype must not suppress other compatible candidates.
+                }
+            }
+        }
+        if (result != null) {
+            instances.put(triggerName, result);
+        }
+        return result;
+    }
+
+    private static Object allocateCallbackObject(Class<?> type, boolean requiresSerializable) {
+        if (type == null || type.isInterface() || Modifier.isAbstract(type.getModifiers())
+                || (requiresSerializable && !java.io.Serializable.class.isAssignableFrom(type))) {
+            return null;
+        }
+        return allocateWithoutConstructor(type);
+    }
+
+    private static final int MAX_CALLBACK_SUBTYPES = 256;
+
+    private static List<String> discoverApplicationClassNames(String packagePrefix) {
+        TreeSet<String> names = new TreeSet<>();
+        String classPath = targetClassPath();
+        for (String entry : classPath.split(java.util.regex.Pattern.quote(
+                java.io.File.pathSeparator))) {
+            if (entry.isBlank() || names.size() >= MAX_CALLBACK_SUBTYPES) {
+                break;
+            }
+            Path path = Path.of(entry);
+            try {
+                if (Files.isDirectory(path)) {
+                    Path scanRoot = packagePrefix == null || packagePrefix.isBlank()
+                            ? path : path.resolve(packagePrefix.replace('.', java.io.File.separatorChar));
+                    if (!Files.isDirectory(scanRoot)) {
+                        continue;
+                    }
+                    try (java.util.stream.Stream<Path> files = Files.walk(scanRoot)) {
+                        files.filter(Files::isRegularFile)
+                                .map(path::relativize)
+                                .map(Path::toString)
+                                .filter(name -> name.endsWith(".class"))
+                                .forEach(name -> addApplicationClassCandidate(names, name,
+                                        packagePrefix));
+                    }
+                } else if (Files.isRegularFile(path) && entry.endsWith(".jar")) {
+                    try (JarFile jar = new JarFile(path.toFile())) {
+                        java.util.Enumeration<JarEntry> entries = jar.entries();
+                        String packagePath = packagePrefix == null ? ""
+                                : packagePrefix.replace('.', '/');
+                        while (entries.hasMoreElements() && names.size() < MAX_CALLBACK_SUBTYPES) {
+                            JarEntry jarEntry = entries.nextElement();
+                            if (!jarEntry.isDirectory()
+                                    && (packagePath.isBlank()
+                                    || jarEntry.getName().startsWith(packagePath))) {
+                                addApplicationClassCandidate(names, jarEntry.getName(),
+                                        packagePrefix);
+                            }
+                        }
+                    }
+                }
+            } catch (IOException | SecurityException ignored) {
+                // Optional classpath roots remain an honest partial boundary.
+            }
+        }
+        return List.copyOf(names);
+    }
+
+    private static void addApplicationClassCandidate(Set<String> names, String name,
+                                                     String packagePrefix) {
+        if (!name.endsWith(".class") || name.contains("module-info")
+                || name.contains("package-info")) {
+            return;
+        }
+        String binary = name.substring(0, name.length() - 6).replace('/', '.').replace('\\', '.');
+        if ((packagePrefix != null && !binary.startsWith(packagePrefix))
+                || binary.startsWith("java.") || binary.startsWith("javax.")
+                || binary.startsWith("jdk.") || binary.startsWith("sun.")
+                || binary.startsWith("com.sun.") || binary.startsWith("io.just.sast.")) {
+            return;
+        }
+        names.add(binary);
+    }
+
+    private static Object inertCallbackSeed(String callbackKind) {
+        return switch (callbackKind == null ? "" : callbackKind) {
+            case "hashCode", "equals", "compareTo", "compare", "toString" ->
+                    new java.util.AbstractMap.SimpleEntry<>("CHAIN_OK", "CHAIN_OK");
+            default -> new java.util.ArrayList<>();
+        };
     }
 
     private static boolean isKryoSource(SourceTrigger trigger) {
@@ -1866,16 +2044,22 @@ public final class ChainVerifyProbe {
             }
             setReferenceField(triggerInstance, downstream);
             setClassField(triggerInstance, downstreamType);
-            configureProbeBean(downstream);
+            configureInertGetterValue(downstream);
         } catch (Exception | LinkageError ignored) {
             // Optional source adaptation must remain partial rather than widening access.
         }
     }
 
-    private static void configureProbeBean(Object wrapper) {
+    private static void configureInertGetterValue(Object wrapper) {
         try {
-            setClassField(wrapper, ProbeBean.class);
-            setReferenceField(wrapper, new ProbeBean());
+            // The target application loader deliberately cannot see probe-private classes.
+            // Use a JDK-visible, serializable getter-shaped value so the source adapter never
+            // leaks ChainVerifyProbe$ProbeBean into a target object graph (which would become
+            // a loader-dependent ClassNotFoundException during real deserialization).
+            java.util.AbstractMap.SimpleEntry<String, String> inertValue =
+                    new java.util.AbstractMap.SimpleEntry<>("CHAIN_OK", "CHAIN_OK");
+            setClassField(wrapper, java.util.AbstractMap.SimpleEntry.class);
+            setReferenceField(wrapper, inertValue);
         } catch (RuntimeException | LinkageError ignored) {
             // The wrapper may not be a bean-style two-slot adapter.
         }
@@ -1929,18 +2113,6 @@ public final class ChainVerifyProbe {
         }
     }
 
-    /** Probe-owned, serializable bean: only a harmless getter can be called by a wrapper. */
-    public static final class ProbeBean implements java.io.Serializable {
-        private static final long serialVersionUID = 1L;
-
-        public ProbeBean() {
-        }
-
-        public String getValue() {
-            return "CHAIN_OK";
-        }
-    }
-
     /** Initialize JDK object-stream bootstrap code before a target source enters the stack. */
     private static void warmObjectInputStream() {
         try (java.io.ObjectInputStream input = new java.io.ObjectInputStream(
@@ -1961,7 +2133,7 @@ public final class ChainVerifyProbe {
      * read attacker bytes, or load native code.
      */
     private static void warmRuntimeSupport(String sinkClass) {
-        warmObjectInputStream();
+        warmJdkRuntimeLinkage();
         if (sinkClass == null) {
             return;
         }
@@ -1979,6 +2151,17 @@ public final class ChainVerifyProbe {
                 // the warmup; provider lookup must never be retried with relaxed access.
             }
         }
+    }
+
+    private static void warmJdkRuntimeLinkage() {
+        warmObjectInputStream();
+        // A target class initializer may ask its application loader for a resource. On
+        // Java 9+ that lookup can lazily initialize the JRT URL handler, whose lambda
+        // metafactory performs reflective setup. Link it while the caller is still the
+        // trusted probe frame; otherwise the deny-by-default manager attributes the same
+        // JDK bootstrap permission to the target initializer and downgrades a valid path.
+        warmClass("sun.net.www.protocol.jrt.Handler");
+        warmClass("sun.net.protocol.jrt.JavaRuntimeURLConnection");
     }
 
     private static void warmClass(String name) {

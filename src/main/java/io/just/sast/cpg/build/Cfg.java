@@ -141,28 +141,105 @@ public final class Cfg {
 
     /** Dense successor table used by ForwardOrigins; semantics are identical to compute(). */
     public static Indexed computeIndexed(MethodInfo method) {
-        Mutable mutable = buildMutable(method);
-        int instructionCount = mutable.edges.size();
-        int[] edgeOffsets = new int[instructionCount + 1];
-        int edgeCount = 0;
-        for (int i = 0; i < instructionCount; i++) {
-            List<CfgEdge> edges = mutable.edges.get(i);
-            edgeCount += edges == null ? 0 : edges.size();
-            edgeOffsets[i + 1] = edgeCount;
+        /*
+         * The indexed representation is the hot path. Do not build the legacy
+         * List<List<CfgEdge>> only to immediately copy it into CSR arrays: on a
+         * large jar that temporary object graph is both measurable CPU work and a
+         * peak-memory multiplier. Count and fill the same semantic edge classes in
+         * two passes instead. The order is deliberately normal edges first and
+         * exception edges second, matching buildMutable().
+         */
+        List<InsnFact> insns = method.instructions();
+        int instructionCount = insns.size();
+        int last = instructionCount - 1;
+        int[] edgeCounts = new int[instructionCount];
+        for (InsnFact insn : insns) {
+            int offset = insn.offset();
+            edgeCounts[offset] += normalEdgeCount(insn, offset, last);
         }
-        int[] targets = new int[edgeCount];
-        byte[] labels = new byte[edgeCount];
-        int cursor = 0;
-        for (List<CfgEdge> edges : mutable.edges) {
-            if (edges == null) {
-                continue;
+        for (TryCatchFact tc : method.tryCatch()) {
+            for (int offset = tc.start(); offset < tc.end() && offset < instructionCount; offset++) {
+                if (tc.handler() < instructionCount && insns.get(offset).op().mayThrow()) {
+                    edgeCounts[offset]++;
+                }
             }
-            for (CfgEdge edge : edges) {
-                targets[cursor] = edge.targetOffset();
-                labels[cursor++] = Indexed.labelCode(edge.label());
+        }
+
+        int[] edgeOffsets = new int[instructionCount + 1];
+        for (int i = 0; i < instructionCount; i++) {
+            edgeOffsets[i + 1] = edgeOffsets[i] + edgeCounts[i];
+        }
+        int[] targets = new int[edgeOffsets[instructionCount]];
+        byte[] labels = new byte[targets.length];
+        int[] cursor = java.util.Arrays.copyOf(edgeOffsets, instructionCount);
+        for (InsnFact insn : insns) {
+            appendNormalEdges(insn, insn.offset(), last, cursor, targets, labels);
+        }
+        for (TryCatchFact tc : method.tryCatch()) {
+            for (int offset = tc.start(); offset < tc.end() && offset < instructionCount; offset++) {
+                if (tc.handler() < instructionCount && insns.get(offset).op().mayThrow()) {
+                    appendEdge(offset, tc.handler(), CfgLabel.EXCEPTION, cursor, targets, labels);
+                }
             }
         }
         return new Indexed(instructionCount, edgeOffsets, targets, labels);
+    }
+
+    private static int normalEdgeCount(InsnFact insn, int offset, int last) {
+        Op op = insn.op();
+        if (op == Op.UNKNOWN || op == Op.RET || op.isReturn()) {
+            return 0;
+        }
+        if (op == Op.JSR) {
+            return offset < last ? 2 : 1;
+        }
+        if (op.isUncondJump()) {
+            return 1;
+        }
+        if (op.isSwitch()) {
+            SwitchRef sw = (SwitchRef) insn.operands().get(0);
+            return sw.cases().size() + 1;
+        }
+        if (op.isCondJump()) {
+            return offset < last ? 2 : 1;
+        }
+        return offset < last ? 1 : 0;
+    }
+
+    private static void appendNormalEdges(InsnFact insn, int offset, int last,
+                                          int[] cursor, int[] targets, byte[] labels) {
+        Op op = insn.op();
+        if (op == Op.UNKNOWN || op == Op.RET || op.isReturn()) {
+            return;
+        }
+        if (op == Op.JSR) {
+            appendEdge(offset, insn.jumpTarget(), CfgLabel.JUMP, cursor, targets, labels);
+            if (offset < last) {
+                appendEdge(offset, offset + 1, CfgLabel.SEQ, cursor, targets, labels);
+            }
+        } else if (op.isUncondJump()) {
+            appendEdge(offset, insn.jumpTarget(), CfgLabel.JUMP, cursor, targets, labels);
+        } else if (op.isSwitch()) {
+            SwitchRef sw = (SwitchRef) insn.operands().get(0);
+            for (var c : sw.cases()) {
+                appendEdge(offset, c.targetOffset(), CfgLabel.JUMP, cursor, targets, labels);
+            }
+            appendEdge(offset, sw.defaultOffset(), CfgLabel.JUMP, cursor, targets, labels);
+        } else if (op.isCondJump()) {
+            if (offset < last) {
+                appendEdge(offset, offset + 1, CfgLabel.FALSE, cursor, targets, labels);
+            }
+            appendEdge(offset, insn.jumpTarget(), CfgLabel.JUMP, cursor, targets, labels);
+        } else if (offset < last) {
+            appendEdge(offset, offset + 1, CfgLabel.SEQ, cursor, targets, labels);
+        }
+    }
+
+    private static void appendEdge(int from, int target, CfgLabel label,
+                                   int[] cursor, int[] targets, byte[] labels) {
+        int index = cursor[from]++;
+        targets[index] = target;
+        labels[index] = Indexed.labelCode(label);
     }
 
     private static Mutable buildMutable(MethodInfo method) {

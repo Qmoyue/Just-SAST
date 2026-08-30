@@ -30,13 +30,17 @@ public final class LegacySinkCanaryAgent {
         if (args == null) {
             return;
         }
-        String[] parts = args.split("\\|", 3);
+        String[] parts = args.split("\\|", 4);
         if (parts.length < 2) {
             return;
         }
         String bootJar = parts.length == 3 ? parts[0] : null;
         String entrySpec = parts.length == 3 ? parts[1] : parts[0];
         String sinkSpec = parts.length == 3 ? parts[2] : parts[1];
+        String token = parts.length == 4 ? parts[3] : "";
+        if (token.length() == 0) {
+            return;
+        }
         int entryHash = entrySpec.indexOf('#');
         if (entryHash <= 0) {
             return;
@@ -52,14 +56,14 @@ public final class LegacySinkCanaryAgent {
             // the canary signal across the loader boundary.
             Class<?> gate = Class.forName(
                     "io.just.sast.verify.legacy.LegacySinkCanaryGate", true, null);
-            gate.getDeclaredMethod("setEntry", String.class, String.class)
+            gate.getDeclaredMethod("setEntry", String.class, String.class, String.class)
                     .invoke(null, entrySpec.substring(0, entryHash),
-                            entrySpec.substring(entryHash + 1));
+                            entrySpec.substring(entryHash + 1), token);
         } catch (Throwable ignored) {
             // A missing gate must not turn a canary into an unbounded execution path.
             return;
         }
-        inst.addTransformer(new CanaryTransformer(sinks), true);
+        inst.addTransformer(new CanaryTransformer(sinks, token), true);
         for (String name : sinks.keySet()) {
             try {
                 Class<?> type = Class.forName(name.replace('/', '.'), false,
@@ -112,15 +116,21 @@ public final class LegacySinkCanaryAgent {
     static final class CanaryTransformer implements ClassFileTransformer {
 
         private final Map<String, Set<String>> sinks;
+        private final String token;
 
         CanaryTransformer(Map<String, Set<String>> sinks) {
+            this(sinks, "");
+        }
+
+        CanaryTransformer(Map<String, Set<String>> sinks, String token) {
             this.sinks = sinks;
+            this.token = token == null ? "" : token;
         }
 
         @Override
         public byte[] transform(ClassLoader loader, String className, Class<?> beingDefined,
                                 ProtectionDomain protectionDomain, byte[] bytes) {
-            if (className == null || bytes == null) {
+            if (className == null || bytes == null || token.length() == 0) {
                 return null;
             }
             Set<String> entryMethods = sinks.get(className);
@@ -148,8 +158,9 @@ public final class LegacySinkCanaryAgent {
                                 super.visitCode();
                                 if (injectable) {
                                     visitLdcInsn(className + "#" + name + "#" + desc);
+                                    visitLdcInsn(token);
                                     visitMethodInsn(Opcodes.INVOKESTATIC, GATE, "hit",
-                                            "(Ljava/lang/String;)V", false);
+                                            "(Ljava/lang/String;Ljava/lang/String;)V", false);
                                     changed[0] = true;
                                 }
                             }
@@ -163,8 +174,9 @@ public final class LegacySinkCanaryAgent {
                                         && (callMethods.contains(calledName)
                                         || callMethods.contains(calledName + "#" + calledDesc))) {
                                     visitLdcInsn(owner + "#" + calledName + "#" + calledDesc);
+                                    visitLdcInsn(token);
                                     visitMethodInsn(Opcodes.INVOKESTATIC, GATE, "hit",
-                                            "(Ljava/lang/String;)V", false);
+                                            "(Ljava/lang/String;Ljava/lang/String;)V", false);
                                     changed[0] = true;
                                 }
                                 super.visitMethodInsn(opcode, owner, calledName, calledDesc,

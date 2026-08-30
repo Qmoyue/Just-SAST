@@ -93,7 +93,7 @@ class SinkCanaryAgentTest {
     @Test
     void transformerInjectsGateCallIntoNamedMethodOnly() throws Exception {
         var transformer = new SinkCanaryAgent.CanaryTransformer(
-                Map.of("t/Sink", Set.of("exec")));
+                Map.of("t/Sink", Set.of("exec")), "test-token");
         byte[] injected = transformer.transform(null, "t/Sink", null, null,
                 simpleClass("t/Sink", "exec"));
 
@@ -107,7 +107,7 @@ class SinkCanaryAgentTest {
     @Test
     void transformerIgnoresNonSinkClassesAndMethods() throws Exception {
         var transformer = new SinkCanaryAgent.CanaryTransformer(
-                Map.of("t/Sink", Set.of("exec")));
+                Map.of("t/Sink", Set.of("exec")), "test-token");
         // 类名未命中 → null（不插桩，目标类原样加载）
         assertNull(transformer.transform(null, "other/Clean", null, null,
                 simpleClass("other/Clean", "exec")));
@@ -122,7 +122,7 @@ class SinkCanaryAgentTest {
     void transformerInjectsGateAtApplicationCallSite() {
         var transformer = new SinkCanaryAgent.CanaryTransformer(
                 Map.of("javax/naming/InitialContext",
-                        Set.of("lookup#(Ljava/lang/String;)Ljava/lang/Object;")));
+                        Set.of("lookup#(Ljava/lang/String;)Ljava/lang/Object;")), "test-token");
         byte[] injected = transformer.transform(null, "t/Caller", null, null,
                 callSiteClass("t/Caller"));
 
@@ -134,16 +134,12 @@ class SinkCanaryAgentTest {
     void gateThrowsMarkerOnlyWhenEntryFrameOnStack() {
         String selfClass = SinkCanaryAgentTest.class.getName();
         // 入口注册为本测试方法自身——hit() 的真实调用栈上必然存在该帧
-        SinkCanaryGate.setEntry(selfClass, "gateThrowsMarkerOnlyWhenEntryFrameOnStack");
-        try {
-            var err = assertThrows(io.just.sast.verify.boot.SinkReachedError.class,
-                    () -> SinkCanaryGate.hit("java/lang/reflect/Method#invoke"));
-            assertEquals("java/lang/reflect/Method#invoke", err.getMessage());
-        } finally {
-            SinkCanaryGate.setEntry(null, null);
-        }
-        // 入口清空后同名调用放行（JVM/探针基础设施路径不得误杀）
-        SinkCanaryGate.hit("java/lang/reflect/Method#invoke");
+        SinkCanaryGate.setEntry(selfClass, "gateThrowsMarkerOnlyWhenEntryFrameOnStack", "test-token");
+        var err = assertThrows(io.just.sast.verify.boot.SinkReachedError.class,
+                () -> SinkCanaryGate.hit("java/lang/reflect/Method#invoke", "test-token"));
+        assertEquals("java/lang/reflect/Method#invoke", err.getMessage());
+        // Wrong/missing token is diagnostic-only and cannot manufacture a positive result.
+        SinkCanaryGate.hit("java/lang/reflect/Method#invoke", "wrong-token");
     }
 
     @Test

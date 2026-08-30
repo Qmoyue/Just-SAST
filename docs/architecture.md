@@ -254,16 +254,39 @@ rules:
 - 不因前端批处理或图存储优化跳过 class、method、sink、异常边或规则；
 - 所有预算、能力、fallback、超时、native 缺失和解析失败均进入结构化报告；
 - 动态验证只能证明真实触发前缀到达 canary 边界，不能把 sink body 执行或 payload bytes 写入产物；
-- 六个校准语料、Gleipner 和 Maven 全量测试已完成；Linux/WSL evaluator 在本机不可用，因此不把未执行的跨平台分数写成通过项，保留为发布前环境验收项。
+- 六个校准语料、Gleipner 和 Maven 全量测试已完成；当前新 `javamix` 工件已经纳入回归，但动态状态仍按 `SINK_BLOCKED/CONCRETE/PARTIAL` 如实记录，不能把静态候选数当作 WP 动态确认。Linux/WSL evaluator 在本机不可用，因此不把未执行的跨平台分数写成通过项，保留为发布前环境验收项。
+
+## 10.2 动态隔离与图优化增量设计（2026-08-30）
+
+本轮对 JDD 的迁移限定在其真正解决的问题：从 sink 向上抽取可复用的 gadget fragment，用字段间输入/输出依赖描述对象构造，并在候选链上保留控制依赖和不确定性。JDD 论文没有提供可直接复用的 Windows/OS 沙箱；因此 Just 不把 JDD 的动态对象构造误称为隔离能力，也不把目标 JAR 放入扫描器进程内执行。
+
+动态验证的安全协议分三层：
+
+1. **进程边界**：每个候选链使用独立子 JVM、独立工作目录和临时目录、清洗后的环境、固定资源上限、超时递归清理和最小 classpath；目标代码不获得 probe 的应用类加载路径。
+2. **Java 能力门**：在当前 JDK 能提供的范围内 deny-by-default，明确拒绝网络、进程、native/link、任意写入、动态 classloader 和退出；不支持可靠能力门时 fail closed，不把“进程启动成功”当作安全验证。
+3. **证据协议**：父进程只接受 probe 生成且带有本次尝试认证标记的结构化终态；目标工件的 stdout/stderr、异常文本和非零退出只能作为诊断，不能单独升级为 sink 证据。canary 命中后立即抛出边界异常，危险 sink 方法体不继续执行。
+
+验证只确认真实的入口、触发器、gadget 前缀和精确 sink 边界可达；不执行最终 sink，不加载目标 native，不连接网络，不生成可直接投递的攻击字节流。Windows evaluator 若需要 JNI，仅允许在 benchmark 的独立 loader/broker 中对经过路径和内容校验的测试库做环境验证，不能改变 Just 默认安全边界。
+
+图优化采用可逆、可核对的顺序：先用 profile 区分前端解析、CFG/CPG 构建、调用图、污点传播、组合和验证调度，再把热路径迁移到 primitive offset/id、CSR/紧凑 slice、可复用 bottom-up fragment summary 和按需 worklist。任何剪枝必须由类型/控制/字段约束证明并记录为完整性事实；不能以 `fast` 默认、固定包名、题目类名或 WP 结构替代通用规则。GPU 只作为未来可选后端：没有稳定的同构数据内核、CPU 等价结果和资源自适应门控时，不加入默认运行时依赖。
+
+本轮实现优先级为：
+
+1. 修复验证状态协议和 native/link 拒绝，降低子进程对伪造输出和隐式能力的信任面；
+2. 将字段依赖计划整理为确定性、去重、可复用的底向上对象构造摘要；
+3. 优化不改变语义的 indexed CFG 构建，避免先创建临时 `CfgEdge` 对象再压缩；
+4. 以新 Javamix 工件和六个校准语料检查真实前缀到 sink 边界的证据，并运行 Gleipner 找出通用语义缺口；
+5. 只有全量等价回归通过后，才更新性能结论；单次 wall time 不能证明提速。
 
 ## 11. 当前验证与已知限制
 
 当前仓库验证基线：
 
-- `mvn test`：153 项通过，0 失败，2 项环境跳过（本轮最终回归）；
-- Gleipner 全量完成 30 个 block 的扫描和转换，其中 29 个 block 完成 evaluator：全路径变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重基线为 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载路径限制单独记录，不折算成扫描器分数；
-- 指定语料的安全动态结果为：`demo=2/3/15`、`demo2=2/3/15`、`babychain=2/2/16`、`n1cat=1/0/19`、`qiao=2/0/18`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；qiao 运行时使用 Jabba JDK 21；
-- `javamix` 当前工件产生 21,635 条静态候选，动态选择 20 条且均为 `PARTIAL`；它不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，不能用另一份工件的结果替代；
+- `mvn test`：156 项通过，0 失败，2 项环境跳过（本轮最终回归）；
+- Gleipner 全量完成 30 个 block 的扫描和转换，其中 29 个 block 完成 evaluator：evaluator 原始块级计数为 `TP=219, FP=22`；当前转换器在连续重复方法节点归一化后的语义变体计数为 `TP=186, FP=22`，按 `(块, 入口类)` 去重基线为 `TP=126, FP=17`。Windows JNI evaluator 的 native 加载路径限制单独记录，不折算成扫描器分数；
+- 指定语料的安全动态结果为：`demo=2/3/15`、`demo2=2/3/15`、`babychain=0/2/18`、`javamix=1/3/16`、`n1cat=5/0/15`、`qiao=2/0/18`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；qiao 运行时使用 Jabba JDK 21；
+- `javamix` 新工件 `benchmark/javamix/JavaMix/challenge/target/javamix-1.0.0.jar` 产生 21,337 条静态候选，动态选择 20 条，状态为 `1 SINK_BLOCKED / 3 CONCRETE / 16 PARTIAL`；不以另一份工件或 WP 文档类名替代当前输入事实；
+- `babychain` 尚未在动态选择的前 20 条中命中 sink boundary，`n1cat/qiao` 的边界证据排名仍偏后，这是后续候选排序、依赖补全和动态适配的真实缺口；
 - 大型工件的 live heap 仍然较高，不能宣称已经满足严格低内存发布门槛；
 - 复杂框架真实输入、代理、JNI/JRMP 和 JDK 版本差异仍可能产生 `PARTIAL`/`UNTESTABLE`；
 - 安全 payload plan、JVM 权限门和 canary 都不等价于生产级 exploit runner 或 OS sandbox。

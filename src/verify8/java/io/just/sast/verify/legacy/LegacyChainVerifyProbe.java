@@ -27,6 +27,8 @@ import java.util.Set;
 public final class LegacyChainVerifyProbe {
 
     private static final int MAX_SERIALIZED_BYTES = 8 * 1024 * 1024;
+    private static final String PROTOCOL_PREFIX = "JUST_VERIFY_V1:";
+    private static String protocolToken = "";
     private static ClassLoader applicationLoader;
 
     private LegacyChainVerifyProbe() {
@@ -48,6 +50,7 @@ public final class LegacyChainVerifyProbe {
         String entryMethod = entryParts[1];
         String mode = entryParts.length > 2 ? entryParts[2] : "DIRECT";
         String entryDescriptor = entryParts.length > 3 ? entryParts[3] : "";
+        protocolToken = args.length > 5 ? args[5] : "";
 
         List<String[]> fieldLinks = parseLinks(args.length > 1 ? args[1] : "");
         String[] sink = parseSink(args.length > 2 ? args[2] : "");
@@ -57,7 +60,13 @@ public final class LegacyChainVerifyProbe {
 
         try {
             installApplicationLoader();
-            LegacySandboxSecurityManager.install(Paths.get(System.getProperty("java.io.tmpdir", ".")));
+            try {
+                LegacySandboxSecurityManager.install(Paths.get(System.getProperty("java.io.tmpdir", ".")));
+            } catch (Throwable sandboxFailure) {
+                emit("SANDBOX_UNAVAILABLE: " + sandboxFailure.getClass().getSimpleName());
+                System.exit(3);
+                return;
+            }
             // Keep stack formatting and collection initialization outside the gadget call. Some
             // old runtimes initialize these classes lazily and can otherwise obscure the result.
             try {
@@ -96,35 +105,35 @@ public final class LegacyChainVerifyProbe {
             }
             fillSimpleFields(instances);
             if (!unlinked.isEmpty()) {
-                System.out.println("PARTIAL_PATH: field-unlinked=" + unlinked.size());
+                emit("PARTIAL_PATH: field-unlinked=" + unlinked.size());
                 System.exit(0);
                 return;
             }
 
             trigger(entryType, entryInstance, entryMethod, entryDescriptor, mode);
             if (LegacySinkCanaryGate.wasReached()) {
-                System.out.println("SINK_BLOCKED: " + sinkClass);
+                emit("SINK_BLOCKED: " + sinkClass);
                 System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
                         + " (canary-latched)");
             } else if ("SERIAL".equals(mode) || "PROXY".equals(mode)
                     || mode.startsWith("TRIGGER_")) {
-                System.out.println("CONCRETE_REACHED: " + mode);
+                emit("CONCRETE_REACHED: " + mode);
             } else {
-                System.out.println("EXECUTED");
+                emit("EXECUTED");
             }
             System.exit(0);
         } catch (Throwable failure) {
             String marker = markerSpec(failure);
             if (marker != null && sameSink(marker, sinkClass, sinkMethod, sinkDescriptor)
                     && entryReached(failure, entryClass, entryMethod)) {
-                System.out.println("SINK_BLOCKED: " + sinkClass);
+                emit("SINK_BLOCKED: " + sinkClass);
                 System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod + " (canary)");
                 System.exit(1);
                 return;
             }
             if (sinkDescriptor.length() == 0 && reachesSink(failure, sinkClass, sinkMethod)
                     && entryReached(failure, entryClass, entryMethod)) {
-                System.out.println("UNTESTABLE: sink-frame-without-canary");
+                emit("UNTESTABLE: sink-frame-without-canary");
                 System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
                         + " without canary (not confirmed)");
                 System.exit(0);
@@ -138,15 +147,47 @@ public final class LegacyChainVerifyProbe {
             if (detail.length() > 120) {
                 detail = detail.substring(0, 120);
             }
-            System.out.println("PARTIAL_PATH: " + failure.getClass().getSimpleName()
+            emit("PARTIAL_PATH: " + failure.getClass().getSimpleName()
                     + (detail.length() == 0 ? "" : ": " + detail));
             System.exit(0);
         }
     }
 
+    private static void emit(String status) {
+        System.out.println(PROTOCOL_PREFIX + (protocolToken == null ? "" : protocolToken)
+                + ":" + status);
+    }
+
     private static List<String[]> parseLinks(String encoded) {
         List<String[]> result = new ArrayList<String[]>();
         if (encoded == null || encoded.length() == 0) {
+            return result;
+        }
+        if (encoded.startsWith("v2;")) {
+            int cursor = 3;
+            while (cursor < encoded.length()) {
+                String[] values = new String[3];
+                for (int i = 0; i < values.length; i++) {
+                    int colon = encoded.indexOf(':', cursor);
+                    if (colon <= cursor) {
+                        return new ArrayList<String[]>();
+                    }
+                    int length;
+                    try {
+                        length = Integer.parseInt(encoded.substring(cursor, colon));
+                    } catch (NumberFormatException malformed) {
+                        return new ArrayList<String[]>();
+                    }
+                    int start = colon + 1;
+                    int end = start + length;
+                    if (length < 0 || end < start || end > encoded.length()) {
+                        return new ArrayList<String[]>();
+                    }
+                    values[i] = encoded.substring(start, end);
+                    cursor = end;
+                }
+                result.add(values);
+            }
             return result;
         }
         for (String hop : encoded.split(",")) {
@@ -497,7 +538,12 @@ public final class LegacyChainVerifyProbe {
             return;
         }
         List<URL> urls = new ArrayList<URL>();
-        String classPath = System.getProperty("java.class.path", "");
+        String classPath = System.getProperty("just.verify.target-cp", "");
+        if (classPath.length() == 0) {
+            // Compatibility for manually launched legacy probes; production children pass a
+            // target-only classpath so the system loader does not expose verifier classes.
+            classPath = System.getProperty("java.class.path", "");
+        }
         String probeJar = System.getProperty("just.verify.probe-jar", "");
         String normalizedProbe = probeJar.length() == 0 ? ""
                 : Paths.get(probeJar).toAbsolutePath().normalize().toString();

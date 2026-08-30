@@ -72,7 +72,12 @@ public final class SandboxSecurityManager extends SecurityManager {
             throw new IllegalArgumentException("writable root is not a directory: " + writableRoot);
         }
         List<Path> roots = new ArrayList<>();
-        String classPath = System.getProperty("java.class.path", "");
+        // The probe launcher classpath intentionally contains only the verifier artifact. The
+        // target/dependency roots arrive through a separate property so an input class cannot
+        // reach verifier classes through its defining loader. Keep the system property fallback
+        // for manually launched probes and older callers.
+        String classPath = System.getProperty("just.verify.target-cp",
+                System.getProperty("java.class.path", ""));
         for (String entry : classPath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
             if (!entry.isBlank()) {
                 roots.add(normalize(Path.of(entry)));
@@ -107,9 +112,12 @@ public final class SandboxSecurityManager extends SecurityManager {
             // the trusted probe; target code still cannot install arbitrary URL handlers.
             if ("specifyStreamHandler".equals(permission.getName())) {
                 // This permission is used by the JDK URL implementation while resolving
-                // class-path resources; it does not grant a socket or file capability. The
-                // actual network gates below remain unconditional.
-                return;
+                // class-path resources; it does not grant a socket or file capability. Keep
+                // it only on a trusted probe/bootstrap stack so target code cannot install a
+                // custom handler and widen the child's network boundary.
+                if (trustedProbeCaller() || trustedSourceAdapterCaller()) {
+                    return;
+                }
             }
             throw new SecurityException("network permission denied: " + permission.getName());
         }
@@ -124,7 +132,9 @@ public final class SandboxSecurityManager extends SecurityManager {
             // The bootstrap scopes below are lifecycle markers only. They must never be an
             // authorization signal: while OIS/Proxy is invoking target code, the scope is
             // still active and a target frame is above the probe on the stack.
-            if (!trustedProbeCaller() && !trustedSourceAdapterCaller()) {
+            if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
+                    && !(permission instanceof ReflectPermission
+                    && trustedLambdaBootstrapCaller())) {
                 throw new SecurityException("reflective/serialization privilege denied: "
                         + permission.getName());
             }
@@ -134,7 +144,6 @@ public final class SandboxSecurityManager extends SecurityManager {
             String name = runtime.getName();
             if (name.equals("setSecurityManager")
                     || name.startsWith("loadLibrary")
-                    || name.startsWith("getenv.")
                     || name.equals("createNativeThread")
                     || name.equals("shutdownHooks")
                     || name.equals("setIO")
@@ -146,12 +155,23 @@ public final class SandboxSecurityManager extends SecurityManager {
                     || name.equals("queuePrintJob")) {
                 throw new SecurityException("runtime permission denied: " + name);
             }
+            if (name.startsWith("getenv.")) {
+                // The parent clears the environment and supplies only JVM startup values
+                // before setting this marker. Read-only access to that minimal environment
+                // lets libraries initialize normally without exposing the analyst's secrets;
+                // an explicitly launched probe without the marker remains deny-by-default.
+                if (Boolean.getBoolean("just.verify.sanitized-env")) {
+                    return;
+                }
+                throw new SecurityException("environment read denied: " + name);
+            }
             if (name.equals("createClassLoader")) {
                 // ObjectStreamClass/Proxy may create a short-lived JDK loader while the
                 // probe builds or reads an object. The first non-platform frame, rather than
                 // an active scope, is the authorization boundary; target code runs inside
                 // the same scopes and must remain denied.
-                if (!trustedProbeCaller() && !trustedSourceAdapterCaller()) {
+                if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
+                        && !trustedLambdaBootstrapCaller()) {
                     throw new SecurityException("runtime permission denied: " + name);
                 }
                 return;
@@ -162,6 +182,14 @@ public final class SandboxSecurityManager extends SecurityManager {
             }
         }
         // 普通属性读取和不改变边界的 JDK 权限保持可用。
+    }
+
+    @Override
+    public void checkPackageAccess(String packageName) {
+        if (packageName != null && (packageName.equals("io.just.sast")
+                || packageName.startsWith("io.just.sast.")) && !trustedProbeCaller()) {
+            throw new SecurityException("verifier package access denied: " + packageName);
+        }
     }
 
     /**
@@ -177,6 +205,30 @@ public final class SandboxSecurityManager extends SecurityManager {
     private boolean trustedProbeCaller() {
         Class<?> frame = firstNonPlatformFrame();
         return frame != null && isVerifierFrame(frame);
+    }
+
+    /**
+     * Java 9+ links an ordinary target lambda by reflectively opening the generated lambda
+     * constructor. This is a JDK implementation step, not target-requested reflection, but
+     * it runs while the target class initializer is on the stack. Keep the exception narrow:
+     * only the JDK lambda metafactory plus its reflective constructor path qualifies; a target
+     * calling setAccessible directly still has no such frames and remains denied.
+     */
+    private boolean trustedLambdaBootstrapCaller() {
+        boolean metafactory = false;
+        boolean constructorAccess = false;
+        for (Class<?> frame : getClassContext()) {
+            String name = frame.getName();
+            if (name.equals("java.lang.invoke.InnerClassLambdaMetafactory")
+                    || name.startsWith("java.lang.invoke.InnerClassLambdaMetafactory$")) {
+                metafactory = true;
+            }
+            if (name.equals("java.lang.reflect.Constructor")
+                    || name.equals("java.lang.reflect.AccessibleObject")) {
+                constructorAccess = true;
+            }
+        }
+        return metafactory && constructorAccess;
     }
 
     private Class<?> firstNonPlatformFrame() {
@@ -313,6 +365,11 @@ public final class SandboxSecurityManager extends SecurityManager {
     }
 
     @Override
+    public void checkLink(String lib) {
+        throw new SecurityException("native load denied: " + lib);
+    }
+
+    @Override
     public void checkConnect(String host, int port) {
         throw new SecurityException("connect denied: " + host + ":" + port);
     }
@@ -432,13 +489,12 @@ public final class SandboxSecurityManager extends SecurityManager {
             if (existing == null) {
                 return false;
             }
-            // The common case for a newly-created file is a direct child of the
-            // configured root. The root itself is already normalized and was
-            // resolved when this manager was constructed; accepting this exact
-            // ancestor also avoids platform-specific spelling differences in
-            // toRealPath() for an otherwise identical root.
             if (existing.equals(lexicalRoot)) {
-                return true;
+                // Do not trust the lexical root merely because it exists: a caller can
+                // supply a junction/symlink root. Resolve the exact root as well; the
+                // lexical read fallback below remains the managed-host compatibility path.
+                Path real = existing.toRealPath();
+                return under(real, realRoot);
             }
             Path real = existing.toRealPath();
             return under(real, realRoot);

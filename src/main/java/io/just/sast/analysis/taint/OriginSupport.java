@@ -31,6 +31,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -64,6 +65,9 @@ public final class OriginSupport {
     private final Map<String, List<Node>> reflectiveInvokeByClass = new HashMap<>();
     private final Map<String, Node> reflectiveInvokeByMethod = new HashMap<>();
     private final Map<Long, List<String>> reflectiveClassesBySite = new HashMap<>();
+    /** Reflective calls are also queried by constant-feasibility proofs. Keep a compact
+     * call-site list so those proofs never rescan every CALL node in a large artifact. */
+    private final List<Node> reflectiveInvokeCalls = new ArrayList<>();
     /** 框架包内的 Method.invoke 位点——框架反射供给的调用者池（包前缀源自 source 规则声明）。 */
     private final List<Node> frameworkMethodInvokeSites = new ArrayList<>();
     /** InvocationHandler 内由代理运行时提供 Method 参数的反射调用位点。 */
@@ -88,6 +92,8 @@ public final class OriginSupport {
     private final Set<String> frameworkPackages;
     /** JavaBean 反射跳：接收者类型 → invoke 位点；类型不可解 → wildcard 位点。 */
     private final Map<String, List<Long>> javabeanSitesByClass = new HashMap<>();
+    /** 反向索引：invoke 位点 → 已解析接收者类型，避免闭包阶段逐类扫描 site id。 */
+    private final Map<Long, String> javabeanClassBySite = new HashMap<>();
     private final List<Long> javabeanWildcardSites = new ArrayList<>();
     private final Map<Long, String> javabeanSiteKinds = new HashMap<>();
     /** 占位类型集（JavaBean wildcard 精度门，惰性）。 */
@@ -99,6 +105,20 @@ public final class OriginSupport {
      * 方法不进入缓存，调用方回退到未知 receiver 的保守语义。
      */
     private final ConcurrentHashMap<String, DominatorIndex> fieldDominators =
+            new ConcurrentHashMap<>();
+    /** Lazily materialized field-write offsets. The CPG already records these offsets; the
+     * cache avoids scanning every instruction when a receiver proof asks about one field. */
+    private final ConcurrentHashMap<String, int[]> fieldWriteOffsetsByMethod =
+            new ConcurrentHashMap<>();
+    /** Receiver facts are pure for a fixed hierarchy revision, but the same call site is
+     * visited by many sink traces and target declarations. Cache the expensive origin proof
+     * once per call site, not once per call/target pair; the bound prevents a broad CHA graph
+     * from trading CPU for an unbounded table. */
+    private static final int RECEIVER_SUMMARY_CACHE_LIMIT = 250_000;
+    private record ReceiverDispatchSummary(long hierarchyRevision, Set<String> exactTypes,
+                                           Set<String> possibleTypes, boolean platformBound) {
+    }
+    private final ConcurrentHashMap<Long, ReceiverDispatchSummary> receiverSummaries =
             new ConcurrentHashMap<>();
     private static final int DOMINATOR_METHOD_LIMIT = 4096;
 
@@ -145,7 +165,13 @@ public final class OriginSupport {
         this.hierarchy = hierarchy;
         this.ruleEngine = ruleEngine;
         this.frameworkPackages = deriveFrameworkPackages();
-        this.origins = new ForwardOrigins(callIdByKey, this.cpgIndex::cfg);
+        // CALL ids are already grouped by host method in the frozen CPG. Forward transfer
+        // can therefore resolve an invoke by (method key, offset) without allocating the
+        // transient "method@offset" string used by the compatibility map.
+        this.origins = new ForwardOrigins((methodKey, offset) -> {
+            Node call = graph.findCallNode(methodKey, offset);
+            return call == null ? null : call.id();
+        }, this.cpgIndex::cfg);
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             callIdByKey.put(methodKey(call) + "@" + call.strProp("offset"), call.id());
             callNodes.put(call.id(), call);
@@ -234,8 +260,12 @@ public final class OriginSupport {
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             if (!"java/lang/reflect/Method".equals(call.strProp("owner"))
                     || !"invoke".equals(call.strProp("name"))) {
-                continue;
+                if (!("java/lang/reflect/Constructor".equals(call.strProp("owner"))
+                        && "newInstance".equals(call.strProp("name")))) {
+                    continue;
+                }
             }
+            reflectiveInvokeCalls.add(call);
             MethodInfo host = methodOf(call.strProp("methodOwner"), call.strProp("methodName"),
                     call.strProp("methodDesc"));
             if (host == null) {
@@ -508,6 +538,7 @@ public final class OriginSupport {
         // 万能类型（Object/Serializable）走 wildcard 路径——可调用于意类的 getter
         if (recvType != null && !isUniversalType(recvType)) {
             javabeanSitesByClass.computeIfAbsent(recvType, k -> new ArrayList<>(1)).add(invokeSite.id());
+            javabeanClassBySite.put(invokeSite.id(), recvType);
             javabeanSiteKinds.put(invokeSite.id(), read ? "read" : "write");
         } else {
             javabeanWildcardSites.add(invokeSite.id());
@@ -758,12 +789,8 @@ public final class OriginSupport {
         if (downstream != null) {
             return downstream;
         }
-        Map<String, List<Node>> callsByMethod = new HashMap<>();
         Map<String, List<String>> fieldsWrittenBy = new HashMap<>();
         Map<String, List<String>> fieldReaders = new HashMap<>();
-        for (Node call : graph.nodesOfType(NodeType.CALL)) {
-            callsByMethod.computeIfAbsent(methodKey(call), k -> new ArrayList<>(1)).add(call);
-        }
         for (Node m : graph.nodesOfType(NodeType.METHOD)) {
             MethodInfo info = methodOf(m.strProp("owner"), m.strProp("name"), m.strProp("desc"));
             if (info == null) {
@@ -917,8 +944,8 @@ public final class OriginSupport {
             Node m = work.poll();
             int depth = workDepth.poll();
             String key = methodKeyOf(m.strProp("owner"), m.strProp("name"), m.strProp("desc"));
-            List<Node> calls = callsByMethod.get(key);
-            if (calls != null) {
+            List<Node> calls = graph.callsOfMethod(key);
+            if (!calls.isEmpty()) {
                 // 反射跳边（FLASH 向后版）：invoke 位点的常量类 public 方法并入可达集
                 for (Node call : calls) {
                     List<String> classes = reflectiveClassesBySite.get(call.id());
@@ -953,10 +980,9 @@ public final class OriginSupport {
                     if (javabeanSiteKinds.containsKey(call.id())) {
                         String kind = javabeanSiteKinds.get(call.id());
                         java.util.Set<String> targetClasses = new HashSet<>();
-                        for (Map.Entry<String, List<Long>> e : javabeanSitesByClass.entrySet()) {
-                            if (e.getValue().contains(call.id())) {
-                                targetClasses.add(e.getKey());
-                            }
+                        String exactTargetClass = javabeanClassBySite.get(call.id());
+                        if (exactTargetClass != null) {
+                            targetClasses.add(exactTargetClass);
                         }
                         if (targetClasses.isEmpty()) {
                             // wildcard（Object 接收者）：所有有 JavaBean 前缀方法的 Serializable 类
@@ -1311,16 +1337,19 @@ public final class OriginSupport {
                 || "DYNAMIC".equals(call.invokeKind())) {
             return true;
         }
-        ForwardOrigins.Result result = origins.compute(caller);
-        Set<ValueOrigin> receivers = argOriginAtOrdinal(call, -1, result);
-        Set<String> concrete = exactConcreteTypes(receivers, caller, call.offset());
+        long revision = hierarchy.revision();
+        ReceiverDispatchSummary summary = receiverSummaries.get(call.id());
+        if (summary == null || summary.hierarchyRevision() != revision) {
+            summary = receiverDispatchSummary(call, caller);
+        }
+        Set<String> concrete = summary.exactTypes();
         if (concrete.isEmpty()) {
-            Set<String> possible = possibleConcreteTypes(receivers, caller, call.offset());
+            Set<String> possible = summary.possibleTypes();
             if (!possible.isEmpty()) {
                 for (String type : possible) {
                     String resolved = hierarchy.resolveMethod(type, targetName, targetDescriptor);
                     // A known NEW/factory type whose class model is unavailable is still an
-                    // external boundary.  Preserve the conservative answer in that case.
+                    // external boundary. Preserve the conservative answer in that case.
                     if (resolved == null || targetOwner.equals(resolved)) {
                         return true;
                     }
@@ -1329,23 +1358,42 @@ public final class OriginSupport {
             }
             // A field which is reinitialized on every reachable write with a platform
             // allocation/factory result cannot hold an application implementation at this
-            // call site.  This is intentionally a one-way precision gate: anything that is
+            // call site. This is intentionally a one-way precision gate: anything that is
             // not proven platform-bound stays on the conservative CHA path.
-            if (platformBoundReceiver(receivers, caller, call.offset())) {
-                return isJdk(targetOwner);
-            }
-            return true;
+            return !summary.platformBound() || isJdk(targetOwner);
         }
         for (String type : concrete) {
             String resolved = hierarchy.resolveMethod(type, targetName, targetDescriptor);
             // A missing external method model is an unknown boundary, not proof that the
-            // dispatch is impossible.  When resolution is available, only the JVM-selected
+            // dispatch is impossible. When resolution is available, only the JVM-selected
             // declaration can receive this call.
             if (resolved == null || targetOwner.equals(resolved)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private ReceiverDispatchSummary receiverDispatchSummary(Node call, MethodInfo caller) {
+        long revision = hierarchy.revision();
+        ForwardOrigins.Result result = origins.compute(caller);
+        Set<ValueOrigin> receivers = argOriginAtOrdinal(call, -1, result);
+        Set<String> concrete = exactConcreteTypes(receivers, caller, call.offset());
+        Set<String> possible = Set.of();
+        boolean platformBound = false;
+        if (concrete.isEmpty()) {
+            possible = possibleConcreteTypes(receivers, caller, call.offset());
+            if (possible.isEmpty()) {
+                platformBound = platformBoundReceiver(receivers, caller, call.offset());
+            }
+        }
+        ReceiverDispatchSummary summary = new ReceiverDispatchSummary(revision, concrete,
+                possible, platformBound);
+        if (hierarchy.revision() == revision && receiverSummaries.mappingCount()
+                < RECEIVER_SUMMARY_CACHE_LIMIT) {
+            receiverSummaries.putIfAbsent(call.id(), summary);
+        }
+        return summary;
     }
 
     /**
@@ -1379,7 +1427,8 @@ public final class OriginSupport {
         ForwardOrigins.Result result = origins.compute(method);
         Set<String> types = new LinkedHashSet<>();
         boolean found = false;
-        for (InsnFact write : method.instructions()) {
+        for (int writeOffset : fieldWriteOffsets(method)) {
+            InsnFact write = method.insnAt(writeOffset);
             if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
                     || !sameField(write.fieldRef(), field)) {
                 continue;
@@ -1453,25 +1502,23 @@ public final class OriginSupport {
                                             int beforeOffset) {
         ForwardOrigins.Result result = origins.compute(method);
         boolean found = false;
-        for (InsnFact write : method.instructions()) {
+        for (int writeOffset : fieldWriteOffsets(method)) {
+            InsnFact write = method.insnAt(writeOffset);
             if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
                     || !sameField(write.fieldRef(), field)) {
                 continue;
             }
+            ForwardOrigins.State state = result.stateBefore().get(write.offset());
+            if (state == null || state.stack().isEmpty()) {
+                return false;
+            }
             if (!field.isStatic()) {
-                ForwardOrigins.State state = result.stateBefore().get(write.offset());
-                if (state == null) {
-                    return false;
-                }
                 Set<ValueOrigin> writerReceiver = fieldWriterReceiver(write, state);
                 if (writerReceiver.isEmpty() || !writerReceiver.contains(field.receiver())) {
                     return false;
                 }
             }
-            ForwardOrigins.State state = result.stateBefore().get(write.offset());
-            if (state == null || state.stack().isEmpty()
-                    || !platformProduced(state.stack().get(state.stack().size() - 1).origins(),
-                    method)) {
+            if (!platformProduced(state.stack().get(state.stack().size() - 1).origins(), method)) {
                 return false;
             }
             found = true;
@@ -1626,7 +1673,8 @@ public final class OriginSupport {
         ForwardOrigins.Result result = origins.compute(method);
         Set<String> types = new LinkedHashSet<>();
         boolean found = false;
-        for (InsnFact write : method.instructions()) {
+        for (int writeOffset : fieldWriteOffsets(method)) {
+            InsnFact write = method.insnAt(writeOffset);
             if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
                     || !sameField(write.fieldRef(), field)) {
                 continue;
@@ -1656,6 +1704,33 @@ public final class OriginSupport {
         return found && types.size() == 1 ? types.iterator().next() : null;
     }
 
+    /**
+     * Return field-write offsets in bytecode order. CpgIndex is the authoritative compact
+     * method slice when available; the fallback keeps Blackboard/unit-test construction
+     * compatible with pre-index callers. The returned array is never mutated by callers.
+     */
+    private int[] fieldWriteOffsets(MethodInfo method) {
+        String key = methodKey(method);
+        return fieldWriteOffsetsByMethod.computeIfAbsent(key, ignored -> {
+            CpgIndex.MethodSlice slice = cpgIndex.slice(key);
+            if (slice != null) {
+                return slice.fieldWriteOffsets();
+            }
+            int[] offsets = new int[8];
+            int size = 0;
+            for (InsnFact insn : method.instructions()) {
+                if (!insn.op().isFieldWrite()) {
+                    continue;
+                }
+                if (size == offsets.length) {
+                    offsets = Arrays.copyOf(offsets, offsets.length << 1);
+                }
+                offsets[size++] = insn.offset();
+            }
+            return Arrays.copyOf(offsets, size);
+        });
+    }
+
     private Set<ValueOrigin> fieldWriterReceiver(InsnFact write, ForwardOrigins.State state) {
         if (write.op() == Op.PUTSTATIC || state.stack().size() < 2) {
             return Set.of();
@@ -1678,10 +1753,6 @@ public final class OriginSupport {
     private DominatorIndex buildDominators(MethodInfo method, boolean includeExceptions) {
         int size = method.instructions().size();
         Cfg.Indexed cfg = cfg(method);
-        List<List<Integer>> predecessors = new ArrayList<>(size);
-        for (int i = 0; i < size; i++) {
-            predecessors.add(new ArrayList<>(2));
-        }
         boolean[] reachable = new boolean[size];
         Deque<Integer> queue = new ArrayDeque<>();
         if (size > 0) {
@@ -1699,10 +1770,50 @@ public final class OriginSupport {
                 if (target < 0 || target >= size) {
                     continue;
                 }
-                predecessors.get(target).add(current);
                 if (!reachable[target]) {
                     reachable[target] = true;
                     queue.addLast(target);
+                }
+            }
+        }
+
+        // Dominator transfer only needs the reverse CFG.  The old representation allocated
+        // one List<Integer> per instruction and boxed every predecessor before the fixed-point
+        // loop even though the forward CFG is already a primitive CSR index.  Rebuild the
+        // reachable reverse edges directly into a primitive CSR array: this keeps the transfer
+        // function identical while removing the per-method object/boxing peak on large jars.
+        int[] predecessorCounts = new int[size];
+        for (int current = 0; current < size; current++) {
+            if (!reachable[current]) {
+                continue;
+            }
+            for (int edgeIndex = cfg.edgeStart(current); edgeIndex < cfg.edgeEnd(current); edgeIndex++) {
+                if (!includeExceptions && cfg.labelAt(edgeIndex) == CfgLabel.EXCEPTION) {
+                    continue;
+                }
+                int target = cfg.targetAt(edgeIndex);
+                if (target >= 0 && target < size) {
+                    predecessorCounts[target]++;
+                }
+            }
+        }
+        int[] predecessorOffsets = new int[size + 1];
+        for (int i = 0; i < size; i++) {
+            predecessorOffsets[i + 1] = predecessorOffsets[i] + predecessorCounts[i];
+        }
+        int[] predecessors = new int[predecessorOffsets[size]];
+        int[] predecessorCursor = predecessorOffsets.clone();
+        for (int current = 0; current < size; current++) {
+            if (!reachable[current]) {
+                continue;
+            }
+            for (int edgeIndex = cfg.edgeStart(current); edgeIndex < cfg.edgeEnd(current); edgeIndex++) {
+                if (!includeExceptions && cfg.labelAt(edgeIndex) == CfgLabel.EXCEPTION) {
+                    continue;
+                }
+                int target = cfg.targetAt(edgeIndex);
+                if (target >= 0 && target < size) {
+                    predecessors[predecessorCursor[target]++] = current;
                 }
             }
         }
@@ -1725,7 +1836,9 @@ public final class OriginSupport {
                     continue;
                 }
                 BitSet next = null;
-                for (int predecessor : predecessors.get(i)) {
+                for (int predecessorIndex = predecessorOffsets[i];
+                     predecessorIndex < predecessorOffsets[i + 1]; predecessorIndex++) {
+                    int predecessor = predecessors[predecessorIndex];
                     if (!reachable[predecessor]) {
                         continue;
                     }
@@ -2711,11 +2824,13 @@ public final class OriginSupport {
                 value = candidate;
                 seen++;
             }
-            // Reflection is deliberately not materialized as a blanket call-graph edge.  If
+            // Reflection is deliberately not materialized as a blanket call-graph edge. If
             // the Method object has one exact Class.getMethod/getDeclaredMethod origin, the
             // Object[] element at the target parameter ordinal is nevertheless a normal JVM
-            // value and can participate in the same constant proof as a direct invoke.
-            for (Node invoke : callNodes.values()) {
+            // value and can participate in the same constant proof as a direct invoke. The
+            // compact index contains only reflective calls; scanning all CALL nodes here made
+            // a large jar pay the full call-site count once per recursive parameter proof.
+            for (Node invoke : reflectiveInvokeCalls) {
                 boolean methodInvoke = "java/lang/reflect/Method".equals(invoke.owner())
                         && "invoke".equals(invoke.name());
                 boolean constructorInvoke = "java/lang/reflect/Constructor".equals(invoke.owner())

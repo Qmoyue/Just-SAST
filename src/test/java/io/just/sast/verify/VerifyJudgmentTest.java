@@ -256,4 +256,26 @@ class VerifyJudgmentTest {
                         + "readClassAndObject|(Lcom/esotericsoftware/kryo/io/Input;)Ljava/lang/Object;||",
                 ParallelVerifier.sourceTriggerSpec(chain));
     }
+
+    @Test
+    void directObjectInputSourceUsesTheNearestGenericCallbackShape() {
+        Chain chain = new Chain("rule", "gadget", "HIGH", "app/Host", "readPayload",
+                "source", "java/lang/reflect/Method", "invoke", java.util.List.of(
+                new io.just.sast.blackboard.ChainHop("app/Gadget", "equals",
+                        "java/lang/reflect/Method", "invoke",
+                        io.just.sast.blackboard.HopKind.DIRECT_CALL, null, "call",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;", null),
+                new io.just.sast.blackboard.ChainHop("java/io/ObjectInputStream", "readObject",
+                        "app/Gadget", "equals", io.just.sast.blackboard.HopKind.NATIVE_CALLBACK,
+                        null, "callback", "(Ljava/lang/Object;)Z", null),
+                new io.just.sast.blackboard.ChainHop("app/Host", "readPayload",
+                        "java/io/ObjectInputStream", "readObject",
+                        io.just.sast.blackboard.HopKind.DIRECT_CALL, null, "call",
+                        "()Ljava/lang/Object;", null),
+                new io.just.sast.blackboard.ChainHop("app/Host", "readPayload",
+                        "app/Host", "readPayload", io.just.sast.blackboard.HopKind.ENTRY,
+                        null, "source", "([B)Ljava/lang/Object;", null)), 0);
+        assertEquals("app/Gadget|equals|equals|java/io/ObjectInputStream|readObject|"
+                        + "()Ljava/lang/Object;||", ParallelVerifier.sourceTriggerSpec(chain));
+    }
 }

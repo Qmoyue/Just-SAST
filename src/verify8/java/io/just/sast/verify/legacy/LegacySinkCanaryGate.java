@@ -8,21 +8,29 @@ public final class LegacySinkCanaryGate {
 
     private static volatile String entryClass;
     private static volatile String entryMethod;
+    private static volatile String entryToken;
     private static volatile boolean reached;
+    private static boolean configured;
 
     private LegacySinkCanaryGate() {
     }
 
-    public static void setEntry(String dottedClass, String method) {
+    public static synchronized void setEntry(String dottedClass, String method, String token) {
+        if (configured || dottedClass == null || method == null || token == null
+                || dottedClass.length() == 0 || method.length() == 0 || token.length() == 0) {
+            return;
+        }
         entryClass = dottedClass;
         entryMethod = method;
+        entryToken = token;
         reached = false;
+        configured = true;
     }
 
-    public static void hit(String spec) {
+    public static void hit(String spec, String token) {
         String ec = entryClass;
         String em = entryMethod;
-        if (ec == null || em == null) {
+        if (ec == null || em == null || entryToken == null || !entryToken.equals(token)) {
             return;
         }
         StackTraceElement[] stack = new Throwable().getStackTrace();

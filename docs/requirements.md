@@ -114,10 +114,10 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 
 截至当前代码：
 
-- `mvn test`：153 项通过，0 失败，2 项环境跳过（本轮最终回归）；
-- Gleipner 全量完成 30 个 block 的扫描和转换，29 个 block 完成 evaluator：全路径变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重基线 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载失败作为环境限制；
-- 默认全量校准语料中，`demo`、`demo2`、`babychain`、`n1cat`、`qiao` 的安全动态结果分别为 `2/3/15`、`2/3/15`、`2/2/16`、`1/0/19`、`2/0/18`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；qiao 使用 Jabba JDK 21；
-- `javamix` 当前工件缺少 WP 文档所述 `InternalDataServiceImpl.processTask`，动态选择的 20 条候选均为 `PARTIAL`，因此不将其它工件的 WP 结果代入；
+- `mvn test`：156 项通过，0 失败，2 项环境跳过（本轮最终回归）；
+- Gleipner 全量完成 30 个 block 的扫描和转换，29 个 block 完成 evaluator：evaluator 原始块级计数为 `TP=219, FP=22`；当前转换器在连续重复方法节点归一化后的语义变体计数为 `TP=186, FP=22`，按 `(块, 入口类)` 去重基线 `TP=126, FP=17`；Windows JNI evaluator 的 native 加载失败作为环境限制；
+- 默认全量校准语料中，`demo`、`demo2`、`babychain`、`javamix`、`n1cat`、`qiao` 的安全动态结果分别为 `2/3/15`、`2/3/15`、`0/2/18`、`1/3/16`、`5/0/15`、`2/0/18`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；qiao 使用 Jabba JDK 21；
+- `javamix` 使用新目录构建出的 `benchmark/javamix/JavaMix/challenge/target/javamix-1.0.0.jar`，不把旧工件或 WP 文档中的类名当作当前输入事实；`babychain` 的前 20 条动态候选尚未命中 sink boundary，`n1cat/qiao` 的边界证据仍偏后，均保留为后续通用优化问题；
 - Windows Gleipner JNI 块缺少 evaluator 对应的 native `.eval.txt`，按环境限制处理；
 - 本机 WSL 不可用，未宣称 Linux evaluator 分数；跨平台验证仍是发布前环境门槛；
 - 大型工件的真实 RSS 峰值尚未建立可复现的外部采样基线，不能宣称严格低内存目标已经达成。
@@ -143,3 +143,16 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 | NFR-12 | 动态验证必须 fail closed，结构化记录精确 JDK、sandbox/canary 能力、终止原因、子进程清理和 native 状态；不执行最终危险 sink |
 | NFR-13 | 报告格式从同一规范化结果模型派生，支持大工件流式写出和稳定 schema；人读 Markdown 与 agent JSON 不得各自重新推导结论 |
 | NFR-14 | 测试覆盖真实子进程边界、跨 JDK/平台、敌意 Jar、确定性、超时/OOM/输出溢出和性能退化；benchmark 语料只作为外部校准，不进入生产特判 |
+
+## 10. 本轮动态与图优化设计约束
+
+| ID | 约束 |
+| --- | --- |
+| SEC-01 | 动态验证的可信终态必须来自 probe 的认证协议；目标 JAR 任意 stdout/stderr 文本、异常消息和普通退出码不能单独形成 `SINK_BLOCKED` 或 `CONCRETE_REACHED` 证据 |
+| SEC-02 | 子 JVM 维持 fork-per-chain、最小环境、独立 cwd/tmp、资源上限、递归清理和 Java deny-by-default；`checkLink`/native load、网络、exec、任意写入和最终 sink 执行均拒绝 |
+| SEC-03 | JDD 只迁移 bottom-up fragment、字段依赖和控制约束思想；它不被当作 OS 沙箱。没有可靠隔离能力时动态验证必须 fail closed |
+| SEC-04 | 验证只证明真实路径到精确 sink 边界，canary 命中后不执行 sink body，不加载目标 native，不连接网络，不生成可直接投递 payload |
+| PERF-01 | indexed CFG/CPG 的存储优化必须保持普通边、跳转、switch、异常、JSR/RET、lambda 和遍历顺序语义等价；删除临时对象前必须有 CFG/扫描回归 |
+| PERF-02 | 任何 fragment summary、worklist、并行或缓存优化必须以方法/类型/字段/控制约束为键，不能按 benchmark、WP、包名或具体类名特判；截断必须进入完整性状态 |
+| PERF-03 | GPU 不进入默认依赖或默认路径；只有 profile 证明适合的同构内核、CPU 等价回归和资源自适应门控全部具备时，才允许作为可选实验后端 |
+| PERF-04 | 性能结论必须同时记录阶段 wall time、报告时 live heap、外部 RSS 峰值（若有）和扫描完整性；不能用减少扫描深度、关闭验证或单次测量宣称提速 |

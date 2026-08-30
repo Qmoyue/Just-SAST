@@ -195,10 +195,20 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                         .comparingInt((Chain chain) -> triggerPriority(chain,
                                 primaryArtifactClasses())).reversed()
                         .thenComparingInt(Chain::unresolvedHops)
-                        .thenComparingInt(chain -> chain.hops().size())
-                        .thenComparing(Chain::key))
+                .thenComparingInt(chain -> chain.hops().size())
+                .thenComparing(Chain::key))
                 .toList();
         List<Map.Entry<String, DeserHost>> hosts = new ArrayList<>(deserHosts.entrySet());
+        Set<String> primaryClasses = primaryArtifactClasses();
+        // The source-host product is bounded by design. A lexical host order lets a large
+        // dependency surface consume the whole first round before an application-defined
+        // deserialization boundary gets a chance to attach a fragment. Put primary-artifact
+        // hosts first, then retain stable key order inside each group. This is provenance
+        // scheduling, not a class/package special case.
+        hosts.sort(java.util.Comparator
+                .comparing((Map.Entry<String, DeserHost> entry) ->
+                        !primaryClasses.contains(entry.getValue().owner()))
+                .thenComparing(Map.Entry::getKey));
         // The old back-chain-first loop let one popular library entry consume the whole
         // source-host budget.  Round-robin scheduling is still deterministic and bounded,
         // but gives each independently discovered deserialization host a chance to attach a
@@ -296,6 +306,41 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (chain.unresolvedHops() == 0) {
             score += 4;
         }
+        // A bounded source-host frontier should spend its first probes on the most
+        // security-relevant continuation, not on whichever library happens to sort first.
+        // This is expressed as capability-family risk (the same semantic categories used by
+        // rules/reports), never as a package, benchmark, or gadget-name preference.
+        score += triggerRiskScore(chain);
+        return score;
+    }
+
+    private static int triggerRiskScore(Chain chain) {
+        String sinkClass = chain.sinkClass() == null ? "" : chain.sinkClass();
+        String category = chain.category() == null ? "" : chain.category();
+        int score = switch (category) {
+            case "JNDI", "REFLECTIVE_INVOKE" -> 12;
+            case "CODE_EXEC" -> 8;
+            case "DESERIALIZE" -> 6;
+            default -> 0;
+        };
+        if (sinkClass.startsWith("javax/naming/") || sinkClass.contains("/jndi/")) {
+            score += 8;
+        } else if (sinkClass.startsWith("java/lang/Runtime")
+                || sinkClass.startsWith("java/lang/ProcessBuilder")) {
+            score += 8;
+        } else if (sinkClass.startsWith("java/lang/reflect/")
+                || sinkClass.startsWith("com/sun/org/apache/xalan")
+                || sinkClass.startsWith("javax/xml/transform")) {
+            score += 6;
+        } else if (sinkClass.startsWith("java/net/")) {
+            score += 3;
+        }
+        score += switch (chain.severity() == null ? "" : chain.severity()) {
+            case "CRITICAL" -> 4;
+            case "HIGH" -> 3;
+            case "MEDIUM" -> 1;
+            default -> 0;
+        };
         return score;
     }
 

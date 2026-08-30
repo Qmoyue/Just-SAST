@@ -38,6 +38,11 @@ import java.util.Set;
  */
 public final class ForwardOrigins {
 
+    @FunctionalInterface
+    interface CallIdLookup {
+        Long find(String methodKey, int offset);
+    }
+
     /** 栈槽：值来源集合 + category-2 标记（long/double 单条目）。 */
     public record Slot(Set<ValueOrigin> origins, boolean cat2) {}
 
@@ -100,17 +105,18 @@ public final class ForwardOrigins {
             if (equals(other)) {
                 return this;
             }
-            List<Slot> mergedStack = new ArrayList<>();
-            int depth = Math.min(stack.length, other.stack.length);
-            for (int i = 0; i < depth; i++) {
+            int stackCount = Math.min(stack.length, other.stack.length);
+            Slot[] mergedStack = new Slot[stackCount];
+            for (int i = 0; i < stackCount; i++) {
                 Slot a = stack[i];
                 Slot b = other.stack[i];
-                mergedStack.add(new Slot(union(a.origins(), b.origins()), a.cat2() || b.cat2()));
+                mergedStack[i] = new Slot(union(a.origins(), b.origins()), a.cat2() || b.cat2());
             }
             int localCount = Math.min(locals.length, other.locals.length);
-            List<Set<ValueOrigin>> mergedLocals = new ArrayList<>(localCount);
+            @SuppressWarnings("unchecked")
+            Set<ValueOrigin>[] mergedLocals = (Set<ValueOrigin>[]) new Set<?>[localCount];
             for (int i = 0; i < localCount; i++) {
-                mergedLocals.add(union(locals[i], other.locals[i]));
+                mergedLocals[i] = union(locals[i], other.locals[i]);
             }
             return new State(mergedStack, mergedLocals);
         }
@@ -145,7 +151,7 @@ public final class ForwardOrigins {
 
     private static final Slot UNKNOWN_SLOT = new Slot(Set.of(new ValueOrigin.Unknown()), false);
 
-    private final Map<String, Long> callIdByKey;
+    private final CallIdLookup callIdLookup;
     private final Map<String, Result> cache = new java.util.concurrent.ConcurrentHashMap<>();
     private final CpgIndex.CfgProvider cfgProvider;
 
@@ -154,7 +160,14 @@ public final class ForwardOrigins {
     }
 
     public ForwardOrigins(Map<String, Long> callIdByKey, CpgIndex.CfgProvider cfgProvider) {
-        this.callIdByKey = callIdByKey;
+        this((methodKey, offset) -> callIdByKey == null ? null
+                : callIdByKey.get(methodKey + "@" + offset), cfgProvider);
+    }
+
+    /** Package-local constructor used by the frozen CPG graph to avoid a string-key lookup
+     * for every invoke instruction in forward interpretation. */
+    ForwardOrigins(CallIdLookup callIdLookup, CpgIndex.CfgProvider cfgProvider) {
+        this.callIdLookup = callIdLookup == null ? (methodKey, offset) -> null : callIdLookup;
         this.cfgProvider = cfgProvider == null ? Cfg::computeIndexed : cfgProvider;
     }
 
@@ -162,10 +175,10 @@ public final class ForwardOrigins {
         String key = CfgKey.of(method);
         // computeIfAbsent 是分析结果的 single owner：反向 sink 并行时同一方法只允许
         // 有一个 CFG/抽象解释任务，避免旧的 get→analyze→put 竞态把最热方法重复算 N 次。
-        return cache.computeIfAbsent(key, ignored -> analyze(method));
+        return cache.computeIfAbsent(key, ignored -> analyze(method, key));
     }
 
-    private Result analyze(MethodInfo method) {
+    private Result analyze(MethodInfo method, String methodKey) {
         // Abstract/native methods can be present in the resolved class model and be reachable
         // through a declaration edge, but they have no bytecode body. There is no offset 0 to
         // interpret; an empty immutable result is the precise summary and keeps callers from
@@ -199,7 +212,7 @@ public final class ForwardOrigins {
             if (state == null) {
                 continue;
             }
-            State out = transfer(method, method.insnAt(offset), state, arrayElements,
+            State out = transfer(method, methodKey, method.insnAt(offset), state, arrayElements,
                     indexedArrayElements);
             for (int edgeIndex = cfg.edgeStart(offset); edgeIndex < cfg.edgeEnd(offset); edgeIndex++) {
                 CfgLabel edgeLabel = cfg.labelAt(edgeIndex);
@@ -232,12 +245,20 @@ public final class ForwardOrigins {
                 .stream().mapToInt(Integer::intValue).sum());
     }
 
-    private State transfer(MethodInfo method, InsnFact insn, State in,
+    private State transfer(MethodInfo method, String methodKey, InsnFact insn, State in,
                            Map<ValueOrigin, Set<ValueOrigin>> arrayElements,
                            Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements) {
+        Op originalOp = insn.op();
+        // These instructions have no abstract-state effect. Returning the immutable input
+        // state avoids two list copies and a pair of backing arrays on the overwhelmingly
+        // common straight-line no-op/terminal path. The successor walk remains unchanged.
+        if (originalOp == Op.NOP || originalOp == Op.GOTO
+                || originalOp == Op.RET || originalOp == Op.RETURN) {
+            return in;
+        }
         List<Slot> stack = new ArrayList<>(Arrays.asList(in.stackArray()));
         List<Set<ValueOrigin>> locals = new ArrayList<>(Arrays.asList(in.localsArray()));
-        Op op = insn.op();
+        Op op = originalOp;
         switch (op) {
             case NOP, GOTO, RET -> {
                 // 无栈变化（RET 读局部变量表中的返回地址，CFG 中无后继）
@@ -288,7 +309,7 @@ public final class ForwardOrigins {
                 if (op != Op.INVOKEDYNAMIC && isReflectiveArraySet(methodRef)) {
                     recordReflectiveArrayWrite(stack, indexedArrayElements, arrayElements);
                 }
-                Long callId = callIdByKey.get(CfgKey.of(method) + "@" + insn.offset());
+                Long callId = callIdLookup.find(methodKey, insn.offset());
                 ValueOrigin.CallResult result = new ValueOrigin.CallResult(callId == null ? -1 : callId);
                 if (op != Op.INVOKEDYNAMIC && isReflectiveArrayGet(methodRef)) {
                     recordReflectiveArrayRead(stack, result, indexedArrayElements, arrayElements);
@@ -500,9 +521,9 @@ public final class ForwardOrigins {
 
     /** 异常边目标状态：栈 = [异常对象]，locals 保留。 */
     private static State exceptionState(State out) {
-        List<Slot> stack = new ArrayList<>(1);
-        stack.add(new Slot(Set.of(new ValueOrigin.Unknown()), false));
-        return new State(stack, out.locals());
+        // State owns immutable array references; transfer always clones them before mutation.
+        // Share locals here instead of materializing a compatibility List and copying it back.
+        return new State(new Slot[]{UNKNOWN_SLOT}, out.localsArray());
     }
 
     /** 规范化 receiver：优先 Param(0)（this），否则取首个来源，保证 memo 键稳定。 */

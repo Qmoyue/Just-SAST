@@ -56,7 +56,8 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             throw new SecurityException("another security manager is already installed");
         }
         List<Path> roots = new ArrayList<Path>();
-        String classPath = System.getProperty("java.class.path", "");
+        String classPath = System.getProperty("just.verify.target-cp",
+                System.getProperty("java.class.path", ""));
         String separator = java.io.File.pathSeparator;
         for (String entry : classPath.split(java.util.regex.Pattern.quote(separator))) {
             if (!entry.isEmpty()) {
@@ -83,12 +84,12 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
         if (permission instanceof NetPermission) {
             // URLClassPath uses this non-network permission while opening jar resources.
-            // It does not grant socket access or URL factory installation; those capabilities
-            // remain denied below/through RuntimePermission. Keeping this JDK plumbing
-            // consistent with the modern verifier avoids framework class-loading false
-            // negatives on Java 8.
+            // It does not grant socket access, but an input JAR must not use it to install
+            // an arbitrary handler. Restrict the compatibility grant to the verifier stack.
             if ("specifyStreamHandler".equals(permission.getName())) {
-                return;
+                if (trustedProbeCaller()) {
+                    return;
+                }
             }
             throw new SecurityException("network permission denied: " + permission.getName());
         }
@@ -100,7 +101,8 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             // Scope markers are not permission grants. During deserialization and proxy
             // callbacks the target frame is still above the probe; only the first
             // non-platform frame may authorize verifier-internal reflection.
-            if (!trustedProbeCaller()) {
+            if (!trustedProbeCaller()
+                    && !(permission instanceof ReflectPermission && trustedLambdaBootstrapCaller())) {
                 throw new SecurityException("reflective/serialization privilege denied: "
                         + permission.getName());
             }
@@ -109,13 +111,30 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         if (permission instanceof RuntimePermission) {
             String name = permission.getName();
             if ("setSecurityManager".equals(name) || name.startsWith("loadLibrary")
-                    || name.startsWith("getenv.") || "createNativeThread".equals(name)
+                    || "createNativeThread".equals(name)
                     || "shutdownHooks".equals(name) || "setIO".equals(name)
                     || "manageProcess".equals(name) || "createClassLoader".equals(name)
                     || "modifyThread".equals(name) || "modifyThreadGroup".equals(name)
                     || "readFileDescriptor".equals(name) || "writeFileDescriptor".equals(name)) {
+                if ("createClassLoader".equals(name) && trustedLambdaBootstrapCaller()) {
+                    return;
+                }
                 throw new SecurityException("runtime permission denied: " + name);
             }
+            if (name.startsWith("getenv.")) {
+                if (Boolean.getBoolean("just.verify.sanitized-env")) {
+                    return;
+                }
+                throw new SecurityException("environment read denied: " + name);
+            }
+        }
+    }
+
+    @Override
+    public void checkPackageAccess(String packageName) {
+        if (packageName != null && (packageName.equals("io.just.sast")
+                || packageName.startsWith("io.just.sast.")) && !trustedProbeCaller()) {
+            throw new SecurityException("verifier package access denied: " + packageName);
         }
     }
 
@@ -133,6 +152,25 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             return isVerifierFrame(frame);
         }
         return false;
+    }
+
+    /** Narrow compatibility allowance for JDK lambda-constructor linkage. */
+    private boolean trustedLambdaBootstrapCaller() {
+        boolean metafactory = false;
+        boolean constructorAccess = false;
+        Class<?>[] context = getClassContext();
+        for (Class<?> frame : context) {
+            String name = frame.getName();
+            if (name.equals("java.lang.invoke.InnerClassLambdaMetafactory")
+                    || name.startsWith("java.lang.invoke.InnerClassLambdaMetafactory$")) {
+                metafactory = true;
+            }
+            if (name.equals("java.lang.reflect.Constructor")
+                    || name.equals("java.lang.reflect.AccessibleObject")) {
+                constructorAccess = true;
+            }
+        }
+        return metafactory && constructorAccess;
     }
 
     static void beginSerializationBootstrap() {
@@ -213,6 +251,11 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
     @Override
     public void checkExec(String cmd) {
         throw new SecurityException("exec denied: " + cmd);
+    }
+
+    @Override
+    public void checkLink(String lib) {
+        throw new SecurityException("native load denied: " + lib);
     }
 
     @Override
@@ -316,8 +359,11 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             while (existing != null && !Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
                 existing = existing.getParent();
             }
-            if (existing == null || existing.equals(lexicalRoot)) {
-                return existing != null;
+            if (existing == null) {
+                return false;
+            }
+            if (existing.equals(lexicalRoot)) {
+                return under(existing.toRealPath(), realRoot);
             }
             return under(existing.toRealPath(), realRoot);
         } catch (Exception denied) {

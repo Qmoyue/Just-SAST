@@ -23,6 +23,7 @@ import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.UUID;
 import io.just.sast.util.AdaptiveParallelism;
 
 /**
@@ -623,7 +624,12 @@ public final class ParallelVerifier {
                     + (sinkDescriptor.isEmpty() ? "" : "|" + sinkDescriptor);
             Path javaExecPath = javaExecutable(runtime.javaHome());
             String javaExec = javaExecPath.toString();
-            String cp = runtimeClasspath(runtime.probeJar()).stream().map(Path::toString)
+            List<Path> classpath = runtimeClasspath(runtime.probeJar());
+            String cp = runtime.probeJar().toAbsolutePath().normalize().toString();
+            String targetCp = classpath.stream()
+                    .filter(entry -> !entry.toAbsolutePath().normalize()
+                            .equals(runtime.probeJar().toAbsolutePath().normalize()))
+                    .map(Path::toString)
                     .collect(java.util.stream.Collectors.joining(File.pathSeparator));
             Path canaryBootstrap = runtime.feature() < 17
                     ? legacyBootstrapCanaryJar(runtime.probeJar()) : bootstrapCanaryJar();
@@ -640,6 +646,8 @@ public final class ParallelVerifier {
             String agentSpec = chain.sinkClass() + "#" + chain.sinkMethod()
                     + (sinkDescriptor.isEmpty() ? "" : "#" + sinkDescriptor);
             String entrySpec = entryDotted + "#" + entryMethod;
+            // The result marker and the bytecode canary share one per-child capability token.
+            String protocolToken = UUID.randomUUID().toString();
             FieldDependencyPlan plan = FieldDependencyPlan.from(
                     chain, mode);
 
@@ -674,6 +682,7 @@ public final class ParallelVerifier {
             command.add("-Duser.country=US");
             command.add("-Djava.util.prefs.userRoot=" + isoDir.resolve("prefs"));
             command.add("-Djava.util.prefs.systemRoot=" + isoDir.resolve("system-prefs"));
+            command.add("-Djust.verify.sanitized-env=true");
             command.add("-Djava.awt.headless=true");
             command.add("-Djava.net.useSystemProxies=false");
             // The probe jar must remain in the launcher loader for the agent/main class, but
@@ -681,15 +690,17 @@ public final class ParallelVerifier {
             // classpath entry to omit so target code cannot resolve Just helper classes through
             // its context loader.
             command.add("-Djust.verify.probe-jar=" + runtime.probeJar().toAbsolutePath());
+            command.add("-Djust.verify.target-cp=" + targetCp);
             if (runtime.feature() < 17) {
                 // The Java 17 scanner jar cannot be loaded by an old target JVM. The separate
                 // verifier8 artifact contains only Java 8-compatible probe/agent classes.
                 command.add("-javaagent:" + runtime.probeJar().toAbsolutePath()
                         + "=" + canaryBootstrap + "|"
-                        + entrySpec + "|" + agentSpec);
+                        + entrySpec + "|" + agentSpec + "|" + protocolToken);
             } else {
                 command.add("-javaagent:" + runtime.probeJar().toAbsolutePath() + "="
-                        + canaryBootstrap + "|" + entrySpec + "|" + agentSpec);
+                        + canaryBootstrap + "|" + entrySpec + "|" + agentSpec + "|"
+                        + protocolToken);
             }
             command.add("-cp");
             command.add(cp);
@@ -697,7 +708,7 @@ public final class ParallelVerifier {
                     ? "io.just.sast.verify.legacy.LegacyChainVerifyProbe"
                     : "io.just.sast.verify.ChainVerifyProbe");
             command.add(entryDotted + "|" + entryMethod + "|" + mode + "|" + entryDescriptor);
-            command.add(plan.encodedFields());
+            command.add(plan.encodedFieldsForProbe());
             command.add(sinkTarget);
             // An unresolved reflective target is a request for a bounded, sink-derived
             // data shape in the child probe. It is an internal protocol bit, not a public
@@ -707,6 +718,9 @@ public final class ParallelVerifier {
             // build an in-memory callback collection for the source boundary; this is a
             // verification adapter only and never writes an attacker payload artifact.
             command.add(sourceTriggerSpec(chain));
+            // The result marker is correlated per child attempt. Target stdout/stderr is
+            // diagnostic only and cannot be parsed as a verification state.
+            command.add(protocolToken);
             ProcessBuilder pb = new ProcessBuilder(command);
             pb.directory(isoDir.toFile());
             pb.redirectErrorStream(true);
@@ -732,31 +746,25 @@ public final class ParallelVerifier {
             if (capture.overflow()) {
                 return new VerifyResult(chain.key(), "UNTESTABLE", "probe-output-limit");
             }
-            // redirectErrorStream 合并了 stderr——先剥离 JVM 警告行（如 canary 追加 bootstrap
-            // classpath 触发的 CDS sharing 警告），再取首个已知判定行
+            // redirectErrorStream 合并了 stderr。只接受带本次 token 的 probe marker；目标
+            // 工件可以任意写 stdout/stderr，普通文本永远不能升级为动态证据。
             String firstLine = null;
             String firstAny = null;
             for (String line : output.split("\\R")) {
                 String trimmed = line.strip();
-                if (trimmed.isEmpty() || trimmed.startsWith("OpenJDK")
-                        || trimmed.startsWith("Java HotSpot") || trimmed.startsWith("WARNING")
-                        || trimmed.startsWith("Warning")) {
+                if (trimmed.isEmpty()) {
                     continue;
                 }
                 if (firstAny == null) {
                     firstAny = trimmed;
                 }
-                if (trimmed.startsWith("SINK_BLOCKED") || trimmed.startsWith("SINK_TRIGGERED")
-                        || trimmed.startsWith("CONCRETE_REACHED") || trimmed.startsWith("EXECUTED")
-                        || trimmed.startsWith("SANDBOX_UNAVAILABLE")
-                        || trimmed.startsWith("UNTESTABLE") || trimmed.startsWith("PARTIAL_PATH")) {
-                    firstLine = trimmed;
+                String status = authenticatedStatus(trimmed, protocolToken);
+                if (status != null) {
+                    firstLine = status;
                     break;
                 }
             }
-            if (firstLine == null) {
-                firstLine = firstAny == null ? "" : firstAny;
-            }
+            if (firstLine == null) firstLine = "";
             if (firstLine.startsWith("SINK_BLOCKED") || firstLine.startsWith("SINK_TRIGGERED")) {
                 if (callback != null) callback.onConfirmed(chain, firstLine, true);
                 return new VerifyResult(chain.key(), "SINK_BLOCKED", "SINK_CANARY_BOUNDARY",
@@ -782,9 +790,12 @@ public final class ParallelVerifier {
             int exit = proc.exitValue();
             if (exit != 0) {
                 return new VerifyResult(chain.key(), "PARTIAL",
-                        "exit=" + exit + " " + firstLine);
+                        "exit=" + exit + " probe-no-authenticated-status"
+                                + (firstAny == null ? "" : " diagnostic=" + firstAny));
             }
-            return new VerifyResult(chain.key(), "FAILED", "no trigger");
+            return new VerifyResult(chain.key(), "FAILED",
+                    "no-authenticated-probe-status"
+                            + (firstAny == null ? "" : " diagnostic=" + firstAny));
 
         } catch (Exception e) {
             if (e instanceof InterruptedException) {
@@ -793,13 +804,38 @@ public final class ParallelVerifier {
             return new VerifyResult(chain.key(), "UNTESTABLE",
                     e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
         } finally {
-            if (proc != null && proc.isAlive()) {
+            // A target is denied Runtime.exec/ProcessBuilder, but a library can still create
+            // an already-running descendant before the permission gate is consulted. Always
+            // perform the bounded cleanup pass after normal exit as well as on timeout; the
+            // cleanup routine only invokes taskkill while the root is alive, avoiding PID reuse
+            // races for an already-reaped process.
+            if (proc != null) {
                 killProcessTree(proc);
             }
             // 每条链一个隔离 cwd/tmp；不能只清理共享的 fat-jar 展开目录，否则批量扫描会
             // 在系统临时目录留下大量 just-verify-* 目录。
             deleteQuietly(isoDir);
         }
+    }
+
+    /** Extract only a status emitted by the probe for this exact child attempt. */
+    static String authenticatedStatus(String line, String token) {
+        if (line == null || token == null || token.isBlank()) {
+            return null;
+        }
+        String prefix = "JUST_VERIFY_V1:" + token + ":";
+        if (!line.startsWith(prefix)) {
+            return null;
+        }
+        String status = line.substring(prefix.length());
+        return isProtocolStatus(status) ? status : null;
+    }
+
+    private static boolean isProtocolStatus(String status) {
+        return status.startsWith("SINK_BLOCKED") || status.startsWith("SINK_TRIGGERED")
+                || status.startsWith("CONCRETE_REACHED") || status.startsWith("EXECUTED")
+                || status.startsWith("SANDBOX_UNAVAILABLE") || status.startsWith("UNTESTABLE")
+                || status.startsWith("PARTIAL_PATH");
     }
 
     /** 优先使用 Chain 的真实 sink 描述符；兼容旧构造的 Chain 时从调用跳回退推断。 */
@@ -854,20 +890,31 @@ public final class ParallelVerifier {
             // The adapter class is a JDK collection, never a target gadget, and the callback
             // is inert; no benchmark or application name is consulted here.
             ChainHop directSource = null;
+            int directSourceIndex = -1;
             // Hops are stored sink→entry and a source seed is not necessarily represented by
             // an explicit entry→source call edge.  Keep the last parsed OIS/Kryo read edge,
             // which is the one closest to the source boundary in that ordering.
-            for (ChainHop hop : chain.hops()) {
+            for (int i = 0; i < chain.hops().size(); i++) {
+                ChainHop hop = chain.hops().get(i);
                 if (isDirectSourceMethod(hop.toOwner(), hop.toName())) {
                     directSource = hop;
+                    directSourceIndex = i;
                 } else if (isDirectSourceMethod(hop.fromOwner(), hop.fromName())) {
                     directSource = new ChainHop(hop.fromOwner(), hop.fromName(),
                             hop.fromOwner(), hop.fromName(), hop.kind(), hop.field(),
                             hop.reason(), hop.desc(), hop.argOrdinal());
+                    directSourceIndex = i;
                 }
             }
             if (directSource == null) {
                 return "";
+            }
+            ChainHop callback = callbackAfterSource(chain.hops(), directSourceIndex);
+            if (callback != null) {
+                String kind = callbackKind(callback.toName());
+                return String.join("|", callback.toOwner(), callback.toName(), kind,
+                        directSource.toOwner(), directSource.toName(),
+                        directSource.desc() == null ? "" : directSource.desc(), "", "");
             }
             return String.join("|", "java/util/ArrayList", "toString", "toString",
                     directSource.toOwner(), directSource.toName(),
@@ -905,6 +952,43 @@ public final class ParallelVerifier {
                 source.toOwner(), source.toName(), source.desc() == null ? "" : source.desc(),
                 downstreamOwner == null ? "" : downstreamOwner,
                 downstreamMethod == null ? "" : downstreamMethod);
+    }
+
+    /**
+     * Recover the first callback immediately downstream of a direct source from the reverse
+     * path. This is the small reusable part of JDD's IOCD-guided construction: the source
+     * adapter can serialize a callback object in a matching inert container instead of always
+     * serializing an unrelated ArrayList. If no callback is represented, the conservative
+     * generic adapter remains in use.
+     */
+    private static ChainHop callbackAfterSource(List<ChainHop> hops, int sourceIndex) {
+        if (hops == null || sourceIndex <= 0) {
+            return null;
+        }
+        for (int i = sourceIndex - 1; i >= 0; i--) {
+            ChainHop candidate = hops.get(i);
+            if (callbackKind(candidate.toName()) != null
+                    && candidate.toOwner() != null && !candidate.toOwner().isBlank()) {
+                return candidate;
+            }
+            if (callbackKind(candidate.fromName()) != null
+                    && candidate.fromOwner() != null && !candidate.fromOwner().isBlank()) {
+                return new ChainHop(candidate.toOwner(), candidate.toName(),
+                        candidate.fromOwner(), candidate.fromName(), candidate.kind(),
+                        candidate.field(), candidate.reason(), candidate.desc(), candidate.argOrdinal());
+            }
+        }
+        return null;
+    }
+
+    private static String callbackKind(String method) {
+        if (method == null) {
+            return null;
+        }
+        return switch (method) {
+            case "hashCode", "equals", "compareTo", "compare", "toString" -> method;
+            default -> null;
+        };
     }
 
     private static boolean isSourceEntryKind(String entryKind) {
@@ -1096,10 +1180,12 @@ public final class ParallelVerifier {
         }
         try {
             ProcessHandle root = process.toHandle();
+            List<ProcessHandle> snapshot = new ArrayList<>();
+            root.descendants().forEach(snapshot::add);
             // ProcessHandle.descendants() is a snapshot and can miss a child that is being
             // spawned during timeout cleanup. Windows' built-in tree termination closes that
             // race for the root PID; the ProcessHandle path remains the portable fallback.
-            if (isWindows()) {
+            if (isWindows() && process.isAlive()) {
                 try {
                     Process taskkill = new ProcessBuilder("taskkill", "/PID",
                             Long.toString(root.pid()), "/T", "/F")
@@ -1111,6 +1197,14 @@ public final class ParallelVerifier {
                     }
                 }
             }
+            snapshot.forEach(child -> {
+                try {
+                    child.destroyForcibly();
+                } catch (RuntimeException ignored) {
+                }
+            });
+            // Re-snapshot after taskkill: descendants created in the small timeout-cleanup
+            // window are not necessarily present in the first snapshot.
             root.descendants().forEach(child -> {
                 try {
                     child.destroyForcibly();

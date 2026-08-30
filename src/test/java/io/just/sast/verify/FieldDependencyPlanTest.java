@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 字段依赖计划契约：分析路径与探针编码使用同一稳定字段流。 */
 class FieldDependencyPlanTest {
@@ -38,5 +39,19 @@ class FieldDependencyPlanTest {
                         HopKind.DIRECT_CALL, null, "call", "()V", null)), 0);
         FieldDependencyPlan plan = FieldDependencyPlan.from(chain, "SERIAL");
         assertEquals("app/Entry.value=app/Gadget", plan.encodedFields());
+    }
+
+    @Test
+    void probeEncodingIsDelimiterSafeAndDeduplicated() {
+        Chain chain = new Chain("R", "C", "HIGH", "app/Entry", "readObject", "readObject",
+                "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Entry", "read,Object", "app/Entry", "value=part",
+                        HopKind.FIELD_FLOW, "value,=part", "field-read", "", null),
+                new ChainHop("app/Entry", "read,Object", "app/Entry", "value=part",
+                        HopKind.FIELD_FLOW, "value,=part", "field-read", "", null)), 0);
+        FieldDependencyPlan plan = FieldDependencyPlan.from(chain, "SERIAL");
+        assertEquals(1, plan.fields().size());
+        assertTrue(plan.encodedFieldsForProbe().startsWith("v2;"));
+        assertTrue(plan.encodedFieldsForProbe().contains("value,=part"));
     }
 }

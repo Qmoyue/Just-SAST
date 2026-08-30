@@ -7,6 +7,8 @@ import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.HandleRef;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.util.JustLogger;
 
@@ -28,6 +30,18 @@ public final class CallGraphBuilder {
     private static final String LAMBDA_METAFACTORY = "java/lang/invoke/LambdaMetafactory";
 
     private final ClassHierarchy hierarchy;
+    /**
+     * Many bytecode call sites share the same erased receiver/name/descriptor. Resolving the
+     * same subtype closure and visibility predicate once per hierarchy revision avoids a large
+     * repeated allocation/lookup cost without changing the candidate set or its order.
+     */
+    private final Map<DispatchKey, DispatchPlan> dispatchCache = new HashMap<>();
+
+    private record DispatchKey(String kind, String owner, String name, String descriptor,
+                               long hierarchyRevision) {}
+
+    private record DispatchPlan(List<String> targets, boolean fallback, boolean skipped,
+                                int candidateCount) {}
 
     public CallGraphBuilder(ClassHierarchy hierarchy) {
         this.hierarchy = hierarchy;
@@ -35,6 +49,7 @@ public final class CallGraphBuilder {
 
     /** 返回添加的调用边数。 */
     public int build(Graph graph) {
+        dispatchCache.clear();
         int edgeCount = 0;
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             String kind = call.strProp("invokeKind");
@@ -61,36 +76,16 @@ public final class CallGraphBuilder {
     }
 
     private int addVirtual(Graph graph, Node call, String owner, String name, String desc) {
-        String declared = hierarchy.resolveMethod(owner, name, desc);
-        // 传递子类型闭包（ClassHierarchy 记忆化；直接子类 + 所有孙类）：深继承链中的覆写方法同样获得分发边
-        List<String> subtypes = hierarchy.transitiveSubtypes(owner);
-        if (declared == null && subtypes.isEmpty()) {
-            graph.addEdge(call, graph.methodNode(owner, name, desc, true), EdgeType.INVOKES, "VIRTUAL");
-            return 1;
+        DispatchPlan plan = dispatchPlan("VIRTUAL", owner, name, desc);
+        if (plan.skipped()) {
+            call.propsNote("dispatchSkipped", plan.candidateCount());
         }
-        Set<String> targets = new LinkedHashSet<>();
-        if (declared != null) {
-            targets.add(declared);
-        }
-        if (subtypes.size() > DISPATCH_CAP) {
-            call.propsNote("dispatchSkipped", subtypes.size());
-        } else {
-            for (String sub : subtypes) {
-                String resolved = hierarchy.resolveMethod(sub, name, desc);
-                // 可见性剪枝（FLASH, USENIX'25）：private/static/跨包 package-private 不可覆写，非真实分发目标
-                // 包比较基准 = 被覆写方法的声明类（declared），非调用点静态类型
-                String overrideRef = declared != null ? declared : owner;
-                if (resolved != null && hierarchy.isOverridableDispatchTarget(overrideRef, sub, name, desc)) {
-                    targets.add(resolved);
-                }
-            }
-        }
-        if (targets.isEmpty()) {
+        if (plan.fallback()) {
             graph.addEdge(call, graph.methodNode(owner, name, desc, true), EdgeType.INVOKES, "VIRTUAL");
             return 1;
         }
         int count = 0;
-        for (String target : targets) {
+        for (String target : plan.targets()) {
             graph.addEdge(call, graph.methodNode(target, name, desc, false), EdgeType.DISPATCHES, "VIRTUAL");
             count++;
         }
@@ -98,35 +93,73 @@ public final class CallGraphBuilder {
     }
 
     private int addInterface(Graph graph, Node call, String owner, String name, String desc) {
-        String declared = hierarchy.resolveMethod(owner, name, desc);
-        List<String> impls = hierarchy.implementers(owner, DISPATCH_CAP);
-        Set<String> targets = new LinkedHashSet<>();
-        if (declared != null) {
-            targets.add(declared);
+        DispatchPlan plan = dispatchPlan("INTERFACE", owner, name, desc);
+        if (plan.skipped()) {
+            call.propsNote("dispatchSkipped", plan.candidateCount() < 0
+                    ? "implementers-over-cap" : plan.candidateCount());
         }
-        if (impls != null) {
-            for (String impl : impls) {
-                String resolved = hierarchy.resolveMethod(impl, name, desc);
-                // 可见性剪枝（FLASH, USENIX'25）：private/static/跨包 package-private 不可覆写，非真实分发目标
-                // 包比较基准 = 被覆写方法的声明类（declared），非调用点静态类型
-                String overrideRef = declared != null ? declared : owner;
-                if (resolved != null && hierarchy.isOverridableDispatchTarget(overrideRef, impl, name, desc)) {
-                    targets.add(resolved);
-                }
-            }
-        } else {
-            call.propsNote("dispatchSkipped", "implementers-over-cap");
-        }
-        if (targets.isEmpty()) {
+        if (plan.fallback()) {
             graph.addEdge(call, graph.methodNode(owner, name, desc, true), EdgeType.INVOKES, "INTERFACE");
             return 1;
         }
         int count = 0;
-        for (String target : targets) {
+        for (String target : plan.targets()) {
             graph.addEdge(call, graph.methodNode(target, name, desc, false), EdgeType.DISPATCHES, "INTERFACE");
             count++;
         }
         return count;
+    }
+
+    private DispatchPlan dispatchPlan(String kind, String owner, String name, String desc) {
+        DispatchKey key = new DispatchKey(kind, owner, name, desc, hierarchy.revision());
+        DispatchPlan cached = dispatchCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        String declared = hierarchy.resolveMethod(owner, name, desc);
+        Set<String> targets = new LinkedHashSet<>();
+        if (declared != null) {
+            targets.add(declared);
+        }
+        boolean skipped = false;
+        int candidateCount = 0;
+        if ("VIRTUAL".equals(kind)) {
+            List<String> subtypes = hierarchy.transitiveSubtypes(owner);
+            candidateCount = subtypes.size();
+            if (subtypes.size() > DISPATCH_CAP) {
+                skipped = true;
+            } else {
+                for (String sub : subtypes) {
+                    String resolved = hierarchy.resolveMethod(sub, name, desc);
+                    String overrideRef = declared != null ? declared : owner;
+                    if (resolved != null
+                            && hierarchy.isOverridableDispatchTarget(overrideRef, sub, name, desc)) {
+                        targets.add(resolved);
+                    }
+                }
+            }
+        } else {
+            List<String> implementers = hierarchy.implementers(owner, DISPATCH_CAP);
+            if (implementers == null) {
+                skipped = true;
+                candidateCount = -1;
+            } else {
+                candidateCount = implementers.size();
+                for (String impl : implementers) {
+                    String resolved = hierarchy.resolveMethod(impl, name, desc);
+                    String overrideRef = declared != null ? declared : owner;
+                    if (resolved != null
+                            && hierarchy.isOverridableDispatchTarget(overrideRef, impl, name, desc)) {
+                        targets.add(resolved);
+                    }
+                }
+            }
+        }
+        DispatchPlan result = targets.isEmpty()
+                ? new DispatchPlan(List.of(), true, skipped, candidateCount)
+                : new DispatchPlan(List.copyOf(targets), false, skipped, candidateCount);
+        dispatchCache.put(key, result);
+        return result;
     }
 
     private int addLambda(Graph graph, Node call, InvokeDynamicRef indy) {

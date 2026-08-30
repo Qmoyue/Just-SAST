@@ -15,6 +15,7 @@ import io.just.sast.blackboard.HopKind;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /** 子 JVM 的环境边界是动态验证的用户可见安全契约。 */
 class ParallelVerifierTest {
@@ -31,6 +32,21 @@ class ParallelVerifierTest {
         assertEquals(ParallelVerifier.VerifyStatus.UNKNOWN, unknown.statusCode());
         assertEquals("UNKNOWN", unknown.evidence(),
                 "未知状态不得被当作动态正向证据");
+    }
+
+    @Test
+    void onlyTheCurrentProbeTokenCanProduceAStatus() {
+        assertEquals("SINK_BLOCKED: java.lang.Runtime",
+                ParallelVerifier.authenticatedStatus(
+                        "JUST_VERIFY_V1:attempt-token:SINK_BLOCKED: java.lang.Runtime",
+                        "attempt-token"));
+        assertNull(ParallelVerifier.authenticatedStatus(
+                "SINK_BLOCKED: java.lang.Runtime", "attempt-token"));
+        assertNull(ParallelVerifier.authenticatedStatus(
+                "JUST_VERIFY_V1:other-token:SINK_BLOCKED: java.lang.Runtime",
+                "attempt-token"));
+        assertNull(ParallelVerifier.authenticatedStatus(
+                "JUST_VERIFY_V1:attempt-token:NOT_A_STATUS", "attempt-token"));
     }
 
     @Test

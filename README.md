@@ -1,255 +1,114 @@
 # Just
 
-Just 是一个面向 Java JAR/WAR 的轻量字节码分析器，专注于发现反序列化 gadget 利用链。
-它把 ASM 前端、可解释的调用/控制流分析、规则驱动的知识源、链校准和安全动态验证组合成一个可直接运行的 CLI JAR。
+Just 是面向 Java JAR/WAR 的轻量级反序列化 gadget 链扫描器，目标是用较低的运行成本提供可解释、可复核的漏洞挖掘结果。
 
-Just 的输出目标是一条可审计的证据链：
+## 能力与架构
 
 ```text
-反序列化入口 → 触发机制 → gadget 片段 → 数据/字段流 → 危险 sink
+JAR/WAR/class 目录
+        ↓
+JarReader + ASM 前端
+        ↓
+语义 CPG / CFG / 调用图 / 数据流索引
+        ↓
+Blackboard 知识源（规则、污点、框架语义、链组合）
+        ↓
+链校准与安全动态前缀验证
+        ↓
+CSV / JSON / SARIF / HTML / Markdown
 ```
 
-它适合真实开源依赖审计、CTF 题目分析和研究型回归。它不是运行时防护产品，也不会默认生成或执行武器化 payload。
+- 支持普通 JAR、Spring Boot fat JAR、WAR、class 目录和外部依赖。
+- 覆盖 Java 原生序列化及常见替代反序列化框架，分析字段流、回调、反射、代理、lambda、继承和 sink 可达性。
+- 规则位于 `src/main/resources/rules/default-rules.yaml`；知识源通过 `KnowledgeSource`、Blackboard 和 ServiceLoader 扩展。
+- 动态验证在独立子 JVM 中执行真实前置触发链，在精确 sink 边界由 canary 阻断；不执行最终 sink、命令、网络、native 或可直接投递的 payload。
 
-## 当前能力
-
-| 能力 | 说明 |
-| --- | --- |
-| 输入 | JAR、WAR、class 目录；支持 Spring Boot `BOOT-INF`、WAR `WEB-INF` 和嵌套依赖 |
-| 静态分析 | ASM 字节码事实、语义 CPG 索引、调用图、按需方法内 CFG、字段流、前/后向污点、反射、lambda、数组和继承回调 |
-| 反序列化语义 | 原生 `ObjectInputStream`、`readObject`/`readObjectNoData`/`readExternal`/`readResolve`，以及 Kryo、Fastjson、Jackson、Hessian 系等替代框架入口 |
-| 链语义 | 集合触发、动态代理、JavaBean setter、反射调用、模板/类加载、JNI/native 和 JRMP/RMI 能力边界 |
-| 规则 | sink、source、magic-entry、model、chain-fragment 五类 YAML 规则；通过 ServiceLoader 扩展知识源 |
-| 动态验证 | 每条候选链独立子 JVM、真实序列化/触发模式和 sink canary；到达精确 sink 边界后停止，不执行 sink 方法体 |
-| 输出 | 分类的 CSV、JSON、SARIF 2.1.0、HTML、Markdown，以及人/agent 可读的 payload 视图、动态汇总和安全 payload plan |
-
-### 设计取舍
-
-- **轻量交付**：单模块、单 CLI JAR，不依赖外部服务；运行时依赖为 ASM、picocli 和 SnakeYAML。
-- **静态与动态分层**：静态分析负责覆盖和解释，动态验证只增加可观察证据，不会把验证失败当成静态否定。
-- **规则即数据**：新增或调整攻击面优先修改 YAML；分析引擎只负责通用语义。
-- **确定性**：任务键、路径代表和报告排序都有稳定全序；并行不会改变链身份或结果顺序。
-- **目标 JDK 保真**：通过 `--jdk-home` 挂载与目标字节码匹配的 JDK，Java 8 使用 `rt.jar`，Java 9+ 使用 `jrt-fs`。
-- **按需 CPG**：保留轻量、稳定的字节码语义核心；CFG、异常、字段/值流和调用关系按查询需求展开并共享索引，不为每条指令预先创建重型图对象。
-- **安全默认值**：动态验证只使用 canary 和默认输入，不发送网络请求、不加载 native 库、不执行命令，也不输出可直接使用的攻击字节流。
-
-## 快速开始
-
-### 构建
+## 构建与快速使用
 
 需要 JDK 17+ 和 Maven 3.6+：
 
 ```bash
 mvn package -DskipTests
-java -jar target/just-sast-0.2.0.jar --help
+java -jar target/just-sast-0.2.0.jar scan --jar app.jar --jdk-home /path/to/jdk
 ```
 
 Windows + Jabba 示例：
 
 ```powershell
-jabba ls
-java -jar target/just-sast-0.2.0.jar scan `
-  --jar path\to\app.jar `
+java -jar target\just-sast-0.2.0.jar scan `
+  --jar app.jar `
   --jdk-home C:\Users\<user>\.jabba\jdk\<matching-jdk> `
   --output just-out
 ```
 
-### 扫描
-
-默认扫描会加载目标 JDK，并对高置信度候选执行有界动态验证：
+目标依赖不在工件内时：
 
 ```bash
-java -jar target/just-sast-0.2.0.jar scan --jar app.jar
-```
-
-常用补充：
-
-```bash
-# 目标依赖不在工件内时补充 classpath
 java -jar target/just-sast-0.2.0.jar scan \
-  --jar app.jar --deps lib/a.jar,lib/b.jar
-
-# 指定目标 JDK；生产审计建议显式指定
-java -jar target/just-sast-0.2.0.jar scan \
-  --jar app.jar --jdk-home /opt/jdk8 --stats
-
-# 仅在受限环境或诊断时使用；可能降低完整性
-java -jar target/just-sast-0.2.0.jar scan --jar app.jar --fast
-
-# 关闭动态验证，只保留静态报告
-java -jar target/just-sast-0.2.0.jar scan --jar app.jar --no-verify
+  --jar app.jar --deps lib/a.jar,lib/b.jar --output just-out
 ```
 
-`--fast` 和 `--no-verify` 都不是默认路径。前者跳过 JDK 全量加载，后者会失去动态证据；两者产生的报告都应结合完整性状态阅读。
+## CLI 参数
 
-输入支持：
+根命令：
 
-- 普通 JAR、Spring Boot fat JAR、WAR；
-- `BOOT-INF/classes`、`BOOT-INF/lib`、`WEB-INF/classes`、`WEB-INF/lib` 的嵌套内容；
-- 已展开的 class 目录；
-- `--deps` 指定的外部 JAR 或目录。
+| 参数 | 作用 |
+| --- | --- |
+| `-h`, `--help` | 显示帮助 |
+| `-V`, `--version` | 显示版本 |
 
-解析优先级为目标工件、显式依赖、目标 JDK。缺失类、解析失败、展开上限和分析预算会记录到完整性报告，而不是静默当作“没有漏洞”。
+### `scan`
 
-### 对比扫描
+用法：`just-sast scan --jar=<jar|dir> [选项]`
 
-```bash
-java -jar target/just-sast-0.2.0.jar diff old-output new-output
-```
-
-`diff` 以 `rule_id + 入口 + sink` 组成链身份，不依赖并行顺序或变体序号；它会报告新增、消失、变更和不变链。
-
-## CLI 选项
-
-| 选项 | 默认值 | 用途 |
+| 参数 | 默认值 | 作用 |
 | --- | --- | --- |
-| `--jar <path>` | 必填 | JAR/WAR/class 目录 |
-| `--deps <path,...>` | 无 | 补充依赖 classpath |
-| `--jdk-home <dir>` | 当前运行时 JDK | 指定目标 JDK/JRE |
-| `--output <dir>` | `just-out` | 输出目录 |
-| `--rules <file>` | 内置规则 | 自定义 YAML 规则 |
-| `--verify-budget <N>` | `20` | 动态验证候选数上限 |
-| `--fast` | 关闭 | 跳过 JDK 全量加载 |
-| `--no-verify` | 关闭 | 关闭子进程动态验证 |
+| `--jar=<jar|dir>` | 必填 | 目标 JAR、WAR 或 class 目录；支持 Spring Boot fat JAR |
+| `--deps=<jar|dir,...>` | 无 | 补充依赖，多个路径以逗号分隔 |
+| `--jdk-home=<dir>` | 当前运行时 JDK | 指定目标 JDK/JRE；Java 8 使用 `rt.jar`，Java 9+ 使用 `jrt-fs` |
+| `--output=<dir>` | `just-out` | 报告输出目录 |
+| `--rules=<file>` | 内置规则 | 指定自定义规则 YAML |
+| `--verify-budget=<N>` | `20` | 动态验证候选链数量预算；同一入口类最多验证 2 条 |
 | `--stats` | 关闭 | 将阶段统计写入 stderr |
+| `--fast` | 关闭 | 不加载目标 JDK 运行库全量；可能导致链不完整 |
+| `--no-verify` | 关闭 | 关闭子进程动态验证，只保留静态结果 |
 
-退出码：`0` 成功，`2` 参数/输入错误，`3` 扫描内部错误。
+完整审计建议保留默认扫描，不使用 `--fast` 或 `--no-verify`。退出码为：`0` 成功，`2` 参数/输入错误，`3` 扫描内部错误。
 
-## 分析管线
+### `diff`
+
+```bash
+java -jar target/just-sast-0.2.0.jar diff <old-dir> <new-dir>
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `<old-dir>` | 旧扫描输出目录 |
+| `<new-dir>` | 新扫描输出目录 |
+
+`diff` 按 `rule_id + 入口 + sink` 对比链的新增、消失、变化和不变状态。
+
+## 输出与动态状态
 
 ```text
-JAR/WAR/classpath
-       │
-       ▼
-JarReader → ASM frontend → Just model
-                              │
-                              ▼
-       冻结的语义 CPG 核心 + 按需 CFG/数据流关系索引
-                              │
-                              ▼
-                     Blackboard 调度
-              ┌───────────────┴───────────────┐
-              │                               │
-       ANALYSIS（并行）                 COMPOSITION
-   backward / forward / OIS          object graph / fragments /
-   framework bridge                  semantic composer
-              └───────────────┬───────────────┘
-                              ▼
-                         CALIBRATION
-                  validate / prune / safe-config /
-                  patterns / dynamic verification
-                              │
-                              ▼
-                分类报告目录 + 人类可读链路视图
+just-out/
+├─ index.md
+├─ findings/       # 主发现及 CSV/JSON/SARIF/HTML/Markdown
+├─ verification/   # 动态汇总与 payload.md/json
+├─ evidence/       # 链、边、sink 和校准证据
+└─ meta/           # 扫描元数据与构造计划
 ```
 
-边界是单向的：ASM 只出现在 frontend；知识源通过 Blackboard 共享事实和事件；知识源之间不直接调用；规则描述攻击面，engine 实现通用推理。
+- `SINK_BLOCKED`：真实前置链抵达精确 sink 边界，canary 已阻断 sink 方法体。
+- `CONCRETE_REACHED`：抵达安全观察点，但尚未观察到精确 sink 边界。
+- `PARTIAL`：只完成部分构造或触发，不能据此否定静态候选。
+- `UNTESTABLE`：缺类、JDK、权限或运行时能力导致无法验证。
 
-静态层包含：
+`payload.md/json` 是人和 agent 可读的安全构造计划与证据视图，不是可执行 exploit。JVM 权限门不等价于 OS 沙箱；处理不可信工件时仍应使用低权限账户、无网络环境及容器或虚拟机隔离。
 
-- 可见性约束和传递子类型分发；
-- 反射目标解析、JavaBean 读写方法、动态代理 handler 和 lambda 实现；
-- 方法内 CFG、异常边、数组元素、字段来源和 receiver 类型约束；
-- `readObject` 家族、`resolveClass`/`resolveProxyClass`、框架反序列化 source；
-- 入口距离调度、路径代表稳定化、预算截断和完整性原因。
+## Gleipner 摘要
 
-分析结果不是“命中一个危险 API 就报警”。每条链都保留入口、sink、规则 ID、逐跳路径、字段流、未解析跳和校准原因。
-
-## 动态验证与安全边界
-
-动态验证是安全 canary 验证器，不是通用 exploit runner。它验证真实的序列化/反序列化前置链、触发器和 sink 可达性，在危险能力的最后一个安全观察边界阻断：
-
-1. 从静态证据中选择有限候选，同一入口类最多两条；
-2. 每条链 fork 独立 JVM，使用隔离工作目录/tmp、超时和内存限制；
-3. 依据链上的字段流构造对象图，并使用 `HashMap`、`TreeSet`、`List.contains`、序列化往返或代理等对应触发模式；
-4. 通过 Java agent 在精确 sink 入口插入 canary；命中后抛出门卫异常，危险 sink 方法体不继续执行；
-5. 将每条链的状态、证据、尝试次数、失败原因和能力限制写入报告。
-
-状态含义：
-
-| 状态 | 含义 |
-| --- | --- |
-| `SINK_BLOCKED` | 真实触发链到达精确 sink 边界，canary 阻断危险方法体；这是最高动态证据 |
-| `CONCRETE_REACHED` | 真实序列化/触发前缀到达安全观察点，但尚未到达精确 sink 边界 |
-| `EXECUTED` | 入口被实际调用并返回，但没有 sink 命中证据 |
-| `PARTIAL` | 对象构造或触发路径只完成了一部分 |
-| `FAILED` | 验证进程失败；不能推翻静态候选 |
-| `UNTESTABLE` | 缺类、JDK/权限/native/运行时能力等导致无法测试 |
-
-JVM 权限门不是 OS 沙箱。扫描不可信 JAR 时，应额外使用容器或虚拟机、低权限账户、只读输入和无网络环境。JDK 24+ 不应依赖已移除的 Security Manager 提供进程隔离。当前轮次不引入 Docker/WSL 运行时依赖；Just 不会为了验证真实漏洞而执行命令、连接远端、加载 native 库或生成可直接武器化 payload。
-
-## 输出契约
-
-| 文件 | 内容 |
-| --- | --- |
-| `index.md` | 扫描导航、摘要、状态解释和产物入口 |
-| `findings/*` | `findings.csv/json/sarif/html/md`，主链与人工审查报告 |
-| `verification/*` | `payload.md/json` 和 `dynamic-verification.json`，真实触发证据与人/agent 可读 payload 视图 |
-| `evidence/*` | `chains.csv`、`edges.csv`、`sinks.csv`、`calibrations.csv`、`dormant.md`，完整审计细节 |
-| `meta/*` | `scan-metadata.json`、`payload-plan.json`，扫描元数据和不可执行构造计划 |
-
-重要判读：`PARTIAL` 表示扫描或验证边界被触发，不表示“没有漏洞”；`EXECUTED` 不等于 sink 到达；只有 `SINK_BLOCKED` 才表示真实触发链观察到精确 sink 边界。`payload.md` 用类似 ysoserial 的逐跳表示帮助人工复核，但它不是可直接投递的攻击字节流。
-
-## 规则与扩展
-
-规则文件位于 `src/main/resources/rules/default-rules.yaml`。规则分五类：
-
-- `sink`：危险调用点及其 tainted 参数；
-- `magic-entry`：序列化回调和特殊入口；
-- `source`：替代反序列化框架入口及安全配置；
-- `model`：声明式参数、返回值和 receiver 传递；
-- `chain-fragment`：可复用的公开链片段。
-
-最小示例：
-
-```yaml
-rules:
-  - id: EXAMPLE-EXEC
-    kind: sink
-    category: CODE_EXEC
-    severity: HIGH
-    match:
-      call: {owner: "java/lang/Runtime", name: "exec"}
-    tainted: [{arg: 0}]
-
-  - id: EXAMPLE-MODEL
-    kind: model
-    match:
-      call: {owner: "java/util/Map", name: "put"}
-    actions: {this: [arg1]}
-```
-
-新增知识源实现 `KnowledgeSource`，声明 `phase`、`priority` 和 `interests`，再通过 ServiceLoader 注册。规则和知识源都必须使用通用语义，不得按题目名、JAR 名、包名、类名或 WP 文本增加分支。
-
-## 当前验证状态
-
-仓库当前回归基线：
-
-- `mvn test`：153 项通过，0 失败，2 项环境跳过（本轮最终回归）；
-- Gleipner 全量：30 个 block 均完成扫描和转换，29 个可评测 block 的全变体块级 `TP=219, FP=22`，按 `(块, 入口类)` 去重基线为 `TP=126, FP=17`；JNI block 在 Windows evaluator 上受 native 加载路径限制，按环境限制记录；
-- 默认完整校准语料的实际动态结果如下（列顺序为 `SINK_BLOCKED / CONCRETE_REACHED+EXECUTED / PARTIAL`）：
-
-  | 语料 | 静态候选链 | 动态结果 |
-  | --- | ---: | --- |
-  | `demo` | 8,368 | `2 / 3 / 15` |
-  | `demo2` | 8,373 | `2 / 3 / 15` |
-  | `babychain` | 9,036 | `2 / 2 / 16` |
-  | `javamix`（当前 JAR） | 21,635 | `0 / 0 / 20` |
-  | `n1cat` | 6,137 | `1 / 0 / 19` |
-  | `qiao`（JDK 21） | 2,841 | `2 / 0 / 18` |
-
-- `demo`、`demo2`、`babychain`、`n1cat`、`qiao` 均有静态证据和安全动态 sink-boundary 证据；`javamix` 当前 JAR 不含 WP 文档所述的 `InternalDataServiceImpl.processTask`，20 条动态候选均为 `PARTIAL`，因此不伪造 WP 确认结果；
-- 上述六个样本均按默认完整扫描执行；`qiao` 显式使用仓库中的 Jabba JDK 21，未通过 `--fast` 或 `--no-verify` 降级；扫描耗时会随 JVM、磁盘、并行度和系统负载变化，不将单次耗时写成性能承诺；
-- 报告中的 `heap_used_mb` 是 JVM 报告时 live heap，`heap_peak_mb` 是 JVM heap pool 峰值，不是 OS RSS 峰值；大型工件的真实 RSS 仍需独立采样验证。
-
-Gleipner 本地基准和 CTF 语料属于开发者本地资产，不随仓库发布。Windows 上 native evaluator 缺失对应 `.eval.txt` 时，结果会如实标记为环境限制；本机 WSL 不可用，因此没有把 Linux evaluator 结果当作本轮通过项。
-
-## 已知边界
-
-- 静态分析在大型、强反射、深层对象图和复杂框架输入下会触发有界预算；报告会公开截断原因。
-- 动态验证需要匹配的 JDK、依赖和可加载类；框架入口、JNI/JRMP、复杂代理可能只能得到 `PARTIAL` 或 `UNTESTABLE`。
-- `payload.md/json` 是对安全构造计划和证据的可读渲染，不是 ysoserial 风格的可执行 payload 生成器。
-- 生产部署必须提供 OS/容器级隔离；JVM 内权限门不能替代它。
+当前本地回归完成 30 个 block 的扫描与转换，其中 29 个完成 evaluator：原始块级计数为 `TP=219, FP=22`；报告转换器对连续重复方法节点归一化后为 `TP=186, FP=22`，按入口类去重为 `TP=126, FP=17`。Windows JNI block 受 evaluator 原生库加载路径限制，按环境不可用记录，不改变 Just 默认不加载 native 的安全边界。benchmark 语料、评测产物和临时结果均由 `.gitignore` 排除，不随仓库提交。
 
 ## 开发
 
@@ -258,6 +117,4 @@ mvn test
 mvn package -DskipTests
 ```
 
-项目结构和模块边界见 [docs/architecture.md](docs/architecture.md)，需求、验收和安全边界见 [docs/requirements.md](docs/requirements.md)，协作约束见 [AGENTS.md](AGENTS.md)。
-
-许可证为 GPLv3，见 [LICENSE](LICENSE)；第三方依赖见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+架构与安全边界见 [docs/architecture.md](docs/architecture.md)，需求与验收见 [docs/requirements.md](docs/requirements.md)，协作规范见 [AGENTS.md](AGENTS.md)。许可证为 GPLv3，见 [LICENSE](LICENSE)。

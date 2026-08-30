@@ -2,7 +2,7 @@ package io.just.sast.verify.boot;
 
 /**
  * sink canary 门卫（bootstrap classloader，无任何依赖）：
- * 插桩后的 sink 方法入口统一调用 {@link #hit(String)}——仅当调用栈上存在本链入口类#入口方法帧
+ * 插桩后的 sink 方法入口统一调用 {@link #hit(String, String)}——仅当调用栈上存在本链入口类#入口方法帧
  * 时抛出 {@link SinkReachedError}，否则静默放行。
  *
  * 必须设门卫的原因：java.lang.reflect.Constructor#newInstance、java.net.URL#openConnection、
@@ -14,23 +14,34 @@ public final class SinkCanaryGate {
 
     private static volatile String entryClass;
     private static volatile String entryMethod;
+    private static volatile String entryToken;
     private static volatile boolean reached;
+    private static boolean configured;
 
     private SinkCanaryGate() {
     }
 
-    /** agent premain 注册本链入口（点分类名 + 方法名）。 */
-    public static void setEntry(String dottedClass, String method) {
+    /** Agent premain registers the one-shot entry and per-child canary token. */
+    public static synchronized void setEntry(String dottedClass, String method, String token) {
+        // The gate is bootstrap-visible, so an input class could otherwise reset it after
+        // premain and manufacture a positive result. Each verifier child handles exactly one
+        // chain; one-shot arming removes that mutation surface without a second dependency.
+        if (configured || dottedClass == null || method == null || token == null
+                || dottedClass.isEmpty() || method.isEmpty() || token.isEmpty()) {
+            return;
+        }
         entryClass = dottedClass;
         entryMethod = method;
+        entryToken = token;
         reached = false;
+        configured = true;
     }
 
-    /** sink 入口调用：栈上存在入口帧 → 抛标记；否则放行。 */
-    public static void hit(String spec) {
+    /** Sink entry call: an authenticated token plus the entry frame is required. */
+    public static void hit(String spec, String token) {
         String ec = entryClass;
         String em = entryMethod;
-        if (ec == null || em == null) {
+        if (ec == null || em == null || entryToken == null || !entryToken.equals(token)) {
             return;
         }
         StackTraceElement[] stack = new Throwable().getStackTrace();
