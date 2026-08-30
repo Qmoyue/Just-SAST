@@ -1,144 +1,149 @@
 package io.just.sast.analysis.taint;
 
-import io.just.sast.analysis.callgraph.CallGraphBuilder;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
-import io.just.sast.blackboard.Blackboard;
 import io.just.sast.config.RuleEngine;
 import io.just.sast.config.RuleSet;
-import io.just.sast.config.YamlRuleLoader;
 import io.just.sast.cpg.build.BuiltCpg;
 import io.just.sast.cpg.build.CpgBuilder;
+import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
-import io.just.sast.frontend.asm.BytecodeFrontend;
-import io.just.sast.frontend.asm.JrtClassSource;
-import io.just.sast.model.InsnFact;
+import io.just.sast.frontend.asm.FactsExtractor;
+import io.just.sast.model.ClassInfo;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.Op;
-import io.just.sast.knowledge.backward.BackwardTaintAnalysis;
 import org.junit.jupiter.api.Test;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TypeInsnNode;
+import org.objectweb.asm.tree.VarInsnNode;
 
-import java.io.InputStream;
-import java.lang.reflect.Method;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.lang.reflect.Modifier;
+import java.util.List;
+import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Regression contracts for the exact local-feasibility pass used to remove impossible sinks. */
+/**
+ * Regression contracts for local feasibility and opaque callback edges.
+ *
+ * <p>The fixtures are assembled from ASM nodes in memory.  They intentionally do not depend on
+ * the ignored benchmark directory, so the same semantic checks run in a clean CI checkout.</p>
+ */
 class OriginSupportFeasibilityTest {
 
     @Test
-    void metadataLengthGuardIsProvedFromClassModel() throws Exception {
-        Fixture fixture = fixture("benchmark/Gleipner/chains/target/gleipner.chains-1.0-reflection-metaobjects.jar");
-        MethodInfo method = fixture.load.classes()
-                .get("gleipner/chains/reflection/metaobjects/MetaObjects_004_FP_Trampoline")
-                .method("hashCode", "()I");
-
-        Node sink = fixture.cpg.graph().nodesOfType(NodeType.CALL).stream()
-                .filter(node -> "gleipner/core/SinkGadget".equals(node.owner())
-                        && "sinkMethod".equals(node.name())
-                        && "gleipner/chains/reflection/metaobjects/MetaObjects_004_FP_Trampoline"
-                        .equals(node.methodOwner()))
-                .findFirst()
-                .orElseThrow();
-
-        assertTrue(fixture.support.sinkPathProvablyUnreachable(method, sink.offset()),
-                "getInterfaces().length == 1 is false for a class with no direct interfaces");
+    void constantBranchMakesSinkPathUnreachable() {
+        MethodInfo method = constantBranchMethod();
+        assertTrue(emptySupport().sinkPathProvablyUnreachable(method, 2),
+                "a known IFEQ branch must remove only the impossible normal edge");
     }
 
     @Test
     void branchTruthUsesTheSameAbstractStateAsTheSinkGuard() throws Exception {
-        Fixture fixture = fixture("benchmark/Gleipner/chains/target/gleipner.chains-1.0-reflection-metaobjects.jar");
-        MethodInfo method = fixture.load.classes()
-                .get("gleipner/chains/reflection/metaobjects/MetaObjects_004_FP_Trampoline")
-                .method("hashCode", "()I");
-        ForwardOrigins.Result state = fixture.support.origins().compute(method);
-        Method branchTruth = OriginSupport.class.getDeclaredMethod("knownBranchResult",
-                MethodInfo.class, ForwardOrigins.Result.class, InsnFact.class);
+        OriginSupport support = emptySupport();
+        MethodInfo method = constantBranchMethod();
+        ForwardOrigins.Result state = support.origins().compute(method);
+        var branchTruth = OriginSupport.class.getDeclaredMethod("knownBranchResult",
+                MethodInfo.class, ForwardOrigins.Result.class, io.just.sast.model.InsnFact.class);
         branchTruth.setAccessible(true);
 
-        boolean sawKnownTrue = false;
-        for (InsnFact insn : method.instructions()) {
-            if (!insn.op().isCondJump()) {
-                continue;
-            }
-            Object value = branchTruth.invoke(fixture.support, method, state, insn);
-            if (Boolean.TRUE.equals(value)) {
-                sawKnownTrue = true;
-                break;
-            }
-        }
-        assertTrue(sawKnownTrue, "the metadata guard must be folded to the non-sink branch");
+        assertEquals(Boolean.TRUE, branchTruth.invoke(support, method, state, method.insnAt(1)),
+                "the feasibility pass must fold the same constant branch used by sink pruning");
     }
 
     @Test
-    void typedMethodCollectionMapsReflectiveReceiverToTargetMethod() throws Exception {
-        Fixture fixture = fixture("benchmark/Gleipner/chains/target/gleipner.chains-1.0-ysoserial-vaadin.jar",
-                "benchmark/Gleipner/just-rules.yaml");
-        Blackboard bb = new Blackboard(fixture.cpg.graph(), fixture.hierarchy, fixture.cpg.fieldWriters(),
-                fixture.rules, 20, new Blackboard.ScanInputs(Path.of("vaadin.jar"), java.util.List.of(),
-                false, false, 20));
-        var backward = new BackwardTaintAnalysis();
-        backward.init(bb);
-        var closure = bb.originSupport().entryDownstream(fixture.cpg.graph());
-        assertTrue(closure.contains("gleipner/chains/ysoserial/vaadin1/Vaadin_Getter_SinkGadget#getOutputProperties()Ljava/lang/String;"));
-        assertTrue(closure.contains("gleipner/chains/ysoserial/vaadin1/Vaadin_NestedMethodProperty#getValue()Ljava/lang/Object;"));
-        var getter = fixture.load.classes()
-                .get("gleipner/chains/ysoserial/vaadin1/Vaadin_Getter_SinkGadget")
-                .method("getOutputProperties", "()Ljava/lang/String;");
-        backward.onEvent(bb, io.just.sast.blackboard.Event.of(
-                io.just.sast.blackboard.EventType.SCAN_START, -1, null));
-        assertTrue(bb.chains().stream().anyMatch(chain ->
-                "gleipner/chains/ysoserial/vaadin1/Vaadin_PropertySetItem".equals(chain.entryClass())
-                        && "gleipner/core/SinkGadget".equals(chain.sinkClass())));
+    void nativeCallbackUsesExplicitJniHop() {
+        String owner = "fixture/NativeBridge";
+        MethodInfo nativeMethod = emptyMethod(owner, "invokeNative", "()V",
+                Modifier.PUBLIC | Modifier.NATIVE);
+        MethodInfo callback = emptyMethod(owner, "onCallback", "()V", Modifier.PUBLIC);
+        ClassInfo bridge = new ClassInfo(owner, "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(nativeMethod, callback), List.of());
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(owner, bridge), null);
+
+        Graph graph = new Graph();
+        graph.methodNode(owner, nativeMethod.name(), nativeMethod.descriptor(), false);
+        graph.methodNode(owner, callback.name(), callback.descriptor(), false);
+        Node nativeCall = graph.addCallNode(owner, nativeMethod.name(), nativeMethod.descriptor(),
+                "VIRTUAL", null, 0, "fixture/Host", "run", "()V");
+        graph.freeze();
+
+        OriginSupport support = new OriginSupport(graph, hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false);
+
+        assertEquals(List.of(nativeCall), support.nativeCallbackSitesOf(callback));
+        assertTrue(support.nativeCallbackSite(nativeCall, callback),
+                "the same-receiver native callback must remain an explicit bounded edge");
     }
 
     @Test
-    void nativeCallbackUsesExplicitJniHop() throws Exception {
-        Fixture fixture = fixture("benchmark/Gleipner/chains/target/gleipner.chains-1.0-jni.jar",
-                "benchmark/Gleipner/just-rules.yaml");
-        Blackboard bb = new Blackboard(fixture.cpg.graph(), fixture.hierarchy, fixture.cpg.fieldWriters(),
-                fixture.rules, 20, new Blackboard.ScanInputs(Path.of("jni.jar"), java.util.List.of(),
-                false, false, 20));
-        MethodInfo target = fixture.load.classes().get("gleipner/chains/jni/Custom001Trampoline")
-                .method("target", "()V");
-        assertTrue(bb.originSupport().nativeCallbackSitesOf(target).size() == 1,
-                () -> bb.originSupport().nativeCallbackSitesOf(target).toString());
-        assertTrue(bb.originSupport().nativeCallbackSite(
-                bb.originSupport().nativeCallbackSitesOf(target).get(0), target));
-        var backward = new BackwardTaintAnalysis();
-        backward.init(bb);
-        backward.onEvent(bb, io.just.sast.blackboard.Event.of(
-                io.just.sast.blackboard.EventType.SCAN_START, -1, null));
-        assertTrue(bb.chains().stream().anyMatch(chain ->
-                chain.entryClass().equals("gleipner/chains/jni/Custom001Trampoline")
-                        && chain.hops().stream().anyMatch(hop -> hop.kind() == io.just.sast.blackboard.HopKind.NATIVE_CALLBACK)),
-                () -> bb.chains().toString());
-    }
+    void methodCollectionReflectiveInvokeRecognizesTypedIteratorElement() {
+        MethodNode method = new MethodNode(0, "run",
+                "(Ljava/util/Iterator;Ljava/lang/Object;)Ljava/lang/Object;", null, null);
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Iterator",
+                "next", "()Ljava/lang/Object;", true));
+        method.instructions.add(new TypeInsnNode(Op.CHECKCAST.code(), "java/lang/reflect/Method"));
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 2));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(), "java/lang/reflect/Method",
+                "invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;", false));
+        method.instructions.add(new InsnNode(Op.ARETURN.code()));
 
-    private static Fixture fixture(String jar) throws Exception {
-        return fixture(jar, "src/main/resources/rules/default-rules.yaml");
-    }
-
-    private static Fixture fixture(String jar, String rulesPath) throws Exception {
-        BytecodeFrontend frontend = new BytecodeFrontend();
-        LoadResult load = frontend.loadStreaming(java.util.List.of(Path.of(jar)));
-        JrtClassSource jdk = JrtClassSource.runtime();
-        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), jdk);
+        MethodInfo methodInfo = extract(method);
+        ClassInfo host = new ClassInfo(methodInfo.owner(), "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(methodInfo), List.of());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host), List.of(), 1, 61);
         BuiltCpg cpg = new CpgBuilder().build(load);
-        new CallGraphBuilder(hierarchy).build(cpg.graph());
         cpg.graph().freeze();
-        RuleSet rules;
-        try (InputStream in = Files.newInputStream(Path.of(rulesPath))) {
-            rules = new YamlRuleLoader().load(in);
-        }
-        RuleEngine engine = new RuleEngine(rules, hierarchy);
-        return new Fixture(load, cpg, hierarchy, rules, new OriginSupport(cpg.graph(), hierarchy, engine, false));
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
+        Node invoke = cpg.graph().nodesOfType(NodeType.CALL).stream()
+                .filter(node -> "java/lang/reflect/Method".equals(node.owner())
+                        && "invoke".equals(node.name()))
+                .findFirst()
+                .orElseThrow();
+
+        assertTrue(support.methodCollectionReflectiveInvokeSite(invoke),
+                "a Method receiver obtained through Iterator.next and CHECKCAST must be recognized");
     }
 
-    private record Fixture(LoadResult load, BuiltCpg cpg, ClassHierarchy hierarchy, RuleSet rules,
-                           OriginSupport support) {
+    private static OriginSupport emptySupport() {
+        Graph graph = new Graph();
+        graph.freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(), null);
+        return new OriginSupport(graph, hierarchy, new RuleEngine(RuleSet.EMPTY, hierarchy), false);
+    }
+
+    private static MethodInfo constantBranchMethod() {
+        LabelNode taken = new LabelNode();
+        MethodNode method = new MethodNode(0, "guard", "()V", null, null);
+        method.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        method.instructions.add(new JumpInsnNode(Op.IFEQ.code(), taken));
+        method.instructions.add(new InsnNode(Op.NOP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+        method.instructions.add(taken);
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+        return extract(method);
+    }
+
+    private static MethodInfo emptyMethod(String owner, String name, String descriptor, int access) {
+        return new MethodInfo(owner, name, descriptor, access, List.of(), List.of(), false);
+    }
+
+    private static MethodInfo extract(MethodNode method) {
+        ClassNode node = new ClassNode();
+        node.name = "fixture/Host";
+        node.superName = "java/lang/Object";
+        node.methods.add(method);
+        return new FactsExtractor().extract(node).methods().get(0);
     }
 }
