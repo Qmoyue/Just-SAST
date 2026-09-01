@@ -20,13 +20,18 @@ public final class PayloadConstructor {
 
     private static final int MAX_DEPTH = 5;
     private static final int MAX_FIELDS = 20;
+    private static final int MAX_RESULT_CACHE = 8192;
 
     private final ClassLoader loader;
     /** 当前递归路径，而不是整个扫描调用的全局 visited；共享字段类型不能被误判为环。 */
     private final Set<String> active = new HashSet<>();
     /** 构造可行性只依赖类结构；同一入口常对应大量候选链，跨链复用解析和字段遍历。 */
     private final Map<String, Class<?>> classCache = new HashMap<>();
-    private final Map<String, ConstructionResult> resultCache = new HashMap<>();
+    /** Depth is part of the key: a result computed near the root has more budget than one
+     * reached at the depth boundary and must not be reused in the latter context. */
+    private record ConstructionKey(String className, int depth) {}
+    private final Map<ConstructionKey, ConstructionResult> resultCache = new HashMap<>();
+    private final java.util.ArrayDeque<ConstructionKey> resultOrder = new java.util.ArrayDeque<>();
 
     public PayloadConstructor(ClassLoader loader) {
         this.loader = loader;
@@ -34,6 +39,9 @@ public final class PayloadConstructor {
 
     /** 尝试构造链的入口对象。 */
     public ConstructionResult tryConstruct(String entryClassDotted) {
+        if (entryClassDotted == null || entryClassDotted.isBlank()) {
+            return new ConstructionResult("SKIP", "invalid-entry-class");
+        }
         active.clear();
         return tryInstantiate(entryClassDotted, 0);
     }
@@ -46,7 +54,8 @@ public final class PayloadConstructor {
             return new ConstructionResult("CONSTRUCTIBLE", "cycle-ok");
         }
         try {
-            ConstructionResult cached = resultCache.get(className);
+            ConstructionKey cacheKey = new ConstructionKey(className, depth);
+            ConstructionResult cached = resultCache.get(cacheKey);
             if (cached != null) {
                 return cached;
             }
@@ -106,13 +115,13 @@ public final class PayloadConstructor {
             }
             if (unfillable.isEmpty()) {
                 ConstructionResult result = new ConstructionResult("CONSTRUCTIBLE", className);
-                resultCache.put(className, result);
+                cacheResult(cacheKey, result);
                 return result;
             }
             ConstructionResult result = new ConstructionResult("PARTIALLY_CONSTRUCTIBLE",
                     className + " unfillable:" + String.join(",", unfillable));
             if (!depthLimited) {
-                resultCache.put(className, result);
+                cacheResult(cacheKey, result);
             }
             return result;
         } catch (LinkageError e) {
@@ -123,5 +132,16 @@ public final class PayloadConstructor {
         } finally {
             active.remove(className);
         }
+    }
+
+    private void cacheResult(ConstructionKey key, ConstructionResult result) {
+        if (key == null || result == null || resultCache.containsKey(key)) {
+            return;
+        }
+        while (resultCache.size() >= MAX_RESULT_CACHE && !resultOrder.isEmpty()) {
+            resultCache.remove(resultOrder.removeFirst());
+        }
+        resultCache.put(key, result);
+        resultOrder.addLast(key);
     }
 }

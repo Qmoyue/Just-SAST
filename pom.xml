@@ -55,6 +55,14 @@
       <artifactId>snakeyaml</artifactId>
       <version>${snakeyaml.version}</version>
     </dependency>
+    <!-- Windows Job Object support for the optional OS-isolated verifier parent. The
+         Java-8 probe artifact does not include this dependency; the parent owns the
+         operating-system attachment before releasing the child probe. -->
+    <dependency>
+      <groupId>net.java.dev.jna</groupId>
+      <artifactId>jna-platform</artifactId>
+      <version>5.7.0</version>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
@@ -110,6 +118,18 @@
               <outputDirectory>${project.build.directory}/verify8-classes</outputDirectory>
             </configuration>
           </execution>
+          <execution>
+            <id>unpack-asm-for-test-probe</id>
+            <phase>process-test-classes</phase>
+            <goals>
+              <goal>unpack-dependencies</goal>
+            </goals>
+            <configuration>
+              <includeArtifactIds>asm</includeArtifactIds>
+              <includeScope>runtime</includeScope>
+              <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+            </configuration>
+          </execution>
         </executions>
       </plugin>
       <plugin>
@@ -117,6 +137,44 @@
         <artifactId>maven-jar-plugin</artifactId>
         <version>3.4.2</version>
         <executions>
+          <!-- mvn test runs before package. Build the same agent-capable probe JAR at
+               process-test-classes so dynamic contract tests do not silently become
+               verifier-artifact-missing. The package execution below remains the release
+               artifact used by the CLI. -->
+          <execution>
+            <id>test-probe</id>
+            <phase>process-test-classes</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+            <configuration>
+              <classifier>testprobe</classifier>
+              <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+              <archive>
+                <manifestEntries>
+                  <Premain-Class>io.just.sast.verify.SinkCanaryAgent</Premain-Class>
+                  <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                </manifestEntries>
+              </archive>
+            </configuration>
+          </execution>
+          <execution>
+            <id>test-java8-verifier</id>
+            <phase>process-test-classes</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+            <configuration>
+              <classifier>verify8</classifier>
+              <classesDirectory>${project.build.directory}/verify8-classes</classesDirectory>
+              <archive>
+                <manifestEntries>
+                  <Premain-Class>io.just.sast.verify.legacy.LegacySinkCanaryAgent</Premain-Class>
+                  <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                </manifestEntries>
+              </archive>
+            </configuration>
+          </execution>
           <execution>
             <id>package-java8-verifier</id>
             <phase>package</phase>

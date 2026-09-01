@@ -1,5 +1,6 @@
 package io.just.sast.config;
 
+import io.just.sast.blackboard.ObjectGraphPlan;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
@@ -98,8 +99,15 @@ public final class YamlRuleLoader {
         }
         String category = requiredString(ruleMap, "category", "sink 规则 " + id + " 缺少 category");
         String severity = requiredString(ruleMap, "severity", "sink 规则 " + id + " 缺少 severity");
+        Object roleValue = ruleMap.containsKey("role") ? ruleMap.get("role") : ruleMap.get("sinkRole");
+        Rule.SinkRole role;
+        try {
+            role = Rule.SinkRole.parse(roleValue == null ? null : roleValue.toString());
+        } catch (IllegalArgumentException invalidRole) {
+            throw new IOException("sink 规则 " + id + " 的 role 无效: " + invalidRole.getMessage(), invalidRole);
+        }
         return new Rule.SinkRule(id, category, severity,
-                callMatcher, List.copyOf(tainted));
+                callMatcher, List.copyOf(tainted), role);
     }
 
     private static String requiredString(Map<?, ?> map, String key, String message) throws IOException {
@@ -141,9 +149,15 @@ public final class YamlRuleLoader {
             implementsType = requiredString(classMap, "implements",
                     "magic-entry 规则 " + id + " 的 class.implements 不能为空");
         }
-        return new Rule.MagicEntryRule(id,
-                requiredString(ruleMap, "entryKind", "magic-entry 规则 " + id + " 缺少 entryKind"),
-                methodMatcher, implementsType);
+        String entryKind = requiredString(ruleMap, "entryKind", "magic-entry 规则 " + id + " 缺少 entryKind");
+        String direction = str(ruleMap, "direction");
+        if (direction != null && !direction.equalsIgnoreCase("deserialize")
+                && !direction.equalsIgnoreCase("serialize")
+                && !direction.equalsIgnoreCase("lifecycle")) {
+            throw new IOException("magic-entry 规则 " + id
+                    + " 的 direction 只能是 deserialize/serialize/lifecycle");
+        }
+        return new Rule.MagicEntryRule(id, entryKind, methodMatcher, implementsType, direction);
     }
 
     @SuppressWarnings("unchecked")
@@ -183,7 +197,47 @@ public final class YamlRuleLoader {
         if (!"serialize".equalsIgnoreCase(bridge) && !"deserialize".equalsIgnoreCase(bridge)) {
             throw new IOException("source 规则 " + id + " 的 bridge 只能是 serialize 或 deserialize");
         }
-        return new Rule.SourceRule(id, bridge, callMatcher, safeConfig);
+        List<Rule.TaintedPos> tainted = parseOptionalTainted(ruleMap, "source 规则 " + id);
+        return new Rule.SourceRule(id, bridge, callMatcher, safeConfig, tainted);
+    }
+
+    /** source 的 tainted 为空表示无条件入口；出现该字段时必须是非空位置列表。 */
+    private static List<Rule.TaintedPos> parseOptionalTainted(Map<?, ?> ruleMap, String context)
+            throws IOException {
+        Object raw = ruleMap.get("tainted");
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list) || list.isEmpty()) {
+            throw new IOException(context + " 的 tainted 必须是非空列表");
+        }
+        List<Rule.TaintedPos> result = new ArrayList<>(list.size());
+        Set<String> seen = new java.util.HashSet<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> position)) {
+                throw new IOException(context + " 的 tainted 项必须是 map");
+            }
+            boolean receiver = Boolean.TRUE.equals(position.get("receiver"));
+            Object arg = position.get("arg");
+            if (receiver == (arg != null)) {
+                throw new IOException(context + " 的 tainted 项必须恰好指定 receiver 或 arg");
+            }
+            if (receiver) {
+                if (!seen.add("receiver")) {
+                    throw new IOException(context + " 的 tainted 位置重复: receiver");
+                }
+                result.add(Rule.TaintedPos.Receiver.INSTANCE);
+            } else if (arg instanceof Number number && number.intValue() >= 0) {
+                String key = "arg" + number.intValue();
+                if (!seen.add(key)) {
+                    throw new IOException(context + " 的 tainted 位置重复: " + key);
+                }
+                result.add(new Rule.TaintedPos.Arg(number.intValue()));
+            } else {
+                throw new IOException(context + " 的 tainted arg 必须是非负整数");
+            }
+        }
+        return List.copyOf(result);
     }
 
     @SuppressWarnings("unchecked")
@@ -252,8 +306,135 @@ public final class YamlRuleLoader {
         if (isBlank(entryClass) || isBlank(sinkOwner) || isBlank(sinkName) || hops.isEmpty()) {
             throw new IOException("chain-fragment 规则 " + id + " 缺少 entryClass/sinkOwner/sinkName/hops");
         }
+        ObjectGraphPlan constructionPlan = parseConstructionPlan(id, ruleMap.get("construction"));
         return new Rule.FragmentRule(id, entryClass, entryKind == null ? "readObject" : entryKind,
-                List.copyOf(hops), sinkOwner, sinkName, sinkDescriptor);
+                List.copyOf(hops), sinkOwner, sinkName, sinkDescriptor, constructionPlan);
+    }
+
+    /**
+     * Parse the bounded object-shape DSL used by safe verification.  It intentionally has no
+     * expression/evaluation form: nodes are allocate/proxy/constructor records and field values
+     * are typed literals or references to another node.
+     */
+    private static ObjectGraphPlan parseConstructionPlan(String id, Object raw) throws IOException {
+        if (raw == null) {
+            return null;
+        }
+        if (!(raw instanceof Map<?, ?> plan)) {
+            throw new IOException("chain-fragment 规则 " + id + " 的 construction 必须是映射");
+        }
+        List<ObjectGraphPlan.Node> nodes = new ArrayList<>();
+        Object rawNodes = plan.get("nodes");
+        if (rawNodes != null) {
+            if (!(rawNodes instanceof List<?> list)) {
+                throw new IOException("chain-fragment 规则 " + id + " 的 construction.nodes 必须是列表");
+            }
+            for (Object rawNode : list) {
+                if (!(rawNode instanceof Map<?, ?> node)) {
+                    throw new IOException("chain-fragment 规则 " + id + " 的 construction node 必须是映射");
+                }
+                String nodeId = requireText(node, "id", "chain-fragment 规则 " + id + " construction node");
+                String type = requireText(node, "type", "chain-fragment 规则 " + id + " construction node");
+                String kindText = str(node, "kind");
+                ObjectGraphPlan.NodeKind kind;
+                try {
+                    kind = kindText == null ? ObjectGraphPlan.NodeKind.ALLOCATE
+                            : ObjectGraphPlan.NodeKind.valueOf(kindText.trim().toUpperCase(java.util.Locale.ROOT));
+                } catch (IllegalArgumentException invalidKind) {
+                    throw new IOException("chain-fragment 规则 " + id + " construction node kind 无效: "
+                            + kindText, invalidKind);
+                }
+                nodes.add(new ObjectGraphPlan.Node(nodeId, type, kind,
+                        parseValues(id, node.get("args"), "construction node args", true)));
+            }
+        }
+        List<ObjectGraphPlan.FieldAssignment> fields = new ArrayList<>();
+        Object rawFields = plan.get("fields");
+        if (rawFields != null) {
+            if (!(rawFields instanceof List<?> list)) {
+                throw new IOException("chain-fragment 规则 " + id + " 的 construction.fields 必须是列表");
+            }
+            for (Object rawField : list) {
+                if (!(rawField instanceof Map<?, ?> field)) {
+                    throw new IOException("chain-fragment 规则 " + id + " 的 construction field 必须是映射");
+                }
+                String owner = requireText(field, "owner", "chain-fragment 规则 " + id + " construction field");
+                String name = requireText(field, "field", "chain-fragment 规则 " + id + " construction field");
+                Object rawValues = field.containsKey("values") ? field.get("values") : field.get("value");
+                List<ObjectGraphPlan.Value> values = parseValues(id, rawValues,
+                        "construction field values", false);
+                fields.add(new ObjectGraphPlan.FieldAssignment(owner, name, values));
+            }
+        }
+        if (nodes.isEmpty() && fields.isEmpty()) {
+            throw new IOException("chain-fragment 规则 " + id + " 的 construction 不能为空");
+        }
+        try {
+            return new ObjectGraphPlan(nodes, fields);
+        } catch (IllegalArgumentException invalidPlan) {
+            throw new IOException("chain-fragment 规则 " + id + " 的 construction 无效: "
+                    + invalidPlan.getMessage(), invalidPlan);
+        }
+    }
+
+    private static List<ObjectGraphPlan.Value> parseValues(String id, Object raw,
+                                                            String label, boolean optional)
+            throws IOException {
+        if (raw == null) {
+            if (optional) {
+                return List.of();
+            }
+            throw new IOException("chain-fragment 规则 " + id + " 的 " + label + " 缺失");
+        }
+        List<?> items;
+        if (raw instanceof List<?> list) {
+            items = list;
+        } else if (!optional) {
+            items = List.of(raw);
+        } else {
+            throw new IOException("chain-fragment 规则 " + id + " 的 " + label + " 必须是列表");
+        }
+        List<ObjectGraphPlan.Value> values = new ArrayList<>(items.size());
+        for (Object item : items) {
+            if (!(item instanceof Map<?, ?> value)) {
+                throw new IOException("chain-fragment 规则 " + id + " 的 construction value 必须是映射");
+            }
+            List<ObjectGraphPlan.ValueKind> kinds = new ArrayList<>();
+            ObjectGraphPlan.Value parsed = null;
+            for (ObjectGraphPlan.ValueKind kind : ObjectGraphPlan.ValueKind.values()) {
+                String key = switch (kind) {
+                    case REF -> "ref";
+                    case CLASS -> "class";
+                    case STRING -> "string";
+                    case INT -> "int";
+                    case LONG -> "long";
+                    case BOOLEAN -> "boolean";
+                    case NULL -> "null";
+                };
+                if (!value.containsKey(key)) {
+                    continue;
+                }
+                kinds.add(kind);
+                Object rawValue = value.get(key);
+                if (kind == ObjectGraphPlan.ValueKind.NULL) {
+                    parsed = new ObjectGraphPlan.Value(kind, "");
+                } else if (rawValue == null) {
+                    throw new IOException("chain-fragment 规则 " + id + " 的 construction " + key
+                            + " value 不能为空");
+                } else {
+                    parsed = new ObjectGraphPlan.Value(kind, rawValue.toString());
+                }
+            }
+            if (kinds.size() != 1 || parsed == null) {
+                throw new IOException("chain-fragment 规则 " + id
+                        + " 的 construction value 必须恰好指定 ref/class/string/int/long/boolean/null");
+            }
+            values.add(parsed);
+        }
+        if (values.isEmpty() && !optional) {
+            throw new IOException("chain-fragment 规则 " + id + " 的 " + label + " 不能为空");
+        }
+        return List.copyOf(values);
     }
 
     private static Match matchOf(Object raw) throws IOException {

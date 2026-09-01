@@ -112,6 +112,26 @@ class DiffCommandTest {
         assertEquals(ExitCode.USAGE.code(), diff(valid, tmp.resolve("empty")).call());
     }
 
+    @Test
+    void optionalEvidenceColumnsParticipateInSemanticDiff(@TempDir Path tmp) throws Exception {
+        Path oldDir = writeFindings(tmp.resolve("old"), ROW_A).getParent();
+        String headerWithEvidence = HEADER + ",sink_role,construction_status,construction_type,"
+                + "construction_fields,construction_trigger,construction_sink_control,construction_reasons,"
+                + "verification_status,sink_distorted,sandbox_ready";
+        String rowWithEvidence = ROW_A
+                + ",TERMINAL,DECLARED,DECLARED_SHAPE,DECLARED_ASSIGNMENTS,STATIC_PATH_ONLY,"
+                + "STATIC_ARGUMENT_FLOW,PLAN_NOT_DECLARED,NOT_SELECTED,false,false";
+        Path newDir = tmp.resolve("new");
+        Files.createDirectories(newDir);
+        Files.writeString(newDir.resolve("findings.csv"),
+                headerWithEvidence + "\r\n" + rowWithEvidence + "\r\n",
+                StandardCharsets.UTF_8);
+
+        String out = captureDiff(oldDir, newDir);
+        assertTrue(out.contains("变更链: 1"),
+                "新增构造/动态旁车字段必须参与语义 diff:\n" + out);
+    }
+
     /** 捕获 diff 的 stdout（结果表是用户可见产物）。 */
     private static String captureDiff(Path oldDir, Path newDir) throws Exception {
         java.io.PrintStream stdout = System.out;

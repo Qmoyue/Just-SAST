@@ -20,3 +20,5 @@ just-fragments.ser
 *.jfr
 *.dump
 *.pid
+docs/repair-todo.md
+docs/audit-repair-plan.md

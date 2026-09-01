@@ -34,10 +34,18 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -56,9 +64,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class BackwardTaintAnalysis implements KnowledgeSource {
 
     /** sink 标记（内部传递的规则事实）。 */
-    private record SinkMark(String ruleId, String category, String severity, List<Rule.TaintedPos> tainted) {}
-    private record LambdaMetadata(HandleRef implementation) {}
+    private record SinkMark(String ruleId, String category, String severity, List<Rule.TaintedPos> tainted,
+                            Rule.SinkRole role) {}
+    private record LambdaMetadata(List<HandleRef> implementations) {}
 
+    /** 每 sink 链上限；全局黑板负责跨 sink 去重，避免并行 worker 持有大批临时链。 */
     private static final int MAX_CHAINS_PER_SINK = 20;
     /** 每 sink 步数预算：须覆盖分发图扇出（层次修复后图正确变宽），全局预算另行兜底。 */
     private static final int STEP_BUDGET = 200_000;
@@ -66,6 +76,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private static final int GLOBAL_BUDGET = 60_000_000;
     /** 并行 worker 数上限：实际值按主机负载与同 JVM 其他知识源共享配额决定。 */
     private static final int MAX_WORKERS = 16;
+    /** 反向分析是有界阶段；不能用裸 Thread.join 无限等待。 */
+    private static final long WORKER_TIMEOUT_SECONDS = 300L;
     private static final int MAX_WRITERS_PER_FIELD = 10;
     /** 链跳数上限：V7 语义改为"动态分派跳数"（VIRTUAL_DISPATCH+FIELD_FLOW），静态直连不计——
      * JDD 复杂度论证：top-down 爆炸因子是动态分派候选数，静态调用链长不构成组合爆炸。 */
@@ -74,6 +86,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private static final int MAX_CALLERS = 10_000;
     /** 祖先反向分发（入边为空时的启发式补全）调用点枚举上限：控制探索成本。 */
     private static final int MAX_MERGED_CALLERS = 300;
+    /** Bound the wildcard callback family supplied by an external serialized proxy. */
+    private static final int MAX_SERIALIZED_PROXY_CALLBACK_SITES = 256;
+    /** Bound structural lambda bridge discovery; ordinary interface calls remain demand-driven. */
+    private static final int MAX_LAMBDA_BRIDGE_STATES = 512;
+    private static final int MAX_LAMBDA_BRIDGE_DEPTH = 8;
+    private static final int MAX_LAMBDA_SAM_ROUTES = 256;
 
     /** V11：按闭包大小调整的每 sink 预算；实例级，避免同 JVM 多扫描互相污染。 */
     private int stepBudgetAdjusted = STEP_BUDGET;
@@ -81,12 +99,52 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private record DeadKey(String methodKey, ValueOrigin origin) {}
     private record CallerSite(Node call, MethodInfo caller, String methodKey) {}
     private record CallerSites(List<CallerSite> sites, boolean merged) {}
+    private record LambdaCarrier(MethodInfo method, int slot, int depth) {}
+    private record LambdaSamRoute(Node factory, Node samCall, MethodInfo samHost) {}
 
     private final ThreadLocal<Set<DeadKey>> localDeadEnds = ThreadLocal.withInitial(java.util.HashSet::new);
+    /**
+     * A sink trace revisits the same method many times while following fields, callbacks and
+     * passthrough arguments.  ForwardOrigins already has a scan-wide cache, but calling it for
+     * every revisit still paid for key construction and concurrent-map bookkeeping.  Keep a
+     * bounded per-worker identity cache across sinks: method summaries are immutable for a
+     * frozen scan, and this lets the worker reuse a hot dependency summary when the next sink
+     * starts.  The cap and eviction order only affect memoization cost, never semantics.
+     */
+    private static final int MAX_WORKER_ORIGIN_CACHE_ENTRIES = 16_384;
+    private static final class WorkerOriginCache {
+        private final IdentityHashMap<MethodInfo, ForwardOrigins.Result> values =
+                new IdentityHashMap<>(256);
+        private final Deque<MethodInfo> order = new ArrayDeque<>();
+
+        private ForwardOrigins.Result get(MethodInfo method) {
+            return values.get(method);
+        }
+
+        private void put(MethodInfo method, ForwardOrigins.Result result) {
+            if (method == null || result == null || values.containsKey(method)) {
+                return;
+            }
+            while (values.size() >= MAX_WORKER_ORIGIN_CACHE_ENTRIES
+                    && !order.isEmpty()) {
+                MethodInfo evicted = order.removeFirst();
+                values.remove(evicted);
+            }
+            values.put(method, result);
+            order.addLast(method);
+        }
+
+    }
+    private final ThreadLocal<WorkerOriginCache> localOriginResults =
+            ThreadLocal.withInitial(WorkerOriginCache::new);
     /** 方法/入口槽的调用者列表只依赖冻结图，按方法缓存后不再为每个 sink 重建和排序。 */
     private final java.util.concurrent.ConcurrentHashMap<String, CallerSites> callerSitesCache =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.concurrent.ConcurrentHashMap<String, Set<String>> ancestorTypesCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** Factory + SAM-shape keyed immutable routes; route discovery is shared across sink workers. */
+    private record LambdaRouteKey(long factoryId, String samDescriptor) {}
+    private final java.util.concurrent.ConcurrentHashMap<LambdaRouteKey, List<LambdaSamRoute>> lambdaRoutesCache =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, Optional<Rule.MagicEntryRule>> entryRuleCache =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -143,7 +201,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         List<SinkTask> sinks = new ArrayList<>();
         for (Node call : bb.graph().nodesOfType(NodeType.CALL)) {
             bb.ruleEngine().matchingSink(call).ifPresent(rule -> sinks.add(new SinkTask(call.id(),
-                    new SinkMark(rule.id(), rule.category(), rule.severity(), rule.tainted()))));
+                    new SinkMark(rule.id(), rule.category(), rule.severity(), rule.tainted(), rule.role()))));
         }
         sinks.sort(java.util.Comparator.comparingInt((SinkTask task) -> {
             MethodInfo host = support.methodOf(bb.graph().node(task.callId()).methodOwner(),
@@ -176,26 +234,51 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
             }
         };
+        ExecutorService executor = null;
         try {
-            if (workerCount <= 1) {
-                worker.run();
-            } else {
-                Thread[] threads = new Thread[workerCount - 1];
-                for (int i = 0; i < threads.length; i++) {
-                    threads[i] = new Thread(worker, "backward-taint-" + i);
-                    threads[i].start();
+            ThreadFactory factory = runnable -> {
+                Thread thread = new Thread(runnable, "backward-taint-worker");
+                thread.setDaemon(true);
+                return thread;
+            };
+            executor = Executors.newFixedThreadPool(workerCount, factory);
+            List<Callable<Void>> tasks = new ArrayList<>(workerCount);
+            for (int i = 0; i < workerCount; i++) {
+                tasks.add(() -> {
+                    worker.run();
+                    return null;
+                });
+            }
+            List<Future<Void>> futures = executor.invokeAll(tasks, WORKER_TIMEOUT_SECONDS,
+                    TimeUnit.SECONDS);
+            for (Future<Void> future : futures) {
+                if (future.isCancelled()) {
+                    bb.markIncomplete("BACKWARD_WORKER_TIMEOUT:" + WORKER_TIMEOUT_SECONDS);
+                    continue;
                 }
-                worker.run();
-                for (Thread t : threads) {
-                    try {
-                        t.join();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
+                try {
+                    future.get();
+                } catch (ExecutionException e) {
+                    bb.markIncomplete("BACKWARD_WORKER_FAILURE");
+                    JustLogger.error("反向污点 worker 失败（结果可能欠完备）: {}",
+                            e.getCause() == null ? e.toString() : e.getCause().toString());
                 }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            bb.markIncomplete("BACKWARD_INTERRUPTED");
         } finally {
+            if (executor != null) {
+                executor.shutdownNow();
+                try {
+                    if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                        bb.markIncomplete("BACKWARD_WORKER_NOT_TERMINATED");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    bb.markIncomplete("BACKWARD_INTERRUPTED");
+                }
+            }
             lease.close();
         }
         if (support.constantProofBudgetExceeded()) {
@@ -209,6 +292,27 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 totalSteps.sum(), stepBudgetAdjusted);
     }
 
+    /**
+     * Lifecycle trigger methods are candidate endpoints, not deserialize roots. Keep their
+     * local sink paths available for calibration so a missing trigger context is reported as
+     * {@code no-trigger} instead of disappearing behind the entry-closure gate. Platform
+     * lifecycle implementations stay excluded; their callers are modeled through the
+     * application-side dispatch/bridge paths when justified.
+     */
+    private boolean isLifecycleEntryHost(MethodInfo method) {
+        if (method == null || isPlatformOwner(method.owner())) {
+            return false;
+        }
+        Rule.MagicEntryRule entry = entryRuleOf(method);
+        return entry != null && "lifecycle".equalsIgnoreCase(entry.direction());
+    }
+
+    private static boolean isPlatformOwner(String owner) {
+        return owner != null && (owner.startsWith("java/") || owner.startsWith("javax/")
+                || owner.startsWith("jdk/") || owner.startsWith("sun/")
+                || owner.startsWith("com/sun/"));
+    }
+
     private void analyzeSink(long callNodeId, SinkMark mark, int stepBudget) {
         Node call = bb.graph().node(callNodeId);
         MethodInfo method = support.enclosingMethod(call);
@@ -216,10 +320,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "UNRESOLVED"));
             return;
         }
-        if (!entryReaching.contains(OriginSupport.methodKey(method))) {
+        if (!entryReaching.contains(OriginSupport.methodKey(method))
+                && !isLifecycleEntryHost(method)) {
             // sink 宿主方法不在入口下游集内：可证明无链。
-            // 注：子类覆写下钻不足（implementers 不穿透实现类）的豁免尝试（覆写感知门/闭包下钻）
-            // 均实测会经全局预算重分配挤掉多态类链——预算按序分配的敏感性是根因，见 development.md
+            // lifecycle trigger（equals/hashCode/toString 等）本身不是反序列化根，
+            // 但仍需生成候选交给 calibration 的 no-trigger 门；否则“无触发调用”的
+            // 触发器会在分析阶段被静默丢弃，报告无法解释该候选为何不成立。
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
             return;
         }
@@ -236,7 +342,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
             return;
         }
-        ForwardOrigins.Result result = support.origins().compute(method);
+        ForwardOrigins.Result result = originsOf(method);
         ForwardOrigins.State state = result.stateBefore().get(call.prop("offset"));
         if (state == null) {
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_STATE"));
@@ -246,6 +352,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         int produced = 0;
         Trace trace = new Trace(call.owner(), call.name(), call.descriptor(), stepBudget);
         for (Rule.TaintedPos pos : mark.tainted()) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             int depthFromTop;
             if (pos instanceof Rule.TaintedPos.Arg a) {
                 depthFromTop = paramCount - 1 - a.index();
@@ -289,6 +398,25 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         totalSteps.add(trace.steps);
         localDeadEnds.get().clear();
         bb.recordOutcome(callNodeId, outcome(call, mark, produced, trace.steps, trace.unresolved, trace.tooLong, verdict));
+    }
+
+    /** Return the forward summary once per method visited by the current sink trace. */
+    private ForwardOrigins.Result originsOf(MethodInfo method) {
+        if (method == null) {
+            return support.origins().compute(null);
+        }
+        WorkerOriginCache cache = localOriginResults.get();
+        ForwardOrigins.Result cached = cache.get(method);
+        if (cached != null) {
+            return cached;
+        }
+        ForwardOrigins.Result result = support.origins().compute(method);
+        if (result != null && !(result.incomplete()
+                && (result.incompleteReasons().contains("INTERRUPTED")
+                || result.incompleteReasons().contains("ANALYSIS_FAILURE")))) {
+            cache.put(method, result);
+        }
+        return result;
     }
 
     /**
@@ -335,6 +463,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
 
     /** 返回：该值可控所产出的链数。 */
     private int controlled(ValueOrigin origin, MethodInfo method, int depth, Trace trace, SinkMark mark) {
+        if (abortIfInterrupted(trace)) {
+            return 0;
+        }
         if (trace.produced >= MAX_CHAINS_PER_SINK) {
             return 0;
         }
@@ -346,7 +477,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         boolean nearBudget = trace.steps > trace.stepBudget * 4 / 5;
         // 深度接近上限的结果受截断影响，不记忆化也不查询（深度无关键的不健全）
         boolean memoizable = depth <= bb.maxDepth() / 2;
-        DeadKey memoKey = new DeadKey(OriginSupport.methodKey(method), origin);
+        DeadKey memoKey = new DeadKey(trace.methodKey(method), origin);
         Set<DeadKey> localDead = localDeadEnds.get();
         if ((memoizable && localDead.contains(memoKey))
                 || trace.visited.contains(memoKey)) {
@@ -377,15 +508,19 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     /** 参数：magic entry 的 this 可控、proxy 入口 args 可控；否则回溯调用者实参（上下文不敏感）。 */
     private int controlledParam(int slot, MethodInfo method, int depth, Trace trace, SinkMark mark) {
         trace.steps++;
+        if (slot == 0 && !method.isStatic() && support.isSerializedProxyHandler(method)) {
+            int external = controlledSerializedProxyHandler(method, depth, trace, mark);
+            if (external > 0) {
+                return external;
+            }
+        }
         Rule.MagicEntryRule entry = entryRuleOf(method);
-        if (entry != null) {
-            if (slot == 0) {
-                // 入口对象本身由反序列化构造，可控（对象图语义的根）
-                return completeChain(mark, entry.entryKind(), method, trace, "this-object");
-            }
-            if (entry.entryKind().equals("proxyInvoke") && bb.hierarchy().isSerializable(method.owner())) {
-                return completeChain(mark, entry.entryKind(), method, trace, "proxy-args");
-            }
+        if (entry != null && slot == 0 && !"proxyInvoke".equals(entry.entryKind())) {
+            // 入口对象本身由反序列化构造，可控（对象图语义的根）。
+            // InvocationHandler.invoke is intentionally excluded: the proxy callback
+            // must be justified by controlledSerializedProxyHandler() or ordinary
+            // in-artifact Proxy.newProxyInstance flow, never by a global root.
+            return completeChain(mark, entry.entryKind(), method, trace, "this-object");
         }
         // 通用框架对象绑定边界：bridge=deserialize 明确声明框架会把外部对象属性
         // 写入 JavaBean setter。该语义不依赖具体框架、题目或类名；仅接受 public
@@ -413,6 +548,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         // 入口距离优先（JDD bottom-up / FLASH 入口导向的探索序）：离反序列化入口近的调用者先走，
         // 链在预算内更快闭合——预算截断下的可复现优先级，替代边序的随机性
         for (CallerSite callerSite : callSites) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             if (callers >= callerCap || trace.produced >= MAX_CHAINS_PER_SINK) {
                 break;
             }
@@ -443,7 +581,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 continue;
             }
             callers++;
-            ForwardOrigins.Result callerResult = support.origins().compute(callerMethod);
+            ForwardOrigins.Result callerResult = originsOf(callerMethod);
             boolean nativeCallback = support.nativeCallbackSite(callerCall, method);
             boolean reflectiveInvoke = isReflectiveMethodInvoke(callerCall);
             Set<ValueOrigin> argOrigins = nativeCallback
@@ -468,6 +606,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
             for (ValueOrigin argOrigin : argOrigins) {
+                if (abortIfInterrupted(trace)) {
+                    break;
+                }
                 produced += controlled(argOrigin, callerMethod, depth + 1, trace, mark);
                 if (trace.produced >= MAX_CHAINS_PER_SINK) {
                     break;
@@ -475,6 +616,63 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
             trace.hops.remove(trace.hops.size() - 1);
             trace.unresolved = unresolvedBefore;
+        }
+        return produced;
+    }
+
+    /**
+     * Reverse a handler receiver through a Method.invoke whose Method value came
+     * from a typed collection.  The proxy object is external to the scanned
+     * artifact; the explicit invoke receiver is the only concrete object edge
+     * available for the callback, so the model keeps that edge and bounds the
+     * wildcard by the indexed site list.
+     */
+    private int controlledSerializedProxyHandler(MethodInfo handler, int depth,
+                                                  Trace trace, SinkMark mark) {
+        int produced = 0;
+        int inspected = 0;
+        for (Node invoke : support.methodCollectionInvokeSites()) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
+            if (inspected++ >= MAX_SERIALIZED_PROXY_CALLBACK_SITES) {
+                bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_CALLBACK_SITE_CAP:"
+                        + MAX_SERIALIZED_PROXY_CALLBACK_SITES);
+                break;
+            }
+            MethodInfo caller = support.enclosingMethod(invoke);
+            if (caller == null || OriginSupport.methodKey(caller).equals(OriginSupport.methodKey(handler))
+                    || !entryReaching.contains(OriginSupport.methodKey(caller))) {
+                continue;
+            }
+            if (support.sinkPathProvablyUnreachable(caller, invoke.offset())) {
+                continue;
+            }
+            ForwardOrigins.Result callerOrigins = originsOf(caller);
+            Set<ValueOrigin> receivers = support.argOriginAtOrdinal(invoke, 0, callerOrigins);
+            if (receivers.isEmpty()) {
+                continue;
+            }
+            bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_CALLBACK_WILDCARD");
+            ChainHop hop = new ChainHop(caller.owner(), caller.name(), handler.owner(),
+                    handler.name(), HopKind.VIRTUAL_DISPATCH, null,
+                    "serialized-proxy-handler", handler.descriptor(), null);
+            int unresolvedBefore = trace.unresolved;
+            trace.hops.add(hop);
+            for (ValueOrigin receiver : receivers) {
+                if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                    break;
+                }
+                if (!(receiver instanceof ValueOrigin.Constant)
+                        && !(receiver instanceof ValueOrigin.Unknown)) {
+                    produced += controlled(receiver, caller, depth + 1, trace, mark);
+                }
+            }
+            trace.hops.remove(trace.hops.size() - 1);
+            trace.unresolved = unresolvedBefore;
+            if (trace.produced >= MAX_CHAINS_PER_SINK) {
+                break;
+            }
         }
         return produced;
     }
@@ -506,6 +704,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         }
         int produced = 0;
         for (Edge edge : methodNode.in()) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             if (edge.type() != EdgeType.LAMBDA) {
                 continue;
             }
@@ -514,13 +715,23 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (metadata == null || !sameMethod(edge.to(), implementation)) {
                 continue;
             }
+            HandleRef implementationHandle = metadata.implementations().stream()
+                    .filter(handle -> handle.owner().equals(edge.to().owner())
+                            && handle.name().equals(edge.to().name())
+                            && handle.descriptor().equals(edge.to().descriptor()))
+                    .findFirst()
+                    .orElse(metadata.implementations().size() == 1
+                            ? metadata.implementations().get(0) : null);
+            if (implementationHandle == null) {
+                continue;
+            }
             MethodInfo caller = support.enclosingMethod(factory);
             if (caller == null || !entryReaching.contains(OriginSupport.methodKey(caller))) {
                 continue;
             }
-            ForwardOrigins.Result callerResult = support.origins().compute(caller);
+            ForwardOrigins.Result callerResult = originsOf(caller);
             int capturedCount = Descriptor.paramCount(factory.descriptor());
-            boolean receiverCapture = lambdaHasCapturedReceiver(metadata.implementation().tag());
+            boolean receiverCapture = lambdaHasCapturedReceiver(implementationHandle.tag());
             int explicitCaptured = Math.max(0, implementation.paramCount()
                     - Descriptor.paramCount(samDescriptor(factory, caller)));
 
@@ -540,29 +751,39 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
             }
 
-            for (Node samCall : bb.graph().callsOfMethod(OriginSupport.methodKey(caller))) {
-                if (samCall == factory || !lambdaReceiverMatches(samCall, factory, callerResult)) {
+            for (LambdaSamRoute route : lambdaSamRoutes(factory, caller, callerResult,
+                    samDescriptor(factory, caller))) {
+                if (abortIfInterrupted(trace)) {
+                    break;
+                }
+                Node samCall = route.samCall();
+                MethodInfo samHost = route.samHost();
+                if (!entryReaching.contains(OriginSupport.methodKey(samHost))
+                        || support.sinkPathProvablyUnreachable(samHost, samCall.offset())) {
                     continue;
                 }
+                ForwardOrigins.Result samResult = originsOf(samHost);
                 int samCount = Descriptor.paramCount(samCall.descriptor());
                 for (int ordinal = 0; ordinal < samCount; ordinal++) {
                     int samSlot = lambdaParameterSlot(implementation, explicitCaptured, ordinal);
-                    if (samSlot != slot || support.sinkPathProvablyUnreachable(caller,
-                            samCall.offset())) {
+                    if (samSlot != slot) {
                         continue;
                     }
                     Set<ValueOrigin> values = support.argOriginAtOrdinal(samCall, ordinal,
-                            callerResult);
+                            samResult);
                     if (values.isEmpty()) {
                         continue;
                     }
-                    ChainHop hop = new ChainHop(caller.owner(), caller.name(), implementation.owner(),
+                    ChainHop hop = new ChainHop(samHost.owner(), samHost.name(), implementation.owner(),
                             implementation.name(), HopKind.VIRTUAL_DISPATCH, null,
                             "lambda-sam", implementation.descriptor(), ordinal);
                     trace.hops.add(hop);
                     int unresolvedBefore = trace.unresolved;
                     for (ValueOrigin value : values) {
-                        produced += controlled(value, caller, depth + 1, trace, mark);
+                        if (abortIfInterrupted(trace)) {
+                            break;
+                        }
+                        produced += controlled(value, samHost, depth + 1, trace, mark);
                         if (trace.produced >= MAX_CHAINS_PER_SINK) {
                             break;
                         }
@@ -576,6 +797,173 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
         }
         return produced;
+    }
+
+    /**
+     * Discover the bounded consumer path of a lambda factory.  The factory result may be
+     * consumed directly in its enclosing method or passed through one or more ordinary Java
+     * bridge methods before an {@code invokeinterface} SAM call.  The call graph deliberately
+     * does not invent an edge from that interface call back to the factory, so this small
+     * carrier search supplies the missing data-flow relation without opening a whole-graph
+     * lambda scan.
+     */
+    private List<LambdaSamRoute> lambdaSamRoutes(Node factory, MethodInfo caller,
+                                                   ForwardOrigins.Result callerResult,
+                                                   String samDescriptor) {
+        if (factory == null || caller == null || callerResult == null || samDescriptor == null) {
+            return List.of();
+        }
+        return lambdaRoutesCache.computeIfAbsent(new LambdaRouteKey(factory.id(), samDescriptor), ignored ->
+                discoverLambdaSamRoutes(factory, caller, callerResult, samDescriptor));
+    }
+
+    private List<LambdaSamRoute> discoverLambdaSamRoutes(Node factory, MethodInfo caller,
+                                                          ForwardOrigins.Result callerResult,
+                                                          String samDescriptor) {
+        Deque<LambdaCarrier> work = new ArrayDeque<>();
+        Set<String> visited = new HashSet<>();
+        Set<Long> routeIds = new HashSet<>();
+        List<LambdaSamRoute> routes = new ArrayList<>();
+        work.addLast(new LambdaCarrier(caller, -1, 0));
+        int inspected = 0;
+        while (!work.isEmpty()) {
+            if (abortForLambdaRouteSearch()) {
+                break;
+            }
+            if (inspected++ >= MAX_LAMBDA_BRIDGE_STATES) {
+                bb.markIncomplete("BACKWARD_LAMBDA_BRIDGE_STATE_CAP:" + MAX_LAMBDA_BRIDGE_STATES);
+                break;
+            }
+            LambdaCarrier carrier = work.removeFirst();
+            MethodInfo host = carrier.method();
+            if (host == null) {
+                continue;
+            }
+            String hostKey = OriginSupport.methodKey(host);
+            String stateKey = hostKey + "#" + carrier.slot();
+            if (!visited.add(stateKey) || !entryReaching.contains(hostKey)) {
+                continue;
+            }
+            ForwardOrigins.Result result = carrier.slot() < 0
+                    ? callerResult : originsOf(host);
+            for (Node call : bb.graph().callsOfMethod(hostKey)) {
+                if (abortForLambdaRouteSearch()) {
+                    return List.copyOf(routes);
+                }
+                boolean receiverMatches = carrier.slot() < 0
+                        ? lambdaReceiverMatches(call, factory, result)
+                        : lambdaParameterMatches(call, carrier.slot(), host, result);
+                if (receiverMatches && isLambdaSamCall(call, samDescriptor)) {
+                    if (routeIds.add(call.id())) {
+                        routes.add(new LambdaSamRoute(factory, call, host));
+                        if (routes.size() >= MAX_LAMBDA_SAM_ROUTES) {
+                            bb.markIncomplete("BACKWARD_LAMBDA_SAM_ROUTE_CAP:" + MAX_LAMBDA_SAM_ROUTES);
+                            return List.copyOf(routes);
+                        }
+                    }
+                }
+                if (carrier.depth() >= MAX_LAMBDA_BRIDGE_DEPTH) {
+                    continue;
+                }
+                int argumentCount = Descriptor.paramCount(call.descriptor());
+                for (int ordinal = 0; ordinal < argumentCount; ordinal++) {
+                    Set<ValueOrigin> values = support.argOriginAtOrdinal(call, ordinal, result);
+                    boolean argumentMatches = carrier.slot() < 0
+                            ? values.stream().anyMatch(value -> sameLambdaOrigin(value,
+                            new ValueOrigin.CallResult(factory.id()), result, host,
+                            new HashSet<>()))
+                            : values.stream().anyMatch(value -> lambdaParameterMatches(value,
+                            carrier.slot(), host, result, new HashSet<>()));
+                    if (!argumentMatches) {
+                        continue;
+                    }
+                    int targetSlot = targetParameterSlot(call, ordinal);
+                    if (targetSlot < 0) {
+                        continue;
+                    }
+                    for (Edge edge : call.out()) {
+                        if (edge.type() != EdgeType.INVOKES && edge.type() != EdgeType.DISPATCHES) {
+                            continue;
+                        }
+                        MethodInfo target = support.methodOf(edge.to().owner(), edge.to().name(),
+                                edge.to().descriptor());
+                        if (target == null) {
+                            continue;
+                        }
+                        work.addLast(new LambdaCarrier(target, targetSlot,
+                                carrier.depth() + 1));
+                    }
+                }
+            }
+        }
+        return routes.isEmpty() ? List.of() : List.copyOf(routes);
+    }
+
+    private boolean abortForLambdaRouteSearch() {
+        return Thread.currentThread().isInterrupted();
+    }
+
+    private static int targetParameterSlot(Node call, int ordinal) {
+        if (call == null || ordinal < 0) {
+            return -1;
+        }
+        boolean staticLike = isStaticLike(call.invokeKind());
+        List<Integer> slots = Descriptor.argSlots(call.descriptor(), staticLike);
+        int index = staticLike ? ordinal : ordinal + 1;
+        if (index < 0 || index >= slots.size()) {
+            return -1;
+        }
+        int slot = 0;
+        for (int i = 0; i < index; i++) {
+            slot += slots.get(i);
+        }
+        return slot;
+    }
+
+    private boolean isLambdaSamCall(Node call, String samDescriptor) {
+        if (call == null || !"INTERFACE".equals(call.invokeKind()) || samDescriptor == null) {
+            return false;
+        }
+        // Generic interfaces are invoked with erased descriptors while the implementation
+        // handle may retain a more specific adapted type.  Arity and return type are stable
+        // enough here; the receiver is already proven to carry this exact lambda object.
+        return Descriptor.paramCount(call.descriptor()) == Descriptor.paramCount(samDescriptor)
+                && Descriptor.returnType(call.descriptor()).equals(Descriptor.returnType(samDescriptor));
+    }
+
+    private boolean lambdaParameterMatches(Node call, int slot, MethodInfo method,
+                                            ForwardOrigins.Result result) {
+        return support.argOriginAtOrdinal(call, -1, result).stream()
+                .anyMatch(value -> lambdaParameterMatches(value, slot, method, result,
+                        new HashSet<>()));
+    }
+
+    private boolean lambdaParameterMatches(ValueOrigin value, int slot, MethodInfo method,
+                                            ForwardOrigins.Result result,
+                                            Set<ValueOrigin> visiting) {
+        if (value instanceof ValueOrigin.Param parameter) {
+            return parameter.slot() == slot;
+        }
+        if (!(value instanceof ValueOrigin.Insn instruction) || method == null
+                || result == null || !visiting.add(value) || instruction.offset() < 0
+                || instruction.offset() >= method.instructions().size()
+                || method.insnAt(instruction.offset()).op() != Op.CHECKCAST) {
+            return false;
+        }
+        try {
+            ForwardOrigins.State before = result.stateBefore().get(instruction.offset());
+            if (before == null || before.stack().isEmpty()) {
+                return false;
+            }
+            for (ValueOrigin candidate : before.stack().get(before.stack().size() - 1).origins()) {
+                if (lambdaParameterMatches(candidate, slot, method, result, visiting)) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            visiting.remove(value);
+        }
     }
 
     private int controlledLambdaCapture(Node factory, MethodInfo caller,
@@ -593,6 +981,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         int unresolvedBefore = trace.unresolved;
         int produced = 0;
         for (ValueOrigin value : values) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             produced += controlled(value, caller, depth + 1, trace, mark);
             if (trace.produced >= MAX_CHAINS_PER_SINK) {
                 break;
@@ -611,11 +1002,22 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         if (!(value instanceof InvokeDynamicRef indy)
                 || indy.bootstrap() == null
                 || !"java/lang/invoke/LambdaMetafactory".equals(indy.bootstrap().owner())
-                || indy.bootstrapArgs().size() < 2
-                || !(indy.bootstrapArgs().get(1) instanceof HandleRef implementation)) {
+                || !("metafactory".equals(indy.bootstrap().name())
+                || "altMetafactory".equals(indy.bootstrap().name()))) {
             return null;
         }
-        return new LambdaMetadata(implementation);
+        List<HandleRef> implementations = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int i = 1; i < indy.bootstrapArgs().size(); i++) {
+            Object argument = indy.bootstrapArgs().get(i);
+            if (argument instanceof HandleRef handle
+                    && seen.add(handle.tag() + "|" + handle.owner() + "#"
+                    + handle.name() + handle.descriptor())) {
+                implementations.add(handle);
+            }
+        }
+        return implementations.isEmpty() ? null
+                : new LambdaMetadata(List.copyOf(implementations));
     }
 
     private String samDescriptor(Node factory, MethodInfo caller) {
@@ -887,7 +1289,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     /** 指令产物：数组分配←元素；数组读←数组；其余←消耗的操作数。 */
     private int controlledInsn(int offset, MethodInfo method, int depth, Trace trace, SinkMark mark) {
         trace.steps++;
-        ForwardOrigins.Result result = support.origins().compute(method);
+        ForwardOrigins.Result result = originsOf(method);
         ForwardOrigins.State state = result.stateBefore().get(offset);
         if (state == null) {
             return 0;
@@ -896,6 +1298,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         int produced = 0;
         if (op == Op.NEWARRAY || op == Op.ANEWARRAY || op == Op.MULTIANEWARRAY) {
             for (ValueOrigin element : result.arrayElements().getOrDefault(new ValueOrigin.Insn(offset), Set.of())) {
+                if (abortIfInterrupted(trace)) {
+                    break;
+                }
                 produced += controlled(element, method, depth + 1, trace, mark);
                 if (trace.produced >= MAX_CHAINS_PER_SINK) {
                     return produced;
@@ -908,7 +1313,13 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         int consumed = OriginSupport.consumedCount(op);
         int start = Math.max(0, state.stack().size() - consumed);
         for (int i = start; i < state.stack().size(); i++) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             for (ValueOrigin operand : state.stack().get(i).origins()) {
+                if (abortIfInterrupted(trace)) {
+                    break;
+                }
                 produced += controlled(operand, method, depth + 1, trace, mark);
                 if (trace.produced >= MAX_CHAINS_PER_SINK) {
                     return produced;
@@ -916,6 +1327,10 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
         }
         return produced;
+    }
+
+    private static boolean isDeserializationSource(Rule.SourceRule source) {
+        return source != null && !"serialize".equalsIgnoreCase(source.bridge());
     }
 
     /** 调用返回值：OIS 读无条件可控；可控 receiver 的返回值可控；可控实参的返回值可控。 */
@@ -931,9 +1346,24 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             return completeChain(mark, "deserialization", method, trace,
                     "ois-read:" + call.name());
         }
-        ForwardOrigins.State state = support.origins().compute(method).stateBefore().get(call.prop("offset"));
+        ForwardOrigins.Result result = originsOf(method);
+        ForwardOrigins.State state = result.stateBefore().get(call.prop("offset"));
         if (state == null) {
             return 0;
+        }
+        var source = bb.ruleEngine().matchingSource(call.owner(), call.name(), call.descriptor());
+        if (source.isPresent() && isDeserializationSource(source.get())) {
+            if (source.get().tainted() == null || source.get().tainted().isEmpty()) {
+                return completeChain(mark, source.get().bridge(), method, trace,
+                        "bridge-source-deserialize");
+            }
+            trace.hops.add(new ChainHop(method.owner(), method.name(), call.owner(), call.name(),
+                    HopKind.DIRECT_CALL, null, "bridge-source-deserialize", call.descriptor(), null));
+            int produced = controlledSourceInput(source.get(), call, method, state, depth, trace, mark);
+            trace.hops.remove(trace.hops.size() - 1);
+            if (produced > 0) {
+                return produced;
+            }
         }
         if (isProxyInvocation(call, method, state)) {
             // A proxy result is the selected InvocationHandler return value. Treating any
@@ -949,6 +1379,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             int receiverDepth = state.stack().size() - 1 - Descriptor.paramCount(call.descriptor());
             if (receiverDepth >= 0 && receiverDepth < state.stack().size()) {
                 for (ValueOrigin receiverOrigin : state.stack().get(receiverDepth).origins()) {
+                    if (abortIfInterrupted(trace)) {
+                        break;
+                    }
                     produced += controlled(receiverOrigin, method, depth + 1, trace, mark);
                     if (trace.produced >= MAX_CHAINS_PER_SINK) {
                         return produced;
@@ -961,7 +1394,13 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             List<Integer> argSlots = Descriptor.argSlots(call.descriptor(), calleeStatic);
             int slot = 0;
             for (int i = 0; i < argSlots.size() && produced == 0; i++) {
-                for (ValueOrigin argOrigin : support.argOriginAt(call, method, slot)) {
+                if (abortIfInterrupted(trace)) {
+                    break;
+                }
+                for (ValueOrigin argOrigin : support.argOriginAt(call, method, slot, result)) {
+                    if (abortIfInterrupted(trace)) {
+                        break;
+                    }
                     produced += controlled(argOrigin, method, depth + 1, trace, mark);
                     if (produced > 0) {
                         break;
@@ -976,10 +1415,43 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         return produced;
     }
 
+    /** Apply a source rule's declared input positions without turning the bridge into a root. */
+    private int controlledSourceInput(Rule.SourceRule source, Node call, MethodInfo method,
+                                      ForwardOrigins.State state, int depth, Trace trace,
+                                      SinkMark mark) {
+        int parameterCount = Descriptor.paramCount(call.descriptor());
+        int produced = 0;
+        for (Rule.TaintedPos position : source.tainted()) {
+            int fromTop;
+            if (position instanceof Rule.TaintedPos.Arg arg) {
+                fromTop = parameterCount - 1 - arg.index();
+            } else {
+                fromTop = parameterCount;
+            }
+            int stackIndex = state.stack().size() - 1 - fromTop;
+            if (stackIndex < 0 || stackIndex >= state.stack().size()) {
+                continue;
+            }
+            for (ValueOrigin origin : state.stack().get(stackIndex).origins()) {
+                if (abortIfInterrupted(trace)) {
+                    return produced;
+                }
+                produced += controlled(origin, method, depth + 1, trace, mark);
+                if (trace.produced >= MAX_CHAINS_PER_SINK) {
+                    return produced;
+                }
+            }
+        }
+        return produced;
+    }
+
     private int controlledProxyResult(Node call, MethodInfo caller, int depth, Trace trace,
                                       SinkMark mark, ForwardOrigins.State state) {
         int produced = 0;
         for (ValueOrigin receiver : receiverOrigins(call, state)) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             Node allocation = proxyAllocationOf(receiver, caller);
             if (allocation == null) {
                 continue;
@@ -988,7 +1460,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (allocationMethod == null) {
                 continue;
             }
-            ForwardOrigins.Result allocationOrigins = support.origins().compute(allocationMethod);
+            ForwardOrigins.Result allocationOrigins = originsOf(allocationMethod);
             for (ValueOrigin handlerOrigin : support.argOriginAtOrdinal(allocation, 2,
                     allocationOrigins)) {
                 String handlerType = concreteType(handlerOrigin, allocationMethod);
@@ -1009,14 +1481,20 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     returnSummary(handler, depth, trace, mark);
                     continue;
                 }
-                ForwardOrigins.Result handlerOrigins = support.origins().compute(handler);
+                ForwardOrigins.Result handlerOrigins = originsOf(handler);
                 for (int offset : returnOffsets) {
+                    if (abortIfInterrupted(trace)) {
+                        break;
+                    }
                     ForwardOrigins.State returnState = handlerOrigins.stateBefore().get(offset);
                     if (returnState == null || returnState.stack().isEmpty()) {
                         continue;
                     }
                     for (ValueOrigin returned : returnState.stack()
                             .get(returnState.stack().size() - 1).origins()) {
+                        if (abortIfInterrupted(trace)) {
+                            break;
+                        }
                         produced += controlled(returned, handler, depth + 1, trace, mark);
                         if (trace.produced >= MAX_CHAINS_PER_SINK) {
                             return produced;
@@ -1030,16 +1508,22 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
 
     private void returnSummary(MethodInfo handler, int depth, Trace trace, SinkMark mark) {
         for (var instruction : handler.instructions()) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             if (!instruction.op().isReturn() || instruction.op() == Op.RETURN
                     || instruction.op() == Op.ATHROW) {
                 continue;
             }
-            ForwardOrigins.State state = support.origins().compute(handler).stateBefore()
+            ForwardOrigins.State state = originsOf(handler).stateBefore()
                     .get(instruction.offset());
             if (state == null || state.stack().isEmpty()) {
                 continue;
             }
             for (ValueOrigin returned : state.stack().get(state.stack().size() - 1).origins()) {
+                if (abortIfInterrupted(trace)) {
+                    break;
+                }
                 controlled(returned, handler, depth + 1, trace, mark);
             }
         }
@@ -1072,7 +1556,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (method.insnAt(instruction.offset()).op() != Op.CHECKCAST) {
                 return null;
             }
-            ForwardOrigins.State before = support.origins().compute(method).stateBefore()
+            ForwardOrigins.State before = originsOf(method).stateBefore()
                     .get(instruction.offset());
             if (before == null || before.stack().isEmpty()) {
                 return null;
@@ -1133,7 +1617,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         int produced = 0;
         if (!fieldRead.isStatic() && isSerializedField(fieldRead.owner(), fieldRead.field())) {
             ChainHop hop = new ChainHop(method.owner(), method.name(),
-                    method.owner(), method.name(), HopKind.FIELD_FLOW, fieldRead.field(), "field-read", "", null);
+                    method.owner(), method.name(), HopKind.FIELD_FLOW, fieldRead.field(), "field-read", "", null,
+                    fieldRead.owner());
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
             produced += controlled(fieldRead.receiver(), method, depth + 1, trace, mark);
@@ -1144,7 +1629,13 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
         }
         int writers = 0;
-        for (FieldWriterIndex.Writer writer : bb.fieldWriters().writersOf(fieldRead.owner(), fieldRead.field())) {
+        String fieldDescriptor = fieldRead.descriptor() == null || fieldRead.descriptor().isBlank()
+                ? fieldDescriptor(fieldRead.owner(), fieldRead.field()) : fieldRead.descriptor();
+        for (FieldWriterIndex.Writer writer : bb.fieldWriters().writersOf(
+                fieldRead.owner(), fieldRead.field(), fieldDescriptor, fieldRead.isStatic())) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
             if (writers >= MAX_WRITERS_PER_FIELD) {
                 trace.unresolved++;
                 break;
@@ -1158,15 +1649,19 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 continue; // 写者祖先链不可达入口：剪枝
             }
             writers++;
-            ForwardOrigins.State state = support.origins().compute(writerMethod).stateBefore().get(writer.insnOffset());
+            ForwardOrigins.State state = originsOf(writerMethod).stateBefore().get(writer.insnOffset());
             if (state == null || state.stack().isEmpty()) {
                 continue;
             }
             ChainHop hop = new ChainHop(writerMethod.owner(), writerMethod.name(),
-                    method.owner(), method.name(), HopKind.FIELD_FLOW, fieldRead.field(), "field-write", "", null);
+                    method.owner(), method.name(), HopKind.FIELD_FLOW, fieldRead.field(), "field-write", "", null,
+                    fieldRead.owner());
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
             for (ValueOrigin valueOrigin : state.stack().get(state.stack().size() - 1).origins()) {
+                if (abortIfInterrupted(trace)) {
+                    break;
+                }
                 produced += controlled(valueOrigin, writerMethod, depth + 1, trace, mark);
                 if (trace.produced >= MAX_CHAINS_PER_SINK) {
                     break;
@@ -1179,6 +1674,20 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
         }
         return produced;
+    }
+
+    private String fieldDescriptor(String owner, String name) {
+        var cls = bb.hierarchy().classInfo(owner);
+        if (cls != null) {
+            var field = cls.field(name);
+            if (field != null) {
+                return field.descriptor();
+            }
+        }
+        // The bytecode FieldRef descriptor is not carried by the current FieldRead origin;
+        // an unknown descriptor is deliberately kept as a conservative no-match rather than
+        // crossing hidden fields. Callers with a class model can still recover the exact type.
+        return "";
     }
 
     /** 链达成：构建 Chain（hops 为 sink→entry 顺序，ENTRY 跳携带入口方法描述符）；跳数超限拒绝。 */
@@ -1203,7 +1712,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 null, reason, entryMethod.descriptor(), null));
         Chain chain = new Chain(mark.ruleId(), mark.category(), mark.severity(),
                 entryClass, entryName, entryKind,
-                trace.sinkOwner, trace.sinkMethod, hops, trace.unresolved, trace.sinkDescriptor);
+                trace.sinkOwner, trace.sinkMethod, hops, trace.unresolved, trace.sinkDescriptor,
+                mark.role().name());
         if (!bb.addChain(chain)) {
             return 0;
         }
@@ -1259,6 +1769,17 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 chains, verdict, steps, unresolved, tooLong);
     }
 
+    /** Make cancellation cooperative even while a sink is walking a large origin set. */
+    private static boolean abortIfInterrupted(Trace trace) {
+        if (Thread.currentThread().isInterrupted()) {
+            if (trace != null) {
+                trace.truncated++;
+            }
+            return true;
+        }
+        return false;
+    }
+
     /** 一次回溯的路径与统计。truncated：深度/预算截断发生次数（子树结论作废判定）。 */
     private static final class Trace {
         final String sinkOwner;
@@ -1267,6 +1788,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         final int stepBudget;
         final List<ChainHop> hops = new ArrayList<>();
         final Set<DeadKey> visited = new HashSet<>();
+        /**
+         * A trace revisits the same canonical MethodInfo while following fields and
+         * passthrough arguments.  Cache its stable key locally so the hot recursion does not
+         * repeatedly allocate and hash the same owner/name/descriptor string.
+         */
+        final IdentityHashMap<MethodInfo, String> methodKeys = new IdentityHashMap<>(64);
         int unresolved;
         int tooLong;
         int steps;
@@ -1278,6 +1805,16 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             this.sinkMethod = sinkMethod;
             this.sinkDescriptor = sinkDescriptor;
             this.stepBudget = stepBudget;
+        }
+
+        String methodKey(MethodInfo method) {
+            String cached = methodKeys.get(method);
+            if (cached != null) {
+                return cached;
+            }
+            String key = OriginSupport.methodKey(method);
+            methodKeys.put(method, key);
+            return key;
         }
     }
 }

@@ -1,6 +1,7 @@
 package io.just.sast.verify.legacy;
 
 import java.io.FilePermission;
+import java.io.IOException;
 import java.net.NetPermission;
 import java.net.SocketPermission;
 import java.nio.file.Files;
@@ -21,6 +22,7 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
 
     private final Path writableRoot;
     private final Path writableRealRoot;
+    private final boolean writableRootRealPathAvailable;
     private final List<Path> readableRoots;
     private final List<Path> readableRealRoots;
     private final String trustedCodeSource;
@@ -30,10 +32,14 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             new ThreadLocal<Integer>();
     private static final ThreadLocal<Integer> PROXY_BOOTSTRAP_DEPTH =
             new ThreadLocal<Integer>();
+    /** Kryo/other serializer construction may need bounded reflective bootstrap access. */
+    private static final ThreadLocal<Integer> SOURCE_ADAPTER_DEPTH =
+            new ThreadLocal<Integer>();
 
     private LegacySandboxSecurityManager(Path writableRoot, List<Path> readableRoots) {
         this.writableRoot = normalize(writableRoot);
         this.writableRealRoot = realPath(this.writableRoot);
+        this.writableRootRealPathAvailable = canResolveRealPath(this.writableRoot);
         this.readableRoots = new ArrayList<Path>();
         this.readableRealRoots = new ArrayList<Path>();
         for (Path root : readableRoots) {
@@ -87,22 +93,39 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             // It does not grant socket access, but an input JAR must not use it to install
             // an arbitrary handler. Restrict the compatibility grant to the verifier stack.
             if ("specifyStreamHandler".equals(permission.getName())) {
-                if (trustedProbeCaller()) {
+                if (trustedProbeCaller() || trustedSourceAdapterCaller()) {
                     return;
                 }
             }
             throw new SecurityException("network permission denied: " + permission.getName());
         }
-        if (permission instanceof java.util.PropertyPermission
-                && permission.getActions().indexOf("write") >= 0) {
-            throw new SecurityException("property write denied: " + permission.getName());
+        if (permission instanceof java.util.PropertyPermission) {
+            if (permission.getActions().indexOf("write") >= 0) {
+                // JDK 8/11 bootstrap code may materialize a bounded cache while the trusted
+                // probe initializes a serializer (for example Kryo's java.time support).
+                // This is not a target grant: once control enters application code the first
+                // non-platform frame is no longer a verifier frame and the write is denied.
+                if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
+                        && !trustedSerializerRuntimeCaller()
+                        && !("*".equals(permission.getName())
+                        && trustedJdkPropertyAccessCaller())) {
+                    throw new SecurityException("property write denied: " + permission.getName()
+                            + " [caller=" + firstNonPlatformFrameLocation() + "]");
+                }
+            }
+            if ("just.verify.canary-token".equals(permission.getName())
+                    && !trustedProbeCaller()) {
+                throw new SecurityException("canary attestation read denied");
+            }
         }
         if (permission instanceof ReflectPermission || permission instanceof SerializablePermission) {
             // Scope markers are not permission grants. During deserialization and proxy
             // callbacks the target frame is still above the probe; only the first
             // non-platform frame may authorize verifier-internal reflection.
-            if (!trustedProbeCaller()
-                    && !(permission instanceof ReflectPermission && trustedLambdaBootstrapCaller())) {
+            if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
+                    && !(permission instanceof ReflectPermission
+                    && (trustedLambdaBootstrapCaller()
+                    || trustedSerializerRuntimeCaller()))) {
                 throw new SecurityException("reflective/serialization privilege denied: "
                         + permission.getName());
             }
@@ -116,10 +139,18 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
                     || "manageProcess".equals(name) || "createClassLoader".equals(name)
                     || "modifyThread".equals(name) || "modifyThreadGroup".equals(name)
                     || "readFileDescriptor".equals(name) || "writeFileDescriptor".equals(name)) {
-                if ("createClassLoader".equals(name) && trustedLambdaBootstrapCaller()) {
+                // ObjectStreamClass may create a short-lived loader while the trusted probe
+                // serializes a callback receiver. The probe code source is already the
+                // isolated verifier artifact; target frames are still denied because the
+                // first non-platform caller is no longer a verifier frame.
+                if ("createClassLoader".equals(name)
+                        && (trustedProbeCaller() || trustedSourceAdapterCaller()
+                        || trustedLambdaBootstrapCaller()
+                        || trustedSerializerRuntimeCaller())) {
                     return;
                 }
-                throw new SecurityException("runtime permission denied: " + name);
+                throw new SecurityException("runtime permission denied: " + name
+                        + " [caller=" + firstNonPlatformFrameLocation() + "]");
             }
             if (name.startsWith("getenv.")) {
                 if (Boolean.getBoolean("just.verify.sanitized-env")) {
@@ -132,6 +163,13 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkPackageAccess(String packageName) {
+        // The transformed JDK sink resolves the shared canary gate from the bootstrap loader.
+        // Keep only this dependency-free package linkable; the verifier and target namespaces
+        // remain closed to application code.
+        if (packageName != null && (packageName.equals("io.just.sast.verify.boot")
+                || packageName.startsWith("io.just.sast.verify.boot."))) {
+            return;
+        }
         if (packageName != null && (packageName.equals("io.just.sast")
                 || packageName.startsWith("io.just.sast.")) && !trustedProbeCaller()) {
             throw new SecurityException("verifier package access denied: " + packageName);
@@ -192,6 +230,26 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
     }
 
+    /** Enter only while the trusted legacy probe serializes an inert source value. */
+    static void beginSourceAdapter() {
+        SecurityManager current = System.getSecurityManager();
+        if (!(current instanceof LegacySandboxSecurityManager)
+                || !((LegacySandboxSecurityManager) current).trustedProbeCaller()) {
+            throw new SecurityException("source adapter is probe-only");
+        }
+        Integer depth = SOURCE_ADAPTER_DEPTH.get();
+        SOURCE_ADAPTER_DEPTH.set(depth == null ? 1 : depth + 1);
+    }
+
+    static void endSourceAdapter() {
+        Integer depth = SOURCE_ADAPTER_DEPTH.get();
+        if (depth == null || depth <= 1) {
+            SOURCE_ADAPTER_DEPTH.remove();
+        } else {
+            SOURCE_ADAPTER_DEPTH.set(depth - 1);
+        }
+    }
+
     static void beginProxyBootstrap() {
         SecurityManager current = System.getSecurityManager();
         if (!(current instanceof LegacySandboxSecurityManager)
@@ -212,13 +270,108 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
     }
 
     private static boolean isPlatformFrame(Class<?> frame) {
-        return frame.getClassLoader() == null;
+        ClassLoader loader = frame.getClassLoader();
+        if (loader == null) {
+            return true;
+        }
+        // Java 9+ loads a substantial part of the JDK through the platform loader rather
+        // than the bootstrap loader. The verifier8 artifact is compiled on Java 8, so it
+        // cannot link ClassLoader.getPlatformClassLoader() directly; use the stable loader
+        // identity instead. On Java 8 the class is absent and the bootstrap check above is
+        // the complete platform definition.
+        return "jdk.internal.loader.ClassLoaders$PlatformClassLoader"
+                .equals(loader.getClass().getName());
     }
 
     private boolean isVerifierFrame(Class<?> frame) {
         return frame.getName().startsWith("io.just.sast.verify.legacy.")
                 && trustedCodeSource != null
                 && trustedCodeSource.equals(codeSourceOf(frame));
+    }
+
+    /**
+     * Allow only serializer implementation frames while the probe prepares inert bytes.
+     * This scope is never consulted by the target invocation path: the first non-platform
+     * frame must still be a verifier frame or the permission is denied.
+     */
+    private boolean trustedSourceAdapterCaller() {
+        Integer depth = SOURCE_ADAPTER_DEPTH.get();
+        if (depth == null || depth <= 0) {
+            return false;
+        }
+        boolean sawProbe = false;
+        Class<?>[] context = getClassContext();
+        for (Class<?> frame : context) {
+            if (frame == LegacySandboxSecurityManager.class || isPlatformFrame(frame)) {
+                continue;
+            }
+            String name = frame.getName();
+            if (isVerifierFrame(frame)) {
+                sawProbe = true;
+                continue;
+            }
+            if (name.startsWith("com.esotericsoftware.kryo.")
+                    || name.startsWith("org.objenesis.")
+                    || name.startsWith("com.esotericsoftware.reflectasm.")
+                    || name.startsWith("com.esotericsoftware.minlog.")) {
+                continue;
+            }
+            return false;
+        }
+        return sawProbe;
+    }
+
+    /**
+     * Kryo 4 + Objenesis can lazily define a serialization constructor during the target's
+     * own bounded deserialization call. This is the one compatibility allowance needed for
+     * that serializer runtime; it does not grant target reflection, file, network or native
+     * privileges. The first non-platform frame must be a known serializer implementation.
+     */
+    private boolean trustedSerializerRuntimeCaller() {
+        boolean firstNonPlatform = true;
+        boolean sawKryo = false;
+        for (Class<?> frame : getClassContext()) {
+            if (frame == LegacySandboxSecurityManager.class || isPlatformFrame(frame)) {
+                continue;
+            }
+            String name = frame.getName();
+            if (firstNonPlatform) {
+                firstNonPlatform = false;
+                if (!isSerializerFrame(name)) {
+                    return false;
+                }
+            }
+            sawKryo = sawKryo || name.startsWith("com.esotericsoftware.kryo.");
+        }
+        return !firstNonPlatform && sawKryo;
+    }
+
+    /**
+     * Java 8--11's privileged property helper requests the broad read/write permission used by
+     * {@code System.getProperties()}, even when the caller only reads a cached runtime value.
+     * Keep that compatibility window tied to an active probe-owned serialization operation and
+     * the JDK helper frame; a target direct call to {@code System.getProperties()} remains denied.
+     */
+    private boolean trustedJdkPropertyAccessCaller() {
+        Integer depth = SERIALIZATION_BOOTSTRAP_DEPTH.get();
+        if (depth == null || depth <= 0) {
+            return false;
+        }
+        for (Class<?> frame : getClassContext()) {
+            String name = frame.getName();
+            if (name.equals("sun.security.action.GetPropertyAction")
+                    || name.startsWith("sun.security.action.GetPropertyAction$")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isSerializerFrame(String name) {
+        return name.startsWith("com.esotericsoftware.kryo.")
+                || name.startsWith("org.objenesis.")
+                || name.startsWith("com.esotericsoftware.reflectasm.")
+                || name.startsWith("com.esotericsoftware.minlog.");
     }
 
     private static String codeSourceOf(Class<?> type) {
@@ -246,6 +399,20 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             }
         }
         return null;
+    }
+
+    private String firstNonPlatformFrameLocation() {
+        for (StackTraceElement frame : new Throwable().getStackTrace()) {
+            String className = frame.getClassName();
+            if (className.equals(LegacySandboxSecurityManager.class.getName())
+                    || className.startsWith("java.") || className.startsWith("javax.")
+                    || className.startsWith("sun.") || className.startsWith("jdk.")) {
+                continue;
+            }
+            return className + "." + frame.getMethodName();
+        }
+        Class<?> frame = firstNonPlatformFrame();
+        return frame == null ? "unknown" : frame.getName();
     }
 
     @Override
@@ -301,8 +468,17 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
     }
 
     private boolean readable(Path path) {
+        Path resolvedPath = resolveForRead(path);
         for (int i = 0; i < readableRoots.size(); i++) {
             if (safeUnder(path, readableRoots.get(i), readableRealRoots.get(i))) {
+                return true;
+            }
+            // Jabba and managed JDK installers may expose the runtime through a
+            // symlink/junction such as jdk/default. Permit reads below the resolved form of
+            // the explicitly configured root; writes remain real-path-only below writableRoot.
+            Path realRoot = readableRealRoots.get(i);
+            if (!realRoot.equals(readableRoots.get(i))
+                    && safeUnder(resolvedPath, realRoot, realRoot)) {
                 return true;
             }
             // On managed Windows hosts a real-path query can be denied for a freshly
@@ -316,6 +492,21 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         return false;
     }
 
+    private Path resolveForRead(Path path) {
+        boolean alreadyResolving = Boolean.TRUE.equals(resolving.get());
+        if (alreadyResolving) {
+            return path;
+        }
+        resolving.set(Boolean.TRUE);
+        try {
+            return Files.exists(path, LinkOption.NOFOLLOW_LINKS) ? path.toRealPath() : path;
+        } catch (IOException | RuntimeException ignored) {
+            return path;
+        } finally {
+            resolving.remove();
+        }
+    }
+
     private boolean lexicallySafeRead(Path path, Path root) {
         if (!under(path, root)) {
             return false;
@@ -325,12 +516,12 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         try {
             Path relative = root.relativize(path);
             Path current = root;
-            if (Files.isSymbolicLink(current)) {
+            if (isLinkOrReparsePoint(current)) {
                 return false;
             }
             for (Path component : relative) {
                 current = current.resolve(component);
-                if (Files.isSymbolicLink(current)) {
+                if (isLinkOrReparsePoint(current)) {
                     return false;
                 }
             }
@@ -367,9 +558,51 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             }
             return under(existing.toRealPath(), realRoot);
         } catch (Exception denied) {
-            return false;
+            return lexicalRoot.equals(writableRoot) && !writableRootRealPathAvailable
+                    && lexicallySafePath(path, lexicalRoot);
         } finally {
             resolving.remove();
+        }
+    }
+
+    private boolean lexicallySafePath(Path path, Path root) {
+        if (!under(path, root) || !Files.exists(root, LinkOption.NOFOLLOW_LINKS)
+                || isLinkOrReparsePoint(root)) {
+            return false;
+        }
+        try {
+            Path current = root;
+            Path relative = root.relativize(path);
+            for (Path component : relative) {
+                current = current.resolve(component);
+                if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                    return true;
+                }
+                if (isLinkOrReparsePoint(current)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (RuntimeException denied) {
+            return false;
+        }
+    }
+
+    private static boolean isLinkOrReparsePoint(Path path) {
+        if (Files.isSymbolicLink(path)) {
+            return true;
+        }
+        if (!isWindows()) {
+            return false;
+        }
+        try {
+            Object value = Files.getAttribute(path, "dos:reparsePoint", LinkOption.NOFOLLOW_LINKS);
+            return Boolean.TRUE.equals(value);
+        } catch (Exception denied) {
+            // Some Java 8 Windows providers do not expose the DOS reparse attribute. The
+            // parent OS backend remains responsible for that check; retain no-link checks
+            // here instead of rejecting every explicitly-created scratch directory.
+            return false;
         }
     }
 
@@ -385,7 +618,45 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
     }
 
+    private static boolean canResolveRealPath(Path path) {
+        try {
+            path.toRealPath();
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     private static boolean under(Path path, Path root) {
-        return path.equals(root) || path.startsWith(root);
+        if (path == null || root == null) {
+            return false;
+        }
+        Path normalizedPath = path.toAbsolutePath().normalize();
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        if (!isWindows()) {
+            return normalizedPath.equals(normalizedRoot)
+                    || normalizedPath.startsWith(normalizedRoot);
+        }
+        // Path.startsWith may compare Windows spelling case-sensitively on managed hosts.
+        // Compare case-insensitively but retain a path-component boundary.
+        String candidate = normalizedPath.toString();
+        String allowed = normalizedRoot.toString();
+        if (candidate.equalsIgnoreCase(allowed)) {
+            return true;
+        }
+        if (!candidate.regionMatches(true, 0, allowed, 0, allowed.length())
+                || candidate.length() <= allowed.length()) {
+            return false;
+        }
+        return isSeparator(allowed.charAt(allowed.length() - 1))
+                || isSeparator(candidate.charAt(allowed.length()));
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).indexOf("win") >= 0;
+    }
+
+    private static boolean isSeparator(char value) {
+        return value == '\\' || value == '/';
     }
 }

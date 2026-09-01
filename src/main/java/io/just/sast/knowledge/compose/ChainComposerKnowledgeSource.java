@@ -255,7 +255,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 }
                 Chain merged = new Chain(back.ruleId(), back.category(), back.severity(),
                         hostClass, hostMethod, "source",
-                        back.sinkClass(), back.sinkMethod(), hops, back.unresolvedHops(), back.sinkDescriptor());
+                        back.sinkClass(), back.sinkMethod(), hops, back.unresolvedHops(),
+                        back.sinkDescriptor(), back.sinkRole(), constructionPlanOf(back, null));
                 if (bb.addChain(merged)) {
                     bb.chainNote(merged.key(), "pattern:src-container-trigger");
                     composed++;
@@ -613,6 +614,18 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         return new Chain(back.ruleId(), back.category(), back.severity(),
                 front.entryClass(), front.entryMethod(), front.entryKind(),
                 back.sinkClass(), back.sinkMethod(), hops,
-                front.unresolvedHops() + back.unresolvedHops(), back.sinkDescriptor());
+                front.unresolvedHops() + back.unresolvedHops(), back.sinkDescriptor(), back.sinkRole(),
+                constructionPlanOf(back, front));
+    }
+
+    /** Preserve the declarative gadget plan while composing a source prefix with a fragment.
+     * The back chain is normally the fragment; the front fallback keeps extension-created
+     * plans visible without inventing a merged executable graph. */
+    private static io.just.sast.blackboard.ObjectGraphPlan constructionPlanOf(Chain back,
+                                                                                Chain front) {
+        if (back != null && back.constructionPlan() != null) {
+            return back.constructionPlan();
+        }
+        return front == null ? null : front.constructionPlan();
     }
 }

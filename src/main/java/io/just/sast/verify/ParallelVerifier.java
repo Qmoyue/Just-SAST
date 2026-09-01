@@ -1,11 +1,13 @@
 package io.just.sast.verify;
 
 import io.just.sast.blackboard.Chain;
+import io.just.sast.chain.ChainRanking;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +27,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.UUID;
 import io.just.sast.util.AdaptiveParallelism;
+import io.just.sast.util.ArtifactFingerprint;
 
 /**
  * 并行链级验证器：沿链 FIELD_FLOW 跳构造完整对象图 → 子进程执行 → sink 特异性判定。
@@ -34,7 +37,8 @@ public final class ParallelVerifier {
 
     /** Closed verifier lifecycle; the serialized string remains for report compatibility. */
     public enum VerifyStatus {
-        SINK_BLOCKED, CONCRETE_REACHED, EXECUTED, PARTIAL, FAILED, TIMEOUT, UNTESTABLE, UNKNOWN;
+        SINK_BLOCKED, SAFE_EFFECT_OBSERVED, CONCRETE_REACHED, EXECUTED, PARTIAL, FAILED,
+        TIMEOUT, UNTESTABLE, UNKNOWN;
 
         static VerifyStatus from(String value) {
             if (value == null) {
@@ -49,7 +53,10 @@ public final class ParallelVerifier {
     }
 
     public record VerifyResult(String chainKey, String status, String detail,
-                               int attempt, long durationMs, String evidence) {
+                               int attempt, long durationMs, String evidence,
+                               String backend, String jdk, String policyDigest,
+                               boolean sinkDistorted, boolean sandboxReady,
+                               String cleanup) {
         public VerifyResult(String chainKey, String status, String detail) {
             this(chainKey, status, detail, 1, 0L, defaultEvidence(status, detail));
         }
@@ -57,6 +64,12 @@ public final class ParallelVerifier {
         public VerifyResult(String chainKey, String status, String detail,
                             int attempt, long durationMs) {
             this(chainKey, status, detail, attempt, durationMs, defaultEvidence(status, detail));
+        }
+
+        public VerifyResult(String chainKey, String status, String detail,
+                            int attempt, long durationMs, String evidence) {
+            this(chainKey, status, detail, attempt, durationMs, evidence,
+                    "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false, "UNKNOWN");
         }
 
         public VerifyResult {
@@ -67,6 +80,14 @@ public final class ParallelVerifier {
             durationMs = Math.max(0L, durationMs);
             evidence = evidence == null || evidence.isBlank()
                     ? defaultEvidence(status, detail) : evidence;
+            backend = normalize(backend);
+            jdk = normalize(jdk);
+            policyDigest = normalize(policyDigest);
+            cleanup = normalize(cleanup);
+        }
+
+        private static String normalize(String value) {
+            return value == null || value.isBlank() ? "UNKNOWN" : value;
         }
 
         public VerifyStatus statusCode() {
@@ -76,12 +97,17 @@ public final class ParallelVerifier {
         private static String defaultEvidence(String status, String detail) {
             return switch (VerifyStatus.from(status)) {
                 case SINK_BLOCKED -> "SINK_CANARY_BOUNDARY";
+                case SAFE_EFFECT_OBSERVED -> "SAFE_EFFECT_OBSERVED";
                 case CONCRETE_REACHED -> "CONCRETE_TRIGGER";
                 case EXECUTED -> "ENTRY_RETURNED";
                 case PARTIAL -> "PARTIAL_PATH";
                 case TIMEOUT -> "PROCESS_TIMEOUT";
                 case UNTESTABLE -> detail != null && detail.startsWith("SANDBOX_UNAVAILABLE")
                         ? "SANDBOX_UNAVAILABLE"
+                        : detail != null && detail.startsWith("PROCESS_OOM")
+                        ? "PROCESS_OOM"
+                        : detail != null && detail.startsWith("PROBE_OUTPUT_LIMIT")
+                        ? "PROBE_OUTPUT_LIMIT"
                         : detail != null && detail.startsWith("CANARY_ARTIFACT_MISSING")
                         ? "VERIFIER_ARTIFACT_MISSING" : "VERIFIER_CAPABILITY_LIMIT";
                 case FAILED -> "NO_TRIGGER";
@@ -99,6 +125,8 @@ public final class ParallelVerifier {
     private static final int MAX_PER_ENTRY = 2;
     private static final int MAX_OUTPUT_BYTES = 64 * 1024;
     private static final int FUTURE_GRACE_SECONDS = 3;
+    private final SafeSinkAdapter.Mode sinkMode;
+    private final String policyDigest;
 
     private final Path targetJar;
     private final List<Path> deps;
@@ -106,6 +134,8 @@ public final class ParallelVerifier {
     private final Path targetJdkHome;
     private final int targetMajorVersion;
     private final ConfirmCallback callback;
+    /** The parent must own a real OS boundary before releasing an untrusted child. */
+    private final OsIsolation.Backend isolationBackend;
     /** 共享的有界 fat JAR/WAR classpath 展开；所有链复用同一只读结果。 */
     private volatile NestedClasspath expandedClasspath;
     /** Classes defined by the primary artifact (not its nested dependency libraries). */
@@ -116,6 +146,14 @@ public final class ParallelVerifier {
     private volatile Path legacyBootstrapJar;
     /** 实际子 JVM 能力，而非仅由 CLI 的 verify 开关推断的请求状态。 */
     private volatile String capability = "NOT_RUN";
+    /** Artifact identity is computed once per verifier and bound into every child attempt. */
+    private volatile String artifactFingerprint;
+
+    /** Launcher-owned identities carried by the authenticated probe protocol. */
+    static record ProtocolIdentity(String token, String runId, String chainFingerprint,
+                                   String sinkFingerprint, String nonce,
+                                   String artifactFingerprint) {
+    }
 
     public ParallelVerifier(Path targetJar, List<Path> deps, ConfirmCallback callback) {
         this(targetJar, deps, null, 0, callback);
@@ -128,6 +166,12 @@ public final class ParallelVerifier {
 
     public ParallelVerifier(Path targetJar, List<Path> deps, Path targetJdkHome,
                             int targetMajorVersion, ConfirmCallback callback) {
+        this(targetJar, deps, targetJdkHome, targetMajorVersion, false, callback);
+    }
+
+    public ParallelVerifier(Path targetJar, List<Path> deps, Path targetJdkHome,
+                            int targetMajorVersion, boolean safeExec,
+                            ConfirmCallback callback) {
         this.targetJar = targetJar.toAbsolutePath().normalize();
         this.deps = deps != null ? deps : List.of();
         this.targetJdkHome = targetJdkHome == null ? null
@@ -135,6 +179,9 @@ public final class ParallelVerifier {
         this.targetMajorVersion = targetMajorVersion;
         this.callback = callback;
         this.ownJar = locateOwnJar();
+        this.isolationBackend = OsIsolation.select();
+        this.sinkMode = safeExec ? SafeSinkAdapter.Mode.SAFE_EXEC : SafeSinkAdapter.Mode.BOUNDARY;
+        this.policyDigest = SafeSinkAdapter.policyDigest(this.sinkMode);
     }
 
     private record RuntimeSelection(Path javaHome, Path probeJar, int feature, String reason) {
@@ -179,11 +226,15 @@ public final class ParallelVerifier {
         }
         Set<String> constructible = constructibleKeys == null ? Set.of() : constructibleKeys;
         List<Chain> sorted = new ArrayList<>(candidates);
-        sorted.sort(Comparator.comparingInt((Chain chain) -> probePriority(chain, constructible)).reversed()
-                // Blackboard insertion can race between independent analysis workers. A stable
-                // chain key keeps the finite verification budget reproducible without changing
-                // which evidence is preferred.
-                .thenComparing(Chain::key));
+        sorted.sort((left, right) -> {
+            int ranking = ChainRanking.compare(left, right, Map.of(), Map.of(), constructible);
+            if (ranking != 0) {
+                return ranking;
+            }
+            int probe = Integer.compare(probePriority(right, constructible),
+                    probePriority(left, constructible));
+            return probe != 0 ? probe : left.key().compareTo(right.key());
+        });
         Map<String, Integer> entryCount = new HashMap<>();
         List<Chain> selected = new ArrayList<>();
         Set<String> selectedKeys = new java.util.HashSet<>();
@@ -479,6 +530,23 @@ public final class ParallelVerifier {
         return capability;
     }
 
+    /** Structured verifier capability metadata used by all reporters. */
+    public String backendId() {
+        return isolationBackend.id();
+    }
+
+    public String backendReason() {
+        return isolationBackend.reason();
+    }
+
+    public String policyDigest() {
+        return policyDigest;
+    }
+
+    public String policyMode() {
+        return sinkMode.name();
+    }
+
     private void updateCapability(List<VerifyResult> results) {
         if (results == null || results.isEmpty()) {
             capability = "NOT_RUN";
@@ -491,9 +559,11 @@ public final class ParallelVerifier {
                 continue;
             }
             if (result.statusCode() != VerifyStatus.UNTESTABLE) {
-                // A child that reached PARTIAL/FAILED/TIMEOUT crossed the sandbox
-                // installation point; the result is evidence about the target run.
-                capability = "JVM_SANDBOX";
+                // The child cannot produce any non-UNTESTABLE result until the parent has
+                // attached the OS backend and released the authenticated ready marker. This
+                // is stronger than the former JVM-only label and prevents FAILED/TIMEOUT from
+                // being mistaken for a successful Java SecurityManager installation.
+                capability = "OS_SANDBOX";
                 return;
             }
             String detail = result.detail() == null ? "" : result.detail();
@@ -508,7 +578,7 @@ public final class ParallelVerifier {
             }
         }
         if (sandboxUnavailable) {
-            capability = "JVM_SANDBOX_UNAVAILABLE";
+            capability = "OS_SANDBOX_UNAVAILABLE";
         } else if (runtimeUnavailable) {
             capability = "JVM_RUNTIME_UNAVAILABLE";
         } else {
@@ -562,17 +632,18 @@ public final class ParallelVerifier {
                 results.set(completed.index(), completed.result());
             } catch (Exception e) {
                 Chain chain = chains.get(expectedIndex);
-                results.set(expectedIndex, new VerifyResult(chain.key(), "UNTESTABLE",
+                results.set(expectedIndex, enrich(new VerifyResult(chain.key(), "UNTESTABLE",
                         e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(),
-                        attempt, 0L));
+                        attempt, 0L)));
             }
         }
         for (Map.Entry<Future<IndexedResult>, Integer> entry : pending.entrySet()) {
             entry.getKey().cancel(true);
             int index = entry.getValue();
             Chain chain = chains.get(index);
-            results.set(index, new VerifyResult(chain.key(), "UNTESTABLE", "verification-future-timeout",
-                    attempt, (long) (TIMEOUT_SECONDS + FUTURE_GRACE_SECONDS) * 1000));
+            results.set(index, enrich(new VerifyResult(chain.key(), "UNTESTABLE",
+                    "verification-future-timeout", attempt,
+                    (long) (TIMEOUT_SECONDS + FUTURE_GRACE_SECONDS) * 1000)));
         }
         return results;
     }
@@ -599,20 +670,69 @@ public final class ParallelVerifier {
     private VerifyResult verifyOne(Chain chain, int attempt) {
         long started = System.nanoTime();
         VerifyResult result = verifyOneInternal(chain);
-        return new VerifyResult(result.chainKey(), result.status(), result.detail(),
+        if (result == null) {
+            result = new VerifyResult(chain.key(), "UNKNOWN", "verifier-returned-null");
+        }
+        VerifyResult timed = new VerifyResult(result.chainKey(), result.status(), result.detail(),
                 attempt,
                 Math.max(result.durationMs(),
                         TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)),
-                result.evidence());
+                result.evidence(), result.backend(), result.jdk(), result.policyDigest(),
+                result.sinkDistorted(), result.sandboxReady(), result.cleanup());
+        return enrich(timed);
+    }
+
+    /** Add the immutable per-attempt policy context before a result reaches the blackboard. */
+    private VerifyResult enrich(VerifyResult result) {
+        RuntimeSelection runtime = selectRuntime();
+        // Readiness is authenticated by the child protocol, not inferred from a non-error
+        // status. In particular FAILED/TIMEOUT must not advertise that the Java policy was
+        // installed when the child may have died before its ready marker was observed.
+        boolean ready = result != null && result.sandboxReady();
+        boolean distorted = ready && result.sinkDistorted();
+        return new VerifyResult(result == null ? "" : result.chainKey(),
+                result == null ? "UNKNOWN" : result.status(),
+                result == null ? "unknown-result" : result.detail(),
+                result == null ? 1 : result.attempt(),
+                result == null ? 0L : result.durationMs(),
+                result == null ? "UNKNOWN" : result.evidence(),
+                backendId(), runtimeLabel(runtime), policyDigest(), distorted, ready,
+                result == null ? "UNKNOWN" : result.cleanup());
+    }
+
+    /** Result carrying the child-authenticated boundary state into the parent enrichment step. */
+    private VerifyResult authenticatedResult(Chain chain, String status, String detail,
+                                             String evidence, boolean sinkDistorted,
+                                             boolean sandboxReady) {
+        return new VerifyResult(chain.key(), status, detail, 1, 0L, evidence,
+                isolationBackend.id(), "UNKNOWN", policyDigest(), sinkDistorted,
+                sandboxReady, "CLEANUP_BEST_EFFORT");
+    }
+
+    private static String runtimeLabel(RuntimeSelection runtime) {
+        if (runtime == null) {
+            return "UNKNOWN";
+        }
+        String home = runtime.javaHome() == null ? "" : runtime.javaHome().toString();
+        return "feature=" + runtime.feature() + ";home=" + home + ";selection=" + runtime.reason();
     }
 
     private VerifyResult verifyOneInternal(Chain chain) {
         Path isoDir = null;
         Process proc = null;
+        OsIsolation.Session isolationSession = null;
         try {
             RuntimeSelection runtime = selectRuntime();
             if (!runtime.available()) {
                 return new VerifyResult(chain.key(), "UNTESTABLE", runtime.reason());
+            }
+            if (!securityManagerSupported(runtime.feature())) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:JVM_POLICY_UNSUPPORTED:jdk=" + runtime.feature());
+            }
+            if (!isolationBackend.available()) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:OS_BACKEND_REQUIRED:" + isolationBackend.reason());
             }
             String entryDotted = chain.entryClass().replace('/', '.');
             String entryMethod = chain.entryMethod();
@@ -625,7 +745,7 @@ public final class ParallelVerifier {
             Path javaExecPath = javaExecutable(runtime.javaHome());
             String javaExec = javaExecPath.toString();
             List<Path> classpath = runtimeClasspath(runtime.probeJar());
-            String cp = runtime.probeJar().toAbsolutePath().normalize().toString();
+            String cp = probeClasspath(runtime.probeJar());
             String targetCp = classpath.stream()
                     .filter(entry -> !entry.toAbsolutePath().normalize()
                             .equals(runtime.probeJar().toAbsolutePath().normalize()))
@@ -648,6 +768,19 @@ public final class ParallelVerifier {
             String entrySpec = entryDotted + "#" + entryMethod;
             // The result marker and the bytecode canary share one per-child capability token.
             String protocolToken = UUID.randomUUID().toString();
+            ProtocolIdentity protocolIdentity;
+            try {
+                protocolIdentity = new ProtocolIdentity(protocolToken, UUID.randomUUID().toString(),
+                        sha256Hex(chain.key()),
+                        sha256Hex(chain.sinkClass() + "#" + chain.sinkMethod() + "#"
+                                + sinkDescriptor),
+                        UUID.randomUUID().toString().replace("-", ""),
+                        artifactFingerprint());
+            } catch (IOException | RuntimeException fingerprintFailure) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "ARTIFACT_FINGERPRINT_UNAVAILABLE:"
+                                + fingerprintFailure.getClass().getSimpleName());
+            }
             FieldDependencyPlan plan = FieldDependencyPlan.from(
                     chain, mode);
 
@@ -655,7 +788,21 @@ public final class ParallelVerifier {
             // fork-per-chain 保持类隔离——静态状态不跨链污染。SecurityManager 只在 JDK
             // 17--23 可用时启用；JDK 24+ 的探针会安全地报告不可验证，不执行目标代码。
             isoDir = Files.createTempDirectory("just-verify-");
+            SafeSinkAdapter.Policy sinkPolicy;
+            try {
+                sinkPolicy = sinkMode == SafeSinkAdapter.Mode.SAFE_EXEC
+                        ? SafeSinkAdapter.safeExecution(isoDir)
+                        : SafeSinkAdapter.boundary();
+            } catch (IllegalArgumentException policyFailure) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SAFE_SINK_POLICY_INVALID:" + policyFailure.getMessage());
+            }
+            SafeSinkAdapter.Decision sinkDecision = SafeSinkAdapter.preflight(sinkPolicy,
+                    new SafeSinkAdapter.Sink(chain.category(), chain.sinkClass(),
+                            chain.sinkMethod(), sinkDescriptor), null).decision();
             Path isoTmp = Files.createDirectories(isoDir.resolve("tmp"));
+            Path isolationReady = isoDir.resolve("isolation.ready");
+            String isolationToken = UUID.randomUUID().toString();
             List<String> command = new ArrayList<>();
             command.add(javaExec);
             command.add("-Xmx256m");
@@ -674,6 +821,9 @@ public final class ParallelVerifier {
             if (securityManagerFlagSupported(runtime.feature())) {
                 command.add("-Djava.security.manager=allow");
             }
+            command.add("-Djust.verify.isolation-ready=" + isolationReady.toAbsolutePath());
+            command.add("-Djust.verify.isolation-token=" + isolationToken);
+            command.add("-Djust.verify.backend=" + isolationBackend.id());
             command.add("-Djava.io.tmpdir=" + isoTmp);
             command.add("-Duser.dir=" + isoDir);
             command.add("-Duser.home=" + isoDir);
@@ -683,6 +833,20 @@ public final class ParallelVerifier {
             command.add("-Djava.util.prefs.userRoot=" + isoDir.resolve("prefs"));
             command.add("-Djava.util.prefs.systemRoot=" + isoDir.resolve("system-prefs"));
             command.add("-Djust.verify.sanitized-env=true");
+            command.add("-Djust.verify.sink-mode=" + sinkMode.name());
+            command.add("-Djust.verify.sink-policy-digest=" + sinkPolicy.digest());
+            command.add("-Djust.verify.sink-disposition=" + sinkDecision.disposition().name());
+            command.add("-Djust.verify.run-id=" + protocolIdentity.runId());
+            command.add("-Djust.verify.chain-fingerprint=" + protocolIdentity.chainFingerprint());
+            command.add("-Djust.verify.sink-fingerprint=" + protocolIdentity.sinkFingerprint());
+            command.add("-Djust.verify.nonce=" + protocolIdentity.nonce());
+            command.add("-Djust.verify.artifact-fingerprint=" + protocolIdentity.artifactFingerprint());
+            String sinkCategory = chain.category() == null ? ""
+                    : chain.category().replace('\n', '_').replace('\r', '_');
+            if (sinkCategory.length() > 96) {
+                sinkCategory = sinkCategory.substring(0, 96);
+            }
+            command.add("-Djust.verify.sink-category=" + sinkCategory);
             command.add("-Djava.awt.headless=true");
             command.add("-Djava.net.useSystemProxies=false");
             // The probe jar must remain in the launcher loader for the agent/main class, but
@@ -696,11 +860,16 @@ public final class ParallelVerifier {
                 // verifier8 artifact contains only Java 8-compatible probe/agent classes.
                 command.add("-javaagent:" + runtime.probeJar().toAbsolutePath()
                         + "=" + canaryBootstrap + "|"
-                        + entrySpec + "|" + agentSpec + "|" + protocolToken);
+                        + entrySpec + "|" + agentSpec + "|" + protocolToken + "|"
+                        + protocolIdentity.runId() + "|" + protocolIdentity.chainFingerprint() + "|"
+                        + protocolIdentity.sinkFingerprint() + "|" + protocolIdentity.nonce() + "|"
+                        + protocolIdentity.artifactFingerprint());
             } else {
                 command.add("-javaagent:" + runtime.probeJar().toAbsolutePath() + "="
                         + canaryBootstrap + "|" + entrySpec + "|" + agentSpec + "|"
-                        + protocolToken);
+                        + protocolToken + "|" + protocolIdentity.runId() + "|"
+                        + protocolIdentity.chainFingerprint() + "|" + protocolIdentity.sinkFingerprint() + "|"
+                        + protocolIdentity.nonce() + "|" + protocolIdentity.artifactFingerprint());
             }
             command.add("-cp");
             command.add(cp);
@@ -718,16 +887,32 @@ public final class ParallelVerifier {
             // build an in-memory callback collection for the source boundary; this is a
             // verification adapter only and never writes an attacker payload artifact.
             command.add(sourceTriggerSpec(chain));
-            // The result marker is correlated per child attempt. Target stdout/stderr is
-            // diagnostic only and cannot be parsed as a verification state.
+            // Keep the attestation token at the historical arg5 position.  The graph plan is
+            // an optional extension field after it so old probe launchers and the current
+            // parent remain wire-compatible while the child can reject malformed plans.
             command.add(protocolToken);
-            ProcessBuilder pb = new ProcessBuilder(command);
+            // Declarative object-shape evidence is data-only. The child parses it with a
+            // length/count-bounded decoder and applies only typed field/proxy operations.
+            command.add(chain.constructionPlan() == null
+                    ? "" : chain.constructionPlan().encodedForProbe());
+            List<String> launchCommand = isolationBackend.command(command, isoDir);
+            ProcessBuilder pb = new ProcessBuilder(launchCommand);
             pb.directory(isoDir.toFile());
             pb.redirectErrorStream(true);
             pb.environment().clear();
             pb.environment().putAll(sanitizedEnvironment(System.getenv(),
                     runtime.javaHome(), isoDir, isoTmp));
             proc = pb.start();
+            try {
+                isolationSession = isolationBackend.attach(proc);
+                Files.writeString(isolationReady, isolationToken, StandardCharsets.US_ASCII,
+                        java.nio.file.StandardOpenOption.CREATE_NEW,
+                        java.nio.file.StandardOpenOption.WRITE);
+            } catch (IOException | RuntimeException isolationFailure) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:OS_ATTACH_OR_HANDSHAKE:"
+                                + isolationFailure.getClass().getSimpleName());
+            }
             OutputCapture capture = new OutputCapture(proc.getInputStream(), MAX_OUTPUT_BYTES);
             Thread outputReader = new Thread(capture, "just-verify-output");
             outputReader.setDaemon(true);
@@ -739,63 +924,101 @@ public final class ParallelVerifier {
             if (!finished) {
                 killProcessTree(proc);
                 outputReader.join(1_000L);
-                return new VerifyResult(chain.key(), "TIMEOUT", TIMEOUT_SECONDS + "s");
+                ProtocolEvidence timeoutProtocol = protocolEvidence(capture.text(), protocolIdentity);
+                boolean ready = protocolReady(timeoutProtocol);
+                return authenticatedResult(chain, "TIMEOUT", TIMEOUT_SECONDS + "s",
+                        "PROCESS_TIMEOUT", ready, ready);
             }
             outputReader.join(1_000L);
             String output = capture.text();
             if (capture.overflow()) {
-                return new VerifyResult(chain.key(), "UNTESTABLE", "probe-output-limit");
+                ProtocolEvidence overflowProtocol = protocolEvidence(output, protocolIdentity);
+                boolean ready = protocolReady(overflowProtocol);
+                return authenticatedResult(chain, "UNTESTABLE", "PROBE_OUTPUT_LIMIT",
+                        "VERIFIER_CAPABILITY_LIMIT", false, ready);
+            }
+            // ExitOnOutOfMemoryError intentionally terminates the child without a terminal
+            // protocol frame.  Treat the diagnostic only as a negative resource outcome: an
+            // untrusted target's text can never create a positive status, but retaining the
+            // reason prevents OOM from being mistaken for an ordinary no-trigger result.
+            if (outOfMemoryDiagnostic(output)) {
+                ProtocolEvidence oomProtocol = protocolEvidence(output, protocolIdentity);
+                boolean ready = protocolReady(oomProtocol);
+                return authenticatedResult(chain, "UNTESTABLE", "PROCESS_OOM",
+                        "PROCESS_OOM", false, ready);
             }
             // redirectErrorStream 合并了 stderr。只接受带本次 token 的 probe marker；目标
             // 工件可以任意写 stdout/stderr，普通文本永远不能升级为动态证据。
-            String firstLine = null;
-            String firstAny = null;
-            for (String line : output.split("\\R")) {
-                String trimmed = line.strip();
-                if (trimmed.isEmpty()) {
-                    continue;
-                }
-                if (firstAny == null) {
-                    firstAny = trimmed;
-                }
-                String status = authenticatedStatus(trimmed, protocolToken);
-                if (status != null) {
-                    firstLine = status;
-                    break;
-                }
+            String firstAny = firstDiagnostic(output);
+            ProtocolEvidence protocol = protocolEvidence(output, protocolIdentity);
+            if (!protocol.bindingValid()) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "PROTOCOL_AUTHENTICATION_FAILED:IDENTITY_MISMATCH", 1, 0L,
+                        "VERIFIER_CAPABILITY_LIMIT", isolationBackend.id(),
+                        runtimeLabel(runtime), policyDigest(), false, false,
+                        "CLEANUP_BEST_EFFORT");
             }
-            if (firstLine == null) firstLine = "";
+            if (!protocol.ready()) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:READY_EVENT_MISSING"
+                                + (protocol.terminal() == null ? "" : ": observed=" + protocol.terminal()),
+                        1, 0L, "SANDBOX_UNAVAILABLE");
+            }
+            if (!protocol.validOrder()) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:READY_EVENT_ORDER_INVALID", 1, 0L,
+                        "SANDBOX_UNAVAILABLE");
+            }
+            if (!isolationBackend.id().equals(protocol.readyBackend())) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:READY_BACKEND_MISMATCH", 1, 0L,
+                        "SANDBOX_UNAVAILABLE");
+            }
+            boolean ready = protocolReady(protocol);
+            String firstLine = protocol.terminal() == null ? "" : protocol.terminal();
+            if (firstLine.startsWith("SAFE_EFFECT_OBSERVED")) {
+                return authenticatedResult(chain, "SAFE_EFFECT_OBSERVED", firstLine,
+                        "SAFE_EFFECT_OBSERVED", true, ready);
+            }
             if (firstLine.startsWith("SINK_BLOCKED") || firstLine.startsWith("SINK_TRIGGERED")) {
                 if (callback != null) callback.onConfirmed(chain, firstLine, true);
-                return new VerifyResult(chain.key(), "SINK_BLOCKED", "SINK_CANARY_BOUNDARY",
-                        1, 0L, "SINK_CANARY_BOUNDARY");
+                String detail = firstLine.isBlank() ? "SINK_CANARY_BOUNDARY" : firstLine;
+                String evidence = firstLine.contains("adapter=")
+                        ? "SINK_CANARY_BOUNDARY_ADAPTER" : "SINK_CANARY_BOUNDARY";
+                return authenticatedResult(chain, "SINK_BLOCKED", detail, evidence, true, ready);
             }
             if (firstLine.startsWith("CONCRETE_REACHED")) {
-                return new VerifyResult(chain.key(), "CONCRETE_REACHED", firstLine,
-                        1, 0L, "CONCRETE_TRIGGER");
+                return authenticatedResult(chain, "CONCRETE_REACHED", firstLine,
+                        "CONCRETE_TRIGGER", true, ready);
             }
             if (firstLine.startsWith("EXECUTED")) {
                 // 入口方法真实调用且正常返回——链可执行，但未证伪/证实 sink 到达
-                return new VerifyResult(chain.key(), "EXECUTED", firstLine);
+                return authenticatedResult(chain, "EXECUTED", firstLine,
+                        "ENTRY_RETURNED", true, ready);
             }
             if (firstLine.startsWith("PARTIAL_PATH")) {
-                return new VerifyResult(chain.key(), "PARTIAL", firstLine);
+                return authenticatedResult(chain, "PARTIAL", firstLine,
+                        "PARTIAL_PATH", true, ready);
             }
             if (firstLine.startsWith("SANDBOX_UNAVAILABLE")) {
-                return new VerifyResult(chain.key(), "UNTESTABLE", firstLine);
+                return authenticatedResult(chain, "UNTESTABLE", firstLine,
+                        "SANDBOX_UNAVAILABLE", false, ready);
             }
             if (firstLine.startsWith("UNTESTABLE")) {
-                return new VerifyResult(chain.key(), "UNTESTABLE", firstLine);
+                return authenticatedResult(chain, "UNTESTABLE", firstLine,
+                        "VERIFIER_CAPABILITY_LIMIT", false, ready);
             }
             int exit = proc.exitValue();
             if (exit != 0) {
-                return new VerifyResult(chain.key(), "PARTIAL",
+                return authenticatedResult(chain, "PARTIAL",
                         "exit=" + exit + " probe-no-authenticated-status"
-                                + (firstAny == null ? "" : " diagnostic=" + firstAny));
+                                + (firstAny == null ? "" : " diagnostic=" + firstAny),
+                        "PARTIAL_PATH", true, ready);
             }
-            return new VerifyResult(chain.key(), "FAILED",
+            return authenticatedResult(chain, "FAILED",
                     "no-authenticated-probe-status"
-                            + (firstAny == null ? "" : " diagnostic=" + firstAny));
+                            + (firstAny == null ? "" : " diagnostic=" + firstAny),
+                    "NO_TRIGGER", true, ready);
 
         } catch (Exception e) {
             if (e instanceof InterruptedException) {
@@ -811,6 +1034,9 @@ public final class ParallelVerifier {
             // races for an already-reaped process.
             if (proc != null) {
                 killProcessTree(proc);
+            }
+            if (isolationSession != null) {
+                isolationSession.close();
             }
             // 每条链一个隔离 cwd/tmp；不能只清理共享的 fat-jar 展开目录，否则批量扫描会
             // 在系统临时目录留下大量 just-verify-* 目录。
@@ -831,8 +1057,146 @@ public final class ParallelVerifier {
         return isProtocolStatus(status) ? status : null;
     }
 
+    static record ProtocolEvidence(boolean ready, boolean validOrder,
+                                   boolean bindingValid, String readyBackend, String terminal) {
+    }
+
+    private boolean protocolReady(ProtocolEvidence evidence) {
+        return evidence != null && evidence.bindingValid() && evidence.ready()
+                && evidence.validOrder()
+                && isolationBackend.id().equals(evidence.readyBackend());
+    }
+
+    /**
+     * Parse the child-owned channel independently from target diagnostics. Readiness is a
+     * protocol event, not an inference from the marker file or process exit; a terminal event
+     * emitted before readiness invalidates the entire attempt.
+     */
+    static ProtocolEvidence protocolEvidence(String output, String token) {
+        boolean ready = false;
+        boolean validOrder = true;
+        String readyBackend = "";
+        String terminal = null;
+        if (output == null) {
+            return new ProtocolEvidence(false, false, true, "", null);
+        }
+        for (String line : output.split("\\R")) {
+            String status = authenticatedStatus(line.strip(), token);
+            if (status == null) {
+                continue;
+            }
+            if (status.startsWith("SANDBOX_READY")) {
+                if (ready) {
+                    validOrder = false;
+                }
+                ready = true;
+                int colon = status.indexOf(':');
+                readyBackend = colon < 0 ? "" : status.substring(colon + 1).strip();
+                continue;
+            }
+            if (!ready) {
+                validOrder = false;
+            }
+            if (terminal == null) {
+                terminal = status;
+            }
+        }
+        return new ProtocolEvidence(ready, validOrder, true, readyBackend, terminal);
+    }
+
+    /** Parse only the V2 channel bound to this exact chain, sink and artifact attempt. */
+    static ProtocolEvidence protocolEvidence(String output, ProtocolIdentity expected) {
+        boolean ready = false;
+        boolean validOrder = true;
+        boolean allFramesValid = true;
+        String readyBackend = "";
+        String terminal = null;
+        if (output == null || expected == null) {
+            return new ProtocolEvidence(false, false, false, "", null);
+        }
+        boolean sawBoundPrefix = false;
+        for (String raw : output.split("\\R")) {
+            String line = raw.strip();
+            if (!line.startsWith("JUST_VERIFY_V2:")) {
+                continue;
+            }
+            sawBoundPrefix = true;
+            ProtocolFrame frame = parseProtocolFrame(line, expected);
+            if (frame == null) {
+                allFramesValid = false;
+                continue;
+            }
+            String status = frame.status();
+            if (status.startsWith("SANDBOX_READY")) {
+                if (ready) {
+                    validOrder = false;
+                }
+                ready = true;
+                int colon = status.indexOf(':');
+                readyBackend = colon < 0 ? "" : status.substring(colon + 1).strip();
+                continue;
+            }
+            if (!ready) {
+                validOrder = false;
+            }
+            if (terminal != null) {
+                validOrder = false;
+            }
+            if (terminal == null) {
+                terminal = status;
+            }
+        }
+        boolean bindingValid = sawBoundPrefix && allFramesValid;
+        return new ProtocolEvidence(ready, validOrder, bindingValid, readyBackend, terminal);
+    }
+
+    private record ProtocolFrame(String status) {
+    }
+
+    private static ProtocolFrame parseProtocolFrame(String line, ProtocolIdentity expected) {
+        String prefix = "JUST_VERIFY_V2:";
+        String[] fields = line.substring(prefix.length()).split(":", 7);
+        if (fields.length != 7 || !expected.token().equals(fields[0])
+                || !expected.runId().equals(fields[1])
+                || !expected.chainFingerprint().equals(fields[2])
+                || !expected.sinkFingerprint().equals(fields[3])
+                || !expected.nonce().equals(fields[4])
+                || !expected.artifactFingerprint().equals(fields[5])
+                || !isProtocolStatus(fields[6])) {
+            return null;
+        }
+        return new ProtocolFrame(fields[6]);
+    }
+
+    private static String firstDiagnostic(String output) {
+        if (output == null) {
+            return null;
+        }
+        for (String line : output.split("\\R")) {
+            String trimmed = line.strip();
+            if (!trimmed.isEmpty() && !trimmed.startsWith("JUST_VERIFY_V1:")
+                    && !trimmed.startsWith("JUST_VERIFY_V2:")) {
+                return trimmed;
+            }
+        }
+        return null;
+    }
+
+    static boolean outOfMemoryDiagnostic(String output) {
+        if (output == null || output.isBlank()) {
+            return false;
+        }
+        String lower = output.toLowerCase(Locale.ROOT);
+        return lower.contains("outofmemoryerror")
+                || lower.contains("java heap space")
+                || lower.contains("gc overhead limit exceeded")
+                || lower.contains("unable to create native thread");
+    }
+
     private static boolean isProtocolStatus(String status) {
-        return status.startsWith("SINK_BLOCKED") || status.startsWith("SINK_TRIGGERED")
+        return status.startsWith("SANDBOX_READY") || status.startsWith("SINK_BLOCKED")
+                || status.startsWith("SINK_TRIGGERED")
+                || status.startsWith("SAFE_EFFECT_OBSERVED")
                 || status.startsWith("CONCRETE_REACHED") || status.startsWith("EXECUTED")
                 || status.startsWith("SANDBOX_UNAVAILABLE") || status.startsWith("UNTESTABLE")
                 || status.startsWith("PARTIAL_PATH");
@@ -912,9 +1276,15 @@ public final class ParallelVerifier {
             ChainHop callback = callbackAfterSource(chain.hops(), directSourceIndex);
             if (callback != null) {
                 String kind = callbackKind(callback.toName());
+                int callbackIndex = callbackIndexAfterSource(chain.hops(), directSourceIndex);
+                String downstreamOwners = downstreamOwnerCandidates(chain.hops(), callbackIndex,
+                        chain.sinkClass());
+                String downstreamMethod = downstreamOwners.isEmpty() || callbackIndex <= 0
+                        ? "" : safe(chain.hops().get(callbackIndex - 1).toName());
                 return String.join("|", callback.toOwner(), callback.toName(), kind,
                         directSource.toOwner(), directSource.toName(),
-                        directSource.desc() == null ? "" : directSource.desc(), "", "");
+                        directSource.desc() == null ? "" : directSource.desc(),
+                        downstreamOwners, downstreamMethod);
             }
             return String.join("|", "java/util/ArrayList", "toString", "toString",
                     directSource.toOwner(), directSource.toName(),
@@ -935,23 +1305,13 @@ public final class ParallelVerifier {
         // describes the first downstream object that the callback must reach (for example a
         // bean wrapper after an EqualsBean). Carry only that semantic boundary to the child;
         // the adapter remains bounded and does not need package/benchmark knowledge.
-        ChainHop downstream = null;
-        if (triggerIndex > 0) {
-            for (int i = triggerIndex - 1; i >= 0; i--) {
-                ChainHop candidate = chain.hops().get(i);
-                if (!"bridge-source-deserialize".equals(candidate.reason())
-                        && !"bridge-trigger-src".equals(candidate.reason())) {
-                    downstream = candidate;
-                    break;
-                }
-            }
-        }
-        String downstreamOwner = downstream == null ? "" : downstream.toOwner();
-        String downstreamMethod = downstream == null ? "" : downstream.toName();
+        String downstreamOwner = downstreamOwnerCandidates(chain.hops(), triggerIndex,
+                chain.sinkClass());
+        String downstreamMethod = downstreamOwner.isEmpty() || triggerIndex <= 0
+                ? "" : safe(chain.hops().get(triggerIndex - 1).toName());
         return String.join("|", trigger.toOwner(), trigger.toName(), kind,
                 source.toOwner(), source.toName(), source.desc() == null ? "" : source.desc(),
-                downstreamOwner == null ? "" : downstreamOwner,
-                downstreamMethod == null ? "" : downstreamMethod);
+                downstreamOwner, downstreamMethod);
     }
 
     /**
@@ -962,23 +1322,67 @@ public final class ParallelVerifier {
      * generic adapter remains in use.
      */
     private static ChainHop callbackAfterSource(List<ChainHop> hops, int sourceIndex) {
-        if (hops == null || sourceIndex <= 0) {
+        int index = callbackIndexAfterSource(hops, sourceIndex);
+        if (index < 0) {
             return null;
+        }
+        ChainHop candidate = hops.get(index);
+        if (callbackKind(candidate.toName()) != null
+                && candidate.toOwner() != null && !candidate.toOwner().isBlank()) {
+            return candidate;
+        }
+        if (callbackKind(candidate.fromName()) != null
+                && candidate.fromOwner() != null && !candidate.fromOwner().isBlank()) {
+            return new ChainHop(candidate.toOwner(), candidate.toName(),
+                    candidate.fromOwner(), candidate.fromName(), candidate.kind(),
+                    candidate.field(), candidate.reason(), candidate.desc(), candidate.argOrdinal());
+        }
+        return null;
+    }
+
+    private static int callbackIndexAfterSource(List<ChainHop> hops, int sourceIndex) {
+        if (hops == null || sourceIndex <= 0) {
+            return -1;
         }
         for (int i = sourceIndex - 1; i >= 0; i--) {
             ChainHop candidate = hops.get(i);
-            if (callbackKind(candidate.toName()) != null
-                    && candidate.toOwner() != null && !candidate.toOwner().isBlank()) {
-                return candidate;
-            }
-            if (callbackKind(candidate.fromName()) != null
-                    && candidate.fromOwner() != null && !candidate.fromOwner().isBlank()) {
-                return new ChainHop(candidate.toOwner(), candidate.toName(),
-                        candidate.fromOwner(), candidate.fromName(), candidate.kind(),
-                        candidate.field(), candidate.reason(), candidate.desc(), candidate.argOrdinal());
+            if ((callbackKind(candidate.toName()) != null
+                    && candidate.toOwner() != null && !candidate.toOwner().isBlank())
+                    || (callbackKind(candidate.fromName()) != null
+                    && candidate.fromOwner() != null && !candidate.fromOwner().isBlank())) {
+                return i;
             }
         }
-        return null;
+        return -1;
+    }
+
+    /**
+     * Carry a bounded declared-to-concrete receiver trail to the child. Interface owners are
+     * common in reflective gadget paths (for example a Templates API backed by an implementation
+     * class), so the child needs the nearby concrete candidate without knowing a benchmark name.
+     */
+    private static String downstreamOwnerCandidates(List<ChainHop> hops, int boundaryIndex,
+                                                    String sinkOwner) {
+        if (hops == null || boundaryIndex <= 0) {
+            return "";
+        }
+        List<String> owners = new ArrayList<>();
+        for (int i = boundaryIndex - 1; i >= 0 && owners.size() < 8; i--) {
+            ChainHop candidate = hops.get(i);
+            if (candidate == null || "bridge-source-deserialize".equals(candidate.reason())
+                    || "bridge-trigger-src".equals(candidate.reason())) {
+                continue;
+            }
+            String owner = safe(candidate.toOwner());
+            if (!owner.isBlank() && !owner.equals(sinkOwner) && !owners.contains(owner)) {
+                owners.add(owner);
+            }
+        }
+        return String.join(",", owners);
+    }
+
+    private static String safe(String value) {
+        return value == null ? "" : value;
     }
 
     private static String callbackKind(String method) {
@@ -1031,10 +1435,63 @@ public final class ParallelVerifier {
         }
     }
 
+    /**
+     * The packaged verifier is self-contained, while the lifecycle test-probe JAR is a
+     * deliberately small classifier. Keep the agent usable in {@code mvn test} by adding the
+     * ASM code source used by the parent test runtime when the classifier does not contain it.
+     * This entry is on the launcher class path only; {@code target-cp} remains isolated from it
+     * through the explicit application loader.
+     */
+    private static String probeClasspath(Path probeJar) {
+        List<String> entries = new ArrayList<>();
+        addClasspathEntry(entries, probeJar);
+        try {
+            Class<?> asm = Class.forName("org.objectweb.asm.ClassVisitor", false,
+                    ParallelVerifier.class.getClassLoader());
+            if (asm.getProtectionDomain() != null
+                    && asm.getProtectionDomain().getCodeSource() != null) {
+                Path location = Path.of(asm.getProtectionDomain().getCodeSource()
+                        .getLocation().toURI());
+                addClasspathEntry(entries, location);
+            }
+        } catch (Exception | LinkageError ignored) {
+            // A packaged shaded verifier does not need an external ASM code source.
+        }
+        return String.join(File.pathSeparator, entries);
+    }
+
+    private static void addClasspathEntry(List<String> entries, Path path) {
+        if (path == null) {
+            return;
+        }
+        String value = path.toAbsolutePath().normalize().toString();
+        if (!entries.contains(value)) {
+            entries.add(value);
+        }
+    }
+
     private static Path locateOwnJar() {
         try {
-            return Path.of(ParallelVerifier.class.getProtectionDomain()
-                    .getCodeSource().getLocation().toURI()).toAbsolutePath();
+            Path location = Path.of(ParallelVerifier.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI()).toAbsolutePath().normalize();
+            if (Files.isRegularFile(location)) {
+                return location;
+            }
+            // Surefire and IDEs load the verifier from target/classes. Resolve the
+            // lifecycle-produced probe artifacts beside that directory so test runs use the
+            // same agent-capable contract as the packaged CLI instead of silently degrading
+            // every dynamic case to verifier-artifact-missing.
+            Path target = location.getParent();
+            if (target != null) {
+                for (String name : List.of("just-sast-0.2.0-testprobe.jar",
+                        "just-sast-0.2.0.jar")) {
+                    Path candidate = target.resolve(name);
+                    if (Files.isRegularFile(candidate)) {
+                        return candidate;
+                    }
+                }
+            }
+            return location;
         } catch (Exception e) {
             return Path.of(".");
         }
@@ -1047,6 +1504,11 @@ public final class ParallelVerifier {
 
     private static boolean securityManagerFlagSupported(int feature) {
         return feature >= 17 && feature < 24;
+    }
+
+    /** Java 8--23 can install the probe's deny-by-default manager programmatically. */
+    static boolean securityManagerSupported(int feature) {
+        return feature >= 8 && feature < 24;
     }
 
     private RuntimeSelection selectRuntime() {
@@ -1091,9 +1553,25 @@ public final class ParallelVerifier {
     private Path probeJarFor(int feature) {
         if (feature < 17) {
             Path legacy = ownJar.resolveSibling("just-sast-0.2.0-verify8.jar");
-            return Files.isRegularFile(legacy) ? legacy : null;
+            if (Files.isRegularFile(legacy)) {
+                return legacy;
+            }
+            // During tests the parent may have been loaded from target/classes while the
+            // verifier JAR is produced in target. Keep the lookup deterministic and allow
+            // an explicit package-first run to use the same artifact.
+            Path parent = ownJar.getParent();
+            if (parent != null) {
+                legacy = parent.resolve("just-sast-0.2.0-verify8.jar");
+                if (Files.isRegularFile(legacy)) {
+                    return legacy;
+                }
+            }
+            return null;
         }
-        return Files.isRegularFile(ownJar) ? ownJar : null;
+        if (Files.isRegularFile(ownJar)) {
+            return ownJar;
+        }
+        return null;
     }
 
     private static Path javaExecutable(Path javaHome) {
@@ -1248,7 +1726,21 @@ public final class ParallelVerifier {
         public void run() {
             byte[] buffer = new byte[8192];
             try {
-                for (int read; (read = input.read(buffer)) >= 0; ) {
+                for (int read; ; ) {
+                    read = input.read(buffer);
+                    if (read < 0) {
+                        break;
+                    }
+                    if (read == 0) {
+                        // InputStream is permitted to make no progress. A hostile or
+                        // instrumented child must not turn output draining into a busy loop.
+                        int one = input.read();
+                        if (one < 0) {
+                            break;
+                        }
+                        buffer[0] = (byte) one;
+                        read = 1;
+                    }
                     synchronized (output) {
                         int remaining = limit - output.size();
                         if (remaining > 0) {
@@ -1354,8 +1846,8 @@ public final class ParallelVerifier {
                 return legacyBootstrapJar;
             }
             try (java.util.jar.JarFile source = new java.util.jar.JarFile(probeJar.toFile())) {
-                String gate = "io/just/sast/verify/legacy/LegacySinkCanaryGate.class";
-                String marker = "io/just/sast/verify/legacy/LegacySinkReachedError.class";
+                String gate = "io/just/sast/verify/boot/SinkCanaryGate.class";
+                String marker = "io/just/sast/verify/boot/SinkReachedError.class";
                 java.util.jar.JarEntry gateEntry = source.getJarEntry(gate);
                 java.util.jar.JarEntry markerEntry = source.getJarEntry(marker);
                 if (gateEntry == null || markerEntry == null) {
@@ -1405,6 +1897,57 @@ public final class ParallelVerifier {
         try {
             Files.deleteIfExists(p);
         } catch (Exception ignored) {
+        }
+    }
+
+    private synchronized String artifactFingerprint() throws IOException {
+        if (artifactFingerprint != null) {
+            return artifactFingerprint;
+        }
+        artifactFingerprint = ArtifactFingerprint.sha256(targetJar);
+        return artifactFingerprint;
+    }
+
+    /** Stable identity for the persistent verification summary; failures remain explicit. */
+    public String artifactFingerprintForReport() {
+        try {
+            return artifactFingerprint();
+        } catch (IOException | RuntimeException failure) {
+            return "UNAVAILABLE:" + failure.getClass().getSimpleName();
+        }
+    }
+
+    private static String sha256Hex(String value) {
+        try {
+            return hex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest((value == null ? "" : value).getBytes(StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            return "sha256-unavailable-" + Integer.toHexString(
+                    (value == null ? "" : value).hashCode());
+        }
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder result = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) {
+            result.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+        }
+        return result.toString();
+    }
+
+    private static String policyDigestOf(String policy) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(policy.getBytes(StandardCharsets.UTF_8));
+            StringBuilder result = new StringBuilder(digest.length * 2);
+            for (byte value : digest) {
+                result.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+            }
+            return result.toString();
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            // SHA-256 is required by every supported Java runtime. Keep a stable fallback
+            // rather than dropping the policy identity from a report on a broken provider.
+            return "sha256-unavailable-" + Integer.toHexString(policy.hashCode());
         }
     }
 }

@@ -34,6 +34,28 @@ class YamlRuleLoaderTest {
     }
 
     @Test
+    void secondaryDeserializeBridgesAreTypedSources() throws IOException {
+        Path rules = Path.of("src/main/resources/rules/default-rules.yaml");
+        RuleSet set = new YamlRuleLoader().load(Files.newInputStream(rules));
+        for (String id : List.of("JUST-SOURCE-HUTOOL-OBJECTUTIL",
+                "JUST-SOURCE-HUTOOL-SERIALIZEUTIL",
+                "JUST-SOURCE-SPRING-SERIALIZATIONUTILS")) {
+            Rule.SourceRule source = set.sources().stream()
+                    .filter(candidate -> id.equals(candidate.id()))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("missing source rule " + id));
+            assertEquals("deserialize", source.bridge());
+            String expectedDescriptor = id.contains("HUTOOL")
+                    ? "([B[Ljava/lang/Class;)Ljava/lang/Object;"
+                    : "([B)Ljava/lang/Object;";
+            assertEquals(expectedDescriptor, source.call().descriptor().pattern());
+            assertTrue(!source.call().descriptor().isRegex(), "byte[] bridge descriptor must be exact");
+            assertEquals(List.of(new Rule.TaintedPos.Arg(0)), source.tainted(),
+                    "secondary bridge must require a tainted byte[] input");
+        }
+    }
+
+    @Test
     void privateAccessAndSafeConfigParsed() throws IOException {
         String yaml = """
                 rules:
@@ -56,6 +78,34 @@ class YamlRuleLoaderTest {
         Rule.SourceRule source = set.sources().get(0);
         assertNotNull(source.safeConfig());
         assertEquals(java.util.Set.of("lock", "seal"), source.safeConfig().methods());
+        assertTrue(source.tainted().isEmpty(), "omitted source tainted means unconditional source");
+    }
+
+    @Test
+    void sourceTaintedPositionsRejectMalformedAndDuplicateDeclarations() {
+        String duplicate = """
+                rules:
+                  - id: T-SOURCE
+                    kind: source
+                    bridge: deserialize
+                    match: { call: { owner: a/B, name: load } }
+                    tainted: [{arg: 0}, {arg: 0}]
+                """;
+        Exception e = assertThrows(IOException.class, () ->
+                new YamlRuleLoader().load(new ByteArrayInputStream(duplicate.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(e.getMessage().contains("重复"), e.getMessage());
+
+        String empty = """
+                rules:
+                  - id: T-SOURCE
+                    kind: source
+                    bridge: deserialize
+                    match: { call: { owner: a/B, name: load } }
+                    tainted: []
+                """;
+        e = assertThrows(IOException.class, () ->
+                new YamlRuleLoader().load(new ByteArrayInputStream(empty.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(e.getMessage().contains("非空"), e.getMessage());
     }
 
     @Test
@@ -169,5 +219,60 @@ class YamlRuleLoaderTest {
         e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
                 new ByteArrayInputStream(badModel.getBytes(StandardCharsets.UTF_8))));
         assertTrue(e.getMessage().contains("argN"), e.getMessage());
+    }
+
+    @Test
+    void sinkRoleIsExplicitAndDefaultsToTerminal() throws Exception {
+        String yaml = "rules:\n"
+                + "  - id: CAP\n"
+                + "    kind: sink\n"
+                + "    category: REFLECTION\n"
+                + "    severity: HIGH\n"
+                + "    role: capability\n"
+                + "    match:\n"
+                + "      call: {owner: java/lang/reflect/Method, name: invoke}\n"
+                + "    tainted: [{arg: 0}]\n"
+                + "  - id: TERM\n"
+                + "    kind: sink\n"
+                + "    category: COMMAND_EXEC\n"
+                + "    severity: HIGH\n"
+                + "    match:\n"
+                + "      call: {owner: java/lang/Runtime, name: exec}\n"
+                + "    tainted: [{arg: 0}]\n";
+
+        RuleSet rules = new YamlRuleLoader().load(
+                new java.io.ByteArrayInputStream(yaml.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+
+        assertEquals(Rule.SinkRole.CAPABILITY, rules.sinks().get(0).role());
+        assertEquals(Rule.SinkRole.TERMINAL, rules.sinks().get(1).role());
+    }
+
+    @Test
+    void defaultRulesCarryBoundedObjectPlanForComplexJdkFragment() throws Exception {
+        RuleSet rules = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+        Rule.FragmentRule fragment = rules.fragments().stream()
+                .filter(rule -> "FRAG-JDK-EVENTLISTENER-SPRING-TEMPLATES".equals(rule.id()))
+                .findFirst().orElseThrow();
+        assertNotNull(fragment.constructionPlan());
+        assertTrue(fragment.constructionPlan().nodes().size() >= 6);
+        assertTrue(fragment.constructionPlan().fields().size() >= 6);
+        assertTrue(fragment.constructionPlan().encodedForProbe().length() < 16_384);
+        assertTrue(fragment.constructionPlan().encodedForProbe().contains("getOutputProperties"));
+    }
+
+    @Test
+    void ruleSetLintReportsOverlapAndOverlyBroadMatchersWithoutChangingLoadSemantics() {
+        Rule.CallMatcher exact = new Rule.CallMatcher(Match.of("a/B"), Match.of("run"), null);
+        Rule.SinkRule first = new Rule.SinkRule("FIRST", "CODE_EXEC", "HIGH", exact,
+                List.of(new Rule.TaintedPos.Arg(0)));
+        Rule.SinkRule second = new Rule.SinkRule("SECOND", "CODE_EXEC", "HIGH", exact,
+                List.of(new Rule.TaintedPos.Arg(0)));
+        Rule.SinkRule broad = new Rule.SinkRule("BROAD", "CODE_EXEC", "HIGH",
+                new Rule.CallMatcher(Match.of("~.*"), Match.of("~.*"), null),
+                List.of(Rule.TaintedPos.Receiver.INSTANCE));
+        RuleSet set = new RuleSet(List.of(first, second, broad), List.of(), List.of(), List.of(), List.of());
+        assertTrue(set.lint().stream().anyMatch(issue -> "EXACT_OVERLAP".equals(issue.code())));
+        assertTrue(set.lint().stream().anyMatch(issue -> "MATCH_TOO_BROAD".equals(issue.code())));
     }
 }

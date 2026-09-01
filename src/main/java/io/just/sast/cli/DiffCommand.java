@@ -32,6 +32,11 @@ public final class DiffCommand implements Callable<Integer> {
     /** 语义列：身份之外参与"变更"判定的字段。 */
     private static final String[] SEMANTIC_COLUMNS = {"category", "severity", "confidence", "confidence_score",
             "chain_length", "unresolved_hops", "variant_count", "patterns", "path", "evidence", "verify"};
+    /** 新版旁车证据列；旧扫描目录没有这些列时仍可被 diff 读取。 */
+    private static final String[] OPTIONAL_SEMANTIC_COLUMNS = {"sink_role", "construction_status",
+            "construction_type", "construction_fields", "construction_trigger",
+            "construction_sink_control", "construction_reasons", "verification_status",
+            "sink_distorted", "sandbox_ready"};
 
     @Parameters(index = "0", paramLabel = "<old-dir>", description = "旧扫描输出目录")
     Path oldDir;
@@ -97,6 +102,7 @@ public final class DiffCommand implements Callable<Integer> {
         Map<String, String> map = new LinkedHashMap<>();
         int[] identityIdx = null;
         int[] semanticIdx = null;
+        int[] optionalSemanticIdx = new int[OPTIONAL_SEMANTIC_COLUMNS.length];
         for (String line : lines) {
             List<String> fields = parseCsvLine(line);
             if (fields.isEmpty()) {
@@ -111,6 +117,9 @@ public final class DiffCommand implements Callable<Integer> {
                 if (semanticIdx == null) {
                     throw new IllegalArgumentException("findings.csv 表头缺少语义列: " + csv.toAbsolutePath());
                 }
+                for (int i = 0; i < OPTIONAL_SEMANTIC_COLUMNS.length; i++) {
+                    optionalSemanticIdx[i] = fields.indexOf(OPTIONAL_SEMANTIC_COLUMNS[i]);
+                }
                 continue; // 表头行
             }
             if (fields.size() < headerWidth(identityIdx, semanticIdx)) {
@@ -120,7 +129,8 @@ public final class DiffCommand implements Callable<Integer> {
             if (identity == null) {
                 throw new IllegalArgumentException("findings.csv 存在畸形数据行: " + csv.toAbsolutePath());
             }
-            String semantic = joinAt(fields, semanticIdx);
+            String semantic = joinAt(fields, semanticIdx) + "|"
+                    + joinOptionalAt(fields, optionalSemanticIdx);
             if (semantic == null) {
                 throw new IllegalArgumentException("findings.csv 存在畸形数据行: " + csv.toAbsolutePath());
             }
@@ -157,6 +167,20 @@ public final class DiffCommand implements Callable<Integer> {
                 sb.append('|');
             }
             sb.append(fields.get(idx[i]));
+        }
+        return sb.toString();
+    }
+
+    private static String joinOptionalAt(List<String> fields, int[] idx) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < idx.length; i++) {
+            if (i > 0) {
+                sb.append('|');
+            }
+            int at = idx[i];
+            if (at >= 0 && at < fields.size()) {
+                sb.append(fields.get(at));
+            }
         }
         return sb.toString();
     }

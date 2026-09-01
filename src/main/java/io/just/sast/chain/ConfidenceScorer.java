@@ -47,7 +47,8 @@ public final class ConfidenceScorer {
         // Keep the construction limitation in the verification summary/notes, but do not
         // let it demote a directly confirmed path in the primary finding ranking.
         if (notes != null && notes.stream().anyMatch(n -> "verify:sink-blocked".equals(n)
-                || "verify:confirmed".equals(n))) {
+                || "verify:confirmed".equals(n)
+                || "verify:safe-effect-observed".equals(n))) {
             return "FEASIBLE";
         }
         if (!degradations.isEmpty()) {
@@ -77,7 +78,8 @@ public final class ConfidenceScorer {
             points += notes.stream().filter(n -> n.startsWith("pattern:")).count() * PATTERN_BONUS;
             // 动态验证证据：确认 > 段归因确认 > 执行
             if (notes.stream().anyMatch(n -> n.equals("verify:sink-blocked")
-                    || n.equals("verify:confirmed"))) {
+                    || n.equals("verify:confirmed")
+                    || n.equals("verify:safe-effect-observed"))) {
                 points += SINK_BLOCKED_BONUS;
             } else if (notes.stream().anyMatch(n -> n.equals("verify:segment-confirmed"))) {
                 points += SEGMENT_CONFIRMED_BONUS;

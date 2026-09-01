@@ -1,5 +1,7 @@
 package io.just.sast.verify;
 
+import io.just.sast.util.ArchiveLimits;
+
 import java.io.IOException;
 import java.net.URL;
 import java.nio.file.Files;
@@ -12,7 +14,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
-import java.util.zip.ZipInputStream;
 
 /**
  * 把普通 JAR、目录和常见 fat JAR/WAR 统一表示为 classpath。
@@ -21,9 +22,6 @@ import java.util.zip.ZipInputStream;
  * 删除所有展开产物。该组件不包含题目或框架名称，构造器和动态探针共享同一边界。</p>
  */
 public final class NestedClasspath implements AutoCloseable {
-
-    static final long MAX_ENTRY_BYTES = 64L * 1024 * 1024;
-    static final long MAX_TOTAL_BYTES = 256L * 1024 * 1024;
 
     private final List<Path> entries;
     private final List<Path> artifacts;
@@ -85,77 +83,94 @@ public final class NestedClasspath implements AutoCloseable {
         if (!Files.isRegularFile(input)) {
             return List.of();
         }
+        if (ArchiveLimits.isLinkOrReparsePoint(input)) {
+            throw new IOException("unsafe classpath input link or reparse point: " + input);
+        }
+        ArchiveLimits.checkContainerSize(input);
         boolean hasClasses = false;
         boolean hasLib = false;
+        List<ZipEntry> orderedEntries = new ArrayList<>();
+        ArchiveLimits.Tracker budget = new ArchiveLimits.Tracker();
+        Set<String> seenNames = new LinkedHashSet<>();
         try (ZipFile zip = new ZipFile(input.toFile())) {
             Enumeration<? extends ZipEntry> elements = zip.entries();
             while (elements.hasMoreElements()) {
-                String name = elements.nextElement().getName();
-                if (isNestedClass(name)) {
+                ZipEntry entry = elements.nextElement();
+                String name = entry.getName();
+                if (!ArchiveLimits.safeEntryName(name)) {
+                    throw new IOException("unsafe archive entry: " + name);
+                }
+                if (!seenNames.add(name)) {
+                    throw new IOException("duplicate archive entry: " + name);
+                }
+                budget.observe(entry);
+                orderedEntries.add(entry);
+                if (!entry.isDirectory() && isNestedClass(name)) {
                     hasClasses = true;
-                } else if (isNestedLibrary(name)) {
+                } else if (!entry.isDirectory() && isNestedLibrary(name)) {
                     hasLib = true;
                 }
             }
+            orderedEntries.sort(Comparator.comparing(ZipEntry::getName));
+            if (!hasClasses && !hasLib) {
+                return List.of();
+            }
+
+            Path root = Files.createTempDirectory("just-verify-cp-");
+            artifacts.add(root);
+            Path classes = root.resolve("classes");
+            Path lib = root.resolve("lib");
+            Files.createDirectories(classes);
+            Files.createDirectories(lib);
+            Set<String> seenOutputs = new LinkedHashSet<>();
+            try {
+                for (ZipEntry entry : orderedEntries) {
+                    String name = entry.getName();
+                    boolean classEntry = isNestedClass(name) && !entry.isDirectory();
+                    boolean libraryEntry = isNestedLibrary(name);
+                    if (!classEntry && !libraryEntry) {
+                        continue;
+                    }
+                    String relative = nestedRelative(name);
+                    if (!ArchiveLimits.safeEntryName(relative)) {
+                        throw new IOException("unsafe nested entry: " + name);
+                    }
+                    String outputKey = (classEntry ? "classes/" : "lib/") + relative;
+                    if (!seenOutputs.add(outputKey)) {
+                        throw new IOException("duplicate normalized nested entry: " + name);
+                    }
+                    Path base = classEntry ? classes : lib;
+                    Path output = base.resolve(relative).normalize();
+                    if (!output.startsWith(base)) {
+                        throw new IOException("unsafe nested entry: " + name);
+                    }
+                    Files.createDirectories(output.getParent());
+                    try (var inputStream = zip.getInputStream(entry)) {
+                        copyBounded(inputStream, output, budget);
+                    }
+                }
+            } catch (IOException | RuntimeException e) {
+                deleteQuietly(root);
+                artifacts.remove(root);
+                throw e;
+            }
+
+            List<Path> result = new ArrayList<>();
+            if (hasClasses) {
+                result.add(classes);
+            }
+            if (hasLib) {
+                try (var stream = Files.list(lib)) {
+                    result.addAll(stream.filter(Files::isRegularFile)
+                            .filter(path -> path.getFileName().toString().endsWith(".jar"))
+                            .sorted(Comparator.comparing(Path::toString))
+                            .toList());
+                }
+            }
+            return List.copyOf(result);
         } catch (java.util.zip.ZipException notAnArchive) {
             return List.of();
         }
-        if (!hasClasses && !hasLib) {
-            return List.of();
-        }
-
-        Path root = Files.createTempDirectory("just-verify-cp-");
-        artifacts.add(root);
-        Path classes = root.resolve("classes");
-        Path lib = root.resolve("lib");
-        Files.createDirectories(classes);
-        Files.createDirectories(lib);
-        long total = 0L;
-        try (ZipInputStream inputStream = new ZipInputStream(Files.newInputStream(input))) {
-            ZipEntry entry;
-            while ((entry = inputStream.getNextEntry()) != null) {
-                String name = entry.getName();
-                boolean classEntry = isNestedClass(name) && !name.endsWith("/");
-                boolean libraryEntry = isNestedLibrary(name);
-                if (!classEntry && !libraryEntry) {
-                    continue;
-                }
-                String relative = nestedRelative(name);
-                Path base = classEntry ? classes : lib;
-                Path output = base.resolve(relative).normalize();
-                if (relative.isBlank() || !output.startsWith(base)) {
-                    throw new IOException("unsafe nested entry: " + name);
-                }
-                long declared = entry.getSize();
-                if (declared > MAX_ENTRY_BYTES) {
-                    throw new IOException("nested entry exceeds limit: " + name);
-                }
-                Files.createDirectories(output.getParent());
-                long copied = copyBounded(inputStream, output, MAX_ENTRY_BYTES);
-                total += copied;
-                if (total > MAX_TOTAL_BYTES) {
-                    throw new IOException("expanded nested archive exceeds limit");
-                }
-            }
-        } catch (IOException | RuntimeException e) {
-            deleteQuietly(root);
-            artifacts.remove(root);
-            throw e;
-        }
-
-        List<Path> result = new ArrayList<>();
-        if (hasClasses) {
-            result.add(classes);
-        }
-        if (hasLib) {
-            try (var stream = Files.list(lib)) {
-                result.addAll(stream.filter(Files::isRegularFile)
-                        .filter(path -> path.getFileName().toString().endsWith(".jar"))
-                        .sorted(Comparator.comparing(Path::toString))
-                        .toList());
-            }
-        }
-        return List.copyOf(result);
     }
 
     private static boolean isNestedClass(String name) {
@@ -169,7 +184,7 @@ public final class NestedClasspath implements AutoCloseable {
 
     private static String nestedRelative(String name) throws IOException {
         String prefix = name.startsWith("BOOT-INF/") ? "BOOT-INF/" : "WEB-INF/";
-        String relative = name.substring(prefix.length());
+        String relative = name.substring(prefix.length()).replace('\\', '/');
         int slash = relative.indexOf('/');
         if (slash < 0 || slash == relative.length() - 1) {
             throw new IOException("invalid nested entry: " + name);
@@ -177,18 +192,37 @@ public final class NestedClasspath implements AutoCloseable {
         return relative.substring(slash + 1);
     }
 
-    private static long copyBounded(java.io.InputStream input, Path output, long limit) throws IOException {
+    private static long copyBounded(java.io.InputStream input, Path output,
+                                    ArchiveLimits.Tracker budget) throws IOException {
         long total = 0L;
+        long limit = Math.min(ArchiveLimits.MAX_ENTRY_UNCOMPRESSED_BYTES,
+                budget.remainingReadBytes());
         byte[] buffer = new byte[8192];
         try (var out = Files.newOutputStream(output)) {
-            for (int read; (read = input.read(buffer)) >= 0; ) {
-                total += read;
-                if (total > limit) {
+            for (int read; ; ) {
+                read = input.read(buffer);
+                if (read == -1) {
+                    break;
+                }
+                if (read == 0) {
+                    // InputStream permits a zero-byte result for a non-empty request. A
+                    // custom nested stream must not turn a bounded extraction into an
+                    // infinite loop; make one-byte progress and retain the same limit check.
+                    int one = input.read();
+                    if (one == -1) {
+                        break;
+                    }
+                    buffer[0] = (byte) one;
+                    read = 1;
+                }
+                if (read > limit - total) {
                     throw new IOException("nested entry exceeds limit: " + limit);
                 }
                 out.write(buffer, 0, read);
+                total += read;
             }
         }
+        budget.recordRead(total);
         return total;
     }
 

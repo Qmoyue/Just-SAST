@@ -16,6 +16,14 @@ import java.util.Set;
  */
 public final class ForwardTaintKnowledgeSource implements KnowledgeSource {
 
+    /**
+     * On a large closure the refined engine contains the complete coarse transfer plus the
+     * optional dispatch/reflection adapters. Running both passes would reinterpret the same
+     * method summaries twice; small inputs keep the two-pass schedule for its cheap staged
+     * precision behavior.
+     */
+    private static final int SINGLE_REFINED_PASS_THRESHOLD = 50_000;
+
     @Override
     public String id() {
         return "forward-taint";
@@ -42,8 +50,35 @@ public final class ForwardTaintKnowledgeSource implements KnowledgeSource {
             return;
         }
         ForwardEngine engine = new ForwardEngine(bb);
+        int closureSize = bb.originSupport().entryDownstream(bb.graph()).size();
+        if (closureSize > SINGLE_REFINED_PASS_THRESHOLD) {
+            io.just.sast.util.JustLogger.info(
+                    "前向污点：大闭包 {} 个方法，采用单次精扫（阈值 {}）",
+                    closureSize, SINGLE_REFINED_PASS_THRESHOLD);
+            long refinedStartedAt = System.nanoTime();
+            engine.run(ForwardEngine.Options.refined());
+            io.just.sast.util.JustLogger.info("前向污点精扫阶段耗时 {} ms",
+                    (System.nanoTime() - refinedStartedAt) / 1_000_000L);
+            if (bb.originSupport().constantProofBudgetExceeded()) {
+                bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
+            }
+            return;
+        }
+        long coarseStartedAt = System.nanoTime();
         engine.run(ForwardEngine.Options.coarse());
+        io.just.sast.util.JustLogger.info("前向污点粗扫阶段耗时 {} ms",
+                (System.nanoTime() - coarseStartedAt) / 1_000_000L);
+        // A phase timeout cancels the worker with its interrupt flag.  Do not start the
+        // refinement pass after cancellation: doing so used to make a timed-out coarse
+        // pass continue for another large-jar traversal and delayed executor shutdown.
+        if (Thread.currentThread().isInterrupted()) {
+            bb.markIncomplete("FORWARD_INTERRUPTED");
+            return;
+        }
+        long refinedStartedAt = System.nanoTime();
         engine.run(ForwardEngine.Options.refined());
+        io.just.sast.util.JustLogger.info("前向污点精扫阶段耗时 {} ms",
+                (System.nanoTime() - refinedStartedAt) / 1_000_000L);
         if (bb.originSupport().constantProofBudgetExceeded()) {
             bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
         }

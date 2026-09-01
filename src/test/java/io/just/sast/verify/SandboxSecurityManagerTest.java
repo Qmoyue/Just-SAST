@@ -12,9 +12,12 @@ import java.net.NetPermission;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** JVM 探针权限契约：测试 deny-by-default 判定，不在测试 JVM 内安装全局 SecurityManager。 */
 @SuppressWarnings("removal")
@@ -57,11 +60,65 @@ class SandboxSecurityManagerTest {
     }
 
     @Test
+    void allowsReadThroughConfiguredSymlinkRootButNotOutside(@TempDir Path tmp) throws Exception {
+        Path target = tmp.resolve("jdk-target");
+        Files.createDirectories(target.resolve("lib"));
+        Path resource = target.resolve("lib").resolve("tzdb.dat");
+        Files.writeString(resource, "runtime-resource");
+        Path link = tmp.resolve("jdk-default");
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException | java.io.IOException | SecurityException e) {
+            Assumptions.assumeTrue(false, "symbolic links are unavailable on this host");
+        }
+        SandboxSecurityManager manager = new SandboxSecurityManager(
+                tmp.resolve("scratch"), List.of(link));
+        assertDoesNotThrow(() -> manager.checkPermission(new FilePermission(
+                link.resolve("lib").resolve("tzdb.dat").toString(), "read")));
+        assertThrows(SecurityException.class, () -> manager.checkPermission(new FilePermission(
+                tmp.resolve("outside").toString(), "read")));
+    }
+
+    @Test
     void deniesReflectiveAndSerializationEscapeHatchesOutsideProbe(@TempDir Path tmp) {
         SandboxSecurityManager manager = new SandboxSecurityManager(tmp, List.of(tmp));
         assertThrows(SecurityException.class, () -> manager.checkPermission(
                 new ReflectPermission("suppressAccessChecks")));
         assertThrows(SecurityException.class, () -> manager.checkPermission(
                 new SerializablePermission("enableSubstitution")));
+    }
+
+    @Test
+    void allowsOnlyBootstrapCanaryPackageToLinkFromTarget(@TempDir Path tmp) {
+        SandboxSecurityManager manager = new SandboxSecurityManager(tmp, List.of(tmp));
+        assertDoesNotThrow(() -> manager.checkPackageAccess("io.just.sast.verify.boot"));
+        assertDoesNotThrow(() -> manager.checkPackageAccess("io.just.sast.verify.boot.internal"));
+        assertThrows(SecurityException.class,
+                () -> manager.checkPackageAccess("io.just.sast.verify"));
+        assertThrows(SecurityException.class,
+                () -> manager.checkPackageAccess("io.just.sast.blackboard"));
+    }
+
+    @Test
+    void subprocessEnforcesTheBoundary(@TempDir Path tmp) throws Exception {
+        Path writable = tmp.resolve("scratch");
+        Files.createDirectories(writable);
+        Path outside = tmp.resolve("outside.txt");
+        Files.writeString(outside, "host-secret");
+        String javaName = System.getProperty("os.name", "").toLowerCase()
+                .contains("win") ? "java.exe" : "java";
+        String javaExe = Path.of(System.getProperty("java.home"), "bin", javaName).toString();
+        String classpath = System.getProperty("java.class.path");
+        Process process = new ProcessBuilder(javaExe, "-cp", classpath, "SandboxSecurityChild",
+                writable.toString(), outside.toString()).redirectErrorStream(true).start();
+        assertTrue(process.waitFor(15, TimeUnit.SECONDS), "sandbox child must terminate");
+        String output = new String(process.getInputStream().readAllBytes(),
+                java.nio.charset.StandardCharsets.UTF_8);
+        assertEquals(0, process.exitValue(), output);
+        assertTrue(output.contains("inside-write=ALLOWED"), output);
+        assertTrue(output.contains("outside-read=DENIED"), output);
+        assertTrue(output.contains("exec=DENIED"), output);
+        assertTrue(output.contains("network=DENIED"), output);
+        assertTrue(output.contains("CHILD_DONE"), output);
     }
 }

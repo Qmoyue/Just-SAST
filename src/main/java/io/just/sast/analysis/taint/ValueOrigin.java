@@ -14,9 +14,14 @@ public sealed interface ValueOrigin
     /** 调用返回值。 */
     record CallResult(long callNodeId) implements ValueOrigin {}
 
-    /** 字段读取（owner=声明类，isStatic=GETSTATIC，receiver=规范化后的接收者来源）。 */
-    record FieldRead(String owner, String field, boolean isStatic, ValueOrigin receiver)
-            implements ValueOrigin {}
+    /** 字段读取（保留 JVM descriptor，避免字段隐藏/重载近似串线）。 */
+    record FieldRead(String owner, String field, String descriptor,
+                     boolean isStatic, ValueOrigin receiver) implements ValueOrigin {
+        /** Compatibility constructor for extensions created before descriptor tracking. */
+        public FieldRead(String owner, String field, boolean isStatic, ValueOrigin receiver) {
+            this(owner, field, "", isStatic, receiver);
+        }
+    }
 
     /** 常量（回溯死胡同）。 */
     record Constant(Object value) implements ValueOrigin {}

@@ -33,4 +33,16 @@ public record ClassInfo(
         }
         return null;
     }
+
+    /**
+     * Java serialization uses this marker to replace the default field set.  The actual
+     * ObjectStreamField contents are runtime data, so callers must treat any inference based
+     * on this method as an explicitly approximate object-graph edge.
+     */
+    public boolean hasSerialPersistentFields() {
+        return fields.stream().anyMatch(field ->
+                "serialPersistentFields".equals(field.name())
+                        && field.isStatic()
+                        && "[Ljava/io/ObjectStreamField;".equals(field.descriptor()));
+    }
 }

@@ -2,13 +2,15 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
+import io.just.sast.blackboard.ConstructionSummary;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.blackboard.VerificationSummary;
+import io.just.sast.chain.ChainRanking;
 import io.just.sast.chain.ConfidenceScorer;
 import io.just.sast.verify.FieldDependencyPlan;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -16,6 +18,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Writes a safe, deterministic construction plan for the highest-value chains.
@@ -30,7 +33,7 @@ public final class PayloadPlanWriter {
 
     private record PlanView(Chain chain, FieldDependencyPlan fields, List<String> notes,
                             VerificationSummary.ChainResult verification,
-                            String construction) {
+                            String construction, ConstructionSummary constructionSummary) {
     }
 
     public void write(Path outDir, List<Chain> chains, Map<String, String> calibrations,
@@ -57,10 +60,7 @@ public final class PayloadPlanWriter {
                 ordered.add(chain);
             }
         }
-        ordered.sort(Comparator.comparingInt((Chain chain) ->
-                        -ConfidenceScorer.evidenceScore(chain,
-                                notes == null ? List.of() : notes.getOrDefault(chain.key(), List.of())))
-                .thenComparing(Chain::key));
+        ordered.sort(ChainRanking.comparator(notes, verified, Set.of()));
         if (ordered.size() > MAX_PLANS) {
             ordered = new ArrayList<>(ordered.subList(0, MAX_PLANS));
         }
@@ -70,9 +70,10 @@ public final class PayloadPlanWriter {
             List<String> chainNotes = notes == null
                     ? List.of() : notes.getOrDefault(chain.key(), List.of());
             FieldDependencyPlan fields = FieldDependencyPlan.from(chain, chain.entryKind());
-            String construction = constructionStatus(chainNotes);
+            String construction = constructionStatus(chain, chainNotes);
             views.add(new PlanView(chain, fields, List.copyOf(chainNotes),
-                    verified.get(chain.key()), construction));
+                    verified.get(chain.key()), construction,
+                    ConstructionSummary.summarize(chain, chainNotes, verified.get(chain.key()))));
         }
 
         StringBuilder json = new StringBuilder("{\n")
@@ -87,21 +88,19 @@ public final class PayloadPlanWriter {
             }
             PlanView view = views.get(i);
             appendPlan(json, view.chain(), view.fields(), view.notes(), view.verification(),
-                    view.construction());
+                    view.construction(), view.constructionSummary());
         }
         json.append("\n  ]\n}\n");
-        Files.write(layout.meta().resolve("payload-plan.json"),
-                json.toString().getBytes(StandardCharsets.UTF_8));
-        Files.write(layout.verification().resolve("payload.json"),
-                readableJson(views).getBytes(StandardCharsets.UTF_8));
-        Files.write(layout.verification().resolve("payload.md"),
-                readableMarkdown(views).getBytes(StandardCharsets.UTF_8));
+        AtomicFiles.writeUtf8(layout.meta().resolve("payload-plan.json"), json.toString());
+        AtomicFiles.writeUtf8(layout.verification().resolve("payload.json"), readableJson(views));
+        AtomicFiles.writeUtf8(layout.verification().resolve("payload.md"), readableMarkdown(views));
     }
 
     private static void appendPlan(StringBuilder json, Chain chain, FieldDependencyPlan fields,
                                    List<String> notes,
                                    VerificationSummary.ChainResult verification,
-                                   String construction) {
+                                   String construction,
+                                   ConstructionSummary constructionSummary) {
         json.append("    {")
                 .append("\"chain_key\":\"").append(esc(chain.key())).append("\"")
                 .append(",\"rule_id\":\"").append(esc(chain.ruleId())).append("\"")
@@ -112,10 +111,23 @@ public final class PayloadPlanWriter {
                 .append(",\"sink\":{\"class\":\"").append(esc(chain.sinkClass()))
                 .append("\",\"method\":\"").append(esc(chain.sinkMethod()))
                 .append("\",\"descriptor\":\"").append(esc(chain.sinkDescriptor()))
+                .append("\",\"role\":\"").append(esc(chain.sinkRole()))
                 .append("\",\"capability\":\"").append(esc(capabilityOf(chain))).append("\"}")
+                .append(",\"ranking_evidence\":\"")
+                .append(esc(ChainRanking.evidence(chain, Map.of(chain.key(), notes),
+                        verification == null ? Map.of() : Map.of(chain.key(), verification), Set.of())
+                        .explanation())).append("\"")
                 .append(",\"construction\":{\"status\":\"").append(construction)
                 .append("\",\"strategy\":\"INERT_REFLECTIVE_OBJECT_GRAPH\"")
-                .append(",\"encoded_fields\":\"").append(esc(fields.encodedFields())).append("\"}")
+                .append(",\"encoded_fields\":\"").append(esc(fields.encodedFields())).append("\"")
+                .append(",\"object_graph_plan\":\"")
+                .append(esc(chain.constructionPlan() == null
+                        ? "" : chain.constructionPlan().encodedForProbe())).append("\"")
+                .append(",\"shape_summary\":");
+        appendShapeSummary(json, chain);
+        json.append(",\"construction_summary\":");
+        appendConstructionSummary(json, constructionSummary);
+        json.append('}')
                 .append(",\"field_dependencies\":[");
         for (int i = 0; i < fields.fields().size(); i++) {
             if (i > 0) {
@@ -145,11 +157,60 @@ public final class PayloadPlanWriter {
                 .append("\"NO_REMOTE_REQUEST\",\"NO_AUTOMATIC_SERIALIZED_BYTES\"]}");
     }
 
-    private static String constructionStatus(List<String> notes) {
+    private static String constructionStatus(Chain chain, List<String> notes) {
+        if (chain.constructionPlan() != null
+                && !chain.constructionPlan().shapeSummary().valid()) {
+            return "PARTIAL";
+        }
         return notes.stream().anyMatch("verify:constructible"::equals)
                 ? "CONSTRUCTIBLE"
+                : chain.constructionPlan() != null && !chain.constructionPlan().isEmpty()
+                ? "PLAN_DECLARED"
                 : notes.stream().anyMatch("degrade:partial-construct"::equals)
                 ? "PARTIAL" : "NOT_EVALUATED";
+    }
+
+    private static void appendShapeSummary(StringBuilder json, Chain chain) {
+        ObjectGraphPlan.ShapeSummary summary = chain.constructionPlan() == null
+                ? new ObjectGraphPlan.ShapeSummary(0, 0, 0, 0, 0, 0, false,
+                List.of("PLAN_NOT_DECLARED"))
+                : chain.constructionPlan().shapeSummary();
+        json.append("{\"status\":\"").append(esc(summary.status())).append("\"")
+                .append(",\"nodes\":").append(summary.nodeCount())
+                .append(",\"fields\":").append(summary.fieldCount())
+                .append(",\"references\":").append(summary.referenceCount())
+                .append(",\"resolved_references\":").append(summary.resolvedReferenceCount())
+                .append(",\"field_owners_resolved\":").append(summary.fieldOwnersResolved())
+                .append(",\"field_owners_unresolved\":").append(summary.fieldOwnersUnresolved())
+                .append(",\"reasons\":[");
+        for (int i = 0; i < summary.reasons().size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append('"').append(esc(summary.reasons().get(i))).append('"');
+        }
+        json.append("]}");
+    }
+
+    private static void appendConstructionSummary(StringBuilder json,
+                                                  ConstructionSummary summary) {
+        if (summary == null) {
+            json.append("{\"overall\":\"UNKNOWN\",\"reasons\":[\"SUMMARY_MISSING\"]}");
+            return;
+        }
+        json.append("{\"overall\":\"").append(esc(summary.overallStatus()))
+                .append("\",\"type\":\"").append(esc(summary.typeStatus()))
+                .append("\",\"fields\":\"").append(esc(summary.fieldStatus()))
+                .append("\",\"trigger\":\"").append(esc(summary.triggerStatus()))
+                .append("\",\"sink_control\":\"")
+                .append(esc(summary.sinkControlStatus())).append("\",\"reasons\":[");
+        for (int i = 0; i < summary.reasons().size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append('"').append(esc(summary.reasons().get(i))).append('"');
+        }
+        json.append("]}");
     }
 
     private static String readableJson(List<PlanView> views) {
@@ -185,14 +246,22 @@ public final class PayloadPlanWriter {
                 .append(esc(chain.entryKind())).append("\"},\n")
                 .append(indent).append("  \"sink_boundary\":{\"class\":\"")
                 .append(esc(chain.sinkClass())).append("\",\"method\":\"")
-                .append(esc(chain.sinkMethod())).append("\",\"status\":\"")
+                .append(esc(chain.sinkMethod())).append("\",\"role\":\"")
+                .append(esc(chain.sinkRole())).append("\",\"status\":\"")
                 .append(esc(verification == null ? "NOT_SELECTED" : verification.status()))
                 .append("\",\"execution\":\"").append(executionLabel())
                 .append("\",\"observed_boundary\":\"")
                 .append(observedBoundary(verification)).append("\"},\n")
                 .append(indent).append("  \"construction\":{\"status\":\"")
                 .append(esc(view.construction()))
-                .append("\",\"strategy\":\"INERT_REFLECTIVE_OBJECT_GRAPH\"},\n")
+                .append("\",\"strategy\":\"INERT_REFLECTIVE_OBJECT_GRAPH\",\"object_graph_plan\":\"")
+                .append(esc(chain.constructionPlan() == null
+                        ? "" : chain.constructionPlan().encodedForProbe()))
+                .append("\",\"shape_summary\":");
+        appendShapeSummary(json, chain);
+        json.append(",\"construction_summary\":");
+        appendConstructionSummary(json, view.constructionSummary());
+        json.append("},\n")
                 .append(indent).append("  \"steps\":");
         appendStringArray(json, stepLabels(chain), indent + "  ");
         json.append(",\n")
@@ -308,6 +377,7 @@ public final class PayloadPlanWriter {
         }
         return switch (verification.status()) {
             case "SINK_BLOCKED" -> "SINK BLOCKED BEFORE BODY";
+            case "SAFE_EFFECT_OBSERVED" -> "SAFE EFFECT OBSERVED; REAL SINK NOT ENTERED";
             case "CONCRETE_REACHED" -> "CONCRETE TRIGGER; SINK NOT PROVEN";
             case "EXECUTED" -> "ENTRY RETURNED; SINK NOT PROVEN";
             default -> "SINK BOUNDARY NOT PROVEN";
@@ -324,6 +394,7 @@ public final class PayloadPlanWriter {
         }
         return switch (verification.status()) {
             case "SINK_BLOCKED" -> "SINK_BLOCKED_BEFORE_BODY";
+            case "SAFE_EFFECT_OBSERVED" -> "SAFE_EFFECT_OBSERVED_WITH_DISTORTION";
             case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER_WITHOUT_EXACT_CANARY";
             case "EXECUTED" -> "ENTRY_RETURNED_WITHOUT_SINK_PROOF";
             default -> "NOT_PROVEN";
@@ -367,6 +438,10 @@ public final class PayloadPlanWriter {
         if (verification != null && "SINK_BLOCKED".equals(verification.status())) {
             return "`SINK_CANARY_ONLY`: the real prefix reached the canary and stopped before `"
                     + sink + "` executed. No command, network, native load, or serialized attack bytes are emitted.\n\n";
+        }
+        if (verification != null && "SAFE_EFFECT_OBSERVED".equals(verification.status())) {
+            return "`SAFE_EFFECT_OBSERVED`: a fixed inert/mock effect was observed under the declared policy; the real sink `"
+                    + sink + "` was not entered. This result is intentionally distorted and does not prove RCE, network access, native loading, or exploitability.\n\n";
         }
         return "`SINK_CANARY_ONLY`: this artifact is an inert plan. The final sink `" + sink
                 + "` is not proven reachable by the recorded verification status. No command, network, native load, or serialized attack bytes are emitted.\n\n";

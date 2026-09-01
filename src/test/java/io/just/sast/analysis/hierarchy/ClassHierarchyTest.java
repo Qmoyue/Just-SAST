@@ -177,4 +177,36 @@ class ClassHierarchyTest {
         assertNull(h.classInfo("jdk/MissingBase"));
         assertEquals(1, loads.get(), "稳定 JDK 来源的缺失类应走负缓存，避免热路径反复探测");
     }
+
+    @Test
+    void transientJdkFailureDoesNotPoisonLaterLookup() {
+        ClassInfo loaded = cls("jdk/LateRetry", "java/lang/Object");
+        AtomicInteger loads = new AtomicInteger();
+        JdkClassSource source = name -> {
+            if (loads.incrementAndGet() == 1) {
+                throw new IllegalStateException("transient provider failure");
+            }
+            return loaded;
+        };
+        ClassHierarchy h = new ClassHierarchy(Map.of(), source);
+
+        assertNull(h.classInfo("jdk/LateRetry"));
+        assertEquals(loaded, h.classInfo("jdk/LateRetry"));
+        assertEquals(2, loads.get());
+    }
+
+    @Test
+    void transitiveInterfacesTraverseInterfaceParentsAndInvalidNamesAreSafe() {
+        ClassHierarchy h = new ClassHierarchy(Map.of(
+                "Parent", cls("Parent", "java/lang/Object"),
+                "Child", cls("Child", "java/lang/Object", "Parent"),
+                "Impl", cls("Impl", "java/lang/Object", "Child")), null);
+
+        assertEquals(List.of("Child", "Parent"), h.transitiveInterfaces("Impl"));
+        assertTrue(h.transitiveSubtypes(null).isEmpty());
+        assertTrue(h.transitiveInterfaces("").isEmpty());
+        assertTrue(h.implementers(null, 10).isEmpty());
+        assertNull(h.resolveMethod(null, "run", "()V"));
+        assertFalse(h.isSubtypeOf("", "Parent"));
+    }
 }

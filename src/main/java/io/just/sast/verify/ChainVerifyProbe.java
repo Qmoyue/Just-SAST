@@ -51,6 +51,19 @@ public final class ChainVerifyProbe {
     /** Parent/child result channel version. Plain target stdout is never a result channel. */
     private static final String PROTOCOL_PREFIX = "JUST_VERIFY_V1:";
     private static String protocolToken = "";
+    private static String protocolRunId = "";
+    private static String protocolChainFingerprint = "";
+    private static String protocolSinkFingerprint = "";
+    private static String protocolNonce = "";
+    private static String protocolArtifactFingerprint = "";
+    /** Capture adapter configuration before any target class is loaded or can mutate properties. */
+    private static String safeSinkMode = "BOUNDARY";
+    private static String safeSinkCategory = "";
+    private static String safeSinkDisposition = "CANARY_BOUNDARY";
+    private static String safeSinkPolicyDigest = "";
+    private static String safeScratchRoot = ".";
+    /** Set only when the declarative graph used the probe-owned reflective proxy adapter. */
+    private static boolean graphAdapterUsed;
     /**
      * The launcher system loader is normally sufficient, but fat JAR/WAR verification has
      * class-path entries materialized immediately before the child is started.  Keep an
@@ -84,7 +97,17 @@ public final class ChainVerifyProbe {
         String mode = entryParts.length > 2 ? entryParts[2] : "DIRECT";
         String entryDescriptor = entryParts.length > 3 ? entryParts[3] : "";
         protocolToken = args.length > 5 ? args[5] : "";
-
+        protocolRunId = safeProperty("just.verify.run-id", "");
+        protocolChainFingerprint = safeProperty("just.verify.chain-fingerprint", "");
+        protocolSinkFingerprint = safeProperty("just.verify.sink-fingerprint", "");
+        protocolNonce = safeProperty("just.verify.nonce", "");
+        protocolArtifactFingerprint = safeProperty("just.verify.artifact-fingerprint", "");
+        graphAdapterUsed = false;
+        if (!awaitIsolationReady()) {
+            emit("SANDBOX_UNAVAILABLE: isolation-ready-timeout-or-missing");
+            System.exit(3);
+            return;
+        }
         // 解析链跳
         List<String[]> fieldLinks = parseFieldLinks(args.length > 1 ? args[1] : "");
 
@@ -107,6 +130,20 @@ public final class ChainVerifyProbe {
         boolean unresolvedReflectiveTarget = args.length > 3
                 && "UNRESOLVED".equals(args[3]);
         SourceTrigger sourceTrigger = parseSourceTrigger(args.length > 4 ? args[4] : "");
+        GraphPlan graphPlan = parseGraphPlan(args.length > 6 ? args[6] : "");
+        if (args.length > 6 && args[6] != null && !args[6].isBlank() && graphPlan == null) {
+            emit("PARTIAL_PATH: construction-plan-invalid");
+            System.exit(0);
+            return;
+        }
+        // These values are launcher-owned configuration. Capture them while only Just's probe
+        // classes have been loaded; target code must not be able to widen a later adapter call
+        // by replacing mutable System properties.
+        safeSinkMode = safeProperty("just.verify.sink-mode", "BOUNDARY");
+        safeSinkCategory = safeProperty("just.verify.sink-category", "");
+        safeSinkDisposition = safeProperty("just.verify.sink-disposition", "CANARY_BOUNDARY");
+        safeSinkPolicyDigest = safeProperty("just.verify.sink-policy-digest", "");
+        safeScratchRoot = safeProperty("java.io.tmpdir", ".");
 
         try {
             installApplicationLoader();
@@ -118,6 +155,24 @@ public final class ChainVerifyProbe {
                 System.exit(3);
                 return;
             }
+            // The parent authenticates this marker only after the OS backend has attached to
+            // this exact child. Require both the agent-owned canary attestation and its
+            // bootstrap identity binding before announcing readiness or loading target code.
+            if (protocolToken.isEmpty()
+                    || !protocolToken.equals(safeProperty("just.verify.canary-token", ""))) {
+                emit("UNTESTABLE: CANARY_AGENT_NOT_READY");
+                System.exit(3);
+                return;
+            }
+            if (!protocolBound()) {
+                emit("UNTESTABLE: PROTOCOL_BINDING_NOT_READY");
+                System.exit(3);
+                return;
+            }
+            emit("SANDBOX_READY: " + safeProperty("just.verify.backend", "unknown"));
+            // The gate keeps its token in bootstrap memory; do not leave the attestation in the
+            // mutable system-properties map where target code could read or replace it.
+            System.clearProperty("just.verify.canary-token");
             // 0. 创建所有类的实例（自底向上）；无无参构造时回退到参数最少的构造器并按类型填默认值。
             //    类加载走 loadClass（非 Class.forName）——探针自身的类解析不得踩中 Class#forName canary
             // Target class initialization can perform a loader/resource lookup before the
@@ -202,6 +257,12 @@ public final class ChainVerifyProbe {
 
             // 2. 链接字段（fromOwner.fieldName = toOwner 实例）
             List<String> unlinkedFields = new ArrayList<>();
+            // Source adapters serialize the callback receiver after this phase.  A static
+            // field-flow edge may point at a non-serializable API helper (for example an
+            // ObjectInputStream owner) even though the declared field is Object.  Keeping
+            // that helper in the graph would make the bounded adapter fail before the target
+            // source is reached; use the inert serializable fallback in that case.
+            boolean serializedProbeGraph = serializationSemantics || sourceTrigger != null;
             for (String[] link : fieldLinks) {
                 String fromClass = link[0].replace('/', '.');
                 String fieldName = link[1];
@@ -224,7 +285,11 @@ public final class ChainVerifyProbe {
                         // 可反射默认值，而不是把入口对象错误地塞回字段（这会让
                         // input.getClass()/getMethod 链永远解析到入口宿主自身）。
                         Object fallback = defaultValue(Object.class);
-                        field.set(fromInstance, toInstance != null ? toInstance
+                        Object assigned = toInstance;
+                        if (serializedProbeGraph && !(assigned instanceof java.io.Serializable)) {
+                            assigned = null;
+                        }
+                        field.set(fromInstance, assigned != null ? assigned
                                 : (fallback != null ? fallback : entryInstance));
                     } else {
                         Object compatible = toInstance != null && field.getType().isInstance(toInstance)
@@ -275,6 +340,15 @@ public final class ChainVerifyProbe {
                 } catch (Exception | LinkageError e) {
                     unlinkedFields.add(fromClass + "." + fieldName + ":" + e.getClass().getSimpleName());
                 }
+            }
+
+            // 2a. Apply rule-declared object shape after ordinary FIELD_FLOW linking.  This
+            // lets a fragment express array slots, final fields and a JDK proxy without adding
+            // a target/package branch to the probe. Every node is still bounded and allocated
+            // without calling a target constructor unless a rule explicitly uses CONSTRUCTOR.
+            if (graphPlan != null && !graphPlan.isEmpty()) {
+                applyGraphPlan(graphPlan, entryInstance, instances, serializedProbeGraph,
+                        unlinkedFields);
             }
 
             // 3. 填充简单字段和安全的应用对象引用（含父类——getDeclaredFields 只看自身类）。
@@ -370,6 +444,17 @@ public final class ChainVerifyProbe {
                                     if (container != null) {
                                         f.set(inst, container);
                                     }
+                                } else if (Map.class.isAssignableFrom(f.getType())
+                                        || Set.class.isAssignableFrom(f.getType())
+                                        || List.class.isAssignableFrom(f.getType())) {
+                                    // Source hosts commonly keep the deserialized value in a
+                                    // collection before iterating it.  An empty JDK collection
+                                    // is a bounded in-memory default and does not execute a
+                                    // target constructor or introduce a capability.
+                                    Object container = newCollection(f.getType());
+                                    if (container != null) {
+                                        f.set(inst, container);
+                                    }
                                 } else if (serializationSemantics && instances.size() < MAX_GRAPH_OBJECTS) {
                                     Object nested = defaults.get(f.getType());
                                     if (nested == null) {
@@ -398,11 +483,27 @@ public final class ChainVerifyProbe {
             }
 
             if (sourceTrigger != null && sourceTriggerInstance != null) {
-                prepareSourceTrigger(sourceTrigger, sourceTriggerInstance);
+                // Field wiring is part of the trusted, inert source adapter. Keep the narrow
+                // adapter scope active here as well as during serialization; otherwise the
+                // deny-by-default manager rejects setAccessible, leaves _obj as the generic
+                // fallback, and the target may quietly return before any callback reaches the
+                // canary.
+                SandboxSecurityManager.beginSourceAdapter();
+                try {
+                    prepareSourceTrigger(sourceTrigger, sourceTriggerInstance);
+                } finally {
+                    SandboxSecurityManager.endSourceAdapter();
+                }
             }
 
             if (!unlinkedFields.isEmpty()) {
-                emit("PARTIAL_PATH: field-unlinked=" + unlinkedFields.size());
+                // Keep the count stable for aggregation, but include only a bounded prefix of
+                // field reasons so a module-access/type mismatch can be fixed from one report
+                // without retaining arbitrary target diagnostics in the parent process.
+                int detailLimit = Math.min(8, unlinkedFields.size());
+                String detail = String.join(",", unlinkedFields.subList(0, detailLimit));
+                emit("PARTIAL_PATH: field-unlinked=" + unlinkedFields.size()
+                        + ";details=" + detail);
                 System.exit(0);
             }
 
@@ -470,7 +571,7 @@ public final class ChainVerifyProbe {
                         } finally {
                             output.close();
                         }
-                        try (java.io.ObjectInputStream input = new java.io.ObjectInputStream(
+                        try (java.io.ObjectInputStream input = new ApplicationObjectInputStream(
                                 new java.io.ByteArrayInputStream(bos.toByteArray()))) {
                             // 动态验证只需确认链是否能到达 sink；对象流本身也必须有界，
                             // 防止恶意 readObject 通过递归/海量引用把验证子 JVM 变成 DoS 点。
@@ -515,7 +616,21 @@ public final class ChainVerifyProbe {
                         System.exit(0);
                     }
                     m.setAccessible(true);
-                    invokeEntry(m, entryInstance, false);
+                    boolean graphBootstrap = graphPlan != null && !graphPlan.isEmpty();
+                    if (graphBootstrap) {
+                        // Jackson/bean metadata may lazily use setAccessible while rendering
+                        // a declared POJONode. Keep that compatibility window scoped to this
+                        // probe-owned graph trigger; target callbacks remain the first frame
+                        // and cannot borrow it.
+                        SandboxSecurityManager.beginSerializationBootstrap();
+                    }
+                    try {
+                        invokeEntry(m, entryInstance, false);
+                    } finally {
+                        if (graphBootstrap) {
+                            SandboxSecurityManager.endSerializationBootstrap();
+                        }
+                    }
                 }
             }
 
@@ -558,12 +673,12 @@ public final class ChainVerifyProbe {
                     && detailCause.getCause() != null) {
                 detailCause = detailCause.getCause();
             }
-            String detail = detailCause.getMessage();
+            String detail = describeFailure(detailCause);
             String cause = detailCause == t ? ""
                     : " cause=" + detailCause.getClass().getSimpleName();
             emit("PARTIAL_PATH: " + t.getClass().getSimpleName() + cause
-                    + (detail != null ? ": " + detail.split("\\R")[0].transform(
-                        s -> s.length() > 120 ? s.substring(0, 120) : s) : ""));
+                    + (detail != null && !detail.isEmpty() ? ": " + detail.split("\\R")[0].transform(
+                        s -> s.length() > 160 ? s.substring(0, 160) : s) : ""));
             System.exit(0); // 正常退出 = 未到达 sink
         }
     }
@@ -611,6 +726,548 @@ public final class ChainVerifyProbe {
             result.add(new String[]{left.substring(0, dot), left.substring(dot + 1), toClass});
         }
         return result;
+    }
+
+    /** A probe-local mirror of ObjectGraphPlan; verify8 stays Java 8 compatible. */
+    private enum GraphNodeKind { ALLOCATE, PROXY, REFLECTIVE_PROXY, CONSTRUCTOR }
+
+    private static final class GraphValue {
+        private final String kind;
+        private final String value;
+
+        private GraphValue(String kind, String value) {
+            this.kind = kind;
+            this.value = value == null ? "" : value;
+        }
+    }
+
+    private static final class GraphNode {
+        private final String id;
+        private final String type;
+        private final GraphNodeKind kind;
+        private final List<GraphValue> arguments;
+
+        private GraphNode(String id, String type, GraphNodeKind kind, List<GraphValue> arguments) {
+            this.id = id;
+            this.type = type;
+            this.kind = kind;
+            this.arguments = arguments;
+        }
+    }
+
+    private static final class GraphField {
+        private final String owner;
+        private final String field;
+        private final List<GraphValue> values;
+
+        private GraphField(String owner, String field, List<GraphValue> values) {
+            this.owner = owner;
+            this.field = field;
+            this.values = values;
+        }
+    }
+
+    private static final class GraphPlan {
+        private final List<GraphNode> nodes;
+        private final List<GraphField> fields;
+
+        private GraphPlan(List<GraphNode> nodes, List<GraphField> fields) {
+            this.nodes = nodes;
+            this.fields = fields;
+        }
+
+        private boolean isEmpty() {
+            return nodes.isEmpty() && fields.isEmpty();
+        }
+    }
+
+    /** Parse the ObjectGraphPlan v1 count/length-prefixed representation. */
+    private static GraphPlan parseGraphPlan(String encoded) {
+        if (encoded == null || encoded.isEmpty()) {
+            return new GraphPlan(List.of(), List.of());
+        }
+        try {
+            GraphCursor cursor = new GraphCursor(encoded);
+            if (!cursor.take("v1;")) {
+                return null;
+            }
+            if (!cursor.take('N')) {
+                return null;
+            }
+            int nodeCount = cursor.count();
+            if (!cursor.take(';') || nodeCount < 0 || nodeCount > 64) {
+                return null;
+            }
+            List<GraphNode> nodes = new ArrayList<>(nodeCount);
+            Set<String> ids = new java.util.HashSet<>();
+            for (int i = 0; i < nodeCount; i++) {
+                String id = cursor.text();
+                String type = cursor.text();
+                String kindText = cursor.text();
+                int argCount = cursor.count();
+                if (id == null || type == null || kindText == null || argCount < 0 || argCount > 16
+                        || !cursor.take(';') || !ids.add(id)) {
+                    return null;
+                }
+                GraphNodeKind kind;
+                try {
+                    kind = GraphNodeKind.valueOf(kindText);
+                } catch (IllegalArgumentException invalidKind) {
+                    return null;
+                }
+                List<GraphValue> arguments = new ArrayList<>(argCount);
+                for (int a = 0; a < argCount; a++) {
+                    String valueKind = cursor.text();
+                    String value = cursor.text();
+                    if (valueKind == null || value == null || !validGraphValueKind(valueKind)) {
+                        return null;
+                    }
+                    arguments.add(new GraphValue(valueKind, value));
+                }
+                nodes.add(new GraphNode(id, type, kind, arguments));
+            }
+            if (!cursor.take('F')) {
+                return null;
+            }
+            int fieldCount = cursor.count();
+            if (!cursor.take(';') || fieldCount < 0 || fieldCount > 128) {
+                return null;
+            }
+            List<GraphField> fields = new ArrayList<>(fieldCount);
+            for (int i = 0; i < fieldCount; i++) {
+                String owner = cursor.text();
+                String field = cursor.text();
+                int valueCount = cursor.count();
+                if (owner == null || field == null || valueCount <= 0 || valueCount > 32
+                        || !cursor.take(';')) {
+                    return null;
+                }
+                List<GraphValue> values = new ArrayList<>(valueCount);
+                for (int v = 0; v < valueCount; v++) {
+                    String valueKind = cursor.text();
+                    String value = cursor.text();
+                    if (valueKind == null || value == null || !validGraphValueKind(valueKind)) {
+                        return null;
+                    }
+                    values.add(new GraphValue(valueKind, value));
+                }
+                fields.add(new GraphField(owner, field, values));
+            }
+            return cursor.atEnd() ? new GraphPlan(nodes, fields) : null;
+        } catch (RuntimeException malformed) {
+            return null;
+        }
+    }
+
+    private static boolean validGraphValueKind(String kind) {
+        return "REF".equals(kind) || "CLASS".equals(kind) || "STRING".equals(kind)
+                || "INT".equals(kind) || "LONG".equals(kind) || "BOOLEAN".equals(kind)
+                || "NULL".equals(kind);
+    }
+
+    /** Small parser kept allocation-bounded by the plan limits and each length prefix. */
+    private static final class GraphCursor {
+        private final String input;
+        private int offset;
+
+        private GraphCursor(String input) {
+            this.input = input;
+        }
+
+        private boolean take(String value) {
+            if (!input.startsWith(value, offset)) {
+                return false;
+            }
+            offset += value.length();
+            return true;
+        }
+
+        private boolean take(char value) {
+            if (offset >= input.length() || input.charAt(offset) != value) {
+                return false;
+            }
+            offset++;
+            return true;
+        }
+
+        private int count() {
+            int start = offset;
+            while (offset < input.length() && Character.isDigit(input.charAt(offset))) {
+                offset++;
+            }
+            if (start == offset || offset >= input.length()) {
+                throw new IllegalArgumentException("missing count");
+            }
+            return Integer.parseInt(input.substring(start, offset));
+        }
+
+        private String text() {
+            int length = count();
+            if (!take(':') || length < 0 || length > 512 || offset + length > input.length()) {
+                throw new IllegalArgumentException("invalid text");
+            }
+            String value = input.substring(offset, offset + length);
+            offset += length;
+            return value;
+        }
+
+        private boolean atEnd() {
+            return offset == input.length();
+        }
+    }
+
+    /** Resolve and apply a rule-declared shape; every failure remains a partial-path reason. */
+    private static void applyGraphPlan(GraphPlan plan, Object entryInstance,
+                                       Map<String, Object> instances,
+                                       boolean serializationSemantics,
+                                       List<String> unlinked) {
+        Map<String, Object> bindings = new HashMap<>();
+        if (entryInstance != null) {
+            bindings.put("entry", entryInstance);
+        }
+        Set<GraphNode> pending = java.util.Collections.newSetFromMap(
+                new IdentityHashMap<GraphNode, Boolean>());
+        pending.addAll(plan.nodes);
+        int passes = Math.max(1, plan.nodes.size() + 1);
+        for (int pass = 0; pass < passes && !pending.isEmpty(); pass++) {
+            boolean progress = false;
+            for (GraphNode node : new ArrayList<>(pending)) {
+                if ("entry".equals(node.id) && entryInstance != null) {
+                    bindings.put(node.id, entryInstance);
+                    pending.remove(node);
+                    progress = true;
+                    continue;
+                }
+                List<Object> args = new ArrayList<>(node.arguments.size());
+                boolean resolved = true;
+                for (GraphValue value : node.arguments) {
+                    ResolvedGraphValue resolvedValue = resolveGraphValue(value, bindings);
+                    if (!resolvedValue.resolved) {
+                        resolved = false;
+                        break;
+                    }
+                    args.add(resolvedValue.value);
+                }
+                if (!resolved) {
+                    continue;
+                }
+                try {
+                    Class<?> type = load(node.type.replace('/', '.'));
+                    Object object;
+                    if (node.kind == GraphNodeKind.PROXY) {
+                        Object handler = args.isEmpty() ? null : args.get(0);
+                        object = handler instanceof InvocationHandler
+                                ? newProxy(type, (InvocationHandler) handler) : null;
+                    } else if (node.kind == GraphNodeKind.REFLECTIVE_PROXY) {
+                        // This adapter is intentionally probe-owned. It preserves the
+                        // interface-to-target dispatch shape while avoiding initialization of
+                        // a target framework handler whose static logger/bootstrap may perform
+                        // unrelated effects under the sandbox.
+                        Object target = args.isEmpty() ? null : args.get(0);
+                        String preferredMethod = args.size() > 1 && args.get(1) instanceof String
+                                ? (String) args.get(1) : "";
+                        object = target == null ? null
+                                : newProxy(type, new SafeReflectiveInvocationHandler(target,
+                                        preferredMethod, type));
+                        if (object != null) {
+                            graphAdapterUsed = true;
+                        }
+                    } else if (node.kind == GraphNodeKind.CONSTRUCTOR) {
+                        object = constructGraphNode(type, args);
+                    } else {
+                        // ALLOCATE is the safe default even for a non-Serializable helper:
+                        // Unsafe allocation skips arbitrary target constructors. Field plans
+                        // are responsible for restoring only the state they can prove.
+                        object = allocateWithoutConstructor(type);
+                    }
+                    if (object == null) {
+                        unlinked.add(node.id + ":node-unavailable");
+                        pending.remove(node);
+                        progress = true;
+                        continue;
+                    }
+                    bindings.put(node.id, object);
+                    instances.putIfAbsent(type.getName(), object);
+                    pending.remove(node);
+                    progress = true;
+                } catch (Throwable failure) {
+                    unlinked.add(node.id + ":" + failure.getClass().getSimpleName());
+                    pending.remove(node);
+                    progress = true;
+                }
+            }
+            if (!progress) {
+                break;
+            }
+        }
+        for (GraphNode node : pending) {
+            unlinked.add(node.id + ":node-reference-unresolved");
+        }
+        SandboxSecurityManager.beginProxyBootstrap();
+        try {
+            for (var assignment : plan.fields) {
+                Object owner = bindings.get(assignment.owner);
+                if (owner == null) {
+                    owner = instances.get(assignment.owner.replace('/', '.'));
+                }
+                if (owner == null) {
+                    unlinked.add(assignment.owner + "." + assignment.field + ":owner-missing");
+                    continue;
+                }
+                List<Object> values = new ArrayList<>(assignment.values.size());
+                boolean resolved = true;
+                for (GraphValue value : assignment.values) {
+                    ResolvedGraphValue resolvedValue = resolveGraphValue(value, bindings);
+                    if (!resolvedValue.resolved) {
+                        resolved = false;
+                        break;
+                    }
+                    values.add(resolvedValue.value);
+                }
+                if (!resolved) {
+                    unlinked.add(assignment.owner + "." + assignment.field + ":value-missing");
+                    continue;
+                }
+                Field field = findField(owner.getClass(), assignment.field);
+                if (field == null) {
+                    unlinked.add(assignment.owner + "." + assignment.field + ":field-missing");
+                    continue;
+                }
+                try {
+                    Object assigned = graphFieldValue(field.getType(), values);
+                    if (assigned == GraphFieldFailure.VALUE) {
+                        unlinked.add(assignment.owner + "." + assignment.field + ":type-mismatch");
+                    } else if (!setGraphField(field, owner, assigned)) {
+                        unlinked.add(assignment.owner + "." + assignment.field
+                                + ":field-write-denied");
+                    }
+                } catch (Throwable failure) {
+                    unlinked.add(assignment.owner + "." + assignment.field + ":"
+                            + failure.getClass().getSimpleName());
+                }
+            }
+        } finally {
+            SandboxSecurityManager.endProxyBootstrap();
+        }
+    }
+
+    private static final class ResolvedGraphValue {
+        private final boolean resolved;
+        private final Object value;
+
+        private ResolvedGraphValue(boolean resolved, Object value) {
+            this.resolved = resolved;
+            this.value = value;
+        }
+    }
+
+    private static ResolvedGraphValue resolveGraphValue(GraphValue value,
+                                                        Map<String, Object> bindings) {
+        try {
+            switch (value.kind) {
+                case "REF":
+                    return bindings.containsKey(value.value)
+                            ? new ResolvedGraphValue(true, bindings.get(value.value))
+                            : new ResolvedGraphValue(false, null);
+                case "CLASS":
+                    return new ResolvedGraphValue(true, load(value.value.replace('/', '.')));
+                case "STRING":
+                    return new ResolvedGraphValue(true, value.value);
+                case "INT":
+                    return new ResolvedGraphValue(true, Integer.valueOf(value.value));
+                case "LONG":
+                    return new ResolvedGraphValue(true, Long.valueOf(value.value));
+                case "BOOLEAN":
+                    return new ResolvedGraphValue(true, Boolean.valueOf(value.value));
+                case "NULL":
+                    return new ResolvedGraphValue(true, null);
+                default:
+                    return new ResolvedGraphValue(false, null);
+            }
+        } catch (Throwable failure) {
+            return new ResolvedGraphValue(false, null);
+        }
+    }
+
+    private static Object constructGraphNode(Class<?> type, List<Object> arguments)
+            throws Exception {
+        for (Constructor<?> constructor : type.getDeclaredConstructors()) {
+            Class<?>[] parameterTypes = constructor.getParameterTypes();
+            if (parameterTypes.length != arguments.size()) {
+                continue;
+            }
+            boolean compatible = true;
+            for (int i = 0; i < parameterTypes.length; i++) {
+                if (arguments.get(i) == null ? parameterTypes[i].isPrimitive()
+                        : !box(parameterTypes[i]).isInstance(arguments.get(i))) {
+                    compatible = false;
+                    break;
+                }
+            }
+            if (!compatible) {
+                continue;
+            }
+            constructor.setAccessible(true);
+            return constructor.newInstance(arguments.toArray());
+        }
+        throw new IllegalArgumentException("constructor-not-found:" + type.getName());
+    }
+
+    /** Safe proxy adapter for a declared interface/target pair; never calls a target setter. */
+    private static final class SafeReflectiveInvocationHandler implements InvocationHandler {
+        private final Object target;
+        private final String preferredMethod;
+        private final Class<?> interfaceType;
+
+        private SafeReflectiveInvocationHandler(Object target, String preferredMethod,
+                                               Class<?> interfaceType) {
+            this.target = target;
+            this.preferredMethod = preferredMethod == null ? "" : preferredMethod;
+            this.interfaceType = interfaceType;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
+            String methodName = preferredMethod.isBlank() ? method.getName() : preferredMethod;
+            Class<?>[] parameterTypes = preferredMethod.isBlank()
+                    ? method.getParameterTypes() : new Class<?>[0];
+            Method targetMethod = null;
+            // Invoke through the exported interface method when possible. On Java 17 a public
+            // implementation method in a non-exported JDK package can be inaccessible even
+            // though its interface is public; the interface dispatch preserves the same
+            // contract without --add-opens.
+            if (interfaceType != null && interfaceType.isInterface()) {
+                try {
+                    targetMethod = interfaceType.getMethod(methodName, parameterTypes);
+                } catch (NoSuchMethodException ignored) {
+                    // Fall through to a public implementation method for ordinary interfaces.
+                }
+            }
+            if (targetMethod == null) {
+                try {
+                    targetMethod = target.getClass().getMethod(methodName, parameterTypes);
+                } catch (NoSuchMethodException missingPublicMethod) {
+                    targetMethod = target.getClass().getDeclaredMethod(methodName, parameterTypes);
+                    // Only a public interface contract is eligible for this adapter. A private
+                    // target method would turn the generic proxy into an access escalation.
+                    if (!Modifier.isPublic(targetMethod.getModifiers())) {
+                        throw missingPublicMethod;
+                    }
+                }
+            }
+            try {
+                return targetMethod.invoke(target, arguments);
+            } catch (InvocationTargetException targetFailure) {
+                Throwable cause = targetFailure.getCause();
+                throw cause == null ? targetFailure : cause;
+            }
+        }
+    }
+
+    private static Class<?> box(Class<?> type) {
+        if (!type.isPrimitive()) return type;
+        if (type == boolean.class) return Boolean.class;
+        if (type == byte.class) return Byte.class;
+        if (type == short.class) return Short.class;
+        if (type == char.class) return Character.class;
+        if (type == int.class) return Integer.class;
+        if (type == long.class) return Long.class;
+        if (type == float.class) return Float.class;
+        if (type == double.class) return Double.class;
+        return Void.class;
+    }
+
+    private enum GraphFieldFailure { VALUE }
+
+    private static Object graphFieldValue(Class<?> fieldType, List<Object> values) {
+        if (fieldType.isArray()) {
+            Object array = java.lang.reflect.Array.newInstance(fieldType.getComponentType(), values.size());
+            for (int i = 0; i < values.size(); i++) {
+                Object value = values.get(i);
+                if (value == null && fieldType.getComponentType().isPrimitive()) {
+                    return GraphFieldFailure.VALUE;
+                }
+                if (value != null && !box(fieldType.getComponentType()).isInstance(value)) {
+                    return GraphFieldFailure.VALUE;
+                }
+                java.lang.reflect.Array.set(array, i, value);
+            }
+            return array;
+        }
+        if (values.size() != 1) {
+            return GraphFieldFailure.VALUE;
+        }
+        Object value = values.get(0);
+        if (value == null) {
+            return fieldType.isPrimitive() ? GraphFieldFailure.VALUE : null;
+        }
+        return box(fieldType).isInstance(value) ? value : GraphFieldFailure.VALUE;
+    }
+
+    /**
+     * Write only a rule-declared, type-checked instance field.  Java 17 modules reject
+     * setAccessible for several JDK collection/event classes used by real gadget graphs;
+     * the probe may use its already-scoped Unsafe allocator as a compatibility fallback.
+     * This never invokes a target setter or constructor and remains inside the probe-only
+     * serialization bootstrap scope.
+     */
+    private static boolean setGraphField(Field field, Object target, Object value) {
+        if (Modifier.isStatic(field.getModifiers())) {
+            return false;
+        }
+        try {
+            field.setAccessible(true);
+            field.set(target, value);
+            return true;
+        } catch (Throwable reflectiveDenied) {
+            boolean bootstrap = false;
+            try {
+                SandboxSecurityManager.beginSerializationBootstrap();
+                bootstrap = true;
+                Object unsafe = probeUnsafe();
+                Class<?> unsafeType = unsafe.getClass();
+                long offset = (Long) unsafeType.getMethod("objectFieldOffset", Field.class)
+                        .invoke(unsafe, field);
+                Class<?> type = field.getType();
+                if (!type.isPrimitive()) {
+                    unsafeType.getMethod("putObject", Object.class, long.class, Object.class)
+                            .invoke(unsafe, target, offset, value);
+                } else if (type == boolean.class) {
+                    unsafeType.getMethod("putBoolean", Object.class, long.class, boolean.class)
+                            .invoke(unsafe, target, offset, ((Boolean) value).booleanValue());
+                } else if (type == byte.class) {
+                    unsafeType.getMethod("putByte", Object.class, long.class, byte.class)
+                            .invoke(unsafe, target, offset, ((Number) value).byteValue());
+                } else if (type == short.class) {
+                    unsafeType.getMethod("putShort", Object.class, long.class, short.class)
+                            .invoke(unsafe, target, offset, ((Number) value).shortValue());
+                } else if (type == char.class) {
+                    unsafeType.getMethod("putChar", Object.class, long.class, char.class)
+                            .invoke(unsafe, target, offset, ((Character) value).charValue());
+                } else if (type == int.class) {
+                    unsafeType.getMethod("putInt", Object.class, long.class, int.class)
+                            .invoke(unsafe, target, offset, ((Number) value).intValue());
+                } else if (type == long.class) {
+                    unsafeType.getMethod("putLong", Object.class, long.class, long.class)
+                            .invoke(unsafe, target, offset, ((Number) value).longValue());
+                } else if (type == float.class) {
+                    unsafeType.getMethod("putFloat", Object.class, long.class, float.class)
+                            .invoke(unsafe, target, offset, ((Number) value).floatValue());
+                } else if (type == double.class) {
+                    unsafeType.getMethod("putDouble", Object.class, long.class, double.class)
+                            .invoke(unsafe, target, offset, ((Number) value).doubleValue());
+                } else {
+                    return false;
+                }
+                return true;
+            } catch (Throwable unsafeDenied) {
+                return false;
+            } finally {
+                if (bootstrap) {
+                    SandboxSecurityManager.endSerializationBootstrap();
+                }
+            }
+        }
     }
 
     /** Return an already-created object satisfying the field's declared JVM type. */
@@ -891,9 +1548,42 @@ public final class ChainVerifyProbe {
         if (!io.just.sast.verify.boot.SinkCanaryGate.wasReached()) {
             return false;
         }
-        emit(token, "SINK_BLOCKED: " + sinkClass);
+        if (observeSafeEffect(sinkClass, sinkMethod)) {
+            emit(token, "SAFE_EFFECT_OBSERVED:" + safeSinkDisposition + adapterSuffix());
+            System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
+                    + " (canary-latched; safe effect observed; target body not entered)");
+            return true;
+        }
+        emit(token, "SINK_BLOCKED: " + sinkClass + adapterSuffix());
         System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod + " (canary-latched)");
         return true;
+    }
+
+    /** Run only the fixed adapter effect after the target sink frame has been unwound. */
+    private static boolean observeSafeEffect(String sinkClass, String sinkMethod) {
+        if (!"SAFE_EXEC".equals(safeSinkMode)
+                || "CANARY_BOUNDARY".equals(safeSinkDisposition)
+                || "DENIED".equals(safeSinkDisposition)
+                || safeSinkPolicyDigest.isBlank()) {
+            return false;
+        }
+        try {
+            Path scratch = Path.of(safeScratchRoot).toAbsolutePath().normalize();
+            SafeSinkAdapter.Policy policy = SafeSinkAdapter.safeExecution(scratch);
+            if (!policy.digest().equals(safeSinkPolicyDigest)) {
+                System.err.println("SAFE_EFFECT_NOT_OBSERVED: policy-digest-mismatch");
+                return false;
+            }
+            SafeSinkAdapter.Sink sink = new SafeSinkAdapter.Sink(safeSinkCategory,
+                    sinkClass.replace('.', '/'), sinkMethod, "");
+            SafeSinkAdapter.AdapterResult result = SafeSinkAdapter.observe(policy, sink, null);
+            return result.effectObserved()
+                    && safeSinkDisposition.equals(result.decision().disposition().name());
+        } catch (RuntimeException failure) {
+            System.err.println("SAFE_EFFECT_NOT_OBSERVED: "
+                    + failure.getClass().getSimpleName());
+            return false;
+        }
     }
 
     /** Emit only a probe-owned, per-attempt result marker; target output remains diagnostic. */
@@ -902,7 +1592,35 @@ public final class ChainVerifyProbe {
     }
 
     private static void emit(String token, String status) {
-        System.out.println(PROTOCOL_PREFIX + (token == null ? "" : token) + ":" + status);
+        String safeStatus = status == null ? "UNTESTABLE: null-status"
+                : status.replace('\r', ' ').replace('\n', ' ');
+        if (safeStatus.length() > 4096) {
+            safeStatus = safeStatus.substring(0, 4096);
+        }
+        if (!protocolRunId.isBlank() && !protocolChainFingerprint.isBlank()
+                && !protocolSinkFingerprint.isBlank() && !protocolNonce.isBlank()
+                && !protocolArtifactFingerprint.isBlank()) {
+            System.out.println("JUST_VERIFY_V2:" + (token == null ? "" : token) + ":"
+                    + protocolRunId + ":" + protocolChainFingerprint + ":"
+                    + protocolSinkFingerprint + ":" + protocolNonce + ":"
+                    + protocolArtifactFingerprint + ":" + safeStatus);
+            return;
+        }
+        System.out.println(PROTOCOL_PREFIX + (token == null ? "" : token) + ":" + safeStatus);
+    }
+
+    private static boolean protocolBound() {
+        try {
+            return io.just.sast.verify.boot.SinkCanaryGate.protocolBound(protocolRunId,
+                    protocolChainFingerprint, protocolSinkFingerprint, protocolNonce,
+                    protocolArtifactFingerprint);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static String adapterSuffix() {
+        return graphAdapterUsed ? ";adapter=REFLECTIVE_PROXY" : "";
     }
 
     /** 沿异常 cause 链（≤6 层）查找 SinkReachedError 标记，返回其 spec（无则 null）。 */
@@ -950,6 +1668,35 @@ public final class ChainVerifyProbe {
             }
         }
         return false;
+    }
+
+    /** Keep a bounded cause chain so runtime/linkage denials remain diagnosable. */
+    private static String describeFailure(Throwable failure) {
+        if (failure == null) {
+            return "";
+        }
+        StringBuilder detail = new StringBuilder();
+        Throwable current = failure;
+        int depth = 0;
+        while (current != null && depth++ < 4) {
+            if (detail.length() > 0) {
+                detail.append(" caused-by ");
+            }
+            detail.append(current.getClass().getSimpleName());
+            String message = current.getMessage();
+            if (message != null && !message.isEmpty()) {
+                detail.append(": ").append(message.replace('\n', ' ').replace('\r', ' '));
+            }
+            Throwable next = current.getCause();
+            if (next == current) {
+                break;
+            }
+            current = next;
+        }
+        if (detail.length() > 384) {
+            detail.setLength(384);
+        }
+        return detail.toString();
     }
 
     /** 异常及其 cause 链（≤6 层）的栈帧中是否存在 declaringClass == sinkClass 且 methodName == sinkMethod 的帧。 */
@@ -1316,6 +2063,54 @@ public final class ChainVerifyProbe {
         }
     }
 
+    /**
+     * The parent attaches the OS boundary before releasing this marker. Waiting here keeps
+     * target class loading and static initialization out of the short pre-attachment window.
+     * A manually launched probe without the nonce is intentionally not a valid verification.
+     */
+    private static boolean awaitIsolationReady() {
+        String marker = System.getProperty("just.verify.isolation-ready", "");
+        String expected = System.getProperty("just.verify.isolation-token", "");
+        if (marker.isBlank() || expected.isBlank() || expected.length() > 128) {
+            return false;
+        }
+        Path markerPath;
+        try {
+            markerPath = Path.of(marker).toAbsolutePath().normalize();
+        } catch (RuntimeException invalidPath) {
+            return false;
+        }
+        long deadline = System.nanoTime() + 5L * 1_000_000_000L;
+        while (System.nanoTime() < deadline) {
+            try {
+                if (Files.isRegularFile(markerPath) && Files.size(markerPath) <= 256L) {
+                    String actual = Files.readString(markerPath).strip();
+                    if (expected.equals(actual)) {
+                        return true;
+                    }
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // The parent may still be creating/renaming the marker.
+            }
+            try {
+                Thread.sleep(10L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static String safeProperty(String key, String fallback) {
+        String value = System.getProperty(key, fallback);
+        if (value == null || value.isBlank() || value.length() > 96
+                || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+            return fallback;
+        }
+        return value;
+    }
+
     private static String targetClassPath() {
         String classPath = System.getProperty("just.verify.target-cp", "");
         if (classPath.isBlank()) {
@@ -1415,6 +2210,57 @@ public final class ChainVerifyProbe {
             // reflection cannot resolve unrelated signatures; report partial instead.
         }
         return null;
+    }
+
+    /**
+     * Resolve serialized application classes through the isolated application loader. The
+     * default ObjectInputStream resolver asks the latest user-defined system loader, which is
+     * deliberately probe-only in this process; that made valid SERIAL candidates fail with
+     * ClassNotFoundException even though the target JAR was present in target-cp. The resolver
+     * stays inside the already-approved loader and never initializes a target class by name.
+     */
+    private static final class ApplicationObjectInputStream extends java.io.ObjectInputStream {
+        private ApplicationObjectInputStream(java.io.InputStream input) throws java.io.IOException {
+            super(input);
+        }
+
+        @Override
+        protected Class<?> resolveClass(ObjectStreamClass descriptor)
+                throws java.io.IOException, ClassNotFoundException {
+            try {
+                return resolveSerializedType(descriptor.getName());
+            } catch (ClassNotFoundException missing) {
+                return super.resolveClass(descriptor);
+            }
+        }
+
+        @Override
+        protected Class<?> resolveProxyClass(String[] interfaces)
+                throws java.io.IOException, ClassNotFoundException {
+            if (applicationLoader != null && interfaces != null) {
+                Class<?>[] resolved = new Class<?>[interfaces.length];
+                try {
+                    for (int i = 0; i < interfaces.length; i++) {
+                        resolved[i] = applicationLoader.loadClass(interfaces[i]);
+                    }
+                    return java.lang.reflect.Proxy.getProxyClass(applicationLoader, resolved);
+                } catch (IllegalArgumentException | SecurityException ignored) {
+                    // Fall through to ObjectInputStream's standard resolver for a JDK proxy.
+                }
+            }
+            return super.resolveProxyClass(interfaces);
+        }
+    }
+
+    private static Class<?> resolveSerializedType(String name) throws ClassNotFoundException {
+        if (applicationLoader == null || name == null || name.isEmpty()) {
+            throw new ClassNotFoundException(name);
+        }
+        if (!name.startsWith("[")) {
+            return applicationLoader.loadClass(name);
+        }
+        Class<?> component = resolveSerializedType(name.substring(1));
+        return java.lang.reflect.Array.newInstance(component, 0).getClass();
     }
 
     /** Resolve only descriptor parameter types; target methods are not initialized. */
@@ -1911,6 +2757,10 @@ public final class ChainVerifyProbe {
                 set.add(value);
                 yield set;
             }
+            // Kryo's MapSerializer calls put() while reading a HashMap. HashSet is not a
+            // safe substitute: with an instantiator strategy Kryo may allocate it without
+            // running the constructor, leaving its internal map null and making the target
+            // catch an NPE before the callback. The raw map keeps the classic bounded shape.
             case "hashCode" -> rawHashMap(value);
             case "equals" -> {
                 Object peer = duplicateWithoutConstructor(value);
@@ -2033,18 +2883,37 @@ public final class ChainVerifyProbe {
             return;
         }
         try {
-            Class<?> downstreamType = load(trigger.downstreamOwner().replace('/', '.'));
-            if (downstreamType.isInterface() || Modifier.isAbstract(downstreamType.getModifiers())
-                    || !java.io.Serializable.class.isAssignableFrom(downstreamType)) {
+            Class<?> declaredType = null;
+            Class<?> concreteType = null;
+            for (String candidate : trigger.downstreamOwner().split(",")) {
+                if (candidate.isBlank()) {
+                    continue;
+                }
+                try {
+                    Class<?> type = load(candidate.replace('/', '.'));
+                    if (declaredType == null) {
+                        declaredType = type;
+                    }
+                    if (!type.isInterface() && !Modifier.isAbstract(type.getModifiers())
+                            && java.io.Serializable.class.isAssignableFrom(type)) {
+                        concreteType = type;
+                        break;
+                    }
+                } catch (ClassNotFoundException | LinkageError | RuntimeException ignored) {
+                    // An optional implementation must not disable other nearby candidates.
+                }
+            }
+            if (concreteType == null) {
                 return;
             }
-            Object downstream = newInstance(downstreamType, true);
-            if (downstream == null) {
+            Object downstream = newInstance(concreteType, true);
+            if (downstream == null || !setReferenceField(triggerInstance, downstream)) {
                 return;
             }
-            setReferenceField(triggerInstance, downstream);
-            setClassField(triggerInstance, downstreamType);
-            configureInertGetterValue(downstream);
+            setClassField(triggerInstance, declaredType == null ? concreteType : declaredType);
+            if (declaredType == concreteType) {
+                configureInertGetterValue(downstream);
+            }
         } catch (Exception | LinkageError ignored) {
             // Optional source adaptation must remain partial rather than widening access.
         }
@@ -2055,11 +2924,11 @@ public final class ChainVerifyProbe {
             // The target application loader deliberately cannot see probe-private classes.
             // Use a JDK-visible, serializable getter-shaped value so the source adapter never
             // leaks ChainVerifyProbe$ProbeBean into a target object graph (which would become
-            // a loader-dependent ClassNotFoundException during real deserialization).
-            java.util.AbstractMap.SimpleEntry<String, String> inertValue =
-                    new java.util.AbstractMap.SimpleEntry<>("CHAIN_OK", "CHAIN_OK");
-            setClassField(wrapper, java.util.AbstractMap.SimpleEntry.class);
-            setReferenceField(wrapper, inertValue);
+            // a loader-dependent ClassNotFoundException during real deserialization). SimpleEntry
+            // is not Kryo 4-safe on Java 17+ because java.base does not open its private fields;
+            // String has a built-in serializer and harmless JavaBeans getters instead.
+            setClassField(wrapper, String.class);
+            setReferenceField(wrapper, "CHAIN_OK");
         } catch (RuntimeException | LinkageError ignored) {
             // The wrapper may not be a bean-style two-slot adapter.
         }
@@ -2155,6 +3024,8 @@ public final class ChainVerifyProbe {
 
     private static void warmJdkRuntimeLinkage() {
         warmObjectInputStream();
+        warmReflectionRuntime();
+        warmJdkDateLinkage();
         // A target class initializer may ask its application loader for a resource. On
         // Java 9+ that lookup can lazily initialize the JRT URL handler, whose lambda
         // metafactory performs reflective setup. Link it while the caller is still the
@@ -2162,6 +3033,47 @@ public final class ChainVerifyProbe {
         // JDK bootstrap permission to the target initializer and downgrades a valid path.
         warmClass("sun.net.www.protocol.jrt.Handler");
         warmClass("sun.net.protocol.jrt.JavaRuntimeURLConnection");
+    }
+
+    /**
+     * Prime the JDK locale/date implementation used by Jackson's first POJONode rendering.
+     * Some Java 17 images request a broad read/write property permission while lazily
+     * selecting the locale provider; doing this from the trusted probe keeps that JDK
+     * bootstrap out of a target callback without granting target code a property capability.
+     */
+    private static void warmJdkDateLinkage() {
+        try {
+            java.util.Locale.getDefault();
+            java.util.TimeZone utc = java.util.TimeZone.getTimeZone("UTC");
+            new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX",
+                    java.util.Locale.US).setTimeZone(utc);
+            new java.util.GregorianCalendar(utc, java.util.Locale.US).getTimeInMillis();
+        } catch (RuntimeException ignored) {
+            // Runtime-specific locale providers are optional; failure remains a normal
+            // partial-path result rather than widening the sandbox.
+        }
+    }
+
+    /**
+     * Prime the JDK reflection accessor path while the caller is still the trusted probe.
+     * The first Method/Class reflective call on older runtimes may lazily define an accessor
+     * class. If that linkage happens from a target callback, the deny-by-default policy sees
+     * a target frame and rejects createClassLoader before the canary call site is reached.
+     * These calls invoke only JDK Object/Class methods and never target code.
+     */
+    private static void warmReflectionRuntime() {
+        try {
+            Method objectToString = Object.class.getMethod("toString");
+            objectToString.invoke(new Object());
+            Method stringToString = String.class.getMethod("toString");
+            stringToString.invoke("CHAIN_WARMUP");
+            Method classGetMethod = Class.class.getMethod("getMethod", String.class,
+                    Class[].class);
+            classGetMethod.invoke(Object.class, "toString", new Class<?>[0]);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // A runtime-specific accessor implementation may already be unavailable. Keep
+            // the normal bounded PARTIAL_PATH result instead of widening permissions.
+        }
     }
 
     private static void warmClass(String name) {

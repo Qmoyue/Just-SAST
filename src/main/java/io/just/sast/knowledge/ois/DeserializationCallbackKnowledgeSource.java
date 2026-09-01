@@ -45,6 +45,7 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
     private static final int MAX_ENTRY_ANCESTRY = 3;
     private static final int MAX_HOSTS_PER_RESOLVER = 2_000;
     private static final int MAX_CHAINS = 2_000;
+    private static final int SUBTYPE_TRAVERSAL_CAP = 10_000;
 
     /** 回调重写：方法名 + 描述符（回调参数恒在 slot 1）。 */
     private record Callback(String name, String desc) {}
@@ -113,7 +114,11 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
     /** 重写了回调方法的 OIS 子类（resolveMethod 指向子类自身）。 */
     private List<String> overriders(Callback callback) {
         List<String> result = new ArrayList<>();
-        for (String sub : bb.hierarchy().transitiveSubtypes(OIS)) {
+        var subtypeResult = bb.hierarchy().transitiveSubtypes(OIS, SUBTYPE_TRAVERSAL_CAP);
+        if (!subtypeResult.complete()) {
+            bb.markIncomplete("OIS_CALLBACK_SUBTYPE_CAP:" + SUBTYPE_TRAVERSAL_CAP);
+        }
+        for (String sub : subtypeResult.values()) {
             if (sub.equals(bb.hierarchy().resolveMethod(sub, callback.name(), callback.desc()))) {
                 result.add(sub);
             }
@@ -305,7 +310,8 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                     HopKind.ENTRY, null, entry.kind(), entry.desc(), null));
             Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
                     entry.owner(), entry.name(), entry.kind(),
-                    sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"));
+                    sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"),
+                    rule.role().name());
             produced += bb.addChain(chain) ? 1 : 0;
         }
         return produced;

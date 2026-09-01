@@ -12,6 +12,9 @@ import java.util.Set;
  */
 public interface KnowledgeSource {
 
+    /** Versioned extension contract.  A future incompatible blackboard protocol must bump it. */
+    int CONTRACT_VERSION = 1;
+
     /** 唯一标识。 */
     String id();
 
@@ -26,6 +29,11 @@ public interface KnowledgeSource {
     /** 同阶段内执行序（小者先，默认 500；同值保持注册顺序稳定）。 */
     default int priority() {
         return 500;
+    }
+
+    /** Plugin contract version; incompatible versions are rejected during discovery. */
+    default int contractVersion() {
+        return CONTRACT_VERSION;
     }
 
     /** 初始化（规则编译、索引准备）；异常由控制器隔离，不中断其他知识源。 */

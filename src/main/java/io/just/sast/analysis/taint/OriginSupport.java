@@ -41,6 +41,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class OriginSupport {
 
+    /** JVM descriptor of the callback method supplied by the proxy runtime. */
+    public static final String SERIALIZED_PROXY_HANDLER_DESCRIPTOR =
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;";
+    private static final int MAX_SERIALIZED_PROXY_HANDLERS = 1024;
+
     private final Graph graph;
     private final CpgIndex cpgIndex;
     private final ForwardOrigins origins;
@@ -58,6 +63,21 @@ public final class OriginSupport {
     private Set<String> entryDownstream;
     /** 入口 BFS 距离（与下游闭包同一次遍历产出）：反向探索按离入口近者优先。 */
     private Map<String, Integer> entryDepths;
+    /**
+     * Sink-relevance index used by bounded dynamic dispatch.  The index is built together
+     * with the semantic entry closure, so a dispatch candidate can be ranked by an
+     * already-proven ordinary path to a configured sink without rescanning the graph for
+     * every call site.  It is a hint for finite candidate ordering, never a soundness gate.
+     */
+    private Map<String, Integer> sinkDistanceIndex = Map.of();
+    /**
+     * JDK-owned serialization callbacks that are safe to admit as roots because their
+     * already-materialized body has an ordinary path to a configured sink.  JDK callbacks
+     * are not global roots: this bounded, sink-relevant set bridges the ObjectInputStream
+     * runtime callback that is absent from ordinary bytecode edges without re-expanding the
+     * whole JDK image.
+     */
+    private Set<String> deserializationCallbackEntries = Set.of();
     /** 接口分发解析记忆：owner#name+desc → (解析类, 方法节点) 列表——闭包展开对同一
      * 接口签名的全部调用点复用（transitiveSubtypes + resolveMethod + findMethodNode 只算一次）。 */
     private final Map<String, List<Object[]>> ifaceDispatchCache = new HashMap<>();
@@ -74,6 +94,10 @@ public final class OriginSupport {
     private final List<Node> proxyMethodInvokeSites = new ArrayList<>();
     /** Method.invoke sites consuming a Method object obtained from a typed iterator/list read. */
     private final List<Node> methodCollectionInvokeSites = new ArrayList<>();
+    /** Serializable InvocationHandler implementations callable by an externally assembled JDK proxy. */
+    private final List<Node> serializedProxyHandlerMethods = new ArrayList<>();
+    /** Cached target family for typed Method-collection callbacks. */
+    private List<Node> methodCollectionTargetMethods = List.of();
     /**
      * Native call sites whose same-receiver callback family is structurally recoverable.
      * JNI bytecode is outside the Java class file, so this index deliberately models only
@@ -98,6 +122,23 @@ public final class OriginSupport {
     private final Map<Long, String> javabeanSiteKinds = new HashMap<>();
     /** 占位类型集（JavaBean wildcard 精度门，惰性）。 */
     private java.util.Set<String> occupiableTypes;
+    /** Shared semantic completeness boundaries discovered by hierarchy/reflection helpers. */
+    private final Set<String> completenessReasons = ConcurrentHashMap.newKeySet();
+    private static final int SUBTYPE_TRAVERSAL_CAP = 10_000;
+    private static final int SINK_REACHABILITY_CAP = 200_000;
+    private static final int METHOD_COLLECTION_TARGET_CAP = 512;
+    private static final int JDK_SERIALIZATION_CALLBACK_CAP = 128;
+    private static final int JDK_CALLBACK_TRIGGER_SEARCH_CAP = 256;
+    private static final Set<String> JDK_SERIALIZATION_ENTRY_KINDS = Set.of(
+            "readObject", "readObjectNoData", "readResolve", "readExternal", "validateObject");
+    /**
+     * These lifecycle names describe a callback activated by a deserialized object graph;
+     * they are not independent bytecode sources.  Keeping this boundary identical to the
+     * forward engine prevents a short hashCode/equals/toString root from hiding the actual
+     * readObject/container boundary in class-level summaries.
+     */
+    private static final Set<String> SERIALIZED_TRIGGER_ENTRY_KINDS = Set.of(
+            "hashCode", "equals", "compareTo", "compare", "toString");
 
     /**
      * 方法内字段重初始化的支配关系只在 receiver 精度查询时按需建立。
@@ -178,6 +219,7 @@ public final class OriginSupport {
         }
         frameworkDeserializeSourceAvailable = hasDeserializeSource(graph);
         indexReflectiveJumps(graph);
+        indexSerializedProxyHandlers(graph);
         indexNativeCallbacks(graph);
     }
 
@@ -190,16 +232,49 @@ public final class OriginSupport {
         return cpgIndex;
     }
 
+    /** Forward summaries are a per-scan memo only; release them before the scan is returned. */
+    public int forwardOriginCacheSize() {
+        return origins.cacheSize();
+    }
+
+    public long forwardOriginComputeCalls() {
+        return origins.computeCalls();
+    }
+
+    public long forwardOriginCacheHits() {
+        return origins.cacheHits();
+    }
+
+    public long forwardOriginAnalysisRuns() {
+        return origins.analysisRuns();
+    }
+
+    public void clearForwardOriginCache() {
+        origins.clearCache();
+    }
+
+    /** Completeness boundaries discovered while lazy semantic indexes are built. */
+    public Set<String> completenessReasons() {
+        return Set.copyOf(completenessReasons);
+    }
+
+    private void markIncomplete(String reason) {
+        if (reason != null && !reason.isBlank()) {
+            completenessReasons.add(reason);
+        }
+    }
+
     /**
      * source 规则的 bridge 是数据契约，不把某个具体框架或目标类写进引擎：
-     * 只要已加载图中存在一个 deserialize source 调用，就允许后续 JavaBean
-     * setter 作为框架对象绑定边界参与反向污点分析。
+     * 只要已加载图中存在一个无条件 deserialize source 调用，就允许后续 JavaBean
+     * setter 作为框架对象绑定边界参与反向污点分析。带 tainted 前置条件的 source
+     * 是二次反序列化/转换桥，不能把整个依赖图提升为外部对象绑定入口。
      */
     private boolean hasDeserializeSource(Graph graph) {
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             var source = ruleEngine.matchingSource(call.strProp("owner"), call.strProp("name"),
                     call.strProp("desc"));
-            if (source.isPresent() && isDeserializeSource(source.get())) {
+            if (source.isPresent() && isUnconditionalDeserializeSource(source.get())) {
                 return true;
             }
         }
@@ -208,6 +283,116 @@ public final class OriginSupport {
 
     private static boolean isDeserializeSource(io.just.sast.config.Rule.SourceRule source) {
         return source != null && !"serialize".equalsIgnoreCase(source.bridge());
+    }
+
+    private static boolean isUnconditionalDeserializeSource(io.just.sast.config.Rule.SourceRule source) {
+        return isDeserializeSource(source) && (source.tainted() == null || source.tainted().isEmpty());
+    }
+
+    private boolean isDeserializeEntry(io.just.sast.config.Rule.MagicEntryRule entry,
+                                       String owner) {
+        if (entry == null || !"deserialize".equalsIgnoreCase(entry.direction())) {
+            return false;
+        }
+        // InvocationHandler.invoke is a callback contract, not a deserialization
+        // source by itself.  A serializable handler becomes attacker-controlled only
+        // after an actual proxy callback edge (for example a Method collection invoke)
+        // has been justified.  Treating every serializable implementation as a root
+        // creates a short synthetic path to its sinks and hides the real trigger.
+        return !"proxyInvoke".equals(entry.entryKind())
+                && !SERIALIZED_TRIGGER_ENTRY_KINDS.contains(entry.entryKind());
+    }
+
+    /**
+     * Rank typed Method-collection targets by the amount of runtime evidence available.
+     * Interface declarations are intentionally ahead of ordinary concrete getters: an
+     * externally assembled JDK proxy exposes Methods from its proxy interfaces, while the
+     * concrete InvocationHandler implementation may not be present in the scanned artifact.
+     * Sink-relevant concrete methods remain first, and the finite cap still bounds wildcard
+     * expansion for dependency-heavy archives.
+     */
+    private int methodCollectionTargetRank(Node node, Map<String, Integer> sinkDistances) {
+        String owner = node.strProp("owner");
+        ClassInfo classInfo = hierarchy.classInfo(owner);
+        if (sinkDistances.containsKey(methodKeyOf(owner, node.strProp("name"), node.strProp("desc")))) {
+            return 0;
+        }
+        if (classInfo != null && classInfo.isInterface()) {
+            return 1;
+        }
+        if (hierarchy.isSerializable(owner)) {
+            return 2;
+        }
+        return 3;
+    }
+
+    /**
+     * Determine whether a platform serialization callback reaches a standard object-graph
+     * trigger through a small JDK helper chain.  This is deliberately structural: it does not
+     * execute the archive, does not inspect benchmark names, and does not follow arbitrary
+     * application methods.  The bounded search breaks the circularity between admitting a
+     * JDK container callback and discovering the serialized field/trigger path that eventually
+     * reaches a configured sink.
+     */
+    private boolean jdkCallbackMayReachTrigger(Graph graph, Node callback) {
+        if (graph == null || callback == null) {
+            return false;
+        }
+        String callbackKey = methodKeyOf(callback.strProp("owner"), callback.strProp("name"),
+                callback.strProp("desc"));
+        Deque<String> work = new ArrayDeque<>();
+        Deque<Integer> depths = new ArrayDeque<>();
+        Set<String> visited = new HashSet<>();
+        work.add(callbackKey);
+        depths.add(0);
+        int inspected = 0;
+        while (!work.isEmpty()) {
+            if (inspected++ >= JDK_CALLBACK_TRIGGER_SEARCH_CAP) {
+                markIncomplete("JDK_CALLBACK_TRIGGER_SEARCH_CAP:" + JDK_CALLBACK_TRIGGER_SEARCH_CAP);
+                return false;
+            }
+            String methodKey = work.removeFirst();
+            int depth = depths.removeFirst();
+            if (!visited.add(methodKey) || depth > 8) {
+                continue;
+            }
+            for (Node call : graph.callsOfMethod(methodKey)) {
+                if (serializationTriggerCall(call)) {
+                    return true;
+                }
+                if (depth >= 8) {
+                    continue;
+                }
+                for (Edge edge : call.out()) {
+                    if (edge.type() != EdgeType.INVOKES && edge.type() != EdgeType.DISPATCHES) {
+                        continue;
+                    }
+                    if (!isJdk(edge.to().owner())) {
+                        continue;
+                    }
+                    work.add(methodKeyOf(edge.to().owner(), edge.to().name(), edge.to().descriptor()));
+                    depths.add(depth + 1);
+                }
+            }
+        }
+        return false;
+    }
+
+    /** A declared call whose receiver is a runtime-controlled object-graph trigger. */
+    private static boolean serializationTriggerCall(Node call) {
+        if (call == null) {
+            return false;
+        }
+        String owner = call.strProp("owner");
+        String name = call.strProp("name");
+        if ("java/lang/Object".equals(owner)) {
+            return Set.of("hashCode", "equals", "toString", "compareTo", "compare")
+                    .contains(name);
+        }
+        if ("java/lang/Comparable".equals(owner)) {
+            return "compareTo".equals(name);
+        }
+        return "java/util/Comparator".equals(owner) && "compare".equals(name);
     }
 
     /** 框架包前缀：source 规则声明的框架入口类取前 3 段包名（与框架桥接 KS 的前缀口径一致）。 */
@@ -294,6 +479,31 @@ public final class OriginSupport {
     }
 
     /**
+     * Index the handler half of a JDK proxy whose proxy object is supplied by
+     * serialized state.  A normal call graph cannot see Proxy.newProxyInstance
+     * in that case, but the handler contract is still precise enough to admit
+     * only serializable InvocationHandler implementations.
+     */
+    private void indexSerializedProxyHandlers(Graph graph) {
+        List<Node> candidates = graph.nodesOfType(NodeType.METHOD).stream()
+                .filter(node -> !isJdk(node.strProp("owner")))
+                .filter(node -> "invoke".equals(node.strProp("name")))
+                .filter(node -> SERIALIZED_PROXY_HANDLER_DESCRIPTOR.equals(node.strProp("desc")))
+                .filter(node -> isSerializedProxyHandler(
+                        methodOf(node.strProp("owner"), node.strProp("name"), node.strProp("desc"))))
+                .sorted(java.util.Comparator.comparing(Node::owner)
+                        .thenComparing(Node::name)
+                        .thenComparing(Node::descriptor))
+                .toList();
+        if (candidates.size() > MAX_SERIALIZED_PROXY_HANDLERS) {
+            markIncomplete("SERIALIZED_PROXY_HANDLER_CAP:" + MAX_SERIALIZED_PROXY_HANDLERS);
+            candidates = candidates.subList(0, MAX_SERIALIZED_PROXY_HANDLERS);
+        }
+        serializedProxyHandlerMethods.addAll(candidates);
+        JustLogger.debug("外部序列化 JDK Proxy handler：{} 个方法", serializedProxyHandlerMethods.size());
+    }
+
+    /**
      * Index the Java-visible part of a JNI callback without reading or loading native code.
      * The descriptor restriction is intentional: it is a sound compatibility filter for the
      * common {@code CallVoidMethod(obj, mid)} shape and keeps an opaque native boundary bounded.
@@ -371,7 +581,11 @@ public final class OriginSupport {
         }
         Set<String> owners = new java.util.LinkedHashSet<>();
         owners.add(nativeCall.owner());
-        owners.addAll(hierarchy.transitiveSubtypes(nativeCall.owner()));
+        var subtypeResult = hierarchy.transitiveSubtypes(nativeCall.owner(), SUBTYPE_TRAVERSAL_CAP);
+        if (!subtypeResult.complete()) {
+            markIncomplete("NATIVE_CALLBACK_SUBTYPE_CAP:" + SUBTYPE_TRAVERSAL_CAP);
+        }
+        owners.addAll(subtypeResult.values());
         List<Node> result = new ArrayList<>();
         for (String owner : owners) {
             result.addAll(candidatesByOwner.getOrDefault(owner, List.of()));
@@ -615,6 +829,19 @@ public final class OriginSupport {
         return methodCollectionInvokeSites;
     }
 
+    /**
+     * Serializable InvocationHandler methods that an externally assembled JDK
+     * proxy can call.  The list is bounded and sorted when it is indexed.
+     */
+    public List<Node> serializedProxyHandlerMethods() {
+        return serializedProxyHandlerMethods;
+    }
+
+    /** Target methods admitted by the typed Method-collection callback model. */
+    public List<Node> methodCollectionTargetMethods() {
+        return methodCollectionTargetMethods;
+    }
+
     /** Native callback targets attached to one Java native call site. */
     public List<Node> nativeCallbackTargets(Node nativeCall) {
         return nativeCall == null ? List.of()
@@ -693,6 +920,11 @@ public final class OriginSupport {
                 || !java.lang.reflect.Modifier.isPublic(target.access())) {
             return false;
         }
+        ClassInfo ownerInfo = hierarchy.classInfo(target.owner());
+        if (ownerInfo != null && java.lang.reflect.Modifier.isInterface(ownerInfo.access())
+                && methodOf(target.owner(), target.name(), target.descriptor()) != null) {
+            return true;
+        }
         for (String iface : hierarchy.transitiveInterfaces(target.owner())) {
             MethodInfo declaration = methodOf(iface, target.name(), target.descriptor());
             if (declaration != null) {
@@ -700,6 +932,24 @@ public final class OriginSupport {
             }
         }
         return false;
+    }
+
+    /**
+     * Whether a loaded method is a concrete serialized InvocationHandler entry.
+     * The runtime can invoke a public interface implementation even when the
+     * proxy itself is created entirely outside the scanned artifact.
+     */
+    public boolean isSerializedProxyHandler(MethodInfo method) {
+        if (method == null || method.isStatic()
+                || !"invoke".equals(method.name())
+                || !SERIALIZED_PROXY_HANDLER_DESCRIPTOR.equals(method.descriptor())
+                || !java.lang.reflect.Modifier.isPublic(method.access())) {
+            return false;
+        }
+        String owner = method.owner();
+        return !isJdk(owner)
+                && hierarchy.isSerializable(owner)
+                && hierarchy.isSubtypeOf(owner, "java/lang/reflect/InvocationHandler");
     }
 
     /**
@@ -799,10 +1049,10 @@ public final class OriginSupport {
             String key = methodKeyOf(m.strProp("owner"), m.strProp("name"), m.strProp("desc"));
             for (io.just.sast.model.InsnFact insn : info.instructions()) {
                 if (insn.op().isFieldRead()) {
-                    String fieldKey = insn.fieldRef().owner() + "#" + insn.fieldRef().name();
+                    String fieldKey = fieldKey(insn);
                     fieldReaders.computeIfAbsent(fieldKey, k -> new ArrayList<>(1)).add(key);
                 } else if (insn.op().isFieldWrite()) {
-                    String fieldKey = insn.fieldRef().owner() + "#" + insn.fieldRef().name();
+                    String fieldKey = fieldKey(insn);
                     fieldsWrittenBy.computeIfAbsent(key, k -> new ArrayList<>(1)).add(fieldKey);
                 }
             }
@@ -811,6 +1061,12 @@ public final class OriginSupport {
         Map<String, Integer> depths = new HashMap<>();
         Deque<Node> work = new ArrayDeque<>();
         Deque<Integer> workDepth = new ArrayDeque<>();
+        // Framework deserialize boundaries admit a broad method set without eagerly
+        // traversing every public method.  Membership is therefore not the same as
+        // having expanded a method; keep both states explicit so an actual root can
+        // still cross an already-admitted framework method.
+        Set<String> scheduled = new HashSet<>();
+        Set<String> expanded = new HashSet<>();
         List<Node> proxyTargets = new ArrayList<>();
         if (!proxyMethodInvokeSites.isEmpty()) {
             for (Node candidate : graph.nodesOfType(NodeType.METHOD)) {
@@ -824,16 +1080,98 @@ public final class OriginSupport {
                 }
             }
         }
+        Map<String, Integer> sinkDistances = sinkDistances(graph);
+        sinkDistanceIndex = Map.copyOf(sinkDistances);
+        List<Node> jdkCallbacks = new ArrayList<>();
+        for (Node candidate : graph.nodesOfType(NodeType.METHOD)) {
+            String owner = candidate.strProp("owner");
+            if (!isJdk(owner)) {
+                continue;
+            }
+            String key = methodKeyOf(owner, candidate.strProp("name"), candidate.strProp("desc"));
+            var entry = ruleEngine.matchingEntry(owner, candidate.strProp("name"), candidate.strProp("desc"));
+            if (entry.isEmpty() || !isDeserializeEntry(entry.get(), owner)
+                    || !JDK_SERIALIZATION_ENTRY_KINDS.contains(entry.get().entryKind())) {
+                continue;
+            }
+            // A JDK callback often reaches a user-controlled trigger through a small
+            // platform helper (HashMap.readObject -> HashMap.hash -> Object.hashCode).
+            // Requiring an already-proven ordinary sink distance here creates a circular
+            // dependency: the callback cannot enter the closure until serialized-field and
+            // trigger semantics have entered it.  Admit only this bounded structural bridge;
+            // unrelated JDK callbacks remain excluded.
+            if (!sinkDistances.containsKey(key)
+                    && !jdkCallbackMayReachTrigger(graph, candidate)) {
+                continue;
+            }
+            MethodInfo method = methodOf(owner, candidate.strProp("name"), candidate.strProp("desc"));
+            if (method != null && !method.instructions().isEmpty()) {
+                jdkCallbacks.add(candidate);
+            }
+        }
+        jdkCallbacks.sort(java.util.Comparator
+                .comparingInt((Node node) -> sinkDistances.getOrDefault(
+                        methodKeyOf(node.strProp("owner"), node.strProp("name"), node.strProp("desc")),
+                        Integer.MAX_VALUE))
+                .thenComparing(Node::owner)
+                .thenComparing(Node::name)
+                .thenComparing(Node::descriptor));
+        if (jdkCallbacks.size() > JDK_SERIALIZATION_CALLBACK_CAP) {
+            markIncomplete("JDK_SERIALIZATION_CALLBACK_CAP:" + JDK_SERIALIZATION_CALLBACK_CAP);
+            jdkCallbacks = jdkCallbacks.subList(0, JDK_SERIALIZATION_CALLBACK_CAP);
+        }
+        Set<String> callbackKeys = new LinkedHashSet<>();
+        for (Node callback : jdkCallbacks) {
+            String key = methodKeyOf(callback.strProp("owner"), callback.strProp("name"),
+                    callback.strProp("desc"));
+            callbackKeys.add(key);
+            if (downstream.add(key)) {
+                depths.put(key, 1);
+            }
+            if (scheduled.add(key)) {
+                work.add(callback);
+                workDepth.add(1);
+            }
+        }
+        deserializationCallbackEntries = Set.copyOf(callbackKeys);
         List<Node> methodCollectionTargets = new ArrayList<>();
         if (!methodCollectionInvokeSites.isEmpty()) {
             for (Node candidate : graph.nodesOfType(NodeType.METHOD)) {
                 String owner = candidate.strProp("owner");
-                if (isJdk(owner)) {
-                    continue;
-                }
                 MethodInfo target = methodOf(owner, candidate.strProp("name"), candidate.strProp("desc"));
+                String targetKey = methodKeyOf(owner, candidate.strProp("name"), candidate.strProp("desc"));
                 if (target != null && javaBeanMatches(target, "read")) {
                     methodCollectionTargets.add(candidate);
+                }
+            }
+        }
+        methodCollectionTargets.sort(java.util.Comparator
+                .comparingInt((Node node) -> methodCollectionTargetRank(node, sinkDistances))
+                .thenComparingInt((Node node) -> sinkDistances.getOrDefault(
+                        methodKeyOf(node.strProp("owner"), node.strProp("name"), node.strProp("desc")),
+                        Integer.MAX_VALUE))
+                .thenComparing(Node::owner)
+                .thenComparing(Node::name)
+                .thenComparing(Node::descriptor));
+        if (methodCollectionTargets.size() > METHOD_COLLECTION_TARGET_CAP) {
+            markIncomplete("METHOD_COLLECTION_TARGET_CAP:" + METHOD_COLLECTION_TARGET_CAP);
+            methodCollectionTargets = methodCollectionTargets.subList(0, METHOD_COLLECTION_TARGET_CAP);
+        }
+        methodCollectionTargetMethods = List.copyOf(methodCollectionTargets);
+        // A handler can be supplied by serialized state while the JDK proxy is
+        // assembled outside the artifact.  Admit that bounded callback family
+        // only when a compatible Method-collection invoke site exists; the
+        // handler list alone is not a global source.
+        if (!serializedProxyHandlerMethods.isEmpty() && !methodCollectionInvokeSites.isEmpty()) {
+            for (Node handler : serializedProxyHandlerMethods) {
+                String handlerKey = methodKeyOf(handler.strProp("owner"),
+                        handler.strProp("name"), handler.strProp("desc"));
+                if (downstream.add(handlerKey)) {
+                    depths.put(handlerKey, 1);
+                }
+                if (scheduled.add(handlerKey)) {
+                    work.add(handler);
+                    workDepth.add(1);
                 }
             }
         }
@@ -845,22 +1183,31 @@ public final class OriginSupport {
             // 内部调用会互相扩散，反向闭包在大 JDK 上先耗尽预算而不是分析应用。
             // JDK 类仍可由应用引用、调用边、对象图与规则片段进入闭包，因此这
             // 是根语义收敛，不是按样本删除某个 gadget。
-            if (!isJdk(m.strProp("owner"))
-                    && ruleEngine.matchingEntry(m.strProp("owner"), m.strProp("name"), m.strProp("desc")).isPresent()
+            var entry = ruleEngine.matchingEntry(m.strProp("owner"), m.strProp("name"),
+                    m.strProp("desc"));
+            if (!isJdk(m.strProp("owner")) && entry.isPresent()
+                    && isDeserializeEntry(entry.get(), m.strProp("owner"))
                     && downstream.add(key)) {
                 depths.put(key, 0);
+            }
+            if (!isJdk(m.strProp("owner")) && entry.isPresent()
+                    && isDeserializeEntry(entry.get(), m.strProp("owner"))
+                    && scheduled.add(key)) {
                 work.add(m);
                 workDepth.add(0);
             }
         }
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             boolean seed = isOisRead(call)
-                    // source（框架反序列化入口）宿主与 OIS 宿主同级 seeding——威胁模型上
+                    // 无条件 source（框架反序列化入口）宿主与 OIS 宿主同级 seeding——威胁模型上
                     // 框架 parse 与 OIS readObject 都是「反序列化发生处」；框架内部的
                     // Method.invoke 位点由此进入闭包，反射供给伪调用者才能挂接应用类
-                    // 的 setter/getter（fastjson @type / XStream / Hessian 的运行时类名分发）
+                    // 的 setter/getter（fastjson @type / XStream / Hessian 的运行时类名分发）。
+                    // 带输入前置条件的二次桥必须先由真实入口把 byte[]/对象送达，不能
+                    // 在闭包阶段单独制造一个根。
                     || ruleEngine.matchingSource(call.strProp("owner"), call.strProp("name"),
-                            call.strProp("desc")).isPresent();
+                            call.strProp("desc")).filter(OriginSupport::isUnconditionalDeserializeSource)
+                            .isPresent();
             if (seed) {
                 Node host = graph.findMethodNode(call.strProp("methodOwner"),
                         call.strProp("methodName"), call.strProp("methodDesc"));
@@ -868,6 +1215,8 @@ public final class OriginSupport {
                         host.strProp("owner"), host.strProp("name"), host.strProp("desc")) : null;
                 if (host != null && key != null && downstream.add(key)) {
                     depths.put(key, 0);
+                }
+                if (host != null && key != null && scheduled.add(key)) {
                     work.add(host);
                     workDepth.add(0);
                 }
@@ -887,11 +1236,11 @@ public final class OriginSupport {
                         String mk = methodKeyOf(cls, mi.name(), mi.descriptor());
                         if (downstream.add(mk)) {
                             depths.put(mk, 1);
-                            Node mn = graph.findMethodNode(cls, mi.name(), mi.descriptor());
-                            if (mn != null) {
-                                work.add(mn);
-                                workDepth.add(1);
-                            }
+                        }
+                        Node mn = graph.findMethodNode(cls, mi.name(), mi.descriptor());
+                        if (mn != null && scheduled.add(mk)) {
+                            work.add(mn);
+                            workDepth.add(1);
                         }
                     }
                 }
@@ -944,6 +1293,9 @@ public final class OriginSupport {
             Node m = work.poll();
             int depth = workDepth.poll();
             String key = methodKeyOf(m.strProp("owner"), m.strProp("name"), m.strProp("desc"));
+            if (!expanded.add(key)) {
+                continue;
+            }
             List<Node> calls = graph.callsOfMethod(key);
             if (!calls.isEmpty()) {
                 // 反射跳边（FLASH 向后版）：invoke 位点的常量类 public 方法并入可达集
@@ -965,11 +1317,11 @@ public final class OriginSupport {
                             String mk = methodKeyOf(cls, mi.name(), mi.descriptor());
                             if (downstream.add(mk)) {
                                 depths.put(mk, depth + 1);
-                                Node mn = graph.findMethodNode(cls, mi.name(), mi.descriptor());
-                                if (mn != null) {
-                                    work.add(mn);
-                                    workDepth.add(depth + 1);
-                                }
+                            }
+                            Node mn = graph.findMethodNode(cls, mi.name(), mi.descriptor());
+                            if (mn != null && scheduled.add(mk)) {
+                                work.add(mn);
+                                workDepth.add(depth + 1);
                             }
                         }
                     }
@@ -1002,11 +1354,11 @@ public final class OriginSupport {
                                     String mk2 = methodKeyOf(cls2, mi2.name(), mi2.descriptor());
                                     if (downstream.add(mk2)) {
                                         depths.put(mk2, depth + 1);
-                                        Node mn2 = graph.findMethodNode(cls2, mi2.name(), mi2.descriptor());
-                                        if (mn2 != null) {
-                                            work.add(mn2);
-                                            workDepth.add(depth + 1);
-                                        }
+                                    }
+                                    Node mn2 = graph.findMethodNode(cls2, mi2.name(), mi2.descriptor());
+                                    if (mn2 != null && scheduled.add(mk2)) {
+                                        work.add(mn2);
+                                        workDepth.add(depth + 1);
                                     }
                                 }
                             }
@@ -1020,6 +1372,8 @@ public final class OriginSupport {
                                 callee.strProp("name"), callee.strProp("desc"));
                         if (downstream.add(calleeKey)) {
                             depths.put(calleeKey, depth + 1);
+                        }
+                        if (scheduled.add(calleeKey)) {
                             work.add(callee);
                             workDepth.add(depth + 1);
                         }
@@ -1039,11 +1393,11 @@ public final class OriginSupport {
                                 String mk2 = methodKeyOf(cls, mi2.name(), mi2.descriptor());
                                 if (downstream.add(mk2)) {
                                     depths.put(mk2, depth + 1);
-                                    Node mn2 = graph.findMethodNode(cls, mi2.name(), mi2.descriptor());
-                                    if (mn2 != null) {
-                                        work.add(mn2);
-                                        workDepth.add(depth + 1);
-                                    }
+                                }
+                                Node mn2 = graph.findMethodNode(cls, mi2.name(), mi2.descriptor());
+                                if (mn2 != null && scheduled.add(mk2)) {
+                                    work.add(mn2);
+                                    workDepth.add(depth + 1);
                                 }
                             }
                         }
@@ -1059,26 +1413,17 @@ public final class OriginSupport {
                                     target.strProp("name"), target.strProp("desc"));
                             if (downstream.add(targetKey)) {
                                 depths.put(targetKey, depth + 1);
+                            }
+                            if (scheduled.add(targetKey)) {
                                 work.add(target);
                                 workDepth.add(depth + 1);
                             }
                         }
                     }
-                    // A typed Method collection (for example a property path assembled by a
-                    // helper) can be populated outside the scan unit.  Keep this external edge
-                    // bounded to public no-arg bean readers, the only methods compatible with a
-                    // zero-argument property getter invocation.
-                    if (methodCollectionReflectiveInvokeSite(call)) {
-                        for (Node target : methodCollectionTargets) {
-                            String targetKey = methodKeyOf(target.strProp("owner"),
-                                    target.strProp("name"), target.strProp("desc"));
-                            if (downstream.add(targetKey)) {
-                                depths.put(targetKey, depth + 1);
-                                work.add(target);
-                                workDepth.add(depth + 1);
-                            }
-                        }
-                    }
+                    // Method-collection targets are activated on demand by the forward
+                    // semantic engine.  Putting the whole sink-relevant getter family in
+                    // this closure would make reachability scale with every public getter
+                    // in a dependency graph instead of with the actual callback site.
                     // JNI callback bridge: native code is outside the Java call graph, but a
                     // bounded same-receiver callback family can still be represented without
                     // loading a library.  Keep these targets in the entry closure so the
@@ -1088,6 +1433,8 @@ public final class OriginSupport {
                                 target.strProp("name"), target.strProp("desc"));
                         if (downstream.add(targetKey)) {
                             depths.put(targetKey, depth + 1);
+                        }
+                        if (scheduled.add(targetKey)) {
                             work.add(target);
                             workDepth.add(depth + 1);
                         }
@@ -1111,15 +1458,17 @@ public final class OriginSupport {
                                 targets = new ArrayList<>();
                                 var ownerCi = hierarchy.classInfo(callOwner);
                                 if (ownerCi != null) {
-                                    java.util.List<String> impls = hierarchy.transitiveSubtypes(callOwner);
-                                    if (impls != null) {
-                                        for (String impl : impls) {
+                                    var subtypeResult = hierarchy.transitiveSubtypes(callOwner,
+                                            SUBTYPE_TRAVERSAL_CAP);
+                                    if (!subtypeResult.complete()) {
+                                        markIncomplete("ENTRY_DISPATCH_SUBTYPE_CAP:" + SUBTYPE_TRAVERSAL_CAP);
+                                    }
+                                    for (String impl : subtypeResult.values()) {
                                             String resolved = hierarchy.resolveMethod(impl, callName, callDesc);
                                             if (resolved != null) {
                                                 targets.add(new Object[]{resolved,
                                                         graph.findMethodNode(resolved, callName, callDesc)});
                                             }
-                                        }
                                     }
                                 }
                                 ifaceDispatchCache.put(sigKey, targets);
@@ -1130,10 +1479,10 @@ public final class OriginSupport {
                                 String mk = methodKeyOf(resolved, callName, callDesc);
                                 if (downstream.add(mk)) {
                                     depths.put(mk, depth + 1);
-                                    if (mn != null) {
-                                        work.add(mn);
-                                        workDepth.add(depth + 1);
-                                    }
+                                }
+                                if (mn != null && scheduled.add(mk)) {
+                                    work.add(mn);
+                                    workDepth.add(depth + 1);
                                 }
                             }
                         }
@@ -1146,11 +1495,11 @@ public final class OriginSupport {
                     for (String reader : fieldReaders.getOrDefault(fieldKey, List.of())) {
                         if (downstream.add(reader)) {
                             depths.put(reader, depth + 1);
-                            Node rn = methodNodeOf(graph, reader);
-                            if (rn != null) {
-                                work.add(rn);
-                                workDepth.add(depth + 1);
-                            }
+                        }
+                        Node rn = methodNodeOf(graph, reader);
+                        if (rn != null && scheduled.add(reader)) {
+                            work.add(rn);
+                            workDepth.add(depth + 1);
                         }
                     }
                 }
@@ -1159,6 +1508,50 @@ public final class OriginSupport {
         entryDownstream = downstream;
         entryDepths = depths;
         return downstream;
+    }
+
+    /**
+     * Methods that can reach a configured sink through ordinary call edges.  A
+     * typed Method collection can select any compatible getter, but only a
+     * getter with a sink-relevant body needs to be materialized by the forward
+     * semantic bridge.  This keeps the wildcard precise for large dependency
+     * graphs while retaining JDK sink targets such as TemplatesImpl getters.
+     */
+    private Map<String, Integer> sinkDistances(Graph graph) {
+        Map<String, List<String>> callersByCallee = new HashMap<>();
+        Map<String, Integer> distances = new HashMap<>();
+        Deque<String> work = new ArrayDeque<>();
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            String callerKey = methodKeyOf(call.strProp("methodOwner"),
+                    call.strProp("methodName"), call.strProp("methodDesc"));
+            if (ruleEngine.matchingSink(call).isPresent() && !distances.containsKey(callerKey)) {
+                distances.put(callerKey, 0);
+                work.add(callerKey);
+            }
+            for (Edge edge : call.out()) {
+                if (edge.type() != EdgeType.INVOKES && edge.type() != EdgeType.DISPATCHES) {
+                    continue;
+                }
+                String calleeKey = methodKeyOf(edge.to().strProp("owner"),
+                        edge.to().strProp("name"), edge.to().strProp("desc"));
+                callersByCallee.computeIfAbsent(calleeKey, ignored -> new ArrayList<>())
+                        .add(callerKey);
+            }
+        }
+        while (!work.isEmpty()) {
+            String callee = work.removeFirst();
+            for (String caller : callersByCallee.getOrDefault(callee, List.of())) {
+                if (distances.size() >= SINK_REACHABILITY_CAP) {
+                    markIncomplete("SINK_REACHABILITY_CAP:" + SINK_REACHABILITY_CAP);
+                    return distances;
+                }
+                if (!distances.containsKey(caller)) {
+                    distances.put(caller, distances.get(callee) + 1);
+                    work.addLast(caller);
+                }
+            }
+        }
+        return distances;
     }
 
 
@@ -1179,6 +1572,27 @@ public final class OriginSupport {
     public int entryDepthOf(String methodKey) {
         Map<String, Integer> depths = entryDepths;
         return depths != null ? depths.getOrDefault(methodKey, Integer.MAX_VALUE) : Integer.MAX_VALUE;
+    }
+
+    /**
+     * Return the bounded ordinary-call distance from a method to a configured sink.
+     * {@link Integer#MAX_VALUE} means that no such path was proven in the current graph
+     * snapshot.  Consumers may use this only to order a finite approximation; an absent
+     * distance must not discard the candidate.
+     */
+    public int sinkDistanceOf(String methodKey) {
+        if (methodKey == null || methodKey.isBlank()) {
+            return Integer.MAX_VALUE;
+        }
+        return sinkDistanceIndex.getOrDefault(methodKey, Integer.MAX_VALUE);
+    }
+
+    /**
+     * JDK serialization callbacks admitted by the sink-relevant, bounded callback bridge.
+     * The snapshot is empty until {@link #entryDownstream(Graph)} has been built.
+     */
+    public Set<String> deserializationCallbackEntries() {
+        return deserializationCallbackEntries;
     }
 
     private static Node methodNodeOf(Graph graph, String key) {
@@ -1430,7 +1844,7 @@ public final class OriginSupport {
         for (int writeOffset : fieldWriteOffsets(method)) {
             InsnFact write = method.insnAt(writeOffset);
             if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
-                    || !sameField(write.fieldRef(), field)) {
+                    || !sameField(write, field)) {
                 continue;
             }
             ForwardOrigins.State state = result.stateBefore().get(write.offset());
@@ -1505,7 +1919,7 @@ public final class OriginSupport {
         for (int writeOffset : fieldWriteOffsets(method)) {
             InsnFact write = method.insnAt(writeOffset);
             if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
-                    || !sameField(write.fieldRef(), field)) {
+                    || !sameField(write, field)) {
                 continue;
             }
             ForwardOrigins.State state = result.stateBefore().get(write.offset());
@@ -1676,7 +2090,7 @@ public final class OriginSupport {
         for (int writeOffset : fieldWriteOffsets(method)) {
             InsnFact write = method.insnAt(writeOffset);
             if (write.offset() >= beforeOffset || !write.op().isFieldWrite()
-                    || !sameField(write.fieldRef(), field)) {
+                    || !sameField(write, field)) {
                 continue;
             }
             if (!dominators.reachable()[write.offset()]
@@ -2976,7 +3390,7 @@ public final class OriginSupport {
         Integer value = null;
         int writes = 0;
         for (InsnFact write : constructor.instructions()) {
-            if (write.op() != Op.PUTFIELD || !sameField(write.fieldRef(), field)) {
+            if (write.op() != Op.PUTFIELD || !sameField(write, field)) {
                 continue;
             }
             ForwardOrigins.State state = constructorResult.stateBefore().get(write.offset());
@@ -3524,7 +3938,7 @@ public final class OriginSupport {
             boolean normalized = false;
             for (int i = branchOffset + 1; i < target && i < method.instructions().size(); i++) {
                 InsnFact candidate = method.instructions().get(i);
-                if (candidate.op() == Op.PUTFIELD && sameField(candidate.fieldRef(), field)
+                if (candidate.op() == Op.PUTFIELD && sameField(candidate, field)
                         && multipliedByMinusOne(method, i, field)) {
                     normalized = true;
                     break;
@@ -3549,7 +3963,7 @@ public final class OriginSupport {
             boolean sawField = false;
             for (int j = i - 1; j >= Math.max(0, i - 5); j--) {
                 InsnFact prior = method.instructions().get(j);
-                if (prior.op() == Op.GETFIELD && sameField(prior.fieldRef(), field)) {
+                if (prior.op() == Op.GETFIELD && sameField(prior, field)) {
                     sawField = true;
                 }
                 if (isMinusOne(prior)) {
@@ -3576,7 +3990,7 @@ public final class OriginSupport {
                                          ValueOrigin.FieldRead field) {
         for (int i = Math.max(0, start); i < Math.min(end, method.instructions().size()); i++) {
             InsnFact insn = method.instructions().get(i);
-            if (insn.op().isFieldWrite() && sameField(insn.fieldRef(), field)) {
+            if (insn.op().isFieldWrite() && sameField(insn, field)) {
                 return true;
             }
         }
@@ -3592,13 +4006,27 @@ public final class OriginSupport {
         return false;
     }
 
-    private static boolean sameField(FieldRef ref, ValueOrigin.FieldRead field) {
-        return ref != null && ref.owner().equals(field.owner()) && ref.name().equals(field.field());
+    private static boolean sameField(InsnFact insn, ValueOrigin.FieldRead field) {
+        if (insn == null || insn.fieldRef() == null || field == null
+                || !insn.fieldRef().owner().equals(field.owner())
+                || !insn.fieldRef().name().equals(field.field())) {
+            return false;
+        }
+        boolean staticField = insn.op() == Op.GETSTATIC || insn.op() == Op.PUTSTATIC;
+        if (staticField != field.isStatic()) {
+            return false;
+        }
+        return field.descriptor() == null || field.descriptor().isBlank()
+                || insn.fieldRef().descriptor() == null
+                || field.descriptor().equals(insn.fieldRef().descriptor());
     }
 
     private static boolean sameField(ValueOrigin.FieldRead left, ValueOrigin.FieldRead right) {
         return left.owner().equals(right.owner()) && left.field().equals(right.field())
-                && left.isStatic() == right.isStatic();
+                && left.isStatic() == right.isStatic()
+                && (left.descriptor() == null || left.descriptor().isBlank()
+                || right.descriptor() == null || right.descriptor().isBlank()
+                || left.descriptor().equals(right.descriptor()));
     }
 
     private boolean nullReceiverMayThrow(MethodInfo method, ForwardOrigins.Result result,
@@ -3787,6 +4215,9 @@ public final class OriginSupport {
     }
 
     private String fieldDescriptor(ValueOrigin.FieldRead field) {
+        if (field.descriptor() != null && !field.descriptor().isBlank()) {
+            return field.descriptor();
+        }
         String declaring = hierarchy.resolveField(field.owner(), field.field());
         ClassInfo cls = hierarchy.classInfo(declaring == null ? field.owner() : declaring);
         io.just.sast.model.FieldInfo info = cls == null ? null : cls.field(field.field());
@@ -3849,7 +4280,7 @@ public final class OriginSupport {
         }
         InsnFact selected = null;
         for (InsnFact write : clinit.instructions()) {
-            if (write.op() != Op.PUTSTATIC || !sameField(write.fieldRef(), field)) {
+            if (write.op() != Op.PUTSTATIC || !sameField(write, field)) {
                 continue;
             }
             boolean dominatesAll = true;
@@ -3910,7 +4341,7 @@ public final class OriginSupport {
         ForwardOrigins.Result result = origins.compute(clinit);
         Set<ValueOrigin> values = new HashSet<>();
         for (InsnFact insn : clinit.instructions()) {
-            if (insn.op() != Op.PUTSTATIC || !sameField(insn.fieldRef(), field)) {
+            if (insn.op() != Op.PUTSTATIC || !sameField(insn, field)) {
                 continue;
             }
             ForwardOrigins.State state = result.stateBefore().get(insn.offset());
@@ -4349,5 +4780,11 @@ public final class OriginSupport {
 
     public static String methodKeyOf(String owner, String name, String desc) {
         return owner + "#" + name + desc;
+    }
+
+    private static String fieldKey(InsnFact insn) {
+        FieldRef ref = insn.fieldRef();
+        boolean isStatic = insn.op() == Op.GETSTATIC || insn.op() == Op.PUTSTATIC;
+        return ref.owner() + "#" + ref.name() + "#" + ref.descriptor() + "#" + isStatic;
     }
 }

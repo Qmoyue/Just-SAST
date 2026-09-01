@@ -1,6 +1,7 @@
 package io.just.sast.cli;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 import javax.tools.JavaCompiler;
@@ -32,6 +33,38 @@ class ScanPipelineTest {
         assertThrows(ScanPipeline.UsageException.class, () -> ScanPipeline.run(
                 Path.of("target", "definitely-missing-input.jar"), List.of(),
                 Path.of("target", "just-test-output"), null,
+                false, true, null, false, 0));
+    }
+
+    @Test
+    void safeExecRequiresDynamicVerification(@TempDir Path tmp) throws Exception {
+        Path input = Files.writeString(tmp.resolve("input.jar"), "not-a-jar");
+
+        ScanPipeline.UsageException failure = assertThrows(ScanPipeline.UsageException.class,
+                () -> ScanPipeline.run(input, List.of(), tmp.resolve("out"), null,
+                        false, true, null, false, 0, true));
+
+        assertTrue(failure.getMessage().contains("--safe-exec"));
+    }
+
+    @Test
+    void rejectsSymbolicLinkInputsAndOutputDirectories(@TempDir Path tmp) throws Exception {
+        Path realInput = Files.writeString(tmp.resolve("real.jar"), "not-a-jar");
+        Path inputLink = tmp.resolve("input-link.jar");
+        Path realOutput = Files.createDirectory(tmp.resolve("real-output"));
+        Path outputLink = tmp.resolve("output-link");
+        try {
+            Files.createSymbolicLink(inputLink, realInput.getFileName());
+            Files.createSymbolicLink(outputLink, realOutput.getFileName());
+        } catch (UnsupportedOperationException | java.io.IOException | SecurityException e) {
+            Assumptions.assumeTrue(false, "当前平台不能创建符号链接: " + e.getMessage());
+            return;
+        }
+        assertThrows(ScanPipeline.UsageException.class, () -> ScanPipeline.run(
+                inputLink, List.of(), tmp.resolve("out"), null,
+                false, true, null, false, 0));
+        assertThrows(ScanPipeline.UsageException.class, () -> ScanPipeline.run(
+                realInput, List.of(), outputLink, null,
                 false, true, null, false, 0));
     }
 
@@ -175,6 +208,74 @@ class ScanPipelineTest {
     }
 
     @Test
+    void serializeOnlyDoesNotBecomeAnExternalDeserializeSourceInMixedFlow(@TempDir Path tmp)
+            throws Exception {
+        String serializer = """
+                package fake;
+                public final class Serializer {
+                    public static Object write(Object value) { return value; }
+                }
+                """;
+        String parser = """
+                package fake;
+                public final class Parser {
+                    public static String parse(String value) { return value; }
+                }
+                """;
+        String entry = """
+                package app;
+                public final class Mixed implements java.io.Serializable {
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        Object serialized = fake.Serializer.write("constant");
+                        String value = fake.Parser.parse("input");
+                        Runtime.getRuntime().exec(value);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-SERIALIZE-ONLY
+                    kind: source
+                    bridge: serialize
+                    match:
+                      call: { owner: "fake/Serializer", name: "write" }
+                  - id: T-DESERIALIZE-ONLY
+                    kind: source
+                    bridge: deserialize
+                    match:
+                      call: { owner: "fake/Parser", name: "parse" }
+                  - id: T-RUNTIME-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "java/lang/Runtime", name: "exec" }
+                    tainted: [{arg: 0}]
+                  - id: T-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                """;
+        Path jar = compileToJar(tmp.resolve("mixed-direction.jar"), Map.of(
+                "fake.Serializer", serializer, "fake.Parser", parser, "app.Mixed", entry));
+        Path rulesFile = tmp.resolve("mixed-direction-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/Mixed,readObject")
+                        && findings.contains("java/lang/Runtime,exec"),
+                "the real deserialize entry should remain analyzable in a mixed-direction flow:\n"
+                        + findings);
+        assertFalse(findings.contains("fake/Serializer,write"),
+                "serialize-only source must not create an external deserialize path:\n" + findings);
+    }
+
+    @Test
     void deserializeSourceModelsGenericBeanSetterInputWithoutOpeningEveryPublicMethod(@TempDir Path tmp)
             throws Exception {
         String parser = """
@@ -234,6 +335,327 @@ class ScanPipelineTest {
                 "deserialize source 应建立通用 setter 输入边界：\n" + findings);
         assertFalse(findings.contains("app/Unrelated,run"),
                 "普通公共方法不能仅因存在 source 就被泛化为外部输入：\n" + findings);
+    }
+
+    @Test
+    void externallyAssembledSerializedProxyReachesHandlerSink(@TempDir Path tmp) throws Exception {
+        String handler = """
+                package app;
+                public final class ExternalHandler implements java.lang.reflect.InvocationHandler,
+                        java.io.Serializable {
+                    private String command;
+                    public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args)
+                            throws Throwable {
+                        return Runtime.getRuntime().exec(command);
+                    }
+                }
+                """;
+        String trigger = """
+                package app;
+                public final class Trigger implements java.io.Serializable {
+                    private Object instance;
+                    private java.util.List<java.lang.reflect.Method> methods;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        in.defaultReadObject();
+                        java.lang.reflect.Method method = methods.iterator().next();
+                        method.invoke(instance, new Object[0]);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-PROXY-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                  - id: T-RUNTIME-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "java/lang/Runtime", name: "exec" }
+                    tainted: [{arg: 0}]
+                """;
+        Path jar = compileToJar(tmp.resolve("serialized-proxy.jar"), Map.of(
+                "app.ExternalHandler", handler, "app.Trigger", trigger));
+        Path rulesFile = tmp.resolve("serialized-proxy-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/Trigger,readObject")
+                        && findings.contains("app/Trigger.readObject -> app/ExternalHandler.invoke")
+                        && findings.contains("java/lang/Runtime,exec"),
+                "外部组装的可序列化 JDK Proxy 应闭合到 handler sink：\n" + findings);
+    }
+
+    @Test
+    void serializedProxyHandlerIsNotAStandaloneDeserializationRoot(@TempDir Path tmp)
+            throws Exception {
+        String handler = """
+                package app;
+                public final class UnconnectedHandler implements java.lang.reflect.InvocationHandler,
+                        java.io.Serializable {
+                    private String command;
+                    public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args)
+                            throws Throwable {
+                        return Runtime.getRuntime().exec(command);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-PROXY-ENTRY
+                    kind: magic-entry
+                    entryKind: proxyInvoke
+                    match:
+                      method: { name: "invoke", descriptor: "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;" }
+                      class: { implements: "java/lang/reflect/InvocationHandler" }
+                  - id: T-RUNTIME-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "java/lang/Runtime", name: "exec" }
+                    tainted: [{arg: 0}]
+                """;
+        Path jar = compileToJar(tmp.resolve("unconnected-proxy.jar"),
+                Map.of("app.UnconnectedHandler", handler));
+        Path rulesFile = tmp.resolve("unconnected-proxy-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertFalse(findings.contains("app/UnconnectedHandler,invoke")
+                        || findings.contains("java/lang/Runtime,exec"),
+                "没有反序列化入口或实际 proxy callback 的 handler 不能成为独立污点根：\n"
+                        + findings);
+    }
+
+    @Test
+    void hutoolConvertModelCarriesSerializedProxyInputToSecondaryDeserializeSink(@TempDir Path tmp)
+            throws Exception {
+        String convert = """
+                package cn.hutool.core.convert;
+                public final class Convert {
+                    private Convert() {}
+                    public static native Object convert(Class<?> type, Object value);
+                }
+                """;
+        String objectUtil = """
+                package cn.hutool.core.util;
+                public final class ObjectUtil {
+                    private ObjectUtil() {}
+                    public static Object deserialize(byte[] value, Class<?>... classes) { return null; }
+                }
+                """;
+        String handler = """
+                package app;
+                public final class ExternalHandler implements java.lang.reflect.InvocationHandler,
+                        java.io.Serializable {
+                    private byte[] payload;
+                    public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args)
+                            throws Throwable {
+                        Object converted = cn.hutool.core.convert.Convert.convert(Object.class, payload);
+                        return cn.hutool.core.util.ObjectUtil.deserialize((byte[]) converted);
+                    }
+                }
+                """;
+        String trigger = """
+                package app;
+                public final class Trigger implements java.io.Serializable {
+                    private Object instance;
+                    private java.util.List<java.lang.reflect.Method> methods;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        in.defaultReadObject();
+                        java.lang.reflect.Method method = methods.iterator().next();
+                        method.invoke(instance, new Object[0]);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-HUTOOL-MODEL
+                    kind: model
+                    match:
+                      call: { owner: "cn/hutool/core/convert/Convert", name: "convert" }
+                    actions: { return: [arg1] }
+                  - id: T-HUTOOL-SINK
+                    kind: sink
+                    category: DESERIALIZE
+                    severity: HIGH
+                    match:
+                      call: { owner: "cn/hutool/core/util/ObjectUtil", name: "deserialize" }
+                    tainted: [{arg: 0}]
+                  - id: T-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                """;
+        Path jar = compileToJar(tmp.resolve("hutool-model.jar"), Map.of(
+                "cn.hutool.core.convert.Convert", convert,
+                "cn.hutool.core.util.ObjectUtil", objectUtil,
+                "app.ExternalHandler", handler,
+                "app.Trigger", trigger));
+        Path rulesFile = tmp.resolve("hutool-model-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/Trigger,readObject")
+                        && findings.contains("app/Trigger.readObject -> app/ExternalHandler.invoke")
+                        && findings.contains("cn/hutool/core/util/ObjectUtil,deserialize"),
+                "Hutool Convert 的 return←arg1 摘要应把外部 Proxy 输入带到二次反序列化 sink：\n" + findings);
+    }
+
+    @Test
+    void admittedFrameworkMethodsStillExpandWhenReachedFromARealEntry(@TempDir Path tmp)
+            throws Exception {
+        String framework = """
+                package fake;
+                public final class Framework {
+                    public static Object deserialize() { return null; }
+                    public Object decode(Object value) { return Sink.fire(value); }
+                }
+                """;
+        String sink = """
+                package fake;
+                public final class Sink {
+                    public static Object fire(Object value) { return value; }
+                }
+                """;
+        String entry = """
+                package app;
+                public final class Entry implements java.io.Serializable {
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        in.defaultReadObject();
+                        fake.Framework.deserialize();
+                        new fake.Framework().decode(this);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-FRAMEWORK-SOURCE
+                    kind: source
+                    bridge: deserialize
+                    match:
+                      call: { owner: "fake/Framework", name: "deserialize", descriptor: "()Ljava/lang/Object;" }
+                  - id: T-FRAMEWORK-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "fake/Sink", name: "fire" }
+                    tainted: [{arg: 0}]
+                  - id: T-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                """;
+        Path jar = compileToJar(tmp.resolve("framework-boundary.jar"), Map.of(
+                "fake.Framework", framework, "fake.Sink", sink, "app.Entry", entry));
+        Path rulesFile = tmp.resolve("framework-boundary-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/Entry,readObject")
+                        && findings.contains("fake/Sink,fire"),
+                "已被框架边界预纳入的方法仍应在真实入口抵达后展开：\n" + findings);
+    }
+
+    @Test
+    void externalSerializedProxyHandlerCarriesMapValueToSecondaryDeserialize(@TempDir Path tmp)
+            throws Exception {
+        String convert = """
+                package fake;
+                public final class Convert {
+                    private Convert() {}
+                    public static Object convert(Class<?> type, Object value) { return value; }
+                }
+                """;
+        String objectUtil = """
+                package fake;
+                public final class ObjectUtil {
+                    private ObjectUtil() {}
+                    public static Object deserialize(byte[] value) { return null; }
+                }
+                """;
+        String handler = """
+                package app;
+                public final class MapHandler implements java.lang.reflect.InvocationHandler,
+                        java.io.Serializable {
+                    private java.util.Map<String, Object> map;
+                    public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args)
+                            throws Throwable {
+                        Object value = map.get("margin");
+                        Object converted = fake.Convert.convert(Object.class, value);
+                        return fake.ObjectUtil.deserialize((byte[]) converted);
+                    }
+                }
+                """;
+        String trigger = """
+                package app;
+                public final class Trigger implements java.io.Serializable {
+                    private Object instance;
+                    private java.util.List<java.lang.reflect.Method> methods;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        in.defaultReadObject();
+                        java.lang.reflect.Method method = methods.iterator().next();
+                        method.invoke(instance, new Object[0]);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-MAP-CONVERT
+                    kind: model
+                    match:
+                      call: { owner: "fake/Convert", name: "convert" }
+                    actions: { return: [arg1] }
+                  - id: T-MAP-DESERIALIZE
+                    kind: sink
+                    category: DESERIALIZE
+                    severity: HIGH
+                    match:
+                      call: { owner: "fake/ObjectUtil", name: "deserialize" }
+                    tainted: [{arg: 0}]
+                  - id: T-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                """;
+        Path jar = compileToJar(tmp.resolve("serialized-map-proxy.jar"), Map.of(
+                "fake.Convert", convert, "fake.ObjectUtil", objectUtil,
+                "app.MapHandler", handler, "app.Trigger", trigger));
+        Path rulesFile = tmp.resolve("serialized-map-proxy-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/Trigger,readObject")
+                        && findings.contains("app/MapHandler.invoke")
+                        && findings.contains("fake/ObjectUtil,deserialize"),
+                "外部序列化 Proxy handler 应将 Map 字段值传递到二次反序列化 sink：\n" + findings);
     }
 
     @Test

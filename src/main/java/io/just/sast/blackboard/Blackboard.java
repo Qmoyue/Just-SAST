@@ -23,25 +23,31 @@ import java.util.concurrent.ConcurrentHashMap;
  * 黑板 = CPG 图 + 链产物 + 校准记录 + 链注释 + 事件队列。
  * 知识源通过本对象读写共享状态，互不直接调用。
  * 共享支撑（originSupport/ruleEngine）随黑板分发一次构建，全知识源复用。
- * 单线程契约：控制器串行调度，本类不加锁。
+ * 分析阶段允许知识源并行；跨阶段集合通过同步写入和 immutable snapshot 对外暴露。
  */
 public final class Blackboard {
 
     /** 扫描输入（管线编排期注入；知识源经黑板读取，无全局属性通道）。 */
     public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                             int verifyBudget, Path jdkHome, int targetMajorVersion) {
+                             int verifyBudget, Path jdkHome, int targetMajorVersion,
+                             boolean safeExec) {
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget) {
-            this(target, deps, fast, verify, verifyBudget, null, 0);
+            this(target, deps, fast, verify, verifyBudget, null, 0, false);
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget, Path jdkHome) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, 0);
+            this(target, deps, fast, verify, verifyBudget, jdkHome, 0, false);
+        }
+
+        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
+                          int verifyBudget, Path jdkHome, int targetMajorVersion) {
+            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion, false);
         }
 
         public static ScanInputs fastDefault(Path target) {
-            return new ScanInputs(target, List.of(), true, true, 20, null, 0);
+            return new ScanInputs(target, List.of(), true, true, 20, null, 0, false);
         }
     }
 
@@ -65,6 +71,11 @@ public final class Blackboard {
     private final Map<String, String> chainCalibrations = new HashMap<>();
     /** 链级注释（按链 key 归属，如 gadget 模式标注），报告层输出。 */
     private final Map<String, List<String>> chainNotes = new HashMap<>();
+    /** Versioned, typed extension facts; each snapshot is immutable and isolated by class. */
+    private final Map<Class<?>, List<BlackboardFact>> facts = new HashMap<>();
+    /** Publication log preserves cross-type ordering for consumers that need deterministic replay. */
+    private final List<BlackboardFact> factLog = new ArrayList<>();
+    private long factRevision;
     /** 扫描完整性边界：分析器触顶/跳过的稳定原因码，供统计与报告层消费。 */
     private final Set<String> completenessReasons = ConcurrentHashMap.newKeySet();
     /** 动态验证能力的实际状态；不把“请求了验证”冒充成“子 JVM 已安全启动”。 */
@@ -84,11 +95,12 @@ public final class Blackboard {
         this.hierarchy = hierarchy;
         this.fieldWriters = fieldWriters;
         this.cpgIndex = cpgIndex == null ? CpgIndex.empty() : cpgIndex;
-        this.rules = rules;
+        this.rules = rules == null ? RuleSet.EMPTY : rules;
         this.maxDepth = maxDepth;
-        this.scanInputs = scanInputs;
-        this.ruleEngine = new RuleEngine(rules, hierarchy);
-        this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, scanInputs.fast(),
+        this.scanInputs = scanInputs == null
+                ? ScanInputs.fastDefault(Path.of(".")) : scanInputs;
+        this.ruleEngine = new RuleEngine(this.rules, hierarchy);
+        this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, this.scanInputs.fast(),
                 this.cpgIndex);
     }
 
@@ -132,6 +144,9 @@ public final class Blackboard {
 
     /** 记录链；按 key 去重（backward 的 per-sink 并行可能并发调用，方法级同步）。返回是否为新链。 */
     public synchronized boolean addChain(Chain chain) {
+        if (chain == null) {
+            return false;
+        }
         if (chainKeys.add(chain.key())) {
             chains.add(chain);
             publish(Event.of(EventType.CHAIN_FOUND, -1, chain));
@@ -156,7 +171,9 @@ public final class Blackboard {
     // ---- sink 裁决 ----
 
     public void recordOutcome(long callNodeId, SinkOutcome outcome) {
-        sinkOutcomes.put(callNodeId, outcome);
+        if (outcome != null) {
+            sinkOutcomes.put(callNodeId, outcome);
+        }
     }
 
     public Map<Long, SinkOutcome> sinkOutcomes() {
@@ -165,15 +182,17 @@ public final class Blackboard {
 
     // ---- 校准与注释 ----
 
-    public void calibrateChain(String chainKey, String reason) {
-        chainCalibrations.put(chainKey, reason);
+    public synchronized void calibrateChain(String chainKey, String reason) {
+        if (chainKey != null && !chainKey.isBlank() && reason != null && !reason.isBlank()) {
+            chainCalibrations.put(chainKey, reason);
+        }
     }
 
-    public String calibrationOf(String chainKey) {
+    public synchronized String calibrationOf(String chainKey) {
         return chainCalibrations.get(chainKey);
     }
 
-    public Map<String, String> chainCalibrations() {
+    public synchronized Map<String, String> chainCalibrations() {
         return Map.copyOf(chainCalibrations);
     }
 
@@ -189,7 +208,12 @@ public final class Blackboard {
     }
 
     public Set<String> completenessReasons() {
-        return Set.copyOf(completenessReasons);
+        if (originSupport == null || originSupport.completenessReasons().isEmpty()) {
+            return Set.copyOf(completenessReasons);
+        }
+        Set<String> result = new HashSet<>(completenessReasons);
+        result.addAll(originSupport.completenessReasons());
+        return Set.copyOf(result);
     }
 
     public void setVerificationStatus(String status) {
@@ -211,13 +235,53 @@ public final class Blackboard {
     }
 
     /** 链级注释（gadget 模式标注等），附着到具体链 key。 */
-    public void chainNote(String chainKey, String note) {
-        chainNotes.computeIfAbsent(chainKey, k -> new ArrayList<>(1)).add(note);
+    public synchronized void chainNote(String chainKey, String note) {
+        if (chainKey != null && !chainKey.isBlank() && note != null && !note.isBlank()) {
+            chainNotes.computeIfAbsent(chainKey, k -> new ArrayList<>(1)).add(note);
+        }
     }
 
-    public List<String> chainNotesOf(String chainKey) {
+    public synchronized List<String> chainNotesOf(String chainKey) {
         List<String> list = chainNotes.get(chainKey);
         return list != null ? List.copyOf(list) : List.of();
+    }
+
+    // ---- typed immutable extension facts ----
+
+    /**
+     * Publish an immutable record fact.  A plugin may publish its own record type without
+     * coupling to another knowledge source; readers request a typed immutable snapshot.
+     */
+    public synchronized void publishFact(BlackboardFact fact) {
+        if (fact == null) {
+            return;
+        }
+        if (!fact.getClass().isRecord()) {
+            throw new IllegalArgumentException("blackboard facts must be immutable records: "
+                    + fact.getClass().getName());
+        }
+        facts.computeIfAbsent(fact.getClass(), ignored -> new ArrayList<>(1)).add(fact);
+        factLog.add(fact);
+        factRevision++;
+    }
+
+    /** Return all facts assignable to the requested type in publication order. */
+    public synchronized <T extends BlackboardFact> List<T> facts(Class<T> type) {
+        if (type == null) {
+            return List.of();
+        }
+        List<T> result = new ArrayList<>();
+        for (BlackboardFact value : factLog) {
+            if (type.isInstance(value)) {
+                result.add(type.cast(value));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /** Monotonic publication revision for downstream memoization keys. */
+    public synchronized long factRevision() {
+        return factRevision;
     }
 
     // ---- 事件 ----
@@ -226,15 +290,15 @@ public final class Blackboard {
         queue.addLast(event);
     }
 
-    Event poll() {
+    synchronized Event poll() {
         return queue.pollFirst();
     }
 
-    boolean hasEvents() {
+    synchronized boolean hasEvents() {
         return !queue.isEmpty();
     }
 
-    void clearEvents() {
+    synchronized void clearEvents() {
         queue.clear();
     }
 }

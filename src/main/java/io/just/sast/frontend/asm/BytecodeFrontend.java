@@ -106,6 +106,7 @@ public final class BytecodeFrontend {
     public LoadResult load(Inputs input) {
         Map<String, ClassInfo> classes = new LinkedHashMap<>();
         List<ParseDiagnostic> diagnostics = new ArrayList<>(input.diagnostics());
+        LinkedHashSet<String> completenessReasons = new LinkedHashSet<>(input.completenessReasons());
         List<ParsedClass> parsed = parse(input.classes());
         int maxMajor = 0;
         for (ParsedClass result : parsed) {
@@ -113,11 +114,13 @@ public final class BytecodeFrontend {
                 diagnostics.add(result.diagnostic());
                 continue;
             }
-            classes.putIfAbsent(result.className(), result.info());
+            if (classes.putIfAbsent(result.className(), result.info()) != null) {
+                completenessReasons.add("DUPLICATE_CLASS:" + result.className());
+            }
             maxMajor = Math.max(maxMajor, result.majorVersion());
         }
         return new LoadResult(classes, List.copyOf(diagnostics), input.classes().size(), maxMajor,
-                input.completenessReasons());
+                List.copyOf(completenessReasons));
     }
 
     /** 在已有目标结果上追加外部类，避免 JDK 切片规划时再次解析目标类。 */
@@ -127,9 +130,11 @@ public final class BytecodeFrontend {
         }
         Map<String, ClassInfo> classes = new LinkedHashMap<>(base.classes());
         List<ParseDiagnostic> diagnostics = new ArrayList<>(base.diagnostics());
+        LinkedHashSet<String> completenessReasons = new LinkedHashSet<>(base.completenessReasons());
         for (ParsedClass result : parse(extraClassBytes)) {
             // 应用类优先；与旧的 target + extra 装载契约一致，重复 extra 也不产生新诊断。
             if (classes.containsKey(result.className())) {
+                completenessReasons.add("DUPLICATE_CLASS:" + result.className());
                 continue;
             }
             if (result.diagnostic() != null) {
@@ -140,7 +145,7 @@ public final class BytecodeFrontend {
         }
         return new LoadResult(classes, List.copyOf(diagnostics),
                 base.filesScanned() + extraClassBytes.size(), base.targetMajorVersion(),
-                base.completenessReasons());
+                List.copyOf(completenessReasons));
     }
 
     /** 目标输入 + 外部类的兼容入口。 */
@@ -185,11 +190,21 @@ public final class BytecodeFrontend {
 
     private ParsedClass parseOne(ClassBytes bytes) {
         try {
+            if (bytes == null || bytes.bytes() == null || bytes.className() == null) {
+                throw new IllegalArgumentException("missing class input metadata");
+            }
             ClassInfo info = classFileReaders.get().read(bytes.bytes());
+            if (!bytes.className().equals(info.internalName())) {
+                return new ParsedClass(bytes.className(), ClassFileReader.majorOf(bytes.bytes()), null,
+                        new ParseDiagnostic(bytes.origin(), "CLASS_NAME_MISMATCH: expected "
+                                + bytes.className() + ", actual " + info.internalName()));
+            }
             return new ParsedClass(bytes.className(), ClassFileReader.majorOf(bytes.bytes()), info, null);
         } catch (Exception e) {
-            return new ParsedClass(bytes.className(), 0, null,
-                    new ParseDiagnostic(bytes.origin(), e.getClass().getSimpleName() + ": " + e.getMessage()));
+            String origin = bytes == null ? "<null>" : bytes.origin();
+            String className = bytes == null ? "<null>" : bytes.className();
+            return new ParsedClass(className, 0, null,
+                    new ParseDiagnostic(origin, e.getClass().getSimpleName() + ": " + e.getMessage()));
         }
     }
 
@@ -230,7 +245,9 @@ public final class BytecodeFrontend {
                     diagnostics.add(parsed.diagnostic());
                     continue;
                 }
-                classes.putIfAbsent(parsed.className(), parsed.info());
+                if (classes.putIfAbsent(parsed.className(), parsed.info()) != null) {
+                    completenessReasons.add("DUPLICATE_CLASS:" + parsed.className());
+                }
                 maxMajor = Math.max(maxMajor, parsed.majorVersion());
             }
             batch.clear();

@@ -38,6 +38,9 @@ public final class ClassHierarchy {
             new java.util.concurrent.ConcurrentHashMap<>();
     /** 传递子类型闭包缓存（调用图与引擎侧展开共用同一来源，避免直接/传递口径分叉）。 */
     private final Map<String, List<String>> transitiveSubtypesCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private record SubtypeKey(String internalName, int cap) {}
+    private final Map<SubtypeKey, SubtypeResult> boundedSubtypeCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
     /** 类的传递接口缓存；同一类的每个方法都会查询一次接口反向分发，必须跨方法复用。 */
     private final Map<String, List<String>> transitiveInterfacesCache =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -48,23 +51,36 @@ public final class ClassHierarchy {
     private volatile long revision;
 
     public ClassHierarchy(Map<String, ClassInfo> initial, JdkClassSource jdk) {
-        this.classes = new java.util.concurrent.ConcurrentHashMap<>(initial);
+        this.classes = new java.util.concurrent.ConcurrentHashMap<>();
         this.jdk = jdk;
+        if (initial != null) {
+            initial.forEach((name, info) -> {
+                if (name != null && !name.isBlank() && info != null) {
+                    this.classes.put(name, info);
+                }
+            });
+        }
         // The input map is often a LinkedHashMap, but tests and extension points are free to
         // provide a HashMap.  Subtype indexing is semantically a set operation; making its
         // seed order explicit prevents HashMap iteration order from leaking into dispatch
         // candidates and, ultimately, finite path budgets.
-        initial.values().stream()
+        (initial == null ? List.<ClassInfo>of() : initial.values()).stream()
+                .filter(java.util.Objects::nonNull)
                 .sorted(java.util.Comparator.comparing(ClassInfo::internalName))
                 .forEach(this::indexSubtypes);
     }
 
     private void indexSubtypes(ClassInfo c) {
-        if (c.superName() != null) {
+        if (c == null || c.internalName() == null || c.internalName().isBlank()) {
+            return;
+        }
+        if (c.superName() != null && !c.superName().isBlank()) {
             addDirectSubtype(c.superName(), c.internalName());
         }
         for (String itf : c.interfaces()) {
-            addDirectSubtype(itf, c.internalName());
+            if (itf != null && !itf.isBlank()) {
+                addDirectSubtype(itf, c.internalName());
+            }
         }
     }
 
@@ -75,15 +91,23 @@ public final class ClassHierarchy {
      * the latter created a large transient allocation cliff for generated polymorphism jars.
      */
     private void addDirectSubtype(String parent, String child) {
+        if (parent == null || parent.isBlank() || child == null || child.isBlank()) {
+            return;
+        }
         List<String> children = directSubtypes.computeIfAbsent(parent,
                 ignored -> new ArrayList<>());
         synchronized (children) {
-            children.add(child);
+            if (!children.contains(child)) {
+                children.add(child);
+            }
         }
     }
 
     /** 取类信息，未知类走 JDK 懒加载；确认缺失的类负缓存（来源集合不变，结果稳定）。懒加载段同步（并发下防重复探测/结构破坏）。 */
     public ClassInfo classInfo(String internalName) {
+        if (internalName == null || internalName.isBlank()) {
+            return null;
+        }
         ClassInfo c = classes.get(internalName);
         if (c != null || jdk == null) {
             return c;
@@ -98,7 +122,15 @@ public final class ClassHierarchy {
             if (!unresolvable.add(internalName)) {
                 return null;
             }
-            c = jdk.load(internalName);
+            try {
+                c = jdk.load(internalName);
+            } catch (RuntimeException | LinkageError unavailable) {
+                // A provider may fail transiently while the runtime is being probed. Do not
+                // poison the negative cache forever; callers still receive null for this
+                // attempt and a later hierarchy revision can retry the load.
+                unresolvable.remove(internalName);
+                return null;
+            }
             if (c != null) {
                 classes.put(internalName, c);
                 indexSubtypes(c);
@@ -112,6 +144,7 @@ public final class ClassHierarchy {
                 resolveCache.clear();
                 implementersCache.clear();
                 transitiveSubtypesCache.clear();
+                boundedSubtypeCache.clear();
                 transitiveInterfacesCache.clear();
                 revision++;
             }
@@ -150,6 +183,9 @@ public final class ClassHierarchy {
      * 调用图与引擎侧的分发展开共用本方法——深继承链中的覆写方法两处一致。
      */
     public List<String> transitiveSubtypes(String internalName) {
+        if (internalName == null || internalName.isBlank()) {
+            return List.of();
+        }
         List<String> cached = transitiveSubtypesCache.get(internalName);
         if (cached != null) {
             return cached;
@@ -175,9 +211,61 @@ public final class ClassHierarchy {
         return frozen;
     }
 
+    /**
+     * Bounded lazy subtype traversal.  Unlike the legacy unbounded compatibility method this
+     * never materializes the complete closure merely to discover that a caller's cap was
+     * exceeded.  {@code complete=false} is an explicit analysis boundary, not an empty result.
+     */
+    public SubtypeResult transitiveSubtypes(String internalName, int cap) {
+        if (internalName == null || internalName.isBlank()) {
+            return new SubtypeResult(List.of(), true);
+        }
+        int effectiveCap = Math.max(0, cap);
+        SubtypeKey key = new SubtypeKey(internalName, effectiveCap);
+        SubtypeResult cached = boundedSubtypeCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        java.util.Set<String> result = new java.util.LinkedHashSet<>();
+        java.util.Set<String> visited = new HashSet<>();
+        Deque<String> work = new ArrayDeque<>();
+        work.add(internalName);
+        boolean truncated = false;
+        while (!work.isEmpty() && !truncated) {
+            String cur = work.poll();
+            if (!visited.add(cur)) {
+                continue;
+            }
+            for (String sub : loadedSubtypes(cur)) {
+                if (result.size() >= effectiveCap) {
+                    truncated = true;
+                    break;
+                }
+                if (result.add(sub)) {
+                    work.add(sub);
+                }
+            }
+        }
+        List<String> values = new ArrayList<>(result);
+        values.sort(String::compareTo);
+        SubtypeResult output = new SubtypeResult(List.copyOf(values), !truncated);
+        boundedSubtypeCache.put(key, output);
+        return output;
+    }
+
+    /** Result of a capped subtype traversal. */
+    public record SubtypeResult(List<String> values, boolean complete) {
+        public SubtypeResult {
+            values = values == null ? List.of() : List.copyOf(values);
+        }
+    }
+
     /** name 的全部祖先类型（父类链 + 传递接口，不含自身）。 */
     private java.util.Set<String> ancestorsOf(String internalName) {
         java.util.Set<String> result = new HashSet<>();
+        if (internalName == null || internalName.isBlank()) {
+            return result;
+        }
         Deque<String> queue = new ArrayDeque<>();
         ClassInfo ci = internalName.equals("") ? null : classInfo(internalName);
         if (ci != null) {
@@ -205,6 +293,9 @@ public final class ClassHierarchy {
 
     /** 类的传递接口（含父类继承），供接口反向分发使用。 */
     public List<String> transitiveInterfaces(String internalName) {
+        if (internalName == null || internalName.isBlank()) {
+            return List.of();
+        }
         List<String> cached = transitiveInterfacesCache.get(internalName);
         if (cached != null) {
             return cached;
@@ -223,7 +314,7 @@ public final class ClassHierarchy {
                 continue;
             }
             for (String itf : ci.interfaces()) {
-                if (visited.add(itf)) {
+                if (itf != null && !itf.isBlank() && !visited.contains(itf)) {
                     result.add(itf);
                     queue.add(itf);
                 }
@@ -240,6 +331,9 @@ public final class ClassHierarchy {
 
     /** a 是否为 b 的子类型（沿父类 + 传递接口）。 */
     public boolean isSubtypeOf(String a, String b) {
+        if (a == null || b == null || a.isBlank() || b.isBlank()) {
+            return false;
+        }
         if (a.equals(b)) {
             return true;
         }
@@ -281,7 +375,7 @@ public final class ClassHierarchy {
     }
 
     public boolean isSerializable(String internalName) {
-        return isSubtypeOf(internalName, "java/io/Serializable");
+        return internalName != null && isSubtypeOf(internalName, "java/io/Serializable");
     }
 
     /**
@@ -290,6 +384,10 @@ public final class ClassHierarchy {
      * 接口 default method，与真实 JVM 分派一致。未找到返回 null。
      */
     public String resolveMethod(String owner, String name, String desc) {
+        if (owner == null || owner.isBlank() || name == null || name.isBlank()
+                || desc == null || desc.isBlank()) {
+            return null;
+        }
         String key = owner + "#" + name + desc;
         Optional<String> cached = resolveCache.get(key);
         if (cached != null) {
@@ -313,6 +411,9 @@ public final class ClassHierarchy {
      * （同包判定以声明类为基准，非调用点静态类型）。FLASH (USENIX'25) 可见性剪枝的 JVM 语义实现。
      */
     public boolean isOverridableDispatchTarget(String declared, String candidate, String name, String desc) {
+        if (declared == null || candidate == null || name == null || desc == null) {
+            return false;
+        }
         // candidate 往往继承 declared 的方法，并不在 candidate.methods() 中直接出现。
         // 先按 JVM 方法解析找到真正的声明类，再读取其 access；否则 final native
         // Object.getClass 等方法会因“候选类未直接声明”被错误地当成可覆写目标。
@@ -409,12 +510,16 @@ public final class ClassHierarchy {
      * 接口实现类（传递，非接口类），超上限返回 null 表示放弃枚举。按 (接口, 上限) 缓存。
      */
     public List<String> implementers(String interfaceName, int cap) {
-        IfaceKey key = new IfaceKey(interfaceName, cap);
+        if (interfaceName == null || interfaceName.isBlank()) {
+            return List.of();
+        }
+        int effectiveCap = Math.max(0, cap);
+        IfaceKey key = new IfaceKey(interfaceName, effectiveCap);
         Optional<List<String>> cached = implementersCache.get(key);
         if (cached != null) {
             return cached.orElse(null);
         }
-        List<String> result = new ArrayList<>();
+        Set<String> result = new java.util.LinkedHashSet<>();
         Deque<String> queue = new ArrayDeque<>();
         Set<String> visited = new HashSet<>();
         queue.add(interfaceName);
@@ -436,15 +541,16 @@ public final class ClassHierarchy {
                     // 具体类也可能还有覆写它的子类；接口实现闭包必须继续穿过
                     // 实现类，而不能只枚举“直接实现者”。
                     queue.add(sub);
-                    if (result.size() > cap) {
+                    if (result.size() > effectiveCap) {
                         implementersCache.put(key, Optional.empty());
                         return null;
                     }
                 }
             }
         }
-        result.sort(String::compareTo);
-        List<String> frozen = List.copyOf(result);
+        List<String> ordered = new ArrayList<>(result);
+        ordered.sort(String::compareTo);
+        List<String> frozen = List.copyOf(ordered);
         implementersCache.put(key, Optional.of(frozen));
         return frozen;
     }

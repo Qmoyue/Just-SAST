@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.Map;
 import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.util.JustLogger;
+import java.lang.reflect.Modifier;
 
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -121,12 +122,20 @@ public final class CallGraphBuilder {
         if (declared != null) {
             targets.add(declared);
         }
+        // A final receiver class or a final/private/static declaration cannot have a
+        // dynamically dispatched implementation.  Expanding its subtype closure is both
+        // semantically redundant and very expensive for ubiquitous Object/JDK calls in fat
+        // jars.  Keep the single resolved target and preserve the ordinary edge shape.
+        if (declared != null && isFixedDispatch(owner, declared, name, desc)) {
+            return new DispatchPlan(List.copyOf(targets), false, false, 0);
+        }
         boolean skipped = false;
         int candidateCount = 0;
         if ("VIRTUAL".equals(kind)) {
-            List<String> subtypes = hierarchy.transitiveSubtypes(owner);
+            ClassHierarchy.SubtypeResult subtypeResult = hierarchy.transitiveSubtypes(owner, DISPATCH_CAP);
+            List<String> subtypes = subtypeResult.values();
             candidateCount = subtypes.size();
-            if (subtypes.size() > DISPATCH_CAP) {
+            if (!subtypeResult.complete()) {
                 skipped = true;
             } else {
                 for (String sub : subtypes) {
@@ -162,20 +171,43 @@ public final class CallGraphBuilder {
         return result;
     }
 
+    private boolean isFixedDispatch(String receiverOwner, String declaredOwner,
+                                    String name, String desc) {
+        int access = hierarchy.methodAccess(declaredOwner, name, desc);
+        if (access >= 0 && (Modifier.isFinal(access) || Modifier.isPrivate(access)
+                || Modifier.isStatic(access))) {
+            return true;
+        }
+        io.just.sast.model.ClassInfo receiver = hierarchy.classInfo(receiverOwner);
+        return receiver != null && Modifier.isFinal(receiver.access());
+    }
+
     private int addLambda(Graph graph, Node call, InvokeDynamicRef indy) {
         if (indy == null) {
             return 0;
         }
-        if (LAMBDA_METAFACTORY.equals(indy.bootstrap().owner()) && indy.bootstrapArgs().size() > 1) {
-            Object impl = indy.bootstrapArgs().get(1);
-            if (impl instanceof HandleRef h) {
-                String target = hierarchy.resolveMethod(h.owner(), h.name(), h.descriptor());
-                // 与 SPECIAL 边同语义：用解析后的真实声明类建节点（方法引用指向继承方法时避免幽灵节点）
-                String edgeOwner = target != null ? target : h.owner();
-                graph.addEdge(call, graph.methodNode(edgeOwner, h.name(), h.descriptor(), target == null),
-                        EdgeType.LAMBDA, "LAMBDA");
-                return 1;
+        if (indy.bootstrap() != null && LAMBDA_METAFACTORY.equals(indy.bootstrap().owner())) {
+            // Both metafactory and altMetafactory keep the implementation handle in the
+            // bootstrap argument list.  Scan all handle arguments after the SAM type instead
+            // of hard-coding index 1: this preserves bridge/adapter variants emitted by newer
+            // compilers and remains conservative because marker/bridge metadata is TypeRef,
+            // not HandleRef.  A stable set avoids duplicate edges for repeated handles.
+            Set<String> seen = new LinkedHashSet<>();
+            int count = 0;
+            for (int i = 1; i < indy.bootstrapArgs().size(); i++) {
+                Object impl = indy.bootstrapArgs().get(i);
+                if (impl instanceof HandleRef h && seen.add(h.owner() + "#"
+                        + h.name() + h.descriptor())) {
+                    String target = hierarchy.resolveMethod(h.owner(), h.name(), h.descriptor());
+                    // 与 SPECIAL 边同语义：用解析后的真实声明类建节点（方法引用指向继承方法时避免幽灵节点）
+                    String edgeOwner = target != null ? target : h.owner();
+                    graph.addEdge(call,
+                            graph.methodNode(edgeOwner, h.name(), h.descriptor(), target == null),
+                            EdgeType.LAMBDA, "LAMBDA");
+                    count++;
+                }
             }
+            return count;
         }
         return 0;
     }

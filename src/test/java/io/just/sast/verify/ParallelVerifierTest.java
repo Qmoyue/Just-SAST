@@ -15,7 +15,9 @@ import io.just.sast.blackboard.HopKind;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 子 JVM 的环境边界是动态验证的用户可见安全契约。 */
 class ParallelVerifierTest {
@@ -32,6 +34,24 @@ class ParallelVerifierTest {
         assertEquals(ParallelVerifier.VerifyStatus.UNKNOWN, unknown.statusCode());
         assertEquals("UNKNOWN", unknown.evidence(),
                 "未知状态不得被当作动态正向证据");
+
+        ParallelVerifier.VerifyResult safe = new ParallelVerifier.VerifyResult(
+                "chain", "SAFE_EFFECT_OBSERVED", "INERT_COMMAND", 1, 0L);
+        assertEquals(ParallelVerifier.VerifyStatus.SAFE_EFFECT_OBSERVED, safe.statusCode());
+        assertEquals("SAFE_EFFECT_OBSERVED", safe.evidence());
+    }
+
+    @Test
+    void resourceLimitDiagnosticsRemainNegativeEvidence() {
+        assertTrue(ParallelVerifier.outOfMemoryDiagnostic(
+                "java.lang.OutOfMemoryError: Java heap space"));
+        assertTrue(ParallelVerifier.outOfMemoryDiagnostic("GC overhead limit exceeded"));
+        assertFalse(ParallelVerifier.outOfMemoryDiagnostic(
+                "JUST_VERIFY_V2:token:run:chain:sink:nonce:artifact:SINK_BLOCKED"));
+
+        ParallelVerifier.VerifyResult oom = new ParallelVerifier.VerifyResult(
+                "chain", "UNTESTABLE", "PROCESS_OOM");
+        assertEquals("PROCESS_OOM", oom.evidence());
     }
 
     @Test
@@ -47,6 +67,63 @@ class ParallelVerifierTest {
                 "attempt-token"));
         assertNull(ParallelVerifier.authenticatedStatus(
                 "JUST_VERIFY_V1:attempt-token:NOT_A_STATUS", "attempt-token"));
+    }
+
+    @Test
+    void readinessMustPrecedeAuthenticatedTerminalEvidence() {
+        String token = "attempt-token";
+        ParallelVerifier.ProtocolEvidence valid = ParallelVerifier.protocolEvidence(
+                "noise\nJUST_VERIFY_V1:" + token + ":SANDBOX_READY: WINDOWS_JOB_OBJECT_JVM_POLICY\n"
+                        + "JUST_VERIFY_V1:" + token + ":SINK_BLOCKED: sink",
+                token);
+        ParallelVerifier.ProtocolEvidence invalid = ParallelVerifier.protocolEvidence(
+                "JUST_VERIFY_V1:" + token + ":SINK_BLOCKED: sink\n"
+                        + "JUST_VERIFY_V1:" + token + ":SANDBOX_READY: backend",
+                token);
+
+        assertEquals(true, valid.ready());
+        assertEquals(true, valid.validOrder());
+        assertEquals("WINDOWS_JOB_OBJECT_JVM_POLICY", valid.readyBackend());
+        assertEquals("SINK_BLOCKED: sink", valid.terminal());
+        assertEquals(false, invalid.validOrder());
+
+        String safe = "JUST_VERIFY_V1:" + token + ":SAFE_EFFECT_OBSERVED:INERT_COMMAND";
+        assertEquals("SAFE_EFFECT_OBSERVED:INERT_COMMAND",
+                ParallelVerifier.authenticatedStatus(safe, token));
+    }
+
+    @Test
+    void v2EvidenceBindsAttemptChainSinkAndArtifact() {
+        ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
+                "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
+        String prefix = "JUST_VERIFY_V2:token:run:chain-fingerprint:sink-fingerprint:nonce:artifact:";
+        ParallelVerifier.ProtocolEvidence valid = ParallelVerifier.protocolEvidence(
+                prefix + "SANDBOX_READY: WINDOWS_JOB_OBJECT_JVM_POLICY\n"
+                        + prefix + "SINK_BLOCKED: sink", identity);
+        assertTrue(valid.bindingValid());
+        assertTrue(valid.ready());
+        assertTrue(valid.validOrder());
+        assertEquals("SINK_BLOCKED: sink", valid.terminal());
+
+        ParallelVerifier.ProtocolEvidence tampered = ParallelVerifier.protocolEvidence(
+                prefix + "SANDBOX_READY: WINDOWS_JOB_OBJECT_JVM_POLICY\n"
+                        + "JUST_VERIFY_V2:token:run:other-chain:sink-fingerprint:nonce:artifact:"
+                        + "SINK_BLOCKED: sink", identity);
+        assertFalse(tampered.bindingValid());
+    }
+
+    @Test
+    void anyTamperedV2FrameInvalidatesTheWholeAttempt() {
+        ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
+                "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
+        String prefix = "JUST_VERIFY_V2:token:run:chain-fingerprint:sink-fingerprint:nonce:artifact:";
+        ParallelVerifier.ProtocolEvidence evidence = ParallelVerifier.protocolEvidence(
+                prefix + "SANDBOX_READY: WINDOWS_JOB_OBJECT_JVM_POLICY\n"
+                        + "JUST_VERIFY_V2:token:run:wrong-chain:sink-fingerprint:nonce:artifact:"
+                        + "PARTIAL_PATH:tampered\n"
+                        + prefix + "SINK_BLOCKED: sink", identity);
+
+        assertFalse(evidence.bindingValid(), "坏帧之后不能被后续好帧重新认证");
     }
 
     @Test
@@ -74,6 +151,18 @@ class ParallelVerifierTest {
             assertEquals("/usr/bin:/bin", result.get("PATH"));
             assertEquals(isoDir.toString(), result.get("HOME"));
         }
+    }
+
+    @Test
+    void sinkPolicyModeIsExplicitAndStable() {
+        ParallelVerifier boundary = new ParallelVerifier(Path.of("."), List.of(),
+                null, 0, false, null);
+        ParallelVerifier safe = new ParallelVerifier(Path.of("."), List.of(),
+                null, 0, true, null);
+
+        assertEquals("BOUNDARY", boundary.policyMode());
+        assertEquals("SAFE_EXEC", safe.policyMode());
+        assertNotEquals(boundary.policyDigest(), safe.policyDigest());
     }
 
     @Test
@@ -111,6 +200,34 @@ class ParallelVerifierTest {
         List<Chain> selected = verifier.selectChains(List.of(dependency, application), 2);
 
         org.junit.jupiter.api.Assertions.assertTrue(selected.contains(application));
+    }
+
+    @Test
+    void directKryoSourceIsEncodedForTheSourceAdapter() {
+        List<ChainHop> hops = List.of(
+                new ChainHop("app/Gadget", "toString", "java/lang/reflect/Method", "invoke",
+                        HopKind.DIRECT_CALL, null, null, "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;", null),
+                new ChainHop("com/sun/syndication/feed/impl/EqualsBean", "hashCode",
+                        "com/sun/syndication/feed/impl/ToStringBean", "toString",
+                        HopKind.DIRECT_CALL, null, null, "", null),
+                new ChainHop("com/esotericsoftware/kryo/Kryo", "readClassAndObject",
+                        "com/sun/syndication/feed/impl/EqualsBean", "hashCode",
+                        HopKind.VIRTUAL_DISPATCH, null, null, "()I", null),
+                new ChainHop("app/Controller", "read", "com/esotericsoftware/kryo/Kryo",
+                        "readClassAndObject", HopKind.DIRECT_CALL, null, null,
+                        "(Lcom/esotericsoftware/kryo/io/Input;)Ljava/lang/Object;", null),
+                new ChainHop("app/Controller", "read", "app/Controller", "read",
+                        HopKind.ENTRY, null, "source", "(Ljava/lang/String;)Ljava/lang/String;", null));
+        Chain chain = new Chain("rule", "REFLECTIVE_INVOKE", "HIGH", "app/Controller", "read",
+                "source", "java/lang/reflect/Method", "invoke", hops, 0);
+
+        assertEquals(
+                "com/sun/syndication/feed/impl/EqualsBean|hashCode|hashCode"
+                        + "|com/esotericsoftware/kryo/Kryo|readClassAndObject"
+                        + "|(Lcom/esotericsoftware/kryo/io/Input;)Ljava/lang/Object;"
+                        + "|com/sun/syndication/feed/impl/ToStringBean"
+                        + "|toString",
+                ParallelVerifier.sourceTriggerSpec(chain));
     }
 
 }

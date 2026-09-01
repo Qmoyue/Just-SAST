@@ -92,7 +92,11 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                 }
                 Rule.SourceRule matched = bb.ruleEngine()
                         .matchingSource(ref.owner(), ref.name(), ref.descriptor()).orElse(null);
-                if (matched == null) {
+                if (matched == null || !isUnconditionalDeserializeSource(matched)
+                        && !"serialize".equalsIgnoreCase(matched.bridge())) {
+                    // A constrained source is a secondary object-graph boundary.  The
+                    // framework BFS must not publish it as an independent entry->sink
+                    // chain; its input provenance is established by the taint engines.
                     continue;
                 }
                 Long callId = support.callId(methodKey, insn.offset());
@@ -122,6 +126,11 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
             }
         }
         JustLogger.info("框架桥接[规则驱动]：产链 {} 条", chains);
+    }
+
+    private static boolean isUnconditionalDeserializeSource(Rule.SourceRule source) {
+        return source != null && !"serialize".equalsIgnoreCase(source.bridge())
+                && (source.tainted() == null || source.tainted().isEmpty());
     }
 
     /** 包前缀剪枝 BFS：框架入口沿同包方法到反射 sink，返回入口→…→sink 的调用点路径。 */
@@ -232,7 +241,8 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                 HopKind.ENTRY, null, bridge, entryMethod.descriptor(), null));
         return new Chain(rule.id(), rule.category(), rule.severity(),
                 entryMethod.owner(), entryMethod.name(), bridge,
-                sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"));
+                sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"),
+                rule.role().name());
     }
 
     private static String packagePrefix(String internalName, int segments) {

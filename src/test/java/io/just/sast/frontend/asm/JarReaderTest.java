@@ -80,4 +80,88 @@ class JarReaderTest {
         assertEquals(compatibilityNames, names);
         assertTrue(result.completenessReasons().isEmpty());
     }
+
+    @Test
+    void duplicateClassesAcrossNestedArchivesAreReported(@TempDir Path tmp) throws Exception {
+        byte[] nested = zip(Map.of("com/app/Main.class", JarReaderTest::markerClass));
+        Path jar = tmp.resolve("duplicate.jar");
+        Map<String, Function<String, byte[]>> root = new LinkedHashMap<>();
+        root.put("BOOT-INF/classes/com/app/Main.class", JarReaderTest::markerClass);
+        root.put("BOOT-INF/lib/dependency.jar", ignored -> nested);
+        Files.write(jar, zip(root));
+
+        JarReader.ReadResult result = new JarReader().readDetailed(jar);
+
+        assertEquals(1, result.classes().size());
+        assertTrue(result.completenessReasons().stream()
+                .anyMatch(reason -> reason.equals("DUPLICATE_CLASS:com/app/Main")),
+                result.completenessReasons().toString());
+    }
+
+    @Test
+    void compressionRatioLimitIsObservable(@TempDir Path tmp) throws Exception {
+        byte[] zeros = new byte[4 * 1024 * 1024];
+        Path jar = tmp.resolve("ratio.jar");
+        Map<String, Function<String, byte[]>> root = new LinkedHashMap<>();
+        root.put("BOOT-INF/classes/com/app/HighlyCompressed.class", ignored -> zeros);
+        Files.write(jar, zip(root));
+
+        JarReader.ReadResult result = new JarReader().readDetailed(jar);
+
+        assertTrue(result.classes().isEmpty());
+        assertTrue(result.completenessReasons().contains("ARCHIVE_COMPRESSION_RATIO_CAP"),
+                result.completenessReasons().toString());
+    }
+
+    @Test
+    void malformedTopLevelZipIsAnAuditableCompletenessReason(@TempDir Path tmp) throws Exception {
+        Path jar = tmp.resolve("malformed.jar");
+        Files.write(jar, "not a zip".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+
+        JarReader.ReadResult result = new JarReader().readDetailed(jar);
+
+        assertTrue(result.classes().isEmpty());
+        assertEquals(List.of("ARCHIVE_CORRUPT"), result.completenessReasons());
+    }
+
+    @Test
+    void malformedNestedZipDoesNotHideValidOuterClasses(@TempDir Path tmp) throws Exception {
+        Path jar = tmp.resolve("malformed-nested.jar");
+        Map<String, Function<String, byte[]>> root = new LinkedHashMap<>();
+        root.put("BOOT-INF/classes/com/app/Main.class", JarReaderTest::markerClass);
+        root.put("BOOT-INF/lib/broken.jar", ignored ->
+                "not a nested zip".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        Files.write(jar, zip(root));
+
+        JarReader.ReadResult result = new JarReader().readDetailed(jar);
+
+        assertEquals(1, result.classes().size());
+        assertEquals("com/app/Main", result.classes().get(0).className());
+        assertTrue(result.completenessReasons().contains("ARCHIVE_CORRUPT"),
+                result.completenessReasons().toString());
+    }
+
+    @Test
+    void consumerFailureClosesTopLevelAndNestedZipResources(@TempDir Path tmp) throws Exception {
+        byte[] nested = zip(Map.of("lib/Dependency.class", JarReaderTest::markerClass));
+        Path jar = tmp.resolve("consumer-failure.jar");
+        Map<String, Function<String, byte[]>> root = new LinkedHashMap<>();
+        root.put("app/Main.class", JarReaderTest::markerClass);
+        root.put("BOOT-INF/lib/dependency.jar", ignored -> nested);
+        Files.write(jar, zip(root));
+
+        java.util.concurrent.atomic.AtomicInteger seen = new java.util.concurrent.atomic.AtomicInteger();
+        java.io.IOException failure = org.junit.jupiter.api.Assertions.assertThrows(
+                java.io.IOException.class,
+                () -> new JarReader().streamDetailed(jar, bytes -> {
+                    if (seen.incrementAndGet() >= 2) {
+                        throw new java.io.IOException("consumer-stop");
+                    }
+                }));
+
+        assertEquals("consumer-stop", failure.getMessage());
+        Path moved = tmp.resolve("consumer-failure-moved.jar");
+        Files.move(jar, moved);
+        assertTrue(Files.isRegularFile(moved), "consumer 中断后 ZipFile/ZipInputStream 必须关闭");
+    }
 }

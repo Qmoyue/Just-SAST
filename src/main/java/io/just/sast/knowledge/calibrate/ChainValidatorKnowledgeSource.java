@@ -112,9 +112,10 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
                 continue;
             }
             if (hop.kind() == HopKind.FIELD_FLOW) {
-                String declaring = bb.hierarchy().resolveField(hop.fromOwner(), hop.field());
-                if (declaring == null && bb.hierarchy().superclassChainResolvable(hop.fromOwner())) {
-                    return "field-not-declared:" + hop.fromOwner() + "." + hop.field();
+                String owner = fieldOwnerOf(hop);
+                String declaring = bb.hierarchy().resolveField(owner, hop.field());
+                if (declaring == null && bb.hierarchy().superclassChainResolvable(owner)) {
+                    return "field-not-declared:" + owner + "." + hop.field();
                 }
                 continue;
             }
@@ -194,7 +195,7 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
             return "L" + chain.entryClass() + ";";
         }
         if (hop.kind() == HopKind.FIELD_FLOW && hop.field() != null) {
-            String declaring = bb.hierarchy().resolveField(hop.toOwner(), hop.field());
+            String declaring = bb.hierarchy().resolveField(fieldOwnerOf(hop), hop.field());
             if (declaring == null) {
                 return null;
             }
@@ -217,7 +218,7 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
             if (hop.kind() != HopKind.FIELD_FLOW || hop.field() == null) {
                 continue;
             }
-            String declaring = bb.hierarchy().resolveField(hop.toOwner(), hop.field());
+            String declaring = bb.hierarchy().resolveField(fieldOwnerOf(hop), hop.field());
             if (declaring == null || !bb.hierarchy().isSerializable(declaring)) {
                 continue;
             }
@@ -251,8 +252,8 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
             if (hop.kind() != HopKind.FIELD_FLOW || hop.field() == null) {
                 continue;
             }
-            String declaring = bb.hierarchy().resolveField(hop.toOwner(), hop.field());
-            ClassInfo cls = bb.hierarchy().classInfo(declaring != null ? declaring : hop.toOwner());
+            String declaring = bb.hierarchy().resolveField(fieldOwnerOf(hop), hop.field());
+            ClassInfo cls = bb.hierarchy().classInfo(declaring != null ? declaring : fieldOwnerOf(hop));
             FieldInfo field = cls != null ? cls.field(hop.field()) : null;
             if (field == null || !field.descriptor().startsWith("L")) {
                 continue;
@@ -292,12 +293,21 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
             return "L" + chain.entryClass() + ";";
         }
         if (hop.kind() == HopKind.FIELD_FLOW && hop.field() != null) {
-            String declaring = bb.hierarchy().resolveField(hop.toOwner(), hop.field());
-            ClassInfo cls = bb.hierarchy().classInfo(declaring != null ? declaring : hop.toOwner());
+            String declaring = bb.hierarchy().resolveField(fieldOwnerOf(hop), hop.field());
+            ClassInfo cls = bb.hierarchy().classInfo(declaring != null ? declaring : fieldOwnerOf(hop));
             FieldInfo field = cls != null ? cls.field(hop.field()) : null;
             return field != null ? field.descriptor() : null;
         }
         return null;
+    }
+
+    /** New producers retain the field's declaration owner; old extensions used toOwner. */
+    private static String fieldOwnerOf(ChainHop hop) {
+        if (hop == null) {
+            return "";
+        }
+        return hop.fieldOwner() == null || hop.fieldOwner().isBlank()
+                ? hop.toOwner() : hop.fieldOwner();
     }
 
     /**

@@ -24,6 +24,8 @@ import io.just.sast.report.CsvReporter;
 import io.just.sast.report.ReportIndexWriter;
 import io.just.sast.report.ReportLayout;
 import io.just.sast.report.ScanStatistics;
+import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.ArtifactFingerprint;
 import io.just.sast.util.JustLogger;
 
 import java.io.IOException;
@@ -56,6 +58,13 @@ public final class ScanPipeline {
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify,
+                verifyBudget, false);
+    }
+
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec) throws Exception {
         long start = System.currentTimeMillis();
         Map<String, Long> phaseMs = new java.util.LinkedHashMap<>();
         resetHeapPeaks();
@@ -69,11 +78,18 @@ public final class ScanPipeline {
         if (output == null) {
             throw new UsageException("输出目录不能为空");
         }
+        if (Files.exists(output) && ArchiveLimits.isLinkOrReparsePoint(output)) {
+            throw new UsageException("输出路径不能是符号链接或 reparse point: "
+                    + output.toAbsolutePath());
+        }
         if (Files.exists(output) && !Files.isDirectory(output)) {
             throw new UsageException("输出路径不是目录: " + output.toAbsolutePath());
         }
         if (verifyBudget < 0) {
             throw new UsageException("--verify-budget 不能为负数");
+        }
+        if (safeExec && !verify) {
+            throw new UsageException("--safe-exec 需要启用动态验证（不能与 --no-verify 同时使用）");
         }
 
         // 规则
@@ -146,7 +162,7 @@ public final class ScanPipeline {
         long analysisStart = System.currentTimeMillis();
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
-                        verifyBudget, jdkHome, load.targetMajorVersion()));
+                        verifyBudget, jdkHome, load.targetMajorVersion(), safeExec));
         new Controller(blackboard, KnowledgeSources.discover()).run();
         phaseMs.put("analysis", System.currentTimeMillis() - analysisStart);
 
@@ -156,16 +172,27 @@ public final class ScanPipeline {
         CsvReporter reporter = new CsvReporter();
         io.just.sast.report.MultiFormatReporter multiFormatReporter = new io.just.sast.report.MultiFormatReporter();
         reporter.withGraph(cpg.graph());
+        long csvReportStart = System.currentTimeMillis();
         reporter.write(reportLayout, blackboard.chains(), blackboard.sinkOutcomes(),
-                blackboard.chainCalibrations(), blackboardNotes(blackboard));
+                blackboard.chainCalibrations(), blackboardNotes(blackboard),
+                blackboard.verificationSummary());
+        phaseMs.put("report.csv", System.currentTimeMillis() - csvReportStart);
         // C1: SARIF 2.1.0 + E1-E3: JSON/HTML/Markdown 多格式输出
+        long sarifReportStart = System.currentTimeMillis();
         new io.just.sast.report.SarifReporter().withHierarchy(hierarchy).withRules(ruleSet).write(
-                reportLayout, blackboard.chains(), blackboard.chainCalibrations(), blackboardNotes(blackboard));
+                reportLayout, blackboard.chains(), blackboard.chainCalibrations(), blackboardNotes(blackboard),
+                blackboard.verificationSummary());
+        phaseMs.put("report.sarif", System.currentTimeMillis() - sarifReportStart);
+        long multiFormatReportStart = System.currentTimeMillis();
         multiFormatReporter.write(reportLayout, blackboard.chains(),
-                blackboard.chainCalibrations(), blackboardNotes(blackboard));
+                blackboard.chainCalibrations(), blackboardNotes(blackboard),
+                blackboard.verificationSummary());
+        phaseMs.put("report.multi_format", System.currentTimeMillis() - multiFormatReportStart);
+        long payloadReportStart = System.currentTimeMillis();
         new io.just.sast.report.PayloadPlanWriter().write(reportLayout, blackboard.chains(),
                 blackboard.chainCalibrations(), blackboardNotes(blackboard),
                 blackboard.verificationSummary());
+        phaseMs.put("report.payload", System.currentTimeMillis() - payloadReportStart);
         JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
 
         // sink/entry 统计从图直接产出（与引擎同一 RuleEngine 实例，access 过滤口径一致）
@@ -197,7 +224,8 @@ public final class ScanPipeline {
                 verify ? blackboard.verificationStatus() : "DISABLED",
                 verify ? blackboard.verificationSummary()
                         : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget),
-                chainProofCompleteness(blackboard.chains(), outcomes));
+                chainProofCompleteness(blackboard.chains(), outcomes, completenessReasons),
+                artifactHash(target));
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
         if (stats) {
@@ -205,6 +233,7 @@ public final class ScanPipeline {
         }
         // Reports no longer need CFGs. Clear the per-scan cache before returning so callers
         // retaining ScanResult do not accidentally retain every materialized method graph.
+        blackboard.originSupport().clearForwardOriginCache();
         cpg.index().clearCfgCache();
         return new ScanResult(ExitCode.OK.code(), blackboard.chains(), scanStats);
     }
@@ -312,7 +341,8 @@ public final class ScanPipeline {
     }
 
     private static String chainProofCompleteness(List<Chain> chains,
-                                                 Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes) {
+                                                 Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes,
+                                                 List<String> completenessReasons) {
         if (chains == null || chains.isEmpty()) {
             return "NO_SURVIVING_CHAIN";
         }
@@ -320,7 +350,24 @@ public final class ScanPipeline {
         boolean partialSink = outcomes != null && outcomes.values().stream().anyMatch(outcome ->
                 "TRUNCATED".equals(outcome.verdict()) || "TOO_LONG".equals(outcome.verdict())
                         || "UNRESOLVED".equals(outcome.verdict()) || "NO_STATE".equals(outcome.verdict()));
-        return partialChain || partialSink ? "PARTIAL" : "COMPLETE";
+        // A surviving chain is not a complete proof when any upstream semantic phase was
+        // bounded or aborted.  Previously this field only inspected the surviving chain
+        // objects, which could incorrectly report COMPLETE after a global timeout (notably
+        // on dependency-heavy jars where the controller cancels a knowledge source).
+        boolean boundedOrAborted = completenessReasons != null && completenessReasons.stream()
+                .filter(java.util.Objects::nonNull)
+                .anyMatch(ScanPipeline::invalidatesChainProof);
+        return partialChain || partialSink || boundedOrAborted ? "PARTIAL" : "COMPLETE";
+    }
+
+    private static boolean invalidatesChainProof(String reason) {
+        return "ANALYSIS_BOUND".equals(reason)
+                || "CONTROLLER_ABORTED".equals(reason)
+                || reason.startsWith("SOURCE_FAILED:")
+                || reason.startsWith("BACKWARD_")
+                || reason.startsWith("FORWARD_")
+                || reason.startsWith("DISPATCH_")
+                || reason.startsWith("COMPOSITION_");
     }
 
     private static Map<String, Long> scanMetrics(BuiltCpg cpg, Blackboard blackboard) {
@@ -333,6 +380,14 @@ public final class ScanPipeline {
         metrics.put("cpg_cfg_cache_size", (long) cpg.index().cfgCacheSize());
         metrics.put("blackboard_chains", (long) blackboard.chains().size());
         metrics.put("blackboard_calibrations", (long) blackboard.calibrationCount());
+        metrics.put("forward_origin_cache_size",
+                (long) blackboard.originSupport().forwardOriginCacheSize());
+        metrics.put("forward_origin_compute_calls",
+                blackboard.originSupport().forwardOriginComputeCalls());
+        metrics.put("forward_origin_cache_hits",
+                blackboard.originSupport().forwardOriginCacheHits());
+        metrics.put("forward_origin_analysis_runs",
+                blackboard.originSupport().forwardOriginAnalysisRuns());
         return metrics;
     }
 
@@ -343,6 +398,10 @@ public final class ScanPipeline {
         }
         if (!Files.exists(path)) {
             throw new UsageException(label + "不存在: " + path.toAbsolutePath());
+        }
+        if (ArchiveLimits.isLinkOrReparsePoint(path)) {
+            throw new UsageException(label + "不能是符号链接或 reparse point: "
+                    + path.toAbsolutePath());
         }
         if (!Files.isRegularFile(path) && !(allowDirectory && Files.isDirectory(path))) {
             throw new UsageException(label + "不是普通文件或目录: " + path.toAbsolutePath());
@@ -404,6 +463,11 @@ public final class ScanPipeline {
         }
     }
 
+    /** Stable SHA-256 identity used by reports and the dynamic child attestation protocol. */
+    private static String artifactHash(Path input) throws IOException {
+        return ArtifactFingerprint.sha256(input);
+    }
+
     /** 从规则数据提取字面量类型种子；正则 owner 仍由现有调用图/规则逻辑处理。 */
     private static java.util.Set<String> jdkTypeSeeds(RuleSet rules) {
         java.util.Set<String> seeds = new LinkedHashSet<>();
@@ -416,6 +480,25 @@ public final class ScanPipeline {
             addTypeSeed(seeds, rule.sinkOwner());
             for (Rule.HopSpec hop : rule.hops()) {
                 addTypeSeed(seeds, hop.cls());
+            }
+            if (rule.constructionPlan() != null) {
+                for (var node : rule.constructionPlan().nodes()) {
+                    addTypeSeed(seeds, node.type());
+                    for (var value : node.arguments()) {
+                        if (value.kind() == io.just.sast.blackboard.ObjectGraphPlan.ValueKind.CLASS) {
+                            addTypeSeed(seeds, value.value());
+                        }
+                    }
+                }
+                for (var assignment : rule.constructionPlan().fields()) {
+                    // A field owner may be a node id. Node types above are the actual class
+                    // seeds; CLASS values in assignments are JDK/interface dependencies.
+                    for (var value : assignment.values()) {
+                        if (value.kind() == io.just.sast.blackboard.ObjectGraphPlan.ValueKind.CLASS) {
+                            addTypeSeed(seeds, value.value());
+                        }
+                    }
+                }
             }
         }
         return seeds;

@@ -15,8 +15,14 @@ public final class SinkCanaryGate {
     private static volatile String entryClass;
     private static volatile String entryMethod;
     private static volatile String entryToken;
+    private static volatile String protocolRunId;
+    private static volatile String protocolChainFingerprint;
+    private static volatile String protocolSinkFingerprint;
+    private static volatile String protocolNonce;
+    private static volatile String protocolArtifactFingerprint;
     private static volatile boolean reached;
     private static boolean configured;
+    private static boolean protocolConfigured;
 
     private SinkCanaryGate() {
     }
@@ -35,6 +41,33 @@ public final class SinkCanaryGate {
         entryToken = token;
         reached = false;
         configured = true;
+    }
+
+    /** Bind the bootstrap canary to the launcher-owned attempt identity exactly once. */
+    public static synchronized void setProtocolBinding(String runId, String chainFingerprint,
+                                                        String sinkFingerprint, String nonce,
+                                                        String artifactFingerprint) {
+        if (!configured || protocolConfigured || blank(runId) || blank(chainFingerprint)
+                || blank(sinkFingerprint) || blank(nonce) || blank(artifactFingerprint)) {
+            return;
+        }
+        protocolRunId = runId;
+        protocolChainFingerprint = chainFingerprint;
+        protocolSinkFingerprint = sinkFingerprint;
+        protocolNonce = nonce;
+        protocolArtifactFingerprint = artifactFingerprint;
+        protocolConfigured = true;
+    }
+
+    /** Probe-side check that the agent configured this exact bootstrap gate instance. */
+    public static boolean protocolBound(String runId, String chainFingerprint,
+                                        String sinkFingerprint, String nonce,
+                                        String artifactFingerprint) {
+        return protocolConfigured && same(protocolRunId, runId)
+                && same(protocolChainFingerprint, chainFingerprint)
+                && same(protocolSinkFingerprint, sinkFingerprint)
+                && same(protocolNonce, nonce)
+                && same(protocolArtifactFingerprint, artifactFingerprint);
     }
 
     /** Sink entry call: an authenticated token plus the entry frame is required. */
@@ -65,8 +98,21 @@ public final class SinkCanaryGate {
         return reached;
     }
 
+    /** Agent readiness check used before a target class is loaded. */
+    public static boolean configured() {
+        return configured && entryClass != null && entryMethod != null && entryToken != null;
+    }
+
     /** JDK 24+ 无 SecurityManager 时的第二道 Java 级能力门；目标代码调用危险 API 时直接失败。 */
     public static void deny(String capability) {
         throw new SecurityException("dynamic sandbox denied: " + capability);
+    }
+
+    private static boolean blank(String value) {
+        return value == null || value.isEmpty();
+    }
+
+    private static boolean same(String left, String right) {
+        return left != null && left.equals(right);
     }
 }

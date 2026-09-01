@@ -36,6 +36,8 @@ class PayloadPlanWriterTest {
         assertTrue(plan.contains("\"mode\":\"INERT_OBJECT_GRAPH_PLAN\"")
                 && plan.contains("\"strategy\":\"IN_MEMORY_REFERENCE\"")
                 && plan.contains("\"status\":\"CONFIRMED\"")
+                && plan.contains("\"shape_summary\":")
+                && plan.contains("\"status\":\"SHAPE_PARTIAL\"")
                 && plan.contains("NO_COMMAND_EXECUTION")
                 && !plan.contains("\"payload_bytes\""));
 
@@ -73,5 +75,30 @@ class PayloadPlanWriterTest {
                         && readableMarkdown.contains("real prefix reached the canary")
                         && readableMarkdown.contains("No command, network, native load"),
                 "人类可读视图必须说明 canary 边界和安全限制：\n" + readableMarkdown);
+    }
+
+    @Test
+    void marksSafeEffectAsDistortedAndNotAsRealSinkExecution(@TempDir Path temp) throws Exception {
+        Chain chain = new Chain("R", "C", "HIGH", "app/Entry", "readObject",
+                "readObject", "java.lang.Runtime", "exec", List.of(), 0);
+        VerificationSummary verification = new VerificationSummary(
+                "OS_SANDBOX", 1, 1, 0, 1,
+                Map.of("SAFE_EFFECT_OBSERVED", 1), Map.of(),
+                List.of(new VerificationSummary.ChainResult(
+                        1, chain.key(), "SAFE_EFFECT_OBSERVED", "SAFE_EFFECT_OBSERVED:COMMAND",
+                        "HIGH", 10, 1, 4, "SAFE_EFFECT_OBSERVED")));
+
+        new PayloadPlanWriter().write(temp, List.of(chain), Map.of(), Map.of(), verification);
+
+        String readableJson = Files.readString(temp.resolve("payload.json"));
+        String readableMarkdown = Files.readString(temp.resolve("payload.md"));
+        assertTrue(readableJson.contains("SAFE_EFFECT_OBSERVED_WITH_DISTORTION")
+                        && readableJson.contains("NOT_EXECUTED_BY_INERT_PLAN")
+                        && !readableJson.contains("SAFE_SINK_EXECUTED"),
+                "safe effect 必须保留失真且不能升级为真实 sink 执行：\n" + readableJson);
+        assertTrue(readableMarkdown.contains("SAFE EFFECT OBSERVED; REAL SINK NOT ENTERED")
+                        && readableMarkdown.contains("intentionally distorted")
+                        && readableMarkdown.contains("does not prove RCE"),
+                "人类可读视图必须明确 safe-exec 失真：\n" + readableMarkdown);
     }
 }

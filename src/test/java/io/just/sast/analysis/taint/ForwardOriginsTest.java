@@ -15,6 +15,7 @@ import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -134,6 +135,88 @@ class ForwardOriginsTest {
     }
 
     @Test
+    void summaryCacheRemainsBoundedForFatJars() {
+        for (int i = 0; i < ForwardOrigins.MAX_CACHE_ENTRIES + ForwardOrigins.MAX_CACHE_BURST + 512; i++) {
+            MethodInfo method = new MethodInfo("Fat", "m" + i, "()V", 0,
+                    List.of(new io.just.sast.model.InsnFact(0, Op.RETURN, List.of())),
+                    List.of(), false, -1);
+            origins.compute(method);
+        }
+
+        for (int i = 0; i < 3; i++) {
+            origins.compute(new MethodInfo("Fat", "trim-trigger" + i, "()V", 0,
+                    List.of(new io.just.sast.model.InsnFact(0, Op.RETURN, List.of())),
+                    List.of(), false, -1));
+        }
+        assertTrue(origins.cacheSize() <= ForwardOrigins.MAX_CACHE_ENTRIES,
+                "正向摘要缓存必须有界，避免 fat jar 持有全部方法状态，实际=" + origins.cacheSize());
+        origins.clearCache();
+        assertEquals(0, origins.cacheSize());
+    }
+
+    @Test
+    void interruptedComputeReturnsIncompleteWithoutRetainingSummary() {
+        MethodInfo method = new MethodInfo("Interrupted", "run", "()V", 0,
+                List.of(new io.just.sast.model.InsnFact(0, Op.RETURN, List.of())),
+                List.of(), false, -1);
+        Thread.currentThread().interrupt();
+        try {
+            ForwardOrigins.Result result = origins.compute(method);
+            assertTrue(result.incomplete());
+            assertTrue(result.incompleteReasons().contains("INTERRUPTED"));
+            assertEquals(0, origins.cacheSize());
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void oversizedOriginMergeIsBoundedAndMarkedIncomplete() {
+        java.util.LinkedHashSet<ValueOrigin> many = new java.util.LinkedHashSet<>();
+        for (int i = 0; i < ForwardOrigins.MAX_ORIGIN_SET + 64; i++) {
+            many.add(new ValueOrigin.Insn(i));
+        }
+        ForwardOrigins.State left = new ForwardOrigins.State(
+                List.of(new ForwardOrigins.Slot(many, false)), List.of());
+        ForwardOrigins.State right = new ForwardOrigins.State(
+                List.of(new ForwardOrigins.Slot(Set.of(new ValueOrigin.Param(0)), false)),
+                List.of());
+        ForwardOrigins.State merged = left.merge(right);
+
+        assertTrue(merged.originsTruncated());
+        assertEquals(ForwardOrigins.MAX_ORIGIN_SET, merged.stack().get(0).origins().size());
+    }
+
+    @Test
+    void mergeReusesExistingStateWhenIncomingOriginsAreAlreadyCovered() {
+        ValueOrigin source = new ValueOrigin.Param(0);
+        ValueOrigin prior = new ValueOrigin.Insn(7);
+        ForwardOrigins.State existing = new ForwardOrigins.State(
+                List.of(new ForwardOrigins.Slot(Set.of(source, prior), false)), List.of());
+        ForwardOrigins.State incoming = new ForwardOrigins.State(
+                List.of(new ForwardOrigins.Slot(Set.of(source), false)), List.of());
+
+        assertSame(existing, existing.merge(incoming),
+                "被已有来源集合覆盖的 CFG 汇合不应创建等价状态");
+    }
+
+    @Test
+    void stateEqualityUsesContentNotCollectionIdentity() {
+        Set<ValueOrigin> leftOrigins = new java.util.LinkedHashSet<>();
+        leftOrigins.add(new ValueOrigin.Param(0));
+        Set<ValueOrigin> rightOrigins = new java.util.LinkedHashSet<>();
+        rightOrigins.add(new ValueOrigin.Param(0));
+
+        ForwardOrigins.State left = new ForwardOrigins.State(
+                List.of(new ForwardOrigins.Slot(leftOrigins, false)), List.of(leftOrigins));
+        ForwardOrigins.State right = new ForwardOrigins.State(
+                List.of(new ForwardOrigins.Slot(rightOrigins, false)), List.of(rightOrigins));
+
+        assertEquals(left, right, "等价 origin 集合即使是不同实例也必须视为同一状态");
+        assertEquals(left.hashCode(), right.hashCode(), "等价状态必须拥有相同 hashCode");
+    }
+
+    @Test
     void reflectiveArraySetAndGetPreserveIndexedElementOrigin() {
         MethodNode m = new MethodNode(8, "run", "(Ljava/lang/Object;)Ljava/lang/Object;",
                 null, null);
@@ -173,5 +256,53 @@ class ForwardOriginsTest {
         assertTrue(result.indexedArrayElements().values().stream()
                 .anyMatch(indexed -> indexed.values().stream()
                         .anyMatch(values -> values.contains(new ValueOrigin.Param(0)))));
+    }
+
+    @Test
+    void ordinaryArrayLoadPreservesStoredReferenceOrigin() {
+        MethodNode m = new MethodNode(8, "run", "(Ljava/lang/Object;)Ljava/lang/Object;",
+                null, null);
+        m.instructions.add(new InsnNode(Op.ICONST_1.code()));
+        m.instructions.add(new TypeInsnNode(Op.ANEWARRAY.code(), "java/lang/Object"));
+        m.instructions.add(new InsnNode(Op.DUP.code()));
+        m.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        m.instructions.add(new InsnNode(Op.AASTORE.code()));
+        m.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        m.instructions.add(new InsnNode(Op.AALOAD.code()));
+        m.instructions.add(new InsnNode(Op.ARETURN.code()));
+
+        ForwardOrigins.Result result = origins.compute(extract(m));
+
+        assertEquals(Set.of(new ValueOrigin.Param(0)),
+                result.arrayElements().get(new ValueOrigin.Insn(7)),
+                "普通 AALOAD 必须保留 AASTORE 写入的引用来源");
+        assertEquals(Set.of(new ValueOrigin.Insn(7)),
+                result.stateBefore().get(8).stack().get(0).origins(),
+                "AALOAD 的栈值应以自身结果 origin 出现");
+    }
+
+    @Test
+    void longArithmeticBitwiseAndConversionKeepJvmStackShape() {
+        MethodNode m = new MethodNode(0, "run", "()V", null, null);
+        m.instructions.add(new InsnNode(Op.LCONST_0.code()));
+        m.instructions.add(new InsnNode(Op.LCONST_1.code()));
+        m.instructions.add(new InsnNode(Op.LADD.code()));
+        m.instructions.add(new InsnNode(Op.LNEG.code()));
+        m.instructions.add(new InsnNode(Op.L2I.code()));
+        m.instructions.add(new InsnNode(Op.POP.code()));
+        m.instructions.add(new InsnNode(Op.LCONST_0.code()));
+        m.instructions.add(new InsnNode(Op.ICONST_1.code()));
+        m.instructions.add(new InsnNode(Op.LSHL.code()));
+        m.instructions.add(new InsnNode(Op.POP2.code()));
+        m.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        MethodInfo method = extract(m);
+        ForwardOrigins.Result result = origins.compute(method);
+
+        assertTrue(!result.incomplete(), "已建模 long 运算不应触发栈模型不完整: "
+                + result.incompleteReasons());
+        assertTrue(result.stateBefore().get(10).stack().isEmpty(),
+                "long 位运算和 category-2 弹栈后应恢复为空栈");
     }
 }

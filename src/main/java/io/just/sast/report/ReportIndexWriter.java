@@ -3,7 +3,6 @@ package io.just.sast.report;
 import io.just.sast.blackboard.VerificationSummary;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -27,6 +26,7 @@ public final class ReportIndexWriter {
                 .append("| Elapsed | ").append(stats.elapsedMs()).append(" ms |\n")
                 .append("| Heap used | ").append(stats.heapUsedMb()).append(" MB |\n")
                 .append("| Heap peak | ").append(stats.heapPeakMb()).append(" MB |\n")
+                .append("| Artifact SHA-256 | `").append(markdown(stats.artifactHash())).append("` |\n")
                 .append("| Completeness | `").append(markdown(stats.completeness())).append("` |\n")
                 .append("| Chain proof completeness | `")
                 .append(markdown(stats.chainProofCompleteness())).append("` |\n")
@@ -54,8 +54,7 @@ public final class ReportIndexWriter {
             }
             markdown.append('\n');
         }
-        Files.write(layout.root().resolve("index.md"),
-                markdown.toString().getBytes(StandardCharsets.UTF_8));
+        AtomicFiles.writeUtf8(layout.root().resolve("index.md"), markdown.toString());
     }
 
     private static void appendVerificationSummary(StringBuilder markdown,

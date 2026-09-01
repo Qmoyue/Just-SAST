@@ -18,10 +18,12 @@ import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
+import org.objectweb.asm.Type;
 
 import java.lang.reflect.Modifier;
 import java.util.List;
@@ -116,6 +118,68 @@ class OriginSupportFeasibilityTest {
                 "a Method receiver obtained through Iterator.next and CHECKCAST must be recognized");
     }
 
+    @Test
+    void zeroArgumentReflectiveLookupRecoversEmptyClassArrayDescriptor() throws Exception {
+        MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "run", "()V", null, null);
+        method.instructions.add(new LdcInsnNode(Type.getObjectType("fixture/Target")));
+        method.instructions.add(new LdcInsnNode("ping"));
+        method.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        method.instructions.add(new TypeInsnNode(Op.ANEWARRAY.code(), "java/lang/Class"));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(), "java/lang/Class",
+                "getMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;", false));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        MethodInfo hostMethod = extract("fixture/Host", method);
+        MethodInfo targetMethod = emptyMethod("fixture/Target", "ping", "()V", Modifier.PUBLIC);
+        ClassInfo host = new ClassInfo("fixture/Host", "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(hostMethod), List.of());
+        ClassInfo target = new ClassInfo("fixture/Target", "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(targetMethod), List.of());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host, target.internalName(), target),
+                List.of(), 2, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
+        var lookup = hostMethod.instructions().stream()
+                .filter(insn -> insn.op() == Op.INVOKEVIRTUAL
+                        && insn.methodRef() != null
+                        && "getMethod".equals(insn.methodRef().name()))
+                .findFirst().orElseThrow();
+        var descriptor = OriginSupport.class.getDeclaredMethod("reflectiveParameterDescriptor",
+                MethodInfo.class, io.just.sast.model.InsnFact.class, io.just.sast.model.MethodRef.class);
+        descriptor.setAccessible(true);
+
+        assertEquals("()V", descriptor.invoke(support, hostMethod, lookup, lookup.methodRef()),
+                "Class.getMethod(name) 的空 Class[] 必须恢复为零参数方法描述符");
+    }
+
+    @Test
+    void indexesSerializableInvocationHandlerForExternallyAssembledProxy() {
+        String handlerOwner = "fixture/ExternalHandler";
+        String descriptor = OriginSupport.SERIALIZED_PROXY_HANDLER_DESCRIPTOR;
+        MethodNode method = new MethodNode(Modifier.PUBLIC, "invoke", descriptor, null, null);
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new InsnNode(Op.ARETURN.code()));
+        MethodInfo handlerMethod = extract(handlerOwner, method);
+        ClassInfo handler = new ClassInfo(handlerOwner, "java/lang/Object",
+                List.of("java/lang/reflect/InvocationHandler", "java/io/Serializable"),
+                Modifier.PUBLIC | Modifier.FINAL, List.of(handlerMethod), List.of());
+
+        Graph graph = new Graph();
+        Node methodNode = graph.methodNode(handlerOwner, "invoke", descriptor, false);
+        graph.freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(handlerOwner, handler), null);
+        OriginSupport support = new OriginSupport(graph, hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false);
+
+        assertTrue(support.isSerializedProxyHandler(handlerMethod));
+        assertEquals(List.of(methodNode), support.serializedProxyHandlerMethods(),
+                "serialized proxy callbacks must be indexed without requiring Proxy.newProxyInstance");
+    }
+
     private static OriginSupport emptySupport() {
         Graph graph = new Graph();
         graph.freeze();
@@ -140,8 +204,12 @@ class OriginSupportFeasibilityTest {
     }
 
     private static MethodInfo extract(MethodNode method) {
+        return extract("fixture/Host", method);
+    }
+
+    private static MethodInfo extract(String owner, MethodNode method) {
         ClassNode node = new ClassNode();
-        node.name = "fixture/Host";
+        node.name = owner;
         node.superName = "java/lang/Object";
         node.methods.add(method);
         return new FactsExtractor().extract(node).methods().get(0);

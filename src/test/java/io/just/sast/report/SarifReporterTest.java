@@ -67,6 +67,7 @@ class SarifReporterTest {
         assertTrue(sarif.contains("\"startLine\": 42"), sarif);
         // 指纹存在
         assertTrue(sarif.contains("\"partialFingerprints\""), sarif);
+        assertTrue(sarif.contains("\"construction\":{"), sarif);
         // OASIS 规范 schema
         assertTrue(sarif.contains("docs.oasis-open.org/sarif"), sarif);
     }

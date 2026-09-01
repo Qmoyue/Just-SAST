@@ -42,6 +42,10 @@ public final class ScanCommand implements Callable<Integer> {
             description = "关闭子进程链级动态验证（CI/不可执行环境；默认验证会在子 JVM 中真实执行入口方法）")
     boolean noVerify;
 
+    @Option(names = "--safe-exec",
+            description = "显式请求安全化 sink adapter；未覆盖的 sink 仍只在 canary 边界观察，绝不执行目标 sink 方法体")
+    boolean safeExec;
+
     @Option(names = "--verify-budget", paramLabel = "<N>", defaultValue = "20",
             description = "子进程动态验证的链数预算（默认 20；按证据分值选取，同一入口类最多 2 条）")
     int verifyBudget;
@@ -51,7 +55,7 @@ public final class ScanCommand implements Callable<Integer> {
     public Integer call() {
         try {
             return ScanPipeline.run(target, deps, output, rules, stats, fast, jdkHome, !noVerify,
-                    verifyBudget).exitCode();
+                    verifyBudget, safeExec).exitCode();
         } catch (ScanPipeline.UsageException e) {
             System.err.println("[just:error] " + e.getMessage());
             return ExitCode.USAGE.code();

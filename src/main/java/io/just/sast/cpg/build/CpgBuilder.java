@@ -29,7 +29,7 @@ public final class CpgBuilder {
                         addCall(graph, insn, cls.internalName(), method);
                     } else if (op.isFieldWrite()) {
                         FieldRef ref = insn.fieldRef();
-                        fieldWriters.add(ref.owner(), ref.name(), cls.internalName(),
+                        fieldWriters.add(ref.owner(), ref.name(), ref.descriptor(), cls.internalName(),
                                 method.owner(), method.name(), method.descriptor(),
                                 insn.offset(), op == Op.PUTSTATIC);
                     } else if (op == Op.AASTORE && insn.offset() >= 3) {
@@ -38,7 +38,7 @@ public final class CpgBuilder {
                         InsnFact arrayField = method.instructions().get(insn.offset() - 3);
                         if (arrayField.op() == Op.GETFIELD) {
                             FieldRef ref = arrayField.fieldRef();
-                            fieldWriters.add(ref.owner(), ref.name(), cls.internalName(),
+                            fieldWriters.add(ref.owner(), ref.name(), ref.descriptor(), cls.internalName(),
                                     method.owner(), method.name(), method.descriptor(),
                                     insn.offset(), false);
                         }

@@ -45,6 +45,11 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
     private static final Set<String> UNIVERSAL_TYPES = Set.of(
             "java/lang/Object", "java/io/Serializable", "java/lang/Cloneable",
             "java/lang/Comparable", "java/io/Externalizable");
+    /** Erased container types need generic element evidence; a raw container is not a direct gadget field. */
+    private static final Set<String> GENERIC_CONTAINER_TYPES = Set.of(
+            "java/lang/Iterable", "java/util/Collection", "java/util/List", "java/util/Set",
+            "java/util/Queue", "java/util/Deque", "java/util/Map", "java/util/SortedMap",
+            "java/util/SortedSet", "java/util/Iterator");
 
     private Blackboard bb;
 
@@ -93,16 +98,40 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
             if (ci == null) {
                 continue;
             }
+            boolean serialPersistentApprox = ci.hasSerialPersistentFields();
             for (FieldInfo f : ci.fields()) {
-                if (Modifier.isTransient(f.access()) || Modifier.isStatic(f.access())) {
+                boolean transientReference = Modifier.isTransient(f.access())
+                        && referenceTypeOf(f.descriptor()) != null;
+                if ((Modifier.isTransient(f.access()) && !serialPersistentApprox)
+                        || Modifier.isStatic(f.access())) {
                     continue;
                 }
                 String type = referenceTypeOf(f.descriptor());
-                if (type == null || UNIVERSAL_TYPES.contains(type)) {
-                    continue; // 非引用类型 / 万能容器类型：重根无信号
+                List<String> genericTypes = f.genericReferenceTypes();
+                boolean genericContainer = type != null
+                        && GENERIC_CONTAINER_TYPES.contains(type)
+                        && !genericTypes.isEmpty();
+                if (transientReference && serialPersistentApprox) {
+                    bb.markIncomplete("OBJECT_GRAPH_SERIAL_PERSISTENT_FIELDS_APPROX");
                 }
-                containersByType.computeIfAbsent(type, k -> new ArrayList<>(1))
-                        .add(new String[] {owner, f.name()});
+                if (type != null && arrayDepth(f.descriptor()) > 1) {
+                    bb.markIncomplete("OBJECT_GRAPH_MULTIDIMENSIONAL_ARRAY_APPROX");
+                }
+                if (genericContainer) {
+                    bb.markIncomplete("OBJECT_GRAPH_GENERIC_CONTAINER_APPROX");
+                }
+                if (type != null && !genericContainer && !UNIVERSAL_TYPES.contains(type)
+                        && !GENERIC_CONTAINER_TYPES.contains(type)) {
+                    containersByType.computeIfAbsent(type, k -> new ArrayList<>(1))
+                            .add(new String[] {owner, f.name(), "field"});
+                }
+                for (String genericType : genericTypes) {
+                    if (!UNIVERSAL_TYPES.contains(genericType)
+                            && !GENERIC_CONTAINER_TYPES.contains(genericType)) {
+                        containersByType.computeIfAbsent(genericType, k -> new ArrayList<>(1))
+                                .add(new String[] {owner, f.name(), "generic-container"});
+                    }
+                }
             }
         }
         for (List<String[]> containers : containersByType.values()) {
@@ -142,7 +171,8 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
                         }
                         break;
                     }
-                    Chain merged = reroot(chain, container[0], container[1]);
+                    Chain merged = reroot(chain, container[0], container[1], container.length > 2
+                            ? container[2] : "field");
                     if (merged != null && bb.addChain(merged)) {
                         rerooted++;
                         per++;
@@ -162,19 +192,32 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
         };
     }
 
-    /** 字段描述符 → 引用类型名：L..; 直接取，[L..; 取元素类型；其余（基本类型/基本数组）null。 */
+    /** 字段描述符 → 引用类型名：去除任意数组维度后取 L..;，基本类型数组仍为 null。 */
     private static String referenceTypeOf(String desc) {
-        if (desc.startsWith("L") && desc.endsWith(";")) {
-            return desc.substring(1, desc.length() - 1);
+        if (desc == null || desc.isBlank()) {
+            return null;
         }
-        if (desc.startsWith("[L") && desc.endsWith(";")) {
-            return desc.substring(2, desc.length() - 1);
+        int start = 0;
+        while (start < desc.length() && desc.charAt(start) == '[') {
+            start++;
         }
-        return null;
+        return start < desc.length() && desc.charAt(start) == 'L'
+                && desc.endsWith(";") ? desc.substring(start + 1, desc.length() - 1) : null;
+    }
+
+    private static int arrayDepth(String desc) {
+        if (desc == null) {
+            return 0;
+        }
+        int depth = 0;
+        while (depth < desc.length() && desc.charAt(depth) == '[') {
+            depth++;
+        }
+        return depth;
     }
 
     /** F 入口链重根到 E：E 的入口跳 + 字段跳 + F 的链（去 F 入口自跳），sink-first 顺序。 */
-    private Chain reroot(Chain chain, String owner, String field) {
+    private Chain reroot(Chain chain, String owner, String field, String relation) {
         if (owner.equals(chain.entryClass()) || onPath(chain, owner)) {
             return null; // 防环
         }
@@ -188,7 +231,7 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
             hops.add(chain.hops().get(i)); // F 的跳（末位 ENTRY 自跳去掉）
         }
         hops.add(new ChainHop(entry[0], entry[1], chain.entryClass(), chain.entryMethod(),
-                HopKind.FIELD_FLOW, field, "object-graph", "", null));
+                HopKind.FIELD_FLOW, field, "object-graph-" + relation, "", null, owner));
         hops.add(new ChainHop(entry[0], entry[1], entry[0], entry[1],
                 HopKind.ENTRY, null, entry[2], entry[3], null));
         if (hops.size() > MAX_HOPS) {
@@ -196,7 +239,8 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
         }
         return new Chain(chain.ruleId(), chain.category(), chain.severity(),
                 entry[0], entry[1], entry[2],
-                chain.sinkClass(), chain.sinkMethod(), hops, chain.unresolvedHops(), chain.sinkDescriptor());
+                chain.sinkClass(), chain.sinkMethod(), hops, chain.unresolvedHops(), chain.sinkDescriptor(),
+                chain.sinkRole(), chain.constructionPlan());
     }
 
     /** 类的第一个机制回调入口（owner, method, entryKind）；无则 null。 */

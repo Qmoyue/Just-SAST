@@ -9,7 +9,7 @@ Just 的核心任务是：从 JAR/WAR/class 目录中提取 Java 字节码事实
 核心不变量：
 
 1. ASM 只存在于 frontend；分析层只依赖 Just 自有 model。
-2. 规则描述攻击面，知识源实现通用语义；不得为 benchmark、题目、包名或某条 WP 链增加分支。
+2. 规则描述攻击面，知识源实现通用语义；不得为测试样本、题目、包名或某条 WP 链增加分支。
 3. 分析阶段可并行，跨线程事实只能通过局部 delta 和稳定顺序合并。
 4. 静态候选、动态证据和完整性状态互相独立；动态失败不能静默变成“无链”。
 5. 所有链带有 `rule_id`、入口、sink、逐跳路径和可追溯的拒绝/截断原因。
@@ -246,7 +246,7 @@ rules:
 4. **动态安全与证据**：动态验证保持 fork-per-chain 和 sink canary 边界；加入结构化状态、精确 JDK/能力/原因，子进程只获得最小环境。Java 层权限门不宣称为 OS 沙箱；JDK 24+ 若无法启用等价能力必须 fail closed。
 5. **报告与测试**：以规范化验证结果生成 JSON/JSONL、Markdown、CSV、SARIF，分离扫描完整性、链证明完整性和动态能力；补充子进程 E2E、跨 JDK/平台、恶意工件边界、确定性和性能回归。
 
-研究取舍：CPG 论文证明 AST/CFG/PDG 的联合查询适合漏洞路径表达，但 Just 面向无源码 JAR，因此采用字节码语义 CPG，不物化无用 AST 节点；Qilin 的细粒度上下文敏感和增量 worklist 支持“局部按需”而非全程序重型 points-to；FLASH 的反序列化引导调用图支持优先分析可控 receiver；JDD 的动态对象构造思想用于验证真实前置链。上述资料只作为通用设计依据，规则和代码不依赖任何 benchmark 名称或 WP 结构。
+研究取舍：CPG 论文证明 AST/CFG/PDG 的联合查询适合漏洞路径表达，但 Just 面向无源码 JAR，因此采用字节码语义 CPG，不物化无用 AST 节点；Qilin 的细粒度上下文敏感和增量 worklist 支持“局部按需”而非全程序重型 points-to；FLASH 的反序列化引导调用图支持优先分析可控 receiver；JDD 的动态对象构造思想用于验证真实前置链。上述资料只作为通用设计依据，规则和代码不依赖任何测试样本名称或 WP 结构。
 
 本轮验收条件：
 
@@ -254,7 +254,7 @@ rules:
 - 不因前端批处理或图存储优化跳过 class、method、sink、异常边或规则；
 - 所有预算、能力、fallback、超时、native 缺失和解析失败均进入结构化报告；
 - 动态验证只能证明真实触发前缀到达 canary 边界，不能把 sink body 执行或 payload bytes 写入产物；
-- 六个校准语料、Gleipner 和 Maven 全量测试已完成；当前新 `javamix` 工件已经纳入回归，但动态状态仍按 `SINK_BLOCKED/CONCRETE/PARTIAL` 如实记录，不能把静态候选数当作 WP 动态确认。Linux/WSL evaluator 在本机不可用，因此不把未执行的跨平台分数写成通过项，保留为发布前环境验收项。
+- 代表性回归工件、外部语义评测器和 Maven 全量测试均已执行；动态状态仍按 `SINK_BLOCKED/SAFE_EFFECT_OBSERVED/CONCRETE/PARTIAL/TIMEOUT` 如实记录，不能把静态候选数当作 WP 动态确认。未具备等价隔离能力的平台只记录为平台限制，不把未执行的跨平台结果写成通过项。
 
 ## 10.2 动态隔离与图优化增量设计（2026-08-30）
 
@@ -266,7 +266,7 @@ rules:
 2. **Java 能力门**：在当前 JDK 能提供的范围内 deny-by-default，明确拒绝网络、进程、native/link、任意写入、动态 classloader 和退出；不支持可靠能力门时 fail closed，不把“进程启动成功”当作安全验证。
 3. **证据协议**：父进程只接受 probe 生成且带有本次尝试认证标记的结构化终态；目标工件的 stdout/stderr、异常文本和非零退出只能作为诊断，不能单独升级为 sink 证据。canary 命中后立即抛出边界异常，危险 sink 方法体不继续执行。
 
-验证只确认真实的入口、触发器、gadget 前缀和精确 sink 边界可达；不执行最终 sink，不加载目标 native，不连接网络，不生成可直接投递的攻击字节流。Windows evaluator 若需要 JNI，仅允许在 benchmark 的独立 loader/broker 中对经过路径和内容校验的测试库做环境验证，不能改变 Just 默认安全边界。
+验证只确认真实的入口、触发器、gadget 前缀和精确 sink 边界可达；不执行最终 sink，不加载目标 native，不连接网络，不生成可直接投递的攻击字节流。外部评测器若需要 JNI，仅允许在独立 loader/broker 中对经过路径和内容校验的测试库做环境验证，不能改变 Just 默认安全边界。
 
 图优化采用可逆、可核对的顺序：先用 profile 区分前端解析、CFG/CPG 构建、调用图、污点传播、组合和验证调度，再把热路径迁移到 primitive offset/id、CSR/紧凑 slice、可复用 bottom-up fragment summary 和按需 worklist。任何剪枝必须由类型/控制/字段约束证明并记录为完整性事实；不能以 `fast` 默认、固定包名、题目类名或 WP 结构替代通用规则。GPU 只作为未来可选后端：没有稳定的同构数据内核、CPU 等价结果和资源自适应门控时，不加入默认运行时依赖。
 
@@ -275,22 +275,21 @@ rules:
 1. 修复验证状态协议和 native/link 拒绝，降低子进程对伪造输出和隐式能力的信任面；
 2. 将字段依赖计划整理为确定性、去重、可复用的底向上对象构造摘要；
 3. 优化不改变语义的 indexed CFG 构建，避免先创建临时 `CfgEdge` 对象再压缩；
-4. 以新 Javamix 工件和六个校准语料检查真实前缀到 sink 边界的证据，并运行 Gleipner 找出通用语义缺口；
+4. 以代表性回归工件检查真实前缀到 sink 边界的证据，并运行外部语义评测器找出通用语义缺口；
 5. 只有全量等价回归通过后，才更新性能结论；单次 wall time 不能证明提速。
 
 ## 11. 当前验证与已知限制
 
-当前仓库验证基线：
+本轮收口验证：
 
-- `mvn test`：156 项通过，0 失败，2 项环境跳过（本轮最终回归）；
-- Gleipner 全量完成 30 个 block 的扫描和转换，其中 29 个 block 完成 evaluator：evaluator 原始块级计数为 `TP=219, FP=22`；当前转换器在连续重复方法节点归一化后的语义变体计数为 `TP=186, FP=22`，按 `(块, 入口类)` 去重基线为 `TP=126, FP=17`。Windows JNI evaluator 的 native 加载路径限制单独记录，不折算成扫描器分数；
-- 指定语料的安全动态结果为：`demo=2/3/15`、`demo2=2/3/15`、`babychain=0/2/18`、`javamix=1/3/16`、`n1cat=5/0/15`、`qiao=2/0/18`（`SINK_BLOCKED/CONCRETE_REACHED+EXECUTED/PARTIAL`）；qiao 运行时使用 Jabba JDK 21；
-- `javamix` 新工件 `benchmark/javamix/JavaMix/challenge/target/javamix-1.0.0.jar` 产生 21,337 条静态候选，动态选择 20 条，状态为 `1 SINK_BLOCKED / 3 CONCRETE / 16 PARTIAL`；不以另一份工件或 WP 文档类名替代当前输入事实；
-- `babychain` 尚未在动态选择的前 20 条中命中 sink boundary，`n1cat/qiao` 的边界证据排名仍偏后，这是后续候选排序、依赖补全和动态适配的真实缺口；
-- 大型工件的 live heap 仍然较高，不能宣称已经满足严格低内存发布门槛；
-- 复杂框架真实输入、代理、JNI/JRMP 和 JDK 版本差异仍可能产生 `PARTIAL`/`UNTESTABLE`；
-- 安全 payload plan、JVM 权限门和 canary 都不等价于生产级 exploit runner 或 OS sandbox。
+- `mvn test` 通过，包含语义、契约、子进程边界、恶意工件边界和报告回归；`mvn package -DskipTests` 成功；
+- 代表性回归工件和外部语义评测器均完成扫描；评测器逐项保留 TP/FP、跳过、超时、依赖缺失和平台能力原因，不把不可用环境折算为通过或失败；
+- 安全动态结果统一使用 `SINK_BLOCKED/SAFE_EFFECT_OBSERVED/CONCRETE_REACHED/PARTIAL/TIMEOUT` 等状态。边界或 inert adapter 证据不代表真实 RCE，静态候选数也不等同于动态确认；
+- 报告保留 `scan-metadata`、findings、链/边/sink/calibration evidence、对象图计划和动态验证结果；完整性触顶、依赖缺失、字段未链接和 JDK 模块限制均保持为结构化降级状态；
+- 静态性能门按固定输入的历史基线 `×1.5` 验收；动态子进程成本单独报告，不能用关闭验证掩盖静态分析回退；
+- `ObjectGraphPlan`、JVM policy、Job Object、bubblewrap 骨架、canary 和 safe-exec 不等价于生产级 exploit runner 或完整 OS sandbox；各平台的系统能力仍需在对应隔离 runner 中复验；
+- 真实危险 sink、命令、网络、任意文件写、native 和可投递 payload 均不执行；`SAFE_EFFECT_OBSERVED` 始终带 `sink_distorted=true`。
 
 动态验证的设计参考 [JDD](https://zxlfd.github.io/papers/jdd.pdf) 的 bottom-up gadget search 与 dataflow-aided object construction 思路，并参考 [FLASH（USENIX Security 2025）](https://www.usenix.org/system/files/usenixsecurity25-zhang-yiheng.pdf) 对反序列化引导调用图和按需可控性分析的讨论。Just 只借鉴其“真实前置链 + 按需可控性”原则，不执行最终危险能力，也不把论文中的完整 exploit 生成器带入默认 CLI。
 
-这些限制必须进入报告和版本说明，不能通过增加参数、降低扫描深度、删除动态验证或 benchmark 特判来掩盖。
+这些限制必须进入报告和版本说明，不能通过增加参数、降低扫描深度、删除动态验证或测试样本特判来掩盖。

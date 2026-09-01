@@ -116,6 +116,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         }
 
         int confirmed = 0;
+        int safeEffects = 0;
         int executed = 0;
         int partial = 0;
         int failed = 0;
@@ -130,6 +131,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                 Path targetJar = bb.scanInputs().target();
                 verifier = new ParallelVerifier(targetJar, bb.scanInputs().deps(),
                     bb.scanInputs().jdkHome(), bb.scanInputs().targetMajorVersion(),
+                    bb.scanInputs().safeExec(),
                     (chain, detail, sinkReached) -> {
                         if (sinkReached) {
                             JustLogger.info("  ✓ SINK_BLOCKED: {}#{} → {}.{}  [{}]",
@@ -162,6 +164,13 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                         case SINK_BLOCKED -> {
                             bb.chainNote(chain.key(), "verify:sink-blocked");
                             confirmed++;
+                        }
+                        // Safe-exec still reaches the same canary boundary, but the observed
+                        // effect belongs to Just's inert/mock adapter and must remain visibly
+                        // distorted rather than being described as target sink execution.
+                        case SAFE_EFFECT_OBSERVED -> {
+                            bb.chainNote(chain.key(), "verify:safe-effect-observed");
+                            safeEffects++;
                         }
                         // 真实触发前缀完成但未到达精确 sink 边界：保留为低于 sink 的正向证据。
                         case CONCRETE_REACHED -> {
@@ -215,29 +224,49 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
             bb.setVerificationStatus(verifier.capability());
         }
 
-        JustLogger.info("动态验证：构造可行 {} / 不可构造 {} | 子进程 SINK_BLOCKED {} / CONCRETE_REACHED/EXECUTED {} / "
-                        + "PARTIAL {} / FAILED {} / TIMEOUT {} / UNTESTABLE {}",
-                constructible, rejected, confirmed, executed, partial, failed, timeout, untestable);
+        JustLogger.info("动态验证：构造可行 {} / 不可构造 {} | 子进程 SINK_BLOCKED {} / SAFE_EFFECT_OBSERVED {} / "
+                        + "CONCRETE_REACHED/EXECUTED {} / PARTIAL {} / FAILED {} / TIMEOUT {} / UNTESTABLE {}",
+                constructible, rejected, confirmed, safeEffects, executed, partial, failed, timeout, untestable);
         if (!verificationDetails.isEmpty()) {
             JustLogger.info("动态验证明细：{}", verificationDetails.entrySet().stream()
                     .map(entry -> entry.getKey() + "×" + entry.getValue())
                     .reduce((left, right) -> left + ", " + right).orElse(""));
         }
-        bb.setVerificationSummary(summary(bb, selectedChains, verificationResults,
+        bb.setVerificationSummary(summary(bb, verifier, selectedChains, verificationResults,
                 constructible, rejected, budget, verificationDetails));
     }
 
-    private static VerificationSummary summary(Blackboard bb, List<Chain> selected,
+    private static VerificationSummary summary(Blackboard bb, ParallelVerifier verifier,
+                                               List<Chain> selected,
                                                List<ParallelVerifier.VerifyResult> results,
                                                int constructible, int rejected, int budget,
                                                java.util.Map<String, Integer> detailCounts) {
         java.util.Map<String, Integer> statuses = new java.util.TreeMap<>();
         List<VerificationSummary.ChainResult> items = new ArrayList<>();
+        String backend = verifier == null ? "UNKNOWN" : verifier.backendId();
+        String jdk = "UNKNOWN";
+        String policyDigest = verifier == null ? "UNKNOWN" : verifier.policyDigest();
+        String artifactHash = verifier == null ? "UNKNOWN" : verifier.artifactFingerprintForReport();
+        boolean sinkDistorted = false;
+        boolean sandboxReady = false;
+        String cleanup = "UNKNOWN";
         for (int i = 0; i < results.size(); i++) {
             ParallelVerifier.VerifyResult result = results.get(i);
             if (result == null) {
                 continue;
             }
+            if ("UNKNOWN".equals(jdk)) {
+                jdk = result.jdk();
+            }
+            if (!"UNKNOWN".equals(result.backend())) {
+                backend = result.backend();
+            }
+            if (!"UNKNOWN".equals(result.policyDigest())) {
+                policyDigest = result.policyDigest();
+            }
+            sinkDistorted |= result.sinkDistorted();
+            sandboxReady |= result.sandboxReady();
+            cleanup = result.cleanup();
             statuses.merge(result.status(), 1, Integer::sum);
             Chain chain = i < selected.size() ? selected.get(i) : null;
             if (chain == null) {
@@ -247,10 +276,13 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
             int score = ConfidenceScorer.evidenceScore(chain, notes);
             items.add(new VerificationSummary.ChainResult(i + 1, chain.key(), result.status(),
                     result.detail(), ConfidenceScorer.score(chain, notes), score,
-                    result.attempt(), result.durationMs(), result.evidence()));
+                    result.attempt(), result.durationMs(), result.evidence(), result.backend(),
+                    result.jdk(), result.policyDigest(), result.sinkDistorted(),
+                    result.sandboxReady(), result.cleanup()));
         }
         return new VerificationSummary(bb.verificationStatus(), budget, constructible, rejected,
-                selected.size(), statuses, detailCounts, items);
+                selected.size(), statuses, detailCounts, items, backend, jdk, policyDigest,
+                sinkDistorted, sandboxReady, cleanup, artifactHash);
     }
 
     /** 将子进程诊断压缩成稳定、有限长度的聚合键，避免日志被单条异常或类名刷屏。 */

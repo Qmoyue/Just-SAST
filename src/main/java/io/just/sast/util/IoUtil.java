@@ -8,21 +8,46 @@ import java.io.InputStream;
 public final class IoUtil {
 
     /** 单条目读取上限（64MB）：防 zip 炸弹单条目 OOM。 */
-    private static final int MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+    private static final long MAX_ENTRY_BYTES = ArchiveLimits.MAX_ENTRY_UNCOMPRESSED_BYTES;
 
     private IoUtil() {}
 
     public static byte[] readAll(InputStream in) throws IOException {
+        return readAll(in, MAX_ENTRY_BYTES);
+    }
+
+    /** Read one stream with an explicit byte budget. */
+    public static byte[] readAll(InputStream in, long limit) throws IOException {
+        if (in == null || limit < 0) {
+            throw new IllegalArgumentException("input and non-negative limit are required");
+        }
         ByteArrayOutputStream out = new ByteArrayOutputStream(4096);
         byte[] buffer = new byte[8192];
-        int total = 0;
-        int n;
-        while ((n = in.read(buffer)) >= 0) {
-            total += n;
-            if (total > MAX_ENTRY_BYTES) {
-                throw new IOException("条目超过单条目上限 " + MAX_ENTRY_BYTES + " 字节");
+        long total = 0;
+        while (true) {
+            int n = in.read(buffer);
+            if (n < 0) {
+                break;
+            }
+            if (n == 0) {
+                // InputStream is allowed to make a zero-byte progress report. Fall back to
+                // one byte so a hostile/custom stream cannot spin this bounded reader forever.
+                int one = in.read();
+                if (one < 0) {
+                    break;
+                }
+                if (total >= limit) {
+                    throw new IOException("条目超过单条目上限 " + limit + " 字节");
+                }
+                out.write(one);
+                total++;
+                continue;
+            }
+            if (n > limit - total) {
+                throw new IOException("条目超过单条目上限 " + limit + " 字节");
             }
             out.write(buffer, 0, n);
+            total += n;
         }
         return out.toByteArray();
     }

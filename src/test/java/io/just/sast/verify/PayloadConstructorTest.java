@@ -39,4 +39,11 @@ class PayloadConstructorTest {
         PayloadConstructor.ConstructionResult result = constructor.tryConstruct(missing);
         assertEquals("SKIP", result.verdict(), result.detail());
     }
+
+    @Test
+    void invalidEntryClassIsAScopedCapabilitySkip() {
+        PayloadConstructor constructor = new PayloadConstructor(getClass().getClassLoader());
+        assertEquals("SKIP", constructor.tryConstruct(null).verdict());
+        assertEquals("SKIP", constructor.tryConstruct(" ").verdict());
+    }
 }

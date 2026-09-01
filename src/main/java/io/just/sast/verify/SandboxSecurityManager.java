@@ -13,6 +13,7 @@ import java.security.CodeSource;
 import java.security.Permission;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.PropertyPermission;
 
 /**
@@ -27,6 +28,7 @@ public final class SandboxSecurityManager extends SecurityManager {
 
     private final Path writableRoot;
     private final Path writableRealRoot;
+    private final boolean writableRootRealPathAvailable;
     private final List<Path> readableRoots;
     private final List<Path> readableRealRoots;
     /** Only verifier classes from this code source may request reflective escape hatches. */
@@ -50,6 +52,7 @@ public final class SandboxSecurityManager extends SecurityManager {
     SandboxSecurityManager(Path writableRoot, List<Path> readableRoots) {
         this.writableRoot = normalize(writableRoot);
         this.writableRealRoot = realPath(this.writableRoot);
+        this.writableRootRealPathAvailable = canResolveRealPath(this.writableRoot);
         this.readableRoots = readableRoots == null ? List.of()
                 : readableRoots.stream().map(SandboxSecurityManager::normalize).toList();
         this.readableRealRoots = this.readableRoots.stream().map(SandboxSecurityManager::realPath).toList();
@@ -121,9 +124,27 @@ public final class SandboxSecurityManager extends SecurityManager {
             }
             throw new SecurityException("network permission denied: " + permission.getName());
         }
-        if (permission instanceof PropertyPermission property
-                && property.getActions().contains("write")) {
-            throw new SecurityException("property write denied: " + property.getName());
+        if (permission instanceof PropertyPermission property) {
+            if (property.getActions().contains("write")) {
+                // JDK bootstrap code may materialize a bounded cache while the trusted probe
+                // initializes an optional serializer. This remains probe-only: target frames
+                // fail trustedProbeCaller/trustedSourceAdapterCaller and stay deny-by-default.
+                if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
+                        && !trustedSerializerRuntimeCaller()
+                        && !trustedDataBindingCaller()
+                        && !("*".equals(property.getName())
+                        && trustedJdkPropertyAccessCaller())) {
+                    throw new SecurityException("property write denied: " + property.getName()
+                            + " [caller=" + firstNonPlatformFrameLocation() + "]");
+                }
+            }
+            if ("just.verify.canary-token".equals(property.getName())
+                    && !trustedProbeCaller()) {
+                // The attestation is consumed by the trusted probe frame only. Exposing it
+                // to target code would let an entry method call the bootstrap gate directly
+                // and manufacture a positive boundary without reaching the instrumented sink.
+                throw new SecurityException("canary attestation read denied");
+            }
         }
         if (permission instanceof ReflectPermission || permission instanceof SerializablePermission) {
             // A target gadget can otherwise call setAccessible()/serialization escape hooks
@@ -134,7 +155,9 @@ public final class SandboxSecurityManager extends SecurityManager {
             // still active and a target frame is above the probe on the stack.
             if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
                     && !(permission instanceof ReflectPermission
-                    && trustedLambdaBootstrapCaller())) {
+                    && (trustedLambdaBootstrapCaller()
+                    || trustedSerializerRuntimeCaller()
+                    || trustedDataBindingCaller()))) {
                 throw new SecurityException("reflective/serialization privilege denied: "
                         + permission.getName());
             }
@@ -171,7 +194,9 @@ public final class SandboxSecurityManager extends SecurityManager {
                 // an active scope, is the authorization boundary; target code runs inside
                 // the same scopes and must remain denied.
                 if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
-                        && !trustedLambdaBootstrapCaller()) {
+                        && !trustedLambdaBootstrapCaller()
+                        && !trustedSerializerRuntimeCaller()
+                        && !trustedDataBindingCaller()) {
                     throw new SecurityException("runtime permission denied: " + name);
                 }
                 return;
@@ -186,6 +211,15 @@ public final class SandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkPackageAccess(String packageName) {
+        // The transformed target bytecode invokes the one-purpose canary gate from the
+        // bootstrap loader.  ClassLoader.checkPackageAccess() reports that lookup against
+        // the target frame, so requiring trustedProbeCaller() here would reject every real
+        // sink boundary before the gate can run.  This package contains only the immutable
+        // gate/error classes; the main verifier namespace remains closed to target code.
+        if (packageName != null && (packageName.equals("io.just.sast.verify.boot")
+                || packageName.startsWith("io.just.sast.verify.boot."))) {
+            return;
+        }
         if (packageName != null && (packageName.equals("io.just.sast")
                 || packageName.startsWith("io.just.sast.")) && !trustedProbeCaller()) {
             throw new SecurityException("verifier package access denied: " + packageName);
@@ -238,6 +272,20 @@ public final class SandboxSecurityManager extends SecurityManager {
             }
         }
         return null;
+    }
+
+    private String firstNonPlatformFrameLocation() {
+        for (StackTraceElement frame : new Throwable().getStackTrace()) {
+            String className = frame.getClassName();
+            if (className.equals(SandboxSecurityManager.class.getName())
+                    || className.startsWith("java.") || className.startsWith("javax.")
+                    || className.startsWith("sun.") || className.startsWith("jdk.")) {
+                continue;
+            }
+            return className + "." + frame.getMethodName();
+        }
+        Class<?> frame = firstNonPlatformFrame();
+        return frame == null ? "unknown" : frame.getName();
     }
 
     /** Entered by the probe before an OIS/OOS operation that may bootstrap accessors. */
@@ -327,6 +375,85 @@ public final class SandboxSecurityManager extends SecurityManager {
         return sawProbe;
     }
 
+    /**
+     * Kryo 4 + Objenesis can lazily define a serialization constructor during the target's
+     * own bounded deserialization call. That implementation detail is not a target class
+     * loader request when the first non-platform frame is the serializer itself. Keep this
+     * allowance limited to the known serializer stack and to this one JVM permission; file,
+     * network, native and reflection permissions remain denied for target code.
+     */
+    private boolean trustedSerializerRuntimeCaller() {
+        boolean firstNonPlatform = true;
+        boolean sawKryo = false;
+        for (Class<?> frame : getClassContext()) {
+            if (frame == SandboxSecurityManager.class || isPlatformFrame(frame)) {
+                continue;
+            }
+            String name = frame.getName();
+            if (firstNonPlatform) {
+                firstNonPlatform = false;
+                if (!isSerializerFrame(name)) {
+                    return false;
+                }
+            }
+            sawKryo |= name.startsWith("com.esotericsoftware.kryo.");
+        }
+        return !firstNonPlatform && sawKryo;
+    }
+
+    /**
+     * Jackson may lazily open its own bean metadata while the probe renders a declared
+     * POJONode/object graph.  Permit only its narrow reflective/property bootstrap, only
+     * inside the probe's serialization scope, and only when Jackson is the first application
+     * frame.  An application callback that merely invokes Jackson therefore does not inherit
+     * this allowance; its own frame remains the boundary and is denied.
+     */
+    private boolean trustedDataBindingCaller() {
+        if (SERIALIZATION_BOOTSTRAP_DEPTH.get() <= 0) {
+            return false;
+        }
+        boolean firstNonPlatform = true;
+        for (Class<?> frame : getClassContext()) {
+            if (frame == SandboxSecurityManager.class || isPlatformFrame(frame)) {
+                continue;
+            }
+            String name = frame.getName();
+            if (firstNonPlatform) {
+                firstNonPlatform = false;
+                return name.startsWith("com.fasterxml.jackson.databind.")
+                        || name.startsWith("com.fasterxml.jackson.core.");
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Java 8--11's privileged property helper requests the broad read/write permission used by
+     * {@code System.getProperties()}, even when the caller only reads a cached runtime value.
+     * Keep that compatibility window tied to an active probe-owned serialization operation and
+     * the JDK helper frame; a target direct call to {@code System.getProperties()} remains denied.
+     */
+    private boolean trustedJdkPropertyAccessCaller() {
+        if (SERIALIZATION_BOOTSTRAP_DEPTH.get() <= 0) {
+            return false;
+        }
+        for (Class<?> frame : getClassContext()) {
+            String name = frame.getName();
+            if (name.equals("sun.security.action.GetPropertyAction")
+                    || name.startsWith("sun.security.action.GetPropertyAction$")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isSerializerFrame(String name) {
+        return name.startsWith("com.esotericsoftware.kryo.")
+                || name.startsWith("org.objenesis.")
+                || name.startsWith("com.esotericsoftware.reflectasm.")
+                || name.startsWith("com.esotericsoftware.minlog.");
+    }
+
     private static boolean isPlatformFrame(Class<?> frame) {
         ClassLoader loader = frame.getClassLoader();
         return loader == null || loader == ClassLoader.getPlatformClassLoader();
@@ -406,7 +533,8 @@ public final class SandboxSecurityManager extends SecurityManager {
         }
         boolean write = actions.contains("write") || actions.contains("delete");
         if (write && !safeUnder(path, writableRoot, writableRealRoot)) {
-            throw new SecurityException("file write denied: " + path);
+            throw new SecurityException("file write denied: " + path + " root=" + writableRoot
+                    + " realRoot=" + writableRealRoot);
         }
         if (actions.contains("read") && !readable(path)) {
             throw new SecurityException("file read denied: " + path);
@@ -417,8 +545,21 @@ public final class SandboxSecurityManager extends SecurityManager {
     }
 
     private boolean readable(Path path) {
+        Path resolvedPath = resolveForRead(path);
         for (int i = 0; i < readableRoots.size(); i++) {
             if (safeUnder(path, readableRoots.get(i), readableRealRoots.get(i))) {
+                return true;
+            }
+            // Jabba and several managed JDK installers expose the selected runtime through
+            // a junction/symbolic link (for example jdk/default). The lexical root is
+            // explicitly trusted above, while the resolved root is the actual read boundary.
+            // Check that resolved root independently so normal JDK resources such as tzdb.dat
+            // do not become a false PARTIAL_PATH. This does not widen the boundary: the real
+            // root is derived from the same explicitly configured readable root and writes
+            // still use writableRoot's real-path-only check.
+            Path realRoot = readableRealRoots.get(i);
+            if (!realRoot.equals(readableRoots.get(i))
+                    && safeUnder(resolvedPath, realRoot, realRoot)) {
                 return true;
             }
             // Some managed Windows hosts deny GetFinalPathNameByHandle for a freshly
@@ -434,6 +575,22 @@ public final class SandboxSecurityManager extends SecurityManager {
         return false;
     }
 
+    /** Resolve an existing read target once before checking a symlinked readable root. */
+    private Path resolveForRead(Path path) {
+        boolean alreadyResolving = Boolean.TRUE.equals(resolvingPath.get());
+        if (alreadyResolving) {
+            return path;
+        }
+        resolvingPath.set(true);
+        try {
+            return Files.exists(path, LinkOption.NOFOLLOW_LINKS) ? path.toRealPath() : path;
+        } catch (IOException | RuntimeException ignored) {
+            return path;
+        } finally {
+            resolvingPath.remove();
+        }
+    }
+
     private boolean lexicallySafeRead(Path path, Path root) {
         if (!under(path, root)) {
             return false;
@@ -443,12 +600,12 @@ public final class SandboxSecurityManager extends SecurityManager {
         try {
             Path relative = root.relativize(path);
             Path current = root;
-            if (Files.isSymbolicLink(current)) {
+            if (isLinkOrReparsePoint(current)) {
                 return false;
             }
             for (Path component : relative) {
                 current = current.resolve(component);
-                if (Files.isSymbolicLink(current)) {
+                if (isLinkOrReparsePoint(current)) {
                     return false;
                 }
             }
@@ -499,10 +656,56 @@ public final class SandboxSecurityManager extends SecurityManager {
             Path real = existing.toRealPath();
             return under(real, realRoot);
         } catch (IOException | RuntimeException e) {
-            // 无法证明真实路径安全时拒绝，动态验证应报告不可验证而非越过边界。
-            return false;
+            // A few managed Windows file systems deny GetFinalPathNameByHandle for an
+            // explicitly-created temporary directory. If and only if resolving the trusted
+            // writable root itself failed, use a component-by-component no-link check. This
+            // preserves the deny-by-default rule for junctions/reparse points and avoids
+            // turning that host quirk into a false dynamic failure.
+            return lexicalRoot.equals(writableRoot) && !writableRootRealPathAvailable
+                    && lexicallySafePath(path, lexicalRoot);
         } finally {
             resolvingPath.remove();
+        }
+    }
+
+    private boolean lexicallySafePath(Path path, Path root) {
+        if (!under(path, root) || !Files.exists(root, LinkOption.NOFOLLOW_LINKS)
+                || isLinkOrReparsePoint(root)) {
+            return false;
+        }
+        try {
+            Path current = root;
+            Path relative = root.relativize(path);
+            for (Path component : relative) {
+                current = current.resolve(component);
+                if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                    return true;
+                }
+                if (isLinkOrReparsePoint(current)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private static boolean isLinkOrReparsePoint(Path path) {
+        if (Files.isSymbolicLink(path)) {
+            return true;
+        }
+        if (!isWindows()) {
+            return false;
+        }
+        try {
+            Object value = Files.getAttribute(path, "dos:reparsePoint", LinkOption.NOFOLLOW_LINKS);
+            return Boolean.TRUE.equals(value);
+        } catch (IOException | RuntimeException e) {
+            // The stock Windows NIO provider does not expose this DOS attribute on every
+            // supported JDK. Keep the symbolic-link result, and rely on the OS backend's
+            // handle/ACL checks for reparse-point enforcement when it is available.
+            return false;
         }
     }
 
@@ -514,7 +717,46 @@ public final class SandboxSecurityManager extends SecurityManager {
         }
     }
 
+    private static boolean canResolveRealPath(Path path) {
+        try {
+            path.toRealPath();
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
     private static boolean under(Path path, Path root) {
-        return path.equals(root) || path.startsWith(root);
+        if (path == null || root == null) {
+            return false;
+        }
+        Path normalizedPath = path.toAbsolutePath().normalize();
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        if (!isWindows()) {
+            return normalizedPath.equals(normalizedRoot)
+                    || normalizedPath.startsWith(normalizedRoot);
+        }
+        // Windows paths are case-insensitive, while Path.startsWith is provider-specific
+        // and may compare the spelling of a freshly-created TempDir literally. Keep the
+        // component boundary check explicit so "root2" cannot match "root".
+        String candidate = normalizedPath.toString();
+        String allowed = normalizedRoot.toString();
+        if (candidate.equalsIgnoreCase(allowed)) {
+            return true;
+        }
+        if (!candidate.regionMatches(true, 0, allowed, 0, allowed.length())
+                || candidate.length() <= allowed.length()) {
+            return false;
+        }
+        return isSeparator(allowed.charAt(allowed.length() - 1))
+                || isSeparator(candidate.charAt(allowed.length()));
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    private static boolean isSeparator(char value) {
+        return value == '\\' || value == '/';
     }
 }

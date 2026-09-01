@@ -39,13 +39,19 @@ public final class SinkCanaryAgent {
         if (args == null) {
             return;
         }
-        String[] parts = args.split("\\|", 4);
+        // Keep the legacy first four fields, then carry the launcher-owned attempt binding.
+        // All binding fields are generated from bounded hex/UUID values and therefore cannot
+        // collide with the protocol separator.
+        String[] parts = args.split("\\|", -1);
         if (parts.length < 4 || parts[3].isEmpty()) {
             return;
         }
         String bootJar = parts[0];
         String token = parts[3];
         int h = parts[1].indexOf('#');
+        if (h <= 0 || h == parts[1].length() - 1) {
+            return;
+        }
         Map<String, Set<String>> sinks = new HashMap<>();
         for (String spec : parts[2].split(",")) {
             int p = spec.indexOf('#');
@@ -54,11 +60,15 @@ public final class SinkCanaryAgent {
                         .add(spec.substring(p + 1));
             }
         }
+        if (sinks.isEmpty()) {
+            return;
+        }
         try {
             inst.appendToBootstrapClassLoaderSearch(new java.util.jar.JarFile(bootJar));
         } catch (Exception ignored) {
             // bootstrap 挂载失败：仅 java.base 类 sink 不可插桩，其余照常
         }
+        boolean gateReady = false;
         try {
             // The transformed java.base method resolves the gate through the bootstrap
             // loader. Configure that same class identity; using the agent/application loader
@@ -66,10 +76,24 @@ public final class SinkCanaryAgent {
             Class<?> gate = Class.forName(GATE_INTERNAL.replace('/', '.'), true, null);
             gate.getDeclaredMethod("setEntry", String.class, String.class, String.class)
                     .invoke(null, parts[1].substring(0, h), parts[1].substring(h + 1), token);
+            if (parts.length < 9) {
+                return;
+            }
+            gate.getDeclaredMethod("setProtocolBinding", String.class, String.class,
+                            String.class, String.class, String.class)
+                    .invoke(null, parts[4], parts[5], parts[6], parts[7], parts[8]);
+            gateReady = Boolean.TRUE.equals(gate.getDeclaredMethod("configured").invoke(null));
         } catch (Throwable ignored) {
             // canary 不可用时仍保留子 JVM 权限门；安全失败不能降级成任意执行。
         }
-        inst.addTransformer(new CanaryTransformer(sinks, token), true);
+        if (!gateReady) {
+            return;
+        }
+        try {
+            inst.addTransformer(new CanaryTransformer(sinks, token), true);
+        } catch (Throwable ignored) {
+            return;
+        }
         for (String name : sinks.keySet()) {
             try {
                 Class<?> c = Class.forName(name.replace('/', '.'), false,
@@ -80,6 +104,14 @@ public final class SinkCanaryAgent {
             } catch (Throwable ignored) {
                 // 重转换不支持/类不存在：该 sink 退化为被动判定
             }
+        }
+        // This property is an agent-owned readiness attestation. The child verifies it after
+        // installing its deny-by-default policy and before loading target classes; without it,
+        // a missing transformer can never be mistaken for a negative dynamic result.
+        try {
+            System.setProperty("just.verify.canary-token", token);
+        } catch (SecurityException ignored) {
+            // The child will fail closed when the attestation is absent.
         }
     }
 

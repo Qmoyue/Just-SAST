@@ -18,4 +18,17 @@ public final class ChainIds {
             return Integer.toHexString(key.hashCode());
         }
     }
+
+    /** Full content digest for compact evidence tables that must remain collision-resistant. */
+    public static String sha256(String key) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest((key == null ? "" : key).getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is mandatory in every supported JDK; keep a deterministic fallback for
+            // unusual embedded runtimes rather than making report generation fail.
+            return Integer.toHexString((key == null ? "" : key).hashCode());
+        }
+    }
 }

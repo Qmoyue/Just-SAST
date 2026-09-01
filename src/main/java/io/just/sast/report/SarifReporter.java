@@ -4,6 +4,7 @@ import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.chain.ConfidenceScorer;
 import io.just.sast.config.RuleSet;
 
@@ -43,11 +44,20 @@ public final class SarifReporter {
 
     public void write(Path outDir, List<Chain> chains,
                       Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
-        write(ReportLayout.flat(outDir), chains, calibrations, notes);
+        write(ReportLayout.flat(outDir), chains, calibrations, notes, null);
     }
 
     public void write(ReportLayout layout, List<Chain> chains,
                       Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
+        write(layout, chains, calibrations, notes, null);
+    }
+
+    public void write(ReportLayout layout, List<Chain> chains,
+                      Map<String, String> calibrations, Map<String, List<String>> notes,
+                      VerificationSummary verification) throws IOException {
+        chains = chains == null ? List.of() : chains;
+        calibrations = calibrations == null ? Map.of() : calibrations;
+        final Map<String, List<String>> stableNotes = notes == null ? Map.of() : notes;
         Files.createDirectories(layout.findings());
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
@@ -65,8 +75,12 @@ public final class SarifReporter {
         sb.append("    \"results\": [");
         List<String> results = new ArrayList<>();
         Set<String> seen = new HashSet<>();
+        Map<String, VerificationSummary.ChainResult> verificationByKey = verificationByKey(verification);
+        boolean structuredVerification = verification != null;
         List<Chain> orderedChains = new ArrayList<>(chains);
-        orderedChains.sort(Comparator.comparingInt((Chain c) -> hasConfirmedNote(notes, c) ? 0 : 1)
+        orderedChains.sort(Comparator.comparingInt((Chain c) ->
+                        hasConfirmed(verificationByKey.get(c.key()), stableNotes, c,
+                                structuredVerification) ? 0 : 1)
                 .thenComparingInt(c -> c.hops().size()).thenComparing(Chain::key));
         for (Chain chain : orderedChains) {
             if (calibrations.containsKey(chain.key())) {
@@ -76,8 +90,11 @@ public final class SarifReporter {
             if (!seen.add(resultIdentity(chain, ruleId))) {
                 continue; // 同组变体只报一次（与 findings.csv 折叠口径一致）
             }
-            List<String> chainNotes = notes.getOrDefault(chain.key(), List.of());
-            String confidence = chainNotes.stream().anyMatch(n -> n.startsWith("verify:sink-blocked"))
+            List<String> chainNotes = stableNotes.getOrDefault(chain.key(), List.of());
+            VerificationSummary.ChainResult verificationResult = verificationByKey.get(chain.key());
+            String confidence = verificationResult != null ? verificationResult.status()
+                    : structuredVerification ? "NOT_SELECTED"
+                    : chainNotes.stream().anyMatch(n -> n.startsWith("verify:sink-blocked"))
                     ? "SINK_BLOCKED"
                     : chainNotes.stream().anyMatch(n -> n.startsWith("verify:confirmed"))
                     ? "CONFIRMED" : ConfidenceScorer.score(chain, chainNotes);
@@ -87,8 +104,24 @@ public final class SarifReporter {
                     + ",\"entry_kind\":\"" + escape(chain.entryKind()) + "\""
                     + ",\"entry_descriptor\":\"" + escape(entryDescriptor(chain)) + "\""
                     + ",\"sink_descriptor\":\"" + escape(sinkDescriptor(chain)) + "\""
+                    + ",\"sink_role\":\"" + escape(chain.sinkRole()) + "\""
                     + ",\"unresolved_hops\":" + chain.unresolvedHops()
-                    + ",\"chain_length\":" + chain.hops().size();
+                    + ",\"chain_length\":" + chain.hops().size()
+                    + ",\"verification_status\":\"" + escape(confidence) + "\""
+                    + ",\"verification_evidence\":\""
+                    + escape(verificationResult == null ? "" : verificationResult.evidence()) + "\""
+                    + ",\"backend\":\""
+                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.backend()) + "\""
+                    + ",\"jdk\":\""
+                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.jdk()) + "\""
+                    + ",\"policy_digest\":\""
+                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.policyDigest()) + "\""
+                    + ",\"sink_distorted\":"
+                    + (verificationResult != null && verificationResult.sinkDistorted())
+                    + ",\"sandbox_ready\":"
+                    + (verificationResult != null && verificationResult.sandboxReady())
+                    + ",\"construction\":"
+                    + ReportEvidence.constructionJson(chain, chainNotes, verificationResult);
             if (!chainNotes.isEmpty()) {
                 props += ",\"notes\":" + jsonArray(chainNotes);
             }
@@ -110,8 +143,7 @@ public final class SarifReporter {
         sb.append("\n    ]\n");
         sb.append("  }]\n");
         sb.append("}");
-        Files.write(layout.findings().resolve("findings.sarif"),
-                sb.toString().getBytes(StandardCharsets.UTF_8));
+        AtomicFiles.writeUtf8(layout.findings().resolve("findings.sarif"), sb.toString());
     }
 
     /** 入口方法首行（ENTRY 跳携带描述符；层次/行号缺失输出空段——不造假日行号）。 */
@@ -179,11 +211,37 @@ public final class SarifReporter {
                         || n.equals("verify:segment-confirmed"));
     }
 
+    private static boolean hasConfirmed(VerificationSummary.ChainResult result,
+                                        Map<String, List<String>> notes, Chain chain,
+                                        boolean structuredVerification) {
+        if (result != null) {
+            return "SINK_BLOCKED".equals(result.status())
+                    || "SAFE_SINK_EXECUTED".equals(result.status())
+                    || "SAFE_EFFECT_OBSERVED".equals(result.status());
+        }
+        if (structuredVerification) {
+            return false;
+        }
+        return hasConfirmedNote(notes, chain);
+    }
+
+    private static Map<String, VerificationSummary.ChainResult> verificationByKey(
+            VerificationSummary verification) {
+        if (verification == null || verification.results().isEmpty()) {
+            return Map.of();
+        }
+        Map<String, VerificationSummary.ChainResult> result = new java.util.HashMap<>();
+        for (VerificationSummary.ChainResult item : verification.results()) {
+            result.putIfAbsent(item.chainKey(), item);
+        }
+        return result;
+    }
+
     private static String resultIdentity(Chain chain, String ruleId) {
         return ruleId + "|" + chain.category() + "|" + chain.entryClass() + "|" + chain.entryMethod()
                 + "|" + entryDescriptor(chain) + "|" + chain.entryKind()
                 + "|" + chain.sinkClass() + "|" + chain.sinkMethod()
-                + "|" + sinkDescriptor(chain);
+                + "|" + sinkDescriptor(chain) + "|" + chain.sinkRole();
     }
 
     private static String entryDescriptor(Chain chain) {

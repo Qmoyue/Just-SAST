@@ -13,31 +13,61 @@ import java.net.URISyntaxException;
 import java.security.ProtectionDomain;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
 
 /** Java 8-compatible sink-entry canary agent used when the target JDK is older than 17. */
 public final class LegacySinkCanaryAgent {
 
-    private static final String GATE = "io/just/sast/verify/legacy/LegacySinkCanaryGate";
-    private static final String MARKER = "io/just/sast/verify/legacy/LegacySinkReachedError";
+    private static final String GATE = "io/just/sast/verify/boot/SinkCanaryGate";
+    private static final String MARKER = "io/just/sast/verify/boot/SinkReachedError";
+    private static final AtomicInteger TRANSFORMED_CLASSES = new AtomicInteger();
+    private static final AtomicInteger INJECTED_GATES = new AtomicInteger();
+    private static final Set<String> TRANSFORMED_NAMES =
+            java.util.Collections.synchronizedSet(new LinkedHashSet<String>());
+    private static final int MAX_DIAGNOSTIC_NAMES = 12;
 
     private LegacySinkCanaryAgent() {
+    }
+
+    /** Bounded diagnostic for a positive entry return that did not hit the requested sink. */
+    static String instrumentationSummary() {
+        StringBuilder names = new StringBuilder();
+        int count = 0;
+        synchronized (TRANSFORMED_NAMES) {
+            for (String name : TRANSFORMED_NAMES) {
+                if (count++ > 0) {
+                    names.append(',');
+                }
+                names.append(name);
+            }
+        }
+        return "classes=" + TRANSFORMED_CLASSES.get() + ",gates=" + INJECTED_GATES.get()
+                + (names.length() == 0 ? "" : ",targets=" + names);
     }
 
     public static void premain(String args, Instrumentation inst) {
         if (args == null) {
             return;
         }
-        String[] parts = args.split("\\|", 4);
-        if (parts.length < 2) {
+        // Keep the legacy first four fields, then carry the launcher-owned attempt binding.
+        String[] parts = args.split("\\|", -1);
+        // Production verifier arguments are always bootJar|entry|sink|token. The previous
+        // length==3 compatibility branch treated a four-part request as if the bootstrap
+        // path were the entry spec, so every Java 8--16 child silently skipped agent setup
+        // and the probe reported CANARY_AGENT_NOT_READY after an otherwise valid sandbox
+        // handshake. Keep the parser strict for the authenticated protocol; old manual
+        // launches without a token cannot produce dynamic evidence and must fail closed.
+        if (parts.length < 4) {
             return;
         }
-        String bootJar = parts.length == 3 ? parts[0] : null;
-        String entrySpec = parts.length == 3 ? parts[1] : parts[0];
-        String sinkSpec = parts.length == 3 ? parts[2] : parts[1];
-        String token = parts.length == 4 ? parts[3] : "";
+        String bootJar = parts[0];
+        String entrySpec = parts[1];
+        String sinkSpec = parts[2];
+        String token = parts[3];
         if (token.length() == 0) {
             return;
         }
@@ -50,20 +80,35 @@ public final class LegacySinkCanaryAgent {
             return;
         }
         appendCanaryToBootstrap(inst, bootJar);
+        boolean gateReady = false;
         try {
             // The transformed JDK class resolves the gate from the bootstrap loader. Calling
             // the class through the system loader would configure a different copy and lose
             // the canary signal across the loader boundary.
             Class<?> gate = Class.forName(
-                    "io.just.sast.verify.legacy.LegacySinkCanaryGate", true, null);
+                    "io.just.sast.verify.boot.SinkCanaryGate", true, null);
             gate.getDeclaredMethod("setEntry", String.class, String.class, String.class)
                     .invoke(null, entrySpec.substring(0, entryHash),
                             entrySpec.substring(entryHash + 1), token);
+            if (parts.length < 9) {
+                return;
+            }
+            gate.getDeclaredMethod("setProtocolBinding", String.class, String.class,
+                            String.class, String.class, String.class)
+                    .invoke(null, parts[4], parts[5], parts[6], parts[7], parts[8]);
+            gateReady = Boolean.TRUE.equals(gate.getDeclaredMethod("configured").invoke(null));
         } catch (Throwable ignored) {
             // A missing gate must not turn a canary into an unbounded execution path.
             return;
         }
-        inst.addTransformer(new CanaryTransformer(sinks, token), true);
+        if (!gateReady) {
+            return;
+        }
+        try {
+            inst.addTransformer(new CanaryTransformer(sinks, token), true);
+        } catch (Throwable ignored) {
+            return;
+        }
         for (String name : sinks.keySet()) {
             try {
                 Class<?> type = Class.forName(name.replace('/', '.'), false,
@@ -74,6 +119,11 @@ public final class LegacySinkCanaryAgent {
             } catch (Throwable ignored) {
                 // Load-time transformation remains available for classes not yet loaded.
             }
+        }
+        try {
+            System.setProperty("just.verify.canary-token", token);
+        } catch (SecurityException ignored) {
+            // The child reports an untestable result when the readiness attestation is absent.
         }
     }
 
@@ -135,10 +185,11 @@ public final class LegacySinkCanaryAgent {
             }
             Set<String> entryMethods = sinks.get(className);
             final boolean[] changed = new boolean[]{false};
+            final int[] injections = new int[]{0};
             try {
                 ClassReader reader = new ClassReader(bytes);
                 ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_MAXS);
-                reader.accept(new ClassVisitor(Opcodes.ASM7, writer) {
+                reader.accept(new ClassVisitor(Opcodes.ASM9, writer) {
                     @Override
                     public MethodVisitor visitMethod(int access, String name, String desc,
                                                      String signature, String[] exceptions) {
@@ -152,7 +203,7 @@ public final class LegacySinkCanaryAgent {
                         if (!injectable && entryMethods == null && sinks.isEmpty()) {
                             return visitor;
                         }
-                        return new MethodVisitor(Opcodes.ASM7, visitor) {
+                        return new MethodVisitor(Opcodes.ASM9, visitor) {
                             @Override
                             public void visitCode() {
                                 super.visitCode();
@@ -162,6 +213,7 @@ public final class LegacySinkCanaryAgent {
                                     visitMethodInsn(Opcodes.INVOKESTATIC, GATE, "hit",
                                             "(Ljava/lang/String;Ljava/lang/String;)V", false);
                                     changed[0] = true;
+                                    injections[0]++;
                                 }
                             }
 
@@ -178,6 +230,7 @@ public final class LegacySinkCanaryAgent {
                                     visitMethodInsn(Opcodes.INVOKESTATIC, GATE, "hit",
                                             "(Ljava/lang/String;Ljava/lang/String;)V", false);
                                     changed[0] = true;
+                                    injections[0]++;
                                 }
                                 super.visitMethodInsn(opcode, owner, calledName, calledDesc,
                                         isInterface);
@@ -185,6 +238,15 @@ public final class LegacySinkCanaryAgent {
                         };
                     }
                 }, 0);
+                if (changed[0]) {
+                    TRANSFORMED_CLASSES.incrementAndGet();
+                    synchronized (TRANSFORMED_NAMES) {
+                        if (TRANSFORMED_NAMES.size() < MAX_DIAGNOSTIC_NAMES) {
+                            TRANSFORMED_NAMES.add(className);
+                        }
+                    }
+                    INJECTED_GATES.addAndGet(injections[0]);
+                }
                 return changed[0] || entryMethods != null ? writer.toByteArray() : null;
             } catch (Throwable ignored) {
                 return null;

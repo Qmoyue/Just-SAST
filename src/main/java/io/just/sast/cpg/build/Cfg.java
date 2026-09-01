@@ -34,12 +34,14 @@ public final class Cfg {
         private final int[] edgeOffsets;
         private final int[] targets;
         private final byte[] labels;
+        private final boolean valid;
         private static final CfgLabel[] LABELS = CfgLabel.values();
         private volatile List<List<CfgEdge>> legacyView;
 
         public Indexed(List<List<CfgEdge>> successors) {
             List<List<CfgEdge>> safe = successors == null ? List.of() : successors;
             this.instructionCount = safe.size();
+            this.valid = true;
             this.edgeOffsets = new int[instructionCount + 1];
             int edgeCount = 0;
             for (int i = 0; i < instructionCount; i++) {
@@ -63,11 +65,12 @@ public final class Cfg {
         }
 
         private Indexed(int instructionCount, int[] edgeOffsets,
-                        int[] targets, byte[] labels) {
+                        int[] targets, byte[] labels, boolean valid) {
             this.instructionCount = instructionCount;
             this.edgeOffsets = edgeOffsets;
             this.targets = targets;
             this.labels = labels;
+            this.valid = valid;
         }
 
         public int instructionCount() {
@@ -76,6 +79,11 @@ public final class Cfg {
 
         public int edgeCount() {
             return targets.length;
+        }
+
+        /** Whether the table was built from a structurally valid instruction layout. */
+        public boolean valid() {
+            return valid;
         }
 
         public int edgeStart(int offset) {
@@ -128,7 +136,18 @@ public final class Cfg {
     }
 
     public static Map<Integer, List<CfgEdge>> compute(MethodInfo method) {
-        Mutable mutable = buildMutable(method);
+        if (!validInstructionLayout(method)) {
+            return Map.of();
+        }
+        Mutable mutable;
+        try {
+            mutable = buildMutable(method);
+        } catch (RuntimeException malformed) {
+            // The frontend normally rejects malformed operands. Keep this public compatibility
+            // view total for extension callers that construct MethodInfo directly; the indexed
+            // path below exposes the invalid bit so the abstract interpreter marks incomplete.
+            return Map.of();
+        }
         Map<Integer, List<CfgEdge>> result = new HashMap<>();
         for (int offset = 0; offset < mutable.edges.size(); offset++) {
             List<CfgEdge> edges = mutable.edges.get(offset);
@@ -149,40 +168,78 @@ public final class Cfg {
          * two passes instead. The order is deliberately normal edges first and
          * exception edges second, matching buildMutable().
          */
+        if (!validInstructionLayout(method)) {
+            int count = method == null || method.instructions() == null
+                    ? 0 : method.instructions().size();
+            return invalid(count);
+        }
         List<InsnFact> insns = method.instructions();
         int instructionCount = insns.size();
-        int last = instructionCount - 1;
-        int[] edgeCounts = new int[instructionCount];
-        for (InsnFact insn : insns) {
-            int offset = insn.offset();
-            edgeCounts[offset] += normalEdgeCount(insn, offset, last);
-        }
-        for (TryCatchFact tc : method.tryCatch()) {
-            for (int offset = tc.start(); offset < tc.end() && offset < instructionCount; offset++) {
-                if (tc.handler() < instructionCount && insns.get(offset).op().mayThrow()) {
-                    edgeCounts[offset]++;
+        try {
+            int last = instructionCount - 1;
+            int[] edgeCounts = new int[instructionCount];
+            for (InsnFact insn : insns) {
+                int offset = insn.offset();
+                edgeCounts[offset] += normalEdgeCount(insn, offset, last);
+            }
+            List<TryCatchFact> tryCatch = method.tryCatch() == null
+                    ? List.of() : method.tryCatch();
+            for (TryCatchFact tc : tryCatch) {
+                if (tc == null) {
+                    return invalid(instructionCount);
+                }
+                for (int offset = Math.max(0, tc.start());
+                     offset < tc.end() && offset < instructionCount; offset++) {
+                    if (tc.handler() >= 0 && tc.handler() < instructionCount
+                            && insns.get(offset).op().mayThrow()) {
+                        edgeCounts[offset]++;
+                    }
                 }
             }
-        }
 
-        int[] edgeOffsets = new int[instructionCount + 1];
-        for (int i = 0; i < instructionCount; i++) {
-            edgeOffsets[i + 1] = edgeOffsets[i] + edgeCounts[i];
-        }
-        int[] targets = new int[edgeOffsets[instructionCount]];
-        byte[] labels = new byte[targets.length];
-        int[] cursor = java.util.Arrays.copyOf(edgeOffsets, instructionCount);
-        for (InsnFact insn : insns) {
-            appendNormalEdges(insn, insn.offset(), last, cursor, targets, labels);
-        }
-        for (TryCatchFact tc : method.tryCatch()) {
-            for (int offset = tc.start(); offset < tc.end() && offset < instructionCount; offset++) {
-                if (tc.handler() < instructionCount && insns.get(offset).op().mayThrow()) {
-                    appendEdge(offset, tc.handler(), CfgLabel.EXCEPTION, cursor, targets, labels);
+            int[] edgeOffsets = new int[instructionCount + 1];
+            for (int i = 0; i < instructionCount; i++) {
+                edgeOffsets[i + 1] = edgeOffsets[i] + edgeCounts[i];
+            }
+            int[] targets = new int[edgeOffsets[instructionCount]];
+            byte[] labels = new byte[targets.length];
+            int[] cursor = java.util.Arrays.copyOf(edgeOffsets, instructionCount);
+            for (InsnFact insn : insns) {
+                appendNormalEdges(insn, insn.offset(), last, cursor, targets, labels);
+            }
+            for (TryCatchFact tc : tryCatch) {
+                for (int offset = Math.max(0, tc.start());
+                     offset < tc.end() && offset < instructionCount; offset++) {
+                    if (tc.handler() >= 0 && tc.handler() < instructionCount
+                            && insns.get(offset).op().mayThrow()) {
+                        appendEdge(offset, tc.handler(), CfgLabel.EXCEPTION, cursor, targets, labels);
+                    }
                 }
             }
+            return new Indexed(instructionCount, edgeOffsets, targets, labels, true);
+        } catch (RuntimeException malformed) {
+            return invalid(instructionCount);
         }
-        return new Indexed(instructionCount, edgeOffsets, targets, labels);
+    }
+
+    private static Indexed invalid(int instructionCount) {
+        int count = Math.max(0, instructionCount);
+        return new Indexed(count, new int[count + 1], new int[0], new byte[0], false);
+    }
+
+    private static boolean validInstructionLayout(MethodInfo method) {
+        if (method == null || method.instructions() == null) {
+            return false;
+        }
+        List<InsnFact> insns = method.instructions();
+        for (int i = 0; i < insns.size(); i++) {
+            InsnFact insn = insns.get(i);
+            if (insn == null || insn.op() == null || insn.offset() != i
+                    || insn.operands() == null) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static int normalEdgeCount(InsnFact insn, int offset, int last) {
@@ -281,9 +338,13 @@ public final class Cfg {
         }
         // 异常边：只把可能抛出异常的指令连到 handler。未知指令仍保守保留，
         // 已知不会抛异常的常量/局部/纯算术指令不再制造无意义的 handler 合流。
-        for (TryCatchFact tc : method.tryCatch()) {
+        List<TryCatchFact> tryCatch = method.tryCatch() == null ? List.of() : method.tryCatch();
+        for (TryCatchFact tc : tryCatch) {
+            if (tc == null) {
+                continue;
+            }
             for (int offset = tc.start(); offset < tc.end() && offset < insns.size(); offset++) {
-                if (tc.handler() >= insns.size()) {
+                if (tc.handler() < 0 || tc.handler() >= insns.size()) {
                     continue;
                 }
                 if (insns.get(offset).op().mayThrow()) {

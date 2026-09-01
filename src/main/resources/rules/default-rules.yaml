@@ -23,6 +23,7 @@ rules:
     match:
       call: { owner: "java/lang/Class", name: "forName" }
     tainted: [{arg: 0}]
+    role: capability
 
   - id: JUST-SINK-CLASSLOAD-NEWINSTANCE
     kind: sink
@@ -55,6 +56,7 @@ rules:
     match:
       call: { owner: "java/lang/reflect/Method", name: "invoke" }
     tainted: [{arg: 0}, {arg: 1}]
+    role: capability
 
   - id: JUST-SINK-REFLECTIVE-NEWINSTANCE
     kind: sink
@@ -63,6 +65,7 @@ rules:
     match:
       call: { owner: "java/lang/reflect/Constructor", name: "newInstance" }
     tainted: [{arg: 0}]
+    role: capability
 
   - id: JUST-SINK-CLASSLOADER-DEFINECLASS
     kind: sink
@@ -143,6 +146,7 @@ rules:
     match:
       call: { owner: "javax/management/MBeanServer", name: "invoke" }
     tainted: [{arg: 1}, {arg: 2}]
+    role: capability
 
   - id: JUST-SINK-METHODHANDLE-INVOKE
     kind: sink
@@ -151,6 +155,7 @@ rules:
     match:
       call: { owner: "java/lang/invoke/MethodHandle", name: ~"invoke.*" }
     tainted: [{receiver: true}]
+    role: capability
 
   - id: JUST-SINK-SPEL-GETVALUE
     kind: sink
@@ -342,6 +347,30 @@ rules:
     bridge: deserialize
     match:
       call: { owner: "com/alibaba/fastjson2/JSON", name: ~"parseObject|parse|parseArray" }
+
+  # 二次反序列化桥：工具方法从攻击者控制的 byte[] 恢复新的对象图。
+  # 这些规则与对应 sink 并存：source 描述返回对象的污点边界，sink 描述该
+  # 调用本身仍是一个需要审计的反序列化操作；二者不能互相替代。
+  - id: JUST-SOURCE-HUTOOL-OBJECTUTIL
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "cn/hutool/core/util/ObjectUtil", name: deserialize, descriptor: "([B[Ljava/lang/Class;)Ljava/lang/Object;" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SOURCE-HUTOOL-SERIALIZEUTIL
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "cn/hutool/core/util/SerializeUtil", name: deserialize, descriptor: "([B[Ljava/lang/Class;)Ljava/lang/Object;" }
+    tainted: [{arg: 0}]
+
+  - id: JUST-SOURCE-SPRING-SERIALIZATIONUTILS
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "org/springframework/util/SerializationUtils", name: deserialize, descriptor: "([B)Ljava/lang/Object;" }
+    tainted: [{arg: 0}]
 
   - id: JUST-SERIALIZE-JACKSON-MAPPER
     kind: source
@@ -537,6 +566,27 @@ rules:
     actions: { return: [this] }
   # 污染集合的 toString 结果可控（触发 hashCode/toString gadget 的关键桥接）
 
+  # Hutool 的通用转换入口把第二个参数转换成声明类型；这是二次反序列化
+  # 管线中 byte[] 从 MapProxy 进入 BeanConverter 的必要数据摘要。规则只描述
+  # 稳定 API 的数据流，不绑定任何 benchmark 或具体调用者。
+  - id: JUST-MODEL-HUTOOL-CONVERT
+    kind: model
+    match:
+      call: { owner: "cn/hutool/core/convert/Convert", name: "convert" }
+    actions: { return: [arg1] }
+
+  - id: JUST-MODEL-HUTOOL-CONVERTER-REGISTRY
+    kind: model
+    match:
+      call: { owner: "cn/hutool/core/convert/ConverterRegistry", name: "convert" }
+    actions: { return: [arg1] }
+
+  - id: JUST-MODEL-HUTOOL-ABSTRACT-CONVERTER
+    kind: model
+    match:
+      call: { owner: "cn/hutool/core/convert/AbstractConverter", name: "convert" }
+    actions: { return: [arg0] }
+
   # ---- 以下 sink 从 GadgetHunter 165 CVE 提炼清单补充（比前版多 9 sources / 15 sinks）----
   - id: JUST-SINK-SCRIPT-ENGINE-FACTORY
     kind: sink
@@ -593,6 +643,7 @@ rules:
     match:
       call: { owner: "java/lang/reflect/Proxy", name: "newProxyInstance" }
     tainted: [{arg: 2}]
+    role: capability
 
   - id: JUST-SINK-CLASS-WRITE
     kind: sink
@@ -814,6 +865,42 @@ rules:
       - { class: "org/apache/commons/collections/functors/ChainedTransformer", method: "transform" }
     sinkOwner: "org/apache/commons/collections/Transformer"
     sinkName: "transform"
+
+  # Declarative object-shape evidence for the Spring AOP / Jackson node variant commonly
+  # used with a JDK 17 RMI return path.  The plan describes only allocations, field slots and
+  # an inert JDK proxy; the verifier never serializes attacker-supplied bytes or executes the
+  # TemplatesImpl body.  Keeping this in rule data lets other applications reuse the same
+  # fragment without a class/package/benchmark branch in production code.
+  - id: FRAG-JDK-EVENTLISTENER-SPRING-TEMPLATES
+    kind: chain-fragment
+    entryClass: "javax/swing/event/EventListenerList"
+    entryKind: toString
+    hops:
+      - { class: "javax/swing/undo/UndoManager", method: "toString" }
+      - { class: "java/util/Vector", method: "toString" }
+      - { class: "com/fasterxml/jackson/databind/node/POJONode", method: "toString" }
+      - { class: "org/springframework/aop/framework/JdkDynamicAopProxy", method: "invoke" }
+      - { class: "javax/xml/transform/Templates", method: "getOutputProperties" }
+    sinkOwner: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"
+    sinkName: "newTransformer"
+    construction:
+      nodes:
+        - { id: entry, type: "javax/swing/event/EventListenerList", kind: allocate }
+        - { id: undo, type: "javax/swing/undo/UndoManager", kind: allocate }
+        - { id: edits, type: "java/util/Vector", kind: allocate }
+        - { id: node, type: "com/fasterxml/jackson/databind/node/POJONode", kind: allocate }
+        - { id: templates, type: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl", kind: allocate }
+        # The target framework handler is intentionally replaced by a probe-owned, inert
+        # interface/target adapter. The static path still records JdkDynamicAopProxy.invoke;
+        # dynamic evidence is explicitly sink-distorted and never claims framework execution.
+        - { id: proxy, type: "javax/xml/transform/Templates", kind: reflective_proxy, args: [{ ref: templates }, { string: "getOutputProperties" }] }
+      fields:
+        - { owner: entry, field: listenerList, values: [{ class: "java/lang/Class" }, { ref: undo }] }
+        - { owner: undo, field: edits, values: [{ ref: edits }] }
+        - { owner: edits, field: elementData, values: [{ ref: node }] }
+        - { owner: edits, field: elementCount, values: [{ int: 1 }] }
+        - { owner: node, field: _value, values: [{ ref: proxy }] }
+        - { owner: templates, field: _name, values: [{ string: "just-safe-template" }] }
 
   # ---- XXE / 任意文件读 / native 加载 / ProcessImpl / SSRF / 表达式解析 ----
 

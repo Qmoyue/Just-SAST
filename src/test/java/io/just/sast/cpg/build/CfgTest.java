@@ -105,4 +105,14 @@ class CfgTest {
         assertTrue(indexed.successorsAt(0).stream().anyMatch(e -> e.label() == CfgLabel.EXCEPTION));
         assertTrue(indexed.successorsAt(1).stream().anyMatch(e -> e.label() == CfgLabel.EXCEPTION));
     }
+
+    @Test
+    void malformedInstructionLayoutFailsClosedAndIsObservable() {
+        MethodInfo malformed = method(insn(3, Op.NOP));
+        assertTrue(Cfg.compute(malformed).isEmpty());
+        Cfg.Indexed indexed = Cfg.computeIndexed(malformed);
+        assertFalse(indexed.valid());
+        assertEquals(1, indexed.instructionCount());
+        assertEquals(List.of(), indexed.successorsAt(0));
+    }
 }
