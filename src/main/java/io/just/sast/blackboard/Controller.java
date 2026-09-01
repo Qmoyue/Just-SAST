@@ -47,7 +47,8 @@ public final class Controller {
         try {
             // priority 升序（稳定）：同阶段执行序显式化。
             List<KnowledgeSource> ordered = new ArrayList<>(sources);
-            ordered.sort(Comparator.comparingInt(KnowledgeSource::priority));
+            ordered.sort(Comparator.comparingInt(KnowledgeSource::priority)
+                    .thenComparing(source -> source.id() == null ? "" : source.id()));
             Map<Phase, Map<EventType, List<KnowledgeSource>>> subsByPhase =
                     new EnumMap<>(Phase.class);
             Set<KnowledgeSource> initialized = java.util.Collections.newSetFromMap(
@@ -76,8 +77,10 @@ public final class Controller {
             }
 
             int dispatched = 0;
+            long analysisStarted = System.nanoTime();
             DispatchResult analysis = dispatchParallel(
                     subsByPhase.getOrDefault(Phase.ANALYSIS, Map.of()), initialized);
+            blackboard.recordPhaseMs("blackboard.analysis", elapsedMs(analysisStarted));
             dispatched += analysis.dispatched();
             if (!analysis.completed()) {
                 return;
@@ -86,8 +89,10 @@ public final class Controller {
             // COMPOSITION / CALIBRATION 串行（priority 序，跨源数据依赖）。
             blackboard.sortChainsForPhase();
             blackboard.publish(Event.of(EventType.SCAN_ANALYZED, -1, null));
+            long compositionStarted = System.nanoTime();
             DispatchResult composition = drain(
                     subsByPhase.getOrDefault(Phase.COMPOSITION, Map.of()), phaseExecutor);
+            blackboard.recordPhaseMs("blackboard.composition", elapsedMs(compositionStarted));
             dispatched += composition.dispatched();
             if (!composition.completed()) {
                 return;
@@ -95,8 +100,10 @@ public final class Controller {
 
             blackboard.sortChainsForPhase();
             blackboard.publish(Event.of(EventType.SCAN_COMPLETE, -1, null));
+            long calibrationStarted = System.nanoTime();
             DispatchResult calibration = drain(
                     subsByPhase.getOrDefault(Phase.CALIBRATION, Map.of()), phaseExecutor);
+            blackboard.recordPhaseMs("blackboard.calibration", elapsedMs(calibrationStarted));
             dispatched += calibration.dispatched();
             if (!calibration.completed()) {
                 return;
@@ -232,6 +239,10 @@ public final class Controller {
 
     private long deadlineNanos() {
         return System.nanoTime() + TimeUnit.SECONDS.toNanos(PHASE_TIMEOUT_SECONDS);
+    }
+
+    private static long elapsedMs(long started) {
+        return Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
     }
 
     private static long remainingNanos(long deadline) throws TimeoutException {

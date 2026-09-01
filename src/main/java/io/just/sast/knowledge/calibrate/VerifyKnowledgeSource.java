@@ -56,8 +56,6 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
     @Override
     public void init(Blackboard blackboard) {
         this.bb = blackboard;
-        this.payloadLoader = targetClassLoader(blackboard);
-        this.constructor = new PayloadConstructor(payloadLoader);
     }
 
     @Override
@@ -65,22 +63,53 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         if (event.type() != EventType.SCAN_COMPLETE) {
             return;
         }
+        long verificationStarted = System.nanoTime();
         if (!bb.scanInputs().verify()) {
             bb.setVerificationStatus("DISABLED");
             bb.setVerificationSummary(VerificationSummary.empty(
                     "DISABLED", bb.scanInputs().verifyBudget()));
+            bb.recordPhaseMs("verify", 0L);
             JustLogger.info("动态验证已关闭（--no-verify）");
+            return;
+        }
+        int budget = bb.scanInputs().verifyBudget();
+        if (budget <= 0) {
+            bb.setVerificationStatus("NOT_RUN");
+            bb.setVerificationSummary(VerificationSummary.empty("NOT_RUN", budget));
+            bb.recordPhaseMs("verify", java.util.concurrent.TimeUnit.NANOSECONDS
+                    .toMillis(System.nanoTime() - verificationStarted));
+            return;
+        }
+        // Do not expand the target class path when the operator requested no dynamic work.
+        // For real verification, construct the loader lazily and share one immutable class
+        // cache across the bounded construction pass.
+        try {
+            this.payloadLoader = targetClassLoader(bb);
+            this.constructor = new PayloadConstructor(payloadLoader);
+        } catch (RuntimeException | LinkageError loaderFailure) {
+            bb.markIncomplete("VERIFY_CLASSPATH_EXPANSION");
+            bb.setVerificationStatus("UNTESTABLE");
+            bb.setVerificationSummary(VerificationSummary.empty("UNTESTABLE", budget));
+            JustLogger.debug("构造器 classpath 初始化失败: {}", loaderFailure.getMessage());
+            bb.recordPhaseMs("verify", java.util.concurrent.TimeUnit.NANOSECONDS
+                    .toMillis(System.nanoTime() - verificationStarted));
             return;
         }
         int constructible = 0;
         int rejected = 0;
         Set<String> constructibleKeys = new HashSet<>();
         java.util.Map<String, Integer> skipReasons = new java.util.LinkedHashMap<>();
+        java.util.Map<String, PayloadConstructor.ConstructionResult> constructionByEntry =
+                new java.util.HashMap<>();
         try {
             for (Chain chain : bb.chains()) {
                 if (bb.calibrationOf(chain.key()) != null) continue;
                 String dotted = chain.entryClass().replace('/', '.');
-                PayloadConstructor.ConstructionResult result = constructor.tryConstruct(dotted);
+                // Construction depends only on the entry type, not on the selected sink or
+                // the static hop spelling. A scan can publish many variants for one entry;
+                // deduplicate that work before the finite dynamic budget is consumed.
+                PayloadConstructor.ConstructionResult result = constructionByEntry.computeIfAbsent(
+                        dotted, constructor::tryConstruct);
                 switch (result.verdict()) {
                     case "CONSTRUCTIBLE" -> {
                         bb.chainNote(chain.key(), "verify:constructible");
@@ -126,12 +155,12 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         java.util.Map<String, Integer> verificationDetails = new java.util.LinkedHashMap<>();
         List<Chain> selectedChains = List.of();
         List<ParallelVerifier.VerifyResult> verificationResults = List.of();
-        int budget = bb.scanInputs().verifyBudget();
         try {
                 Path targetJar = bb.scanInputs().target();
                 verifier = new ParallelVerifier(targetJar, bb.scanInputs().deps(),
                     bb.scanInputs().jdkHome(), bb.scanInputs().targetMajorVersion(),
                     bb.scanInputs().safeExec(),
+                    bb.scanInputs().requireStrictIsolation(),
                     (chain, detail, sinkReached) -> {
                         if (sinkReached) {
                             JustLogger.info("  ✓ SINK_BLOCKED: {}#{} → {}.{}  [{}]",
@@ -163,6 +192,12 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                     switch (result.statusCode()) {
                         case SINK_BLOCKED -> {
                             bb.chainNote(chain.key(), "verify:sink-blocked");
+                            if (!"OS_STRICT".equals(verifier.isolationLevel())) {
+                                // The exact canary was reached, but this host does not provide
+                                // a production OS boundary. Keep the path evidence while
+                                // lowering only its safety/confidence label.
+                                bb.chainNote(chain.key(), "degrade:sink-canary-non-strict-os");
+                            }
                             confirmed++;
                         }
                         // Safe-exec still reaches the same canary boundary, but the observed
@@ -170,6 +205,9 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                         // distorted rather than being described as target sink execution.
                         case SAFE_EFFECT_OBSERVED -> {
                             bb.chainNote(chain.key(), "verify:safe-effect-observed");
+                            if (!"OS_STRICT".equals(verifier.isolationLevel())) {
+                                bb.chainNote(chain.key(), "degrade:sink-canary-non-strict-os");
+                            }
                             safeEffects++;
                         }
                         // 真实触发前缀完成但未到达精确 sink 边界：保留为低于 sink 的正向证据。
@@ -234,6 +272,8 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         }
         bb.setVerificationSummary(summary(bb, verifier, selectedChains, verificationResults,
                 constructible, rejected, budget, verificationDetails));
+        bb.recordPhaseMs("verify", java.util.concurrent.TimeUnit.NANOSECONDS
+                .toMillis(System.nanoTime() - verificationStarted));
     }
 
     private static VerificationSummary summary(Blackboard bb, ParallelVerifier verifier,
@@ -247,6 +287,9 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         String jdk = "UNKNOWN";
         String policyDigest = verifier == null ? "UNKNOWN" : verifier.policyDigest();
         String artifactHash = verifier == null ? "UNKNOWN" : verifier.artifactFingerprintForReport();
+        String isolationLevel = verifier == null ? "UNKNOWN" : verifier.isolationLevel();
+        List<String> isolationCapabilities = verifier == null
+                ? List.of() : new ArrayList<>(verifier.isolationCapabilities());
         boolean sinkDistorted = false;
         boolean sandboxReady = false;
         String cleanup = "UNKNOWN";
@@ -282,7 +325,8 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         }
         return new VerificationSummary(bb.verificationStatus(), budget, constructible, rejected,
                 selected.size(), statuses, detailCounts, items, backend, jdk, policyDigest,
-                sinkDistorted, sandboxReady, cleanup, artifactHash);
+                sinkDistorted, sandboxReady, cleanup, artifactHash,
+                isolationLevel, isolationCapabilities);
     }
 
     /** 将子进程诊断压缩成稳定、有限长度的聚合键，避免日志被单条异常或类名刷屏。 */

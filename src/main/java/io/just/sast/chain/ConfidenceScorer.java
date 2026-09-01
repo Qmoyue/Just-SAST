@@ -16,11 +16,20 @@ import java.util.List;
  * 框架对象绑定边界：ENTRY reason=framework-bean-input +2
  * 模式：每个命中的 gadget 模式 +2（notes 中 "pattern:" 前缀计数的实现侧约定）
  * 惩罚：unresolved × 2
- * 分桶（V2 四级判定，GadgetHunter schema）：
- * FEASIBLE = 证据充分无降级信号；DEGRADED(reason) = 有降级信号但非可证不可能；
- * NOT_FEASIBLE = 被校准拒绝或证据极弱
+ * 动态证据是分层的：SINK_BLOCKED +4；CONCRETE_REACHED +2；EXECUTED +1；
+ * SAFE_EFFECT_OBSERVED +1（这是失真 adapter 的效果，不能与 canary 边界同级）。
+ * 分桶：FEASIBLE 只保留静态可行或真实 canary 边界；安全 adapter、具体前缀和入口返回
+ * 都显式标记为 DEGRADED(reason)，不可验证不会被当成负向证明。
  */
 public final class ConfidenceScorer {
+
+    /** 供排序器复用的动态证据层级；数值越小越强。 */
+    public static final int DYNAMIC_SINK_BOUNDARY = 0;
+    public static final int DYNAMIC_CONCRETE_TRIGGER = 1;
+    public static final int DYNAMIC_SAFE_ADAPTER = 2;
+    public static final int DYNAMIC_ENTRY_RETURN = 3;
+    public static final int DYNAMIC_NEGATIVE_OR_UNTESTABLE = 4;
+    public static final int DYNAMIC_NOT_SELECTED = 5;
 
     /** 每命中一个 gadget 模式的证据加分（GadgetPattern 经链注释 "pattern:*" 声明）。 */
     public static final int PATTERN_BONUS = 2;
@@ -36,20 +45,32 @@ public final class ConfidenceScorer {
     private ConfidenceScorer() {}
 
     public static String score(Chain chain, List<String> notes) {
+        if (chain == null) {
+            return "UNKNOWN";
+        }
+        // An authenticated exact canary boundary is direct runtime evidence. It must not be
+        // demoted by a static unresolved-hop penalty or a probe-side construction warning;
+        // those limitations remain visible in the evidence vector and notes.
+        if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
+            return hasNote(notes, "degrade:sink-canary-non-strict-os")
+                    ? "DEGRADED(SINK_CANARY_NON_STRICT_OS)" : "FEASIBLE";
+        }
         int r = rank(chain, notes);
         List<String> degradations = notes == null ? List.of() : notes.stream()
-                .filter(n -> n.startsWith("degrade:")).toList();
+                .filter(n -> n != null && n.startsWith("degrade:")).toList();
         if (r == 2 || chain.unresolvedHops() * 2 > evidenceScore(chain, notes)) {
             return "NOT_FEASIBLE";
         }
-        // A sink canary is stronger evidence than a probe-side construction warning:
-        // the target method actually reached the modeled sink in the isolated child JVM.
-        // Keep the construction limitation in the verification summary/notes, but do not
-        // let it demote a directly confirmed path in the primary finding ranking.
-        if (notes != null && notes.stream().anyMatch(n -> "verify:sink-blocked".equals(n)
-                || "verify:confirmed".equals(n)
-                || "verify:safe-effect-observed".equals(n))) {
-            return "FEASIBLE";
+        // Safe adapter effects deliberately remain degraded because they are not target
+        // effects. Concrete and entry-return observations are weaker prefix evidence.
+        if (hasNote(notes, "verify:safe-effect-observed")) {
+            return "DEGRADED(SAFE_EFFECT_DISTORTED)";
+        }
+        if (hasNote(notes, "verify:concrete-reached")) {
+            return "DEGRADED(CONCRETE_TRIGGER_ONLY)";
+        }
+        if (hasNote(notes, "verify:executed")) {
+            return "DEGRADED(ENTRY_RETURN_ONLY)";
         }
         if (!degradations.isEmpty()) {
             return "DEGRADED(" + degradations.get(0).substring("degrade:".length()) + ")";
@@ -59,6 +80,9 @@ public final class ConfidenceScorer {
 
     /** 证据分值（越大越可信，供排序与分桶）。notes 为链级注释（pattern 加分来源）。 */
     public static int evidenceScore(Chain chain, List<String> notes) {
+        if (chain == null) {
+            return 0;
+        }
         int points = 0;
         for (ChainHop hop : chain.hops()) {
             points += switch (hop.kind()) {
@@ -75,20 +99,131 @@ public final class ConfidenceScorer {
         }
         points -= chain.unresolvedHops() * 2;
         if (notes != null) {
-            points += notes.stream().filter(n -> n.startsWith("pattern:")).count() * PATTERN_BONUS;
-            // 动态验证证据：确认 > 段归因确认 > 执行
+            points += notes.stream().filter(n -> n != null && n.startsWith("pattern:")).count()
+                    * PATTERN_BONUS;
+            // 动态验证证据：真实边界 > 具体触发前缀 > 段归因 > 安全 adapter > 入口返回。
             if (notes.stream().anyMatch(n -> n.equals("verify:sink-blocked")
-                    || n.equals("verify:confirmed")
-                    || n.equals("verify:safe-effect-observed"))) {
+                    || n.equals("verify:confirmed"))) {
                 points += SINK_BLOCKED_BONUS;
             } else if (notes.stream().anyMatch(n -> n.equals("verify:segment-confirmed"))) {
                 points += SEGMENT_CONFIRMED_BONUS;
-            } else if (notes.stream().anyMatch(n -> n.equals("verify:concrete-reached")
-                    || n.equals("verify:executed"))) {
+            } else if (notes.stream().anyMatch(n -> n.equals("verify:concrete-reached"))) {
+                points += 2;
+            } else if (notes.stream().anyMatch(n -> n.equals("verify:safe-effect-observed"))) {
                 points += 1;
             }
         }
         return points;
+    }
+
+    /** Stable dynamic order shared by selection, grouped findings and all report renderers. */
+    public static int dynamicRank(String status, List<String> notes) {
+        String value = status == null ? "" : status;
+        if (value.isBlank()) {
+            if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
+                return DYNAMIC_SINK_BOUNDARY;
+            }
+            if (hasNote(notes, "verify:concrete-reached")) {
+                return DYNAMIC_CONCRETE_TRIGGER;
+            }
+            if (hasNote(notes, "verify:safe-effect-observed")) {
+                return DYNAMIC_SAFE_ADAPTER;
+            }
+            if (hasNote(notes, "verify:executed")) {
+                return DYNAMIC_ENTRY_RETURN;
+            }
+            return DYNAMIC_NOT_SELECTED;
+        }
+        return switch (value) {
+            case "SINK_BLOCKED", "SAFE_SINK_EXECUTED" -> DYNAMIC_SINK_BOUNDARY;
+            case "CONCRETE_REACHED" -> DYNAMIC_CONCRETE_TRIGGER;
+            case "SAFE_EFFECT_OBSERVED" -> DYNAMIC_SAFE_ADAPTER;
+            case "EXECUTED" -> DYNAMIC_ENTRY_RETURN;
+            case "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE" -> DYNAMIC_NEGATIVE_OR_UNTESTABLE;
+            default -> DYNAMIC_NOT_SELECTED;
+        };
+    }
+
+    /** Compact evidence vector for callers that need an auditable reason, not just a label. */
+    public record EvidenceVector(int staticScore, int constructionScore, int runtimeScore,
+                                  int isolationScore, int completenessPenalty,
+                                  String runtimeEvidence, String confidence) {
+        /** Compatibility constructor for consumers of the pre-isolation vector shape. */
+        public EvidenceVector(int staticScore, int constructionScore, int runtimeScore,
+                              int uncertaintyPenalty, String runtimeEvidence,
+                              String confidence) {
+            this(staticScore, constructionScore, runtimeScore, 0, uncertaintyPenalty,
+                    runtimeEvidence, confidence);
+        }
+
+        public EvidenceVector {
+            staticScore = Math.max(0, staticScore);
+            constructionScore = Math.max(0, constructionScore);
+            runtimeScore = Math.max(0, runtimeScore);
+            isolationScore = Math.max(0, isolationScore);
+            completenessPenalty = Math.max(0, completenessPenalty);
+            runtimeEvidence = runtimeEvidence == null ? "NONE" : runtimeEvidence;
+            confidence = confidence == null ? "UNKNOWN" : confidence;
+        }
+
+        /** Old name retained as an alias; the penalty is the completeness dimension. */
+        public int uncertaintyPenalty() {
+            return completenessPenalty;
+        }
+
+        public int totalScore() {
+            return staticScore + constructionScore + runtimeScore + isolationScore
+                    - completenessPenalty;
+        }
+    }
+
+    public static EvidenceVector vector(Chain chain, List<String> notes) {
+        return vector(chain, notes, "NONE", false);
+    }
+
+    /** Include the authenticated OS capability separately from runtime/canary evidence. */
+    public static EvidenceVector vector(Chain chain, List<String> notes,
+                                        String isolationLevel, boolean sandboxReady) {
+        List<String> stableNotes = notes == null ? List.of() : notes;
+        int construction = stableNotes.stream().anyMatch("verify:constructible"::equals) ? 2
+                : stableNotes.stream().anyMatch("degrade:partial-construct"::equals) ? 1 : 0;
+        int unresolvedPenalty = chain == null ? 0 : chain.unresolvedHops() * 2;
+        int completenessPenalty = unresolvedPenalty + (int) stableNotes.stream()
+                .filter(note -> note != null && note.startsWith("degrade:"))
+                .count();
+        List<String> staticNotes = stableNotes.stream()
+                .filter(note -> note != null && !note.startsWith("verify:"))
+                .toList();
+        // evidenceScore historically includes the unresolved penalty and dynamic points. Add
+        // the penalty back after removing runtime notes so this vector has disjoint dimensions:
+        // static positives, construction, runtime, and uncertainty.
+        int staticScore = Math.max(0, evidenceScore(chain, staticNotes) + unresolvedPenalty);
+        String runtime = stableNotes.stream().anyMatch("verify:sink-blocked"::equals)
+                || stableNotes.stream().anyMatch("verify:confirmed"::equals)
+                ? "SINK_CANARY_BOUNDARY"
+                : stableNotes.stream().anyMatch("verify:concrete-reached"::equals)
+                ? "CONCRETE_TRIGGER"
+                : stableNotes.stream().anyMatch("verify:safe-effect-observed"::equals)
+                ? "SAFE_EFFECT_DISTORTED"
+                : stableNotes.stream().anyMatch("verify:executed"::equals)
+                ? "ENTRY_RETURN"
+                : "NONE";
+        int runtimeScore = switch (runtime) {
+            case "SINK_CANARY_BOUNDARY" -> SINK_BLOCKED_BONUS;
+            case "CONCRETE_TRIGGER" -> 2;
+            case "SAFE_EFFECT_DISTORTED" -> 1;
+            case "ENTRY_RETURN" -> 1;
+            default -> 0;
+        };
+        int isolationScore = !sandboxReady ? 0 : switch (isolationLevel == null
+                ? "" : isolationLevel) {
+            case "OS_STRICT" -> 2;
+            case "OS_NAMESPACE" -> 1;
+            default -> 0;
+        };
+        return new EvidenceVector(staticScore,
+                construction, runtimeScore, isolationScore, completenessPenalty, runtime,
+                score(chain, stableNotes));
     }
 
     /** 置信度等级（数字越小越高）。 */
@@ -143,7 +278,7 @@ public final class ConfidenceScorer {
         }
         if (notes != null) {
             for (String note : notes) {
-                if (note.startsWith("pattern:")) {
+                if (note != null && note.startsWith("pattern:")) {
                     sb.append(";pattern:").append(note.substring("pattern:".length()))
                             .append("+").append(PATTERN_BONUS);
                 }
@@ -165,8 +300,15 @@ public final class ConfidenceScorer {
     }
 
     private static boolean hasFrameworkBeanInput(Chain chain) {
+        if (chain == null) {
+            return false;
+        }
         return chain.hops().stream()
                 .anyMatch(hop -> hop.kind() == HopKind.ENTRY
                         && "framework-bean-input".equals(hop.reason()));
+    }
+
+    private static boolean hasNote(List<String> notes, String expected) {
+        return notes != null && notes.stream().anyMatch(expected::equals);
     }
 }

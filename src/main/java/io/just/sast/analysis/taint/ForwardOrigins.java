@@ -292,7 +292,7 @@ public final class ForwardOrigins {
             return Set.of();
         }
         LinkedHashSet<ValueOrigin> copy = new LinkedHashSet<>();
-        for (ValueOrigin value : values) {
+        for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
             if (value != null) {
                 copy.add(value);
             }

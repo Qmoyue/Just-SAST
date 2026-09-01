@@ -38,6 +38,7 @@ public final class LegacyChainVerifyProbe {
     private static String protocolSinkFingerprint = "";
     private static String protocolNonce = "";
     private static String protocolArtifactFingerprint = "";
+    private static String isolationPolicyDigest = "";
     private static ClassLoader applicationLoader;
     /** Bounded diagnostic only; never upgrades an entry return to sink evidence. */
     private static String sourceAdapterDetail = "";
@@ -97,8 +98,14 @@ public final class LegacyChainVerifyProbe {
         protocolSinkFingerprint = safeProperty("just.verify.sink-fingerprint", "");
         protocolNonce = safeProperty("just.verify.nonce", "");
         protocolArtifactFingerprint = safeProperty("just.verify.artifact-fingerprint", "");
+        isolationPolicyDigest = safeProperty("just.verify.isolation-policy-digest", "");
         if (!awaitIsolationReady()) {
             emit("SANDBOX_UNAVAILABLE: isolation-ready-timeout-or-missing");
+            System.exit(3);
+            return;
+        }
+        if (!strictOsAttestation()) {
+            emit("SANDBOX_UNAVAILABLE: OS_ATTESTATION_FAILED");
             System.exit(3);
             return;
         }
@@ -285,6 +292,9 @@ public final class LegacyChainVerifyProbe {
     private static void emit(String status) {
         String safeStatus = status == null ? "UNTESTABLE: null-status"
                 : status.replace('\r', ' ').replace('\n', ' ');
+        if (safeStatus.startsWith("SANDBOX_READY")) {
+            safeStatus += "|policy=" + isolationPolicyDigest;
+        }
         if (safeStatus.length() > 4096) {
             safeStatus = safeStatus.substring(0, 4096);
         }
@@ -1308,6 +1318,38 @@ public final class LegacyChainVerifyProbe {
             }
         }
         return false;
+    }
+
+    /** Strict Linux readiness must be proven from inside the namespace before target loading. */
+    private static boolean strictOsAttestation() {
+        if (!"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
+            return true;
+        }
+        if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
+                .contains("linux")) {
+            return false;
+        }
+        try {
+            String[] namespaces = {"user", "mnt", "pid", "net", "ipc", "uts"};
+            for (String namespace : namespaces) {
+                if (!Files.exists(Paths.get("/proc/self/ns", namespace))) {
+                    return false;
+                }
+            }
+            String status = new String(Files.readAllBytes(Paths.get("/proc/self/status")),
+                    "UTF-8");
+            if (!status.matches("(?s).*\\nUid:\\s+65534(?:\\s|$).*")
+                    || !status.matches("(?s).*\\nNoNewPrivs:\\s+1(?:\\s|$).*")
+                    || !status.matches("(?s).*\\nSeccomp:\\s+[12](?:\\s|$).*")) {
+                return false;
+            }
+            String controllers = new String(Files.readAllBytes(
+                    Paths.get("/sys/fs/cgroup/cgroup.controllers")), "UTF-8");
+            return controllers.contains("cpu") && controllers.contains("memory")
+                    && controllers.contains("pids");
+        } catch (IOException | RuntimeException ignored) {
+            return false;
+        }
     }
 
     private static String safeProperty(String key, String fallback) {

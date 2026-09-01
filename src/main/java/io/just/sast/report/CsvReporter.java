@@ -204,8 +204,7 @@ public final class CsvReporter {
         for (Chain c : group) {
             VerificationSummary.ChainResult result = results.get(c.key());
             if (result != null && ("SINK_BLOCKED".equals(result.status())
-                    || "SAFE_SINK_EXECUTED".equals(result.status())
-                    || "SAFE_EFFECT_OBSERVED".equals(result.status()))) {
+                    || "SAFE_SINK_EXECUTED".equals(result.status()))) {
                 return true;
             }
             List<String> notes = chainNotes.get(c.key());
@@ -396,11 +395,12 @@ public final class CsvReporter {
             return Integer.MAX_VALUE;
         }
         return switch (result.status()) {
-            case "SINK_BLOCKED", "SAFE_SINK_EXECUTED", "SAFE_EFFECT_OBSERVED" -> 0;
-            case "CONCRETE_REACHED", "EXECUTED" -> 1;
-            case "PARTIAL" -> 2;
-            case "TIMEOUT", "FAILED", "UNTESTABLE" -> 3;
-            default -> 4;
+            case "SINK_BLOCKED", "SAFE_SINK_EXECUTED" -> 0;
+            case "CONCRETE_REACHED" -> 1;
+            case "SAFE_EFFECT_OBSERVED" -> 2;
+            case "EXECUTED" -> 3;
+            case "PARTIAL", "TIMEOUT", "FAILED", "UNTESTABLE" -> 4;
+            default -> 5;
         };
     }
 

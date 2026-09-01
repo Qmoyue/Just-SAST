@@ -84,13 +84,12 @@ public final class ChainRanking {
         if (status.isBlank()) {
             status = statusFromNotes(chainNotes);
         }
-        int dynamic = switch (status) {
-            case "SINK_BLOCKED", "SAFE_EFFECT_OBSERVED", "SAFE_SINK_EXECUTED" -> 0;
-            case "CONCRETE_REACHED", "EXECUTED" -> 1;
-            case "PARTIAL" -> 2;
-            case "FAILED", "TIMEOUT", "UNTESTABLE" -> 3;
-            default -> 4;
-        };
+        int dynamic = ConfidenceScorer.dynamicRank(status, chainNotes);
+        // A terminal-looking frame without the authenticated readiness bit is not dynamic
+        // evidence. Keep the candidate visible, but place it with untestable results.
+        if (result != null && !result.sandboxReady()) {
+            dynamic = Math.max(dynamic, ConfidenceScorer.DYNAMIC_NEGATIVE_OR_UNTESTABLE);
+        }
         int sinkRole = chain.terminalSink() ? 0 : 1;
         boolean isConstructible = constructible != null && constructible.contains(chain.key())
                 || chainNotes.stream().anyMatch("verify:constructible"::equals);
@@ -111,7 +110,8 @@ public final class ChainRanking {
         };
         int incomplete = 0;
         for (String note : chainNotes) {
-            if (note.startsWith("degrade:") || note.contains("CAP") || note.contains("UNKNOWN")) {
+            if (note != null && (note.startsWith("degrade:") || note.contains("CAP")
+                    || note.contains("UNKNOWN"))) {
                 incomplete++;
             }
         }
@@ -135,13 +135,15 @@ public final class ChainRanking {
 
     private static String statusFromNotes(List<String> notes) {
         if (notes == null) return "";
-        if (notes.stream().anyMatch(n -> n.equals("verify:sink-blocked"))) return "SINK_BLOCKED";
-        if (notes.stream().anyMatch(n -> n.equals("verify:safe-effect-observed"))) {
+        if (notes.stream().anyMatch(n -> "verify:sink-blocked".equals(n))) return "SINK_BLOCKED";
+        if (notes.stream().anyMatch(n -> "verify:safe-effect-observed".equals(n))) {
             return "SAFE_EFFECT_OBSERVED";
         }
-        if (notes.stream().anyMatch(n -> n.equals("verify:concrete-reached")
-                || n.equals("verify:executed"))) return "CONCRETE_REACHED";
-        if (notes.stream().anyMatch(n -> n.startsWith("degrade:partial-path"))) return "PARTIAL";
+        if (notes.stream().anyMatch(n -> "verify:concrete-reached".equals(n)
+                || "verify:executed".equals(n))) return "CONCRETE_REACHED";
+        if (notes.stream().anyMatch(n -> n != null && n.startsWith("degrade:partial-path"))) {
+            return "PARTIAL";
+        }
         return "";
     }
 

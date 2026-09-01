@@ -59,12 +59,29 @@ public final class ScanPipeline {
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, false);
+                verifyBudget, false, false, null, null);
     }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget, boolean safeExec) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify,
+                verifyBudget, safeExec, false, null, null);
+    }
+
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec,
+                                 boolean requireStrictIsolation) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify,
+                verifyBudget, safeExec, requireStrictIsolation, null, null);
+    }
+
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec,
+                                 boolean requireStrictIsolation, Path baseline,
+                                 Path suppressions) throws Exception {
         long start = System.currentTimeMillis();
         Map<String, Long> phaseMs = new java.util.LinkedHashMap<>();
         resetHeapPeaks();
@@ -74,6 +91,9 @@ public final class ScanPipeline {
             for (Path dep : deps) {
                 validatePath(dep, "依赖", true);
             }
+        }
+        if (rules != null) {
+            validatePath(rules, "规则", false);
         }
         if (output == null) {
             throw new UsageException("输出目录不能为空");
@@ -85,12 +105,33 @@ public final class ScanPipeline {
         if (Files.exists(output) && !Files.isDirectory(output)) {
             throw new UsageException("输出路径不是目录: " + output.toAbsolutePath());
         }
+        if (baseline != null) {
+            validatePath(baseline, "baseline", true);
+            if (output.toAbsolutePath().normalize().equals(baseline.toAbsolutePath().normalize())) {
+                throw new UsageException("baseline 不能与当前输出目录相同");
+            }
+        }
+        if (suppressions != null) {
+            validatePath(suppressions, "suppression 文件", false);
+        }
         if (verifyBudget < 0) {
             throw new UsageException("--verify-budget 不能为负数");
         }
         if (safeExec && !verify) {
             throw new UsageException("--safe-exec 需要启用动态验证（不能与 --no-verify 同时使用）");
         }
+        if (requireStrictIsolation && !verify) {
+            throw new UsageException("--require-os-isolation 需要启用动态验证（不能与 --no-verify 同时使用）");
+        }
+
+        // Hash immutable inputs once at the scan boundary. Besides making report identity
+        // available to the cache layer before frontend parsing, reusing these values avoids a
+        // second full read of a large target/dependency archive during report generation.
+        List<Path> scanDeps = deps == null ? List.of() : List.copyOf(deps);
+        String targetArtifactHash = artifactHash(target);
+        List<String> dependencyHashes = io.just.sast.report.ScanCache.dependencyHashes(scanDeps);
+        String dependencyIdentity = io.just.sast.report.ScanCache
+                .dependencyIdentityFromHashes(dependencyHashes);
 
         // 规则
         RuleSet ruleSet;
@@ -158,12 +199,15 @@ public final class ScanPipeline {
         phaseMs.put("cpg", System.currentTimeMillis() - cpgStart);
 
         // 分析期（黑板串行三阶段：ANALYSIS → COMPOSITION → CALIBRATION）
-        List<Path> scanDeps = deps != null ? deps : List.of();
         long analysisStart = System.currentTimeMillis();
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
-                        verifyBudget, jdkHome, load.targetMajorVersion(), safeExec));
+                        verifyBudget, jdkHome, load.targetMajorVersion(), safeExec,
+                        requireStrictIsolation));
         new Controller(blackboard, KnowledgeSources.discover()).run();
+        for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
+            phaseMs.put(timing.getKey(), timing.getValue());
+        }
         phaseMs.put("analysis", System.currentTimeMillis() - analysisStart);
 
         // 报告期
@@ -193,6 +237,16 @@ public final class ScanPipeline {
                 blackboard.chainCalibrations(), blackboardNotes(blackboard),
                 blackboard.verificationSummary());
         phaseMs.put("report.payload", System.currentTimeMillis() - payloadReportStart);
+        long inventoryStart = System.currentTimeMillis();
+        String dependencyInventoryHash = new io.just.sast.report.DependencyInventoryWriter().write(reportLayout, target,
+                scanDeps, targetArtifactHash, load.targetMajorVersion(), dependencyHashes);
+        phaseMs.put("report.inventory", System.currentTimeMillis() - inventoryStart);
+        new io.just.sast.report.ScanIdentityWriter().write(reportLayout, targetArtifactHash,
+                dependencyIdentity, dependencyInventoryHash, rules, jdkHome,
+                load.targetMajorVersion(), fast, verify, verifyBudget, safeExec,
+                requireStrictIsolation);
+        new io.just.sast.report.BaselineSuppressionWriter().write(reportLayout, baseline,
+                suppressions, blackboard.chains(), blackboard.chainCalibrations());
         JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
 
         // sink/entry 统计从图直接产出（与引擎同一 RuleEngine 实例，access 过滤口径一致）
@@ -225,7 +279,7 @@ public final class ScanPipeline {
                 verify ? blackboard.verificationSummary()
                         : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget),
                 chainProofCompleteness(blackboard.chains(), outcomes, completenessReasons),
-                artifactHash(target));
+                targetArtifactHash);
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
         if (stats) {
@@ -388,6 +442,17 @@ public final class ScanPipeline {
                 blackboard.originSupport().forwardOriginCacheHits());
         metrics.put("forward_origin_analysis_runs",
                 blackboard.originSupport().forwardOriginAnalysisRuns());
+        io.just.sast.blackboard.VerificationSummary verification = blackboard.verificationSummary();
+        metrics.put("verification_constructible", (long) verification.constructible());
+        metrics.put("verification_rejected", (long) verification.rejected());
+        metrics.put("verification_selected", (long) verification.selected());
+        metrics.put("verification_results", (long) verification.results().size());
+        metrics.put("verification_attempts", verification.results().stream()
+                .mapToLong(io.just.sast.blackboard.VerificationSummary.ChainResult::attempt).sum());
+        metrics.put("verification_timeouts", (long) verification.statusCounts()
+                .getOrDefault("TIMEOUT", 0));
+        metrics.put("verification_untestable", (long) verification.statusCounts()
+                .getOrDefault("UNTESTABLE", 0));
         return metrics;
     }
 

@@ -20,6 +20,7 @@ import java.util.Set;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Executors;
@@ -127,6 +128,9 @@ public final class ParallelVerifier {
     private static final int FUTURE_GRACE_SECONDS = 3;
     private final SafeSinkAdapter.Mode sinkMode;
     private final String policyDigest;
+    /** Fixed-size child protocol binding; the report keeps the readable composite policy. */
+    private final String policyBindingDigest;
+    private final boolean requireStrictIsolation;
 
     private final Path targetJar;
     private final List<Path> deps;
@@ -148,6 +152,8 @@ public final class ParallelVerifier {
     private volatile String capability = "NOT_RUN";
     /** Artifact identity is computed once per verifier and bound into every child attempt. */
     private volatile String artifactFingerprint;
+    /** Runtime probing is immutable for one verifier; avoid re-reading release metadata per chain. */
+    private volatile RuntimeSelection selectedRuntime;
 
     /** Launcher-owned identities carried by the authenticated probe protocol. */
     static record ProtocolIdentity(String token, String runId, String chainFingerprint,
@@ -172,6 +178,13 @@ public final class ParallelVerifier {
     public ParallelVerifier(Path targetJar, List<Path> deps, Path targetJdkHome,
                             int targetMajorVersion, boolean safeExec,
                             ConfirmCallback callback) {
+        this(targetJar, deps, targetJdkHome, targetMajorVersion, safeExec, false, callback);
+    }
+
+    public ParallelVerifier(Path targetJar, List<Path> deps, Path targetJdkHome,
+                            int targetMajorVersion, boolean safeExec,
+                            boolean requireStrictIsolation,
+                            ConfirmCallback callback) {
         this.targetJar = targetJar.toAbsolutePath().normalize();
         this.deps = deps != null ? deps : List.of();
         this.targetJdkHome = targetJdkHome == null ? null
@@ -181,7 +194,11 @@ public final class ParallelVerifier {
         this.ownJar = locateOwnJar();
         this.isolationBackend = OsIsolation.select();
         this.sinkMode = safeExec ? SafeSinkAdapter.Mode.SAFE_EXEC : SafeSinkAdapter.Mode.BOUNDARY;
-        this.policyDigest = SafeSinkAdapter.policyDigest(this.sinkMode);
+        this.requireStrictIsolation = requireStrictIsolation;
+        this.policyDigest = SafeSinkAdapter.policyDigest(this.sinkMode)
+                + ";os=" + isolationBackend.policyDigest()
+                + ";strict=" + requireStrictIsolation;
+        this.policyBindingDigest = policyDigestOf(this.policyDigest);
     }
 
     private record RuntimeSelection(Path javaHome, Path probeJar, int feature, String reason) {
@@ -225,7 +242,20 @@ public final class ParallelVerifier {
             return List.of();
         }
         Set<String> constructible = constructibleKeys == null ? Set.of() : constructibleKeys;
-        List<Chain> sorted = new ArrayList<>(candidates);
+        // A knowledge source may publish equivalent candidates from concurrent workers.  A
+        // key-indexed snapshot removes duplicate work before the finite budget is applied;
+        // TreeMap also makes the input iteration order irrelevant.
+        Map<String, Chain> unique = new TreeMap<>();
+        for (Chain candidate : candidates) {
+            if (candidate != null) {
+                String key = candidate.key();
+                Chain previous = unique.get(key);
+                if (previous == null || equivalentCandidateOrder(candidate, previous) < 0) {
+                    unique.put(key, candidate);
+                }
+            }
+        }
+        List<Chain> sorted = new ArrayList<>(unique.values());
         sorted.sort((left, right) -> {
             int ranking = ChainRanking.compare(left, right, Map.of(), Map.of(), constructible);
             if (ranking != 0) {
@@ -264,6 +294,20 @@ public final class ParallelVerifier {
             if (selected.size() >= maxTotal) break;
         }
         return selected;
+    }
+
+    private static int equivalentCandidateOrder(Chain left, Chain right) {
+        int unresolved = Integer.compare(left.unresolvedHops(), right.unresolvedHops());
+        if (unresolved != 0) {
+            return unresolved;
+        }
+        return candidateTieKey(left).compareTo(candidateTieKey(right));
+    }
+
+    private static String candidateTieKey(Chain chain) {
+        return String.valueOf(chain.entryClass()) + "|" + String.valueOf(chain.entryMethod())
+                + "|" + String.valueOf(chain.sinkClass()) + "|" + String.valueOf(chain.sinkMethod())
+                + "|" + chain.hops().size();
     }
 
     /**
@@ -496,21 +540,23 @@ public final class ParallelVerifier {
             List<VerifyResult> first = runBatch(chains, pool, 1);
             List<Integer> retryIndexes = new ArrayList<>();
             List<Chain> retryChains = new ArrayList<>();
-            for (int i = 0; i < first.size(); i++) {
-                VerifyResult result = first.get(i);
-                if (retryable(result)) {
-                    retryIndexes.add(i);
-                    retryChains.add(chains.get(i));
+            if (Boolean.parseBoolean(System.getProperty("just.verify.retry-timeouts", "false"))) {
+                for (int i = 0; i < first.size(); i++) {
+                    VerifyResult result = first.get(i);
+                    if (retryable(result)) {
+                        retryIndexes.add(i);
+                        retryChains.add(chains.get(i));
+                    }
                 }
-            }
-            // 只重试进程/调度超时。运行时不可用、沙箱不可用、输出超限等结果是
-            // 确定性状态；重试只会把验证预算翻倍而不会增加证据。
-            List<VerifyResult> retryResults = runBatch(retryChains, pool, 2);
-            for (int i = 0; i < retryIndexes.size(); i++) {
-                int originalIndex = retryIndexes.get(i);
-                VerifyResult retry = retryResults.get(i);
-                if (retry != null && !"verification-future-timeout".equals(retry.detail())) {
-                    first.set(originalIndex, retry);
+                // Timeouts are not retried by default: retrying makes duration and results depend
+                // on scheduler pressure. Operators can opt in when diagnosing a noisy host.
+                List<VerifyResult> retryResults = runBatch(retryChains, pool, 2);
+                for (int i = 0; i < retryIndexes.size(); i++) {
+                    int originalIndex = retryIndexes.get(i);
+                    VerifyResult retry = retryResults.get(i);
+                    if (retry != null && !"verification-future-timeout".equals(retry.detail())) {
+                        first.set(originalIndex, retry);
+                    }
                 }
             }
             updateCapability(first);
@@ -547,6 +593,28 @@ public final class ParallelVerifier {
         return sinkMode.name();
     }
 
+    public String isolationLevel() {
+        return isolationBackend.level().name();
+    }
+
+    public Set<String> isolationCapabilities() {
+        java.util.TreeSet<String> sorted = new java.util.TreeSet<>(isolationBackend.capabilities());
+        return java.util.Collections.unmodifiableSet(sorted);
+    }
+
+    public boolean requireStrictIsolation() {
+        return requireStrictIsolation;
+    }
+
+    private String capabilityForReadyBackend() {
+        return switch (isolationBackend.level()) {
+            case OS_STRICT -> "OS_STRICT";
+            case OS_NAMESPACE -> "OS_NAMESPACE";
+            case PROCESS_RESOURCE -> "PROCESS_RESOURCE";
+            case NONE -> "OS_ISOLATION_UNAVAILABLE";
+        };
+    }
+
     private void updateCapability(List<VerifyResult> results) {
         if (results == null || results.isEmpty()) {
             capability = "NOT_RUN";
@@ -563,7 +631,7 @@ public final class ParallelVerifier {
                 // attached the OS backend and released the authenticated ready marker. This
                 // is stronger than the former JVM-only label and prevents FAILED/TIMEOUT from
                 // being mistaken for a successful Java SecurityManager installation.
-                capability = "OS_SANDBOX";
+                capability = capabilityForReadyBackend();
                 return;
             }
             String detail = result.detail() == null ? "" : result.detail();
@@ -578,7 +646,7 @@ public final class ParallelVerifier {
             }
         }
         if (sandboxUnavailable) {
-            capability = "OS_SANDBOX_UNAVAILABLE";
+            capability = "OS_ISOLATION_UNAVAILABLE";
         } else if (runtimeUnavailable) {
             capability = "JVM_RUNTIME_UNAVAILABLE";
         } else {
@@ -690,9 +758,10 @@ public final class ParallelVerifier {
         // installed when the child may have died before its ready marker was observed.
         boolean ready = result != null && result.sandboxReady();
         boolean distorted = ready && result.sinkDistorted();
+        String detail = result == null ? "unknown-result" : sanitizeDetail(result.detail());
         return new VerifyResult(result == null ? "" : result.chainKey(),
                 result == null ? "UNKNOWN" : result.status(),
-                result == null ? "unknown-result" : result.detail(),
+                detail,
                 result == null ? 1 : result.attempt(),
                 result == null ? 0L : result.durationMs(),
                 result == null ? "UNKNOWN" : result.evidence(),
@@ -713,8 +782,9 @@ public final class ParallelVerifier {
         if (runtime == null) {
             return "UNKNOWN";
         }
-        String home = runtime.javaHome() == null ? "" : runtime.javaHome().toString();
-        return "feature=" + runtime.feature() + ";home=" + home + ";selection=" + runtime.reason();
+        // Reports are portable identities, not host inventory.  The selected feature and
+        // reason are enough to reproduce the decision without leaking a user's JDK path.
+        return "feature=" + runtime.feature() + ";selection=" + runtime.reason();
     }
 
     private VerifyResult verifyOneInternal(Chain chain) {
@@ -733,6 +803,13 @@ public final class ParallelVerifier {
             if (!isolationBackend.available()) {
                 return new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:OS_BACKEND_REQUIRED:" + isolationBackend.reason());
+            }
+            if (requireStrictIsolation
+                    && (!isolationBackend.productionReady()
+                    || isolationBackend.level() != OsIsolation.Level.OS_STRICT)) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:STRICT_OS_REQUIRED:"
+                                + isolationBackend.level().name());
             }
             String entryDotted = chain.entryClass().replace('/', '.');
             String entryMethod = chain.entryMethod();
@@ -824,6 +901,9 @@ public final class ParallelVerifier {
             command.add("-Djust.verify.isolation-ready=" + isolationReady.toAbsolutePath());
             command.add("-Djust.verify.isolation-token=" + isolationToken);
             command.add("-Djust.verify.backend=" + isolationBackend.id());
+            command.add("-Djust.verify.isolation-level=" + isolationBackend.level().name());
+            command.add("-Djust.verify.isolation-policy-digest="
+                    + policyBindingDigest);
             command.add("-Djava.io.tmpdir=" + isoTmp);
             command.add("-Duser.dir=" + isoDir);
             command.add("-Duser.home=" + isoDir);
@@ -927,7 +1007,7 @@ public final class ParallelVerifier {
                 ProtocolEvidence timeoutProtocol = protocolEvidence(capture.text(), protocolIdentity);
                 boolean ready = protocolReady(timeoutProtocol);
                 return authenticatedResult(chain, "TIMEOUT", TIMEOUT_SECONDS + "s",
-                        "PROCESS_TIMEOUT", ready, ready);
+                        "PROCESS_TIMEOUT", false, ready);
             }
             outputReader.join(1_000L);
             String output = capture.text();
@@ -972,6 +1052,11 @@ public final class ParallelVerifier {
             if (!isolationBackend.id().equals(protocol.readyBackend())) {
                 return new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:READY_BACKEND_MISMATCH", 1, 0L,
+                        "SANDBOX_UNAVAILABLE");
+            }
+            if (!policyBindingDigest.equals(protocol.readyPolicyDigest())) {
+                return new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:READY_POLICY_MISMATCH", 1, 0L,
                         "SANDBOX_UNAVAILABLE");
             }
             boolean ready = protocolReady(protocol);
@@ -1058,13 +1143,19 @@ public final class ParallelVerifier {
     }
 
     static record ProtocolEvidence(boolean ready, boolean validOrder,
-                                   boolean bindingValid, String readyBackend, String terminal) {
+                                   boolean bindingValid, String readyBackend,
+                                   String readyPolicyDigest, String terminal) {
+        ProtocolEvidence(boolean ready, boolean validOrder, boolean bindingValid,
+                         String readyBackend, String terminal) {
+            this(ready, validOrder, bindingValid, readyBackend, "", terminal);
+        }
     }
 
     private boolean protocolReady(ProtocolEvidence evidence) {
         return evidence != null && evidence.bindingValid() && evidence.ready()
                 && evidence.validOrder()
-                && isolationBackend.id().equals(evidence.readyBackend());
+                && isolationBackend.id().equals(evidence.readyBackend())
+                && policyBindingDigest.equals(evidence.readyPolicyDigest());
     }
 
     /**
@@ -1076,6 +1167,7 @@ public final class ParallelVerifier {
         boolean ready = false;
         boolean validOrder = true;
         String readyBackend = "";
+        String readyPolicyDigest = "";
         String terminal = null;
         if (output == null) {
             return new ProtocolEvidence(false, false, true, "", null);
@@ -1090,8 +1182,9 @@ public final class ParallelVerifier {
                     validOrder = false;
                 }
                 ready = true;
-                int colon = status.indexOf(':');
-                readyBackend = colon < 0 ? "" : status.substring(colon + 1).strip();
+                ReadyPayload readyPayload = readyPayload(status);
+                readyBackend = readyPayload.backend();
+                readyPolicyDigest = readyPayload.policyDigest();
                 continue;
             }
             if (!ready) {
@@ -1101,7 +1194,8 @@ public final class ParallelVerifier {
                 terminal = status;
             }
         }
-        return new ProtocolEvidence(ready, validOrder, true, readyBackend, terminal);
+        return new ProtocolEvidence(ready, validOrder, true, readyBackend,
+                readyPolicyDigest, terminal);
     }
 
     /** Parse only the V2 channel bound to this exact chain, sink and artifact attempt. */
@@ -1110,6 +1204,7 @@ public final class ParallelVerifier {
         boolean validOrder = true;
         boolean allFramesValid = true;
         String readyBackend = "";
+        String readyPolicyDigest = "";
         String terminal = null;
         if (output == null || expected == null) {
             return new ProtocolEvidence(false, false, false, "", null);
@@ -1132,8 +1227,9 @@ public final class ParallelVerifier {
                     validOrder = false;
                 }
                 ready = true;
-                int colon = status.indexOf(':');
-                readyBackend = colon < 0 ? "" : status.substring(colon + 1).strip();
+                ReadyPayload readyPayload = readyPayload(status);
+                readyBackend = readyPayload.backend();
+                readyPolicyDigest = readyPayload.policyDigest();
                 continue;
             }
             if (!ready) {
@@ -1147,7 +1243,22 @@ public final class ParallelVerifier {
             }
         }
         boolean bindingValid = sawBoundPrefix && allFramesValid;
-        return new ProtocolEvidence(ready, validOrder, bindingValid, readyBackend, terminal);
+        return new ProtocolEvidence(ready, validOrder, bindingValid, readyBackend,
+                readyPolicyDigest, terminal);
+    }
+
+    private record ReadyPayload(String backend, String policyDigest) {
+    }
+
+    private static ReadyPayload readyPayload(String status) {
+        int colon = status == null ? -1 : status.indexOf(':');
+        String payload = colon < 0 ? "" : status.substring(colon + 1).strip();
+        int marker = payload.indexOf("|policy=");
+        if (marker < 0) {
+            return new ReadyPayload(payload, "");
+        }
+        return new ReadyPayload(payload.substring(0, marker),
+                payload.substring(marker + "|policy=".length()));
     }
 
     private record ProtocolFrame(String status) {
@@ -1180,6 +1291,29 @@ public final class ParallelVerifier {
             }
         }
         return null;
+    }
+
+    /** Keep shareable reports path-free while retaining stable capability/error categories. */
+    private String sanitizeDetail(String detail) {
+        String value = detail == null ? "" : detail;
+        List<Path> knownPaths = new ArrayList<>();
+        knownPaths.add(targetJar);
+        if (targetJdkHome != null) {
+            knownPaths.add(targetJdkHome);
+        }
+        knownPaths.add(ownJar);
+        for (Path path : knownPaths) {
+            if (path != null) {
+                value = value.replace(path.toString(), "<path>");
+            }
+        }
+        for (Path dependency : deps) {
+            if (dependency != null) {
+                value = value.replace(dependency.toAbsolutePath().normalize().toString(), "<path>");
+            }
+        }
+        return value.replaceAll("(?i)(?:[A-Z]:[\\\\/]|/)(?:[^\\s;|,\\]\\[()]+[\\\\/])*[^\\s;|,\\]\\[()]*",
+                "<path>");
     }
 
     static boolean outOfMemoryDiagnostic(String output) {
@@ -1512,6 +1646,21 @@ public final class ParallelVerifier {
     }
 
     private RuntimeSelection selectRuntime() {
+        RuntimeSelection cached = selectedRuntime;
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (this) {
+            cached = selectedRuntime;
+            if (cached == null) {
+                cached = selectRuntimeUncached();
+                selectedRuntime = cached;
+            }
+            return cached;
+        }
+    }
+
+    private RuntimeSelection selectRuntimeUncached() {
         int required = requiredFeature(targetMajorVersion);
         int currentFeature = Runtime.version().feature();
         Path currentHome = Paths.get(System.getProperty("java.home", "."))

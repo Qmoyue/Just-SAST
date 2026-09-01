@@ -1,7 +1,10 @@
 package io.just.sast.report;
 
+import io.just.sast.util.ArchiveLimits;
+
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 
 /**
@@ -27,17 +30,31 @@ public record ReportLayout(Path root, Path findings, Path verification,
         Path verification = normalized.resolve("verification");
         Path evidence = normalized.resolve("evidence");
         Path meta = normalized.resolve("meta");
-        Files.createDirectories(findings);
-        Files.createDirectories(verification);
-        Files.createDirectories(evidence);
-        Files.createDirectories(meta);
+        ensureDirectory(normalized);
+        ensureDirectory(findings);
+        ensureDirectory(verification);
+        ensureDirectory(evidence);
+        ensureDirectory(meta);
         return new ReportLayout(normalized, findings, verification, evidence, meta);
     }
 
     /** Compatibility layout for direct reporter callers and older integrations. */
     public static ReportLayout flat(Path root) throws IOException {
         Path normalized = root.toAbsolutePath().normalize();
-        Files.createDirectories(normalized);
+        ensureDirectory(normalized);
         return new ReportLayout(normalized, normalized, normalized, normalized, normalized);
+    }
+
+    private static void ensureDirectory(Path directory) throws IOException {
+        if (Files.exists(directory, LinkOption.NOFOLLOW_LINKS)
+                && (ArchiveLimits.isLinkOrReparsePoint(directory)
+                || !Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS))) {
+            throw new IOException("report directory is not a real directory: " + directory);
+        }
+        Files.createDirectories(directory);
+        if (ArchiveLimits.isLinkOrReparsePoint(directory)
+                || !Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("report directory is not a real directory: " + directory);
+        }
     }
 }

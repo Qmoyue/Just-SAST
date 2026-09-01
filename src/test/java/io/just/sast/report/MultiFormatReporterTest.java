@@ -56,6 +56,8 @@ class MultiFormatReporterTest {
         String dynamic = Files.readString(temp.resolve("dynamic-verification.json"));
         assertTrue(metadata.contains("\"dynamic_verification\""));
         assertTrue(metadata.contains("\"schema_version\":1")
+                && metadata.contains("\"isolation_level\":\"UNKNOWN\"")
+                && metadata.contains("\"isolation_capabilities\":[]")
                 && metadata.contains("\"artifact_sha256\":\"UNKNOWN\"")
                 && metadata.contains("\"heap_peak_mb\":12")
                 && metadata.contains("\"chain_proof_completeness\":\"UNKNOWN\"")

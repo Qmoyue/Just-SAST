@@ -528,8 +528,12 @@ public final class SandboxSecurityManager extends SecurityManager {
             throw new SecurityException("invalid file permission denied: " + name, e);
         }
         String actions = permission.getActions();
-        if (actions.contains("readlink")) {
-            throw new SecurityException("symbolic-link permission denied: " + path);
+        if (actions.contains("readlink")
+                && !Boolean.TRUE.equals(resolvingPath.get())) {
+            // NIO may request readlink while the manager resolves an explicitly trusted
+            // readable root. Allow only that re-entrant boundary check; a target's direct
+            // Files.readSymbolicLink call arrives with the guard clear and remains denied.
+            throw new SecurityException("symbolic-link permission denied");
         }
         boolean write = actions.contains("write") || actions.contains("delete");
         if (write && !safeUnder(path, writableRoot, writableRealRoot)) {
@@ -537,7 +541,11 @@ public final class SandboxSecurityManager extends SecurityManager {
                     + " realRoot=" + writableRealRoot);
         }
         if (actions.contains("read") && !readable(path)) {
-            throw new SecurityException("file read denied: " + path);
+            // Keep the failure useful without placing a host path in the child protocol. The
+            // parent report is path-free as well, so a stable boundary category is more useful
+            // than a path that will be redacted after the fact.
+            throw new SecurityException("file read denied ["
+                    + readableRootCategory(path) + "]");
         }
         if (actions.contains("execute") && !safeUnder(path, writableRoot, writableRealRoot)) {
             throw new SecurityException("file execute denied: " + path);
@@ -562,6 +570,14 @@ public final class SandboxSecurityManager extends SecurityManager {
                     && safeUnder(resolvedPath, realRoot, realRoot)) {
                 return true;
             }
+            // A managed JDK may expose java.home through a junction. Windows can reject the
+            // handle used by toRealPath from inside a SecurityManager even though the same
+            // process can read the runtime. Rebase the explicitly trusted root without
+            // resolving the root again, and reject every link/reparse component below it.
+            if (!realRoot.equals(readableRoots.get(i))
+                    && managedRootRead(path, readableRoots.get(i), realRoot)) {
+                return true;
+            }
             // Some managed Windows hosts deny GetFinalPathNameByHandle for a freshly
             // materialized temp tree even though the tree is the explicit classpath root.
             // A strict real-path check would then turn every nested WAR/JAR class into a
@@ -573,6 +589,84 @@ public final class SandboxSecurityManager extends SecurityManager {
             }
         }
         return false;
+    }
+
+    private boolean managedRootRead(Path path, Path lexicalRoot, Path realRoot) {
+        return "rebased".equals(managedRootReadReason(path, lexicalRoot, realRoot));
+    }
+
+    private String managedRootReadReason(Path path, Path lexicalRoot, Path realRoot) {
+        if (!under(path, lexicalRoot) || realRoot.equals(lexicalRoot)) {
+            return "not-applicable";
+        }
+        boolean alreadyResolving = Boolean.TRUE.equals(resolvingPath.get());
+        resolvingPath.set(true);
+        try {
+            Path relative = lexicalRoot.relativize(path);
+            Path current = lexicalRoot;
+            for (Path component : relative) {
+                current = current.resolve(component);
+                if (isLinkOrReparsePoint(current)) {
+                    return "link-component";
+                }
+            }
+            // realRoot was resolved before this manager was installed; keeping the rebased
+            // path below that immutable root is the same boundary check without a second OS
+            // handle lookup. The returned path is intentionally not opened here.
+            return under(realRoot.resolve(relative), realRoot) ? "rebased" : "rebase-outside";
+        } catch (RuntimeException e) {
+            return "error-" + e.getClass().getSimpleName();
+        } finally {
+            if (alreadyResolving) {
+                resolvingPath.set(true);
+            } else {
+                resolvingPath.remove();
+            }
+        }
+    }
+
+    private String readableRootCategory(Path path) {
+        for (int i = 0; i < readableRoots.size(); i++) {
+            Path lexical = readableRoots.get(i);
+            if (under(path, lexical)) {
+                boolean alreadyResolving = Boolean.TRUE.equals(resolvingPath.get());
+                resolvingPath.set(true);
+                try {
+                    Path existing = path;
+                    while (existing != null && !Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
+                        existing = existing.getParent();
+                    }
+                    if (existing == null) {
+                        return "explicit-root-" + i + "-no-existing-ancestor";
+                    }
+                    String managed = managedRootReadReason(path, lexical,
+                            readableRealRoots.get(i));
+                    Path resolved = existing.toRealPath();
+                    return "explicit-root-" + i + "-"
+                            + (under(resolved, readableRealRoots.get(i))
+                            ? "real-under" : "real-outside") + "-" + managed;
+                } catch (IOException e) {
+                    return "explicit-root-" + i + "-"
+                            + managedRootReadReason(path, lexical,
+                            readableRealRoots.get(i)) + "-io-"
+                            + e.getClass().getSimpleName();
+                } catch (RuntimeException e) {
+                    return "explicit-root-" + i + "-"
+                            + e.getClass().getSimpleName();
+                } finally {
+                    if (alreadyResolving) {
+                        resolvingPath.set(true);
+                    } else {
+                        resolvingPath.remove();
+                    }
+                }
+            }
+            Path real = readableRealRoots.get(i);
+            if (!real.equals(lexical) && under(path, real)) {
+                return "resolved-root-" + i;
+            }
+        }
+        return "outside-explicit-roots";
     }
 
     /** Resolve an existing read target once before checking a symlinked readable root. */
@@ -599,10 +693,10 @@ public final class SandboxSecurityManager extends SecurityManager {
         resolvingPath.set(true);
         try {
             Path relative = root.relativize(path);
+            // The root itself is an explicit launcher-owned capability (java.home may be a
+            // managed symlink). Only descendants must be link-free so an input path cannot
+            // escape the selected root through a nested junction/reparse point.
             Path current = root;
-            if (isLinkOrReparsePoint(current)) {
-                return false;
-            }
             for (Path component : relative) {
                 current = current.resolve(component);
                 if (isLinkOrReparsePoint(current)) {
@@ -713,6 +807,17 @@ public final class SandboxSecurityManager extends SecurityManager {
         try {
             return path.toRealPath();
         } catch (IOException | RuntimeException e) {
+            // Some Windows providers reject GetFinalPathNameByHandle for a managed
+            // symlink. Resolve a direct link target before the manager is installed so the
+            // child can still validate reads against the immutable real root.
+            try {
+                if (Files.isSymbolicLink(path)) {
+                    Path link = Files.readSymbolicLink(path);
+                    return normalize(link.isAbsolute() ? link : path.getParent().resolve(link));
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // Keep the lexical root; the caller will fail closed if it cannot validate it.
+            }
             return path;
         }
     }

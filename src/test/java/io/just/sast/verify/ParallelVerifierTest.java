@@ -98,11 +98,12 @@ class ParallelVerifierTest {
                 "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
         String prefix = "JUST_VERIFY_V2:token:run:chain-fingerprint:sink-fingerprint:nonce:artifact:";
         ParallelVerifier.ProtocolEvidence valid = ParallelVerifier.protocolEvidence(
-                prefix + "SANDBOX_READY: WINDOWS_JOB_OBJECT_JVM_POLICY\n"
+                prefix + "SANDBOX_READY: WINDOWS_JOB_OBJECT_JVM_POLICY|policy=policy-digest\n"
                         + prefix + "SINK_BLOCKED: sink", identity);
         assertTrue(valid.bindingValid());
         assertTrue(valid.ready());
         assertTrue(valid.validOrder());
+        assertEquals("policy-digest", valid.readyPolicyDigest());
         assertEquals("SINK_BLOCKED: sink", valid.terminal());
 
         ParallelVerifier.ProtocolEvidence tampered = ParallelVerifier.protocolEvidence(

@@ -30,24 +30,32 @@ public final class Blackboard {
     /** 扫描输入（管线编排期注入；知识源经黑板读取，无全局属性通道）。 */
     public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                              int verifyBudget, Path jdkHome, int targetMajorVersion,
-                             boolean safeExec) {
+                             boolean safeExec, boolean requireStrictIsolation) {
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget) {
-            this(target, deps, fast, verify, verifyBudget, null, 0, false);
+            this(target, deps, fast, verify, verifyBudget, null, 0, false, false);
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget, Path jdkHome) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, 0, false);
+            this(target, deps, fast, verify, verifyBudget, jdkHome, 0, false, false);
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget, Path jdkHome, int targetMajorVersion) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion, false);
+            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
+                    false, false);
+        }
+
+        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
+                          int verifyBudget, Path jdkHome, int targetMajorVersion,
+                          boolean safeExec) {
+            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
+                    safeExec, false);
         }
 
         public static ScanInputs fastDefault(Path target) {
-            return new ScanInputs(target, List.of(), true, true, 20, null, 0, false);
+            return new ScanInputs(target, List.of(), true, true, 20, null, 0, false, false);
         }
     }
 
@@ -65,6 +73,10 @@ public final class Blackboard {
 
     private final List<Chain> chains = new ArrayList<>();
     private final Set<String> chainKeys = new HashSet<>();
+    /** One sorted publication snapshot avoids re-sorting the same chain set in every source. */
+    private long chainRevision;
+    private long sortedChainRevision = -1L;
+    private List<Chain> sortedChainSnapshot = List.of();
     /** sink 裁决（backward-taint 并行分析写）：CALL 节点 id → 裁决，报告层产出 sinks.csv。 */
     private final Map<Long, SinkOutcome> sinkOutcomes = new java.util.concurrent.ConcurrentHashMap<>();
     /** 链校准（CALIBRATION 写）：链 key → 拒绝理由；报告层过滤被拒绝的链。 */
@@ -78,6 +90,8 @@ public final class Blackboard {
     private long factRevision;
     /** 扫描完整性边界：分析器触顶/跳过的稳定原因码，供统计与报告层消费。 */
     private final Set<String> completenessReasons = ConcurrentHashMap.newKeySet();
+    /** Controller phase timings are immutable snapshots at the report boundary. */
+    private final Map<String, Long> phaseTimings = new ConcurrentHashMap<>();
     /** 动态验证能力的实际状态；不把“请求了验证”冒充成“子 JVM 已安全启动”。 */
     private volatile String verificationStatus = "NOT_RUN";
     /** 动态验证正式产物；报告层不得从 stderr 重新推断验证结果。 */
@@ -149,6 +163,8 @@ public final class Blackboard {
         }
         if (chainKeys.add(chain.key())) {
             chains.add(chain);
+            chainRevision++;
+            sortedChainRevision = -1L;
             publish(Event.of(EventType.CHAIN_FOUND, -1, chain));
             return true;
         }
@@ -156,7 +172,13 @@ public final class Blackboard {
     }
 
     public synchronized List<Chain> chains() {
-        return List.copyOf(chains);
+        if (sortedChainRevision != chainRevision) {
+            List<Chain> snapshot = new ArrayList<>(chains);
+            snapshot.sort(java.util.Comparator.comparing(Chain::key));
+            sortedChainSnapshot = List.copyOf(snapshot);
+            sortedChainRevision = chainRevision;
+        }
+        return sortedChainSnapshot;
     }
 
     /**
@@ -166,6 +188,8 @@ public final class Blackboard {
      */
     synchronized void sortChainsForPhase() {
         chains.sort(java.util.Comparator.comparing(Chain::key));
+        sortedChainSnapshot = List.copyOf(chains);
+        sortedChainRevision = chainRevision;
     }
 
     // ---- sink 裁决 ----
@@ -177,7 +201,7 @@ public final class Blackboard {
     }
 
     public Map<Long, SinkOutcome> sinkOutcomes() {
-        return Map.copyOf(sinkOutcomes);
+        return java.util.Collections.unmodifiableMap(new java.util.TreeMap<>(sinkOutcomes));
     }
 
     // ---- 校准与注释 ----
@@ -193,7 +217,7 @@ public final class Blackboard {
     }
 
     public synchronized Map<String, String> chainCalibrations() {
-        return Map.copyOf(chainCalibrations);
+        return java.util.Collections.unmodifiableMap(new java.util.TreeMap<>(chainCalibrations));
     }
 
     public int calibrationCount() {
@@ -209,11 +233,22 @@ public final class Blackboard {
 
     public Set<String> completenessReasons() {
         if (originSupport == null || originSupport.completenessReasons().isEmpty()) {
-            return Set.copyOf(completenessReasons);
+            return sortedSet(completenessReasons);
         }
         Set<String> result = new HashSet<>(completenessReasons);
         result.addAll(originSupport.completenessReasons());
-        return Set.copyOf(result);
+        return sortedSet(result);
+    }
+
+    /** Record a non-negative controller phase duration without exposing mutable state. */
+    public void recordPhaseMs(String phase, long durationMs) {
+        if (phase != null && !phase.isBlank()) {
+            phaseTimings.put(phase, Math.max(0L, durationMs));
+        }
+    }
+
+    public Map<String, Long> phaseMs() {
+        return java.util.Collections.unmodifiableMap(new java.util.TreeMap<>(phaseTimings));
     }
 
     public void setVerificationStatus(String status) {
@@ -237,13 +272,28 @@ public final class Blackboard {
     /** 链级注释（gadget 模式标注等），附着到具体链 key。 */
     public synchronized void chainNote(String chainKey, String note) {
         if (chainKey != null && !chainKey.isBlank() && note != null && !note.isBlank()) {
-            chainNotes.computeIfAbsent(chainKey, k -> new ArrayList<>(1)).add(note);
+            List<String> notes = chainNotes.computeIfAbsent(chainKey, k -> new ArrayList<>(1));
+            if (!notes.contains(note)) {
+                notes.add(note);
+                notes.sort(String::compareTo);
+            }
         }
     }
 
     public synchronized List<String> chainNotesOf(String chainKey) {
         List<String> list = chainNotes.get(chainKey);
-        return list != null ? List.copyOf(list) : List.of();
+        if (list == null || list.isEmpty()) {
+            return List.of();
+        }
+        return List.copyOf(list);
+    }
+
+    private static Set<String> sortedSet(Set<String> values) {
+        java.util.TreeSet<String> sorted = new java.util.TreeSet<>();
+        if (values != null) {
+            values.stream().filter(value -> value != null && !value.isBlank()).forEach(sorted::add);
+        }
+        return java.util.Collections.unmodifiableSet(sorted);
     }
 
     // ---- typed immutable extension facts ----

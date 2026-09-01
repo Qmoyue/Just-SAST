@@ -54,6 +54,10 @@ Just 面向两类输入：
 | FR-20 | 输出分类目录、`index.md`、CSV、JSON、SARIF 2.1.0、HTML、Markdown、扫描元数据、动态汇总，以及人/agent 可读且不可直接执行的 payload 视图和 plan |
 | FR-21 | `diff` 依据规则、入口和 sink 的语义身份比较扫描，不依赖并行顺序和变体编号 |
 | FR-22 | 退出码为：`0` 成功，`2` 参数/输入错误，`3` 扫描内部错误 |
+| FR-23 | 动态后端必须报告能力级别、策略摘要、资源/文件/网络边界和清理状态；`PROCESS_RESOURCE` 或 `OS_NAMESPACE` 不得冒充 `OS_STRICT` |
+| FR-24 | `--cache`、baseline/suppression 和 dependency inventory 必须以 artifact/dependency/rules/JDK/engine/parameters 身份键控；身份不匹配时 fail closed，cache 只接受完整成功报告 |
+| FR-25 | 依赖清单可输出 SPDX/CycloneDX 兼容的坐标、hash 和嵌套关系；无外部漏洞数据库时不生成 CVE/安全结论 |
+| FR-26 | 动态置信度必须区分真实 canary 边界、safe adapter 失真效果、具体触发前缀、入口返回和不可测状态；安全 adapter 不能与真实边界同级 |
 
 ## 3. 规则与扩展契约
 
@@ -71,7 +75,7 @@ Just 面向两类输入：
 
 | ID | 需求 |
 | --- | --- |
-| NFR-01 | 默认交付不依赖外部服务；运行时依赖保持为 ASM、picocli、SnakeYAML |
+| NFR-01 | 默认交付不依赖外部服务；核心运行时依赖保持为 ASM、picocli、SnakeYAML，Windows 进程资源后端可选用 JNA；缺失可选后端必须显式降级 |
 | NFR-02 | 大工件采用流式读取、原始字节早释放、冻结只读索引、按需 CPG/CFG、共享摘要和有界缓存；必须同时记录报告时 live heap 与完整性边界 |
 | NFR-03 | `heap_used_mb` 明确表示报告时 JVM live heap，不得冒充 OS RSS 峰值；真实内存门槛须用外部采样验证 |
 | NFR-04 | 并行采用有界、自适应 worker 和局部结果合并，保留桌面资源；线程数不是性能验收指标 |
@@ -102,6 +106,11 @@ evidence/calibrations.csv        校准拒绝/降级原因
 evidence/dormant.md              可达但未成链的入口
 meta/scan-metadata.json           输入、JDK、阶段、预算和完整性
 meta/payload-plan.json            安全、确定性的对象图/字段依赖计划
+evidence/dependencies.csv         path-free direct/nested/platform inventory
+meta/dependencies.sbom.json       CycloneDX 1.5 inventory（不含 CVE 结论）
+meta/scan-identity.json            输入身份、参数和增量缓存键
+evidence/baseline.csv              提供 baseline/suppression 时的语义差异
+meta/baseline.json                 baseline/suppression 汇总及未使用项
 ```
 
 `COMPLETE`/`PARTIAL` 表示扫描覆盖；`FEASIBLE`/`DEGRADED`/`NOT_FEASIBLE` 表示静态校准；动态状态表示运行时证据。三套状态必须同时保留，不能互相覆盖。
@@ -148,6 +157,11 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 | NFR-18 | 固定静态扫描基线的性能目标为同输入历史基线的 `<=1.5x`；默认 end-to-end 动态成本必须单独报告，不能用关闭验证隐藏静态回退 |
 | NFR-19 | 性能优化采用 source/sink 导向的需求驱动范围、方法/类型/字段/控制约束键控的有界缓存、稳定索引和可取消预算；不得因“命中测试样本”写入包名、类名、WP 或单条链特判 |
 | NFR-20 | 性能验收必须记录固定输入/JDK/规则/参数、阶段 wall time、链/规则/完整性等价、动态状态、live heap 和可用时的外部 RSS；阶段回归先快速契约、后代表性回归工件与外部评测器，不以单次 wall time 或结束时 heap 关闭性能门 |
+| NFR-21 | OS 隔离能力必须使用闭合枚举和 fail-closed 选择；缺少准备 root、namespace/cgroup/seccomp/文件/网络/token 等任一生产前置能力或子进程 attestation 时，动态结果只能为 `UNTESTABLE` 或明确的非生产能力级别 |
+| NFR-22 | 同一输入和配置下，串行/并行/重复执行的链身份、规则归因、canonical 顺序、校准原因和报告字段必须稳定；预算截断前必须完成稳定排序 |
+| NFR-23 | 默认动态验证不得自动重试 timeout；任何显式重试必须计入总预算并记录 attempt/cost，静态阶段与动态阶段成本分开计量 |
+| NFR-24 | cache 命中只能恢复同一不可变输入身份的完整报告；部分、取消、失败和截断结果不得写成可复用成功摘要 |
+| NFR-25 | reproducible build 必须固定归档时间和输入依赖版本；签名只能由显式密钥 profile 产生，未配置密钥不得产生成功状态 |
 
 ## 10. 本轮动态与图优化设计约束
 
@@ -168,3 +182,5 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 | PERF-09 | 扫描级摘要缓存必须有明确容量和不可变输入边界；命中只复用同一方法/同一分析版本的完整摘要，超限可重新解释但不得改变结果，且必须记录命中/解释/淘汰指标 |
 | PERF-10 | 反向 sink worker 可在同一扫描会话的多个 sink 间复用有界 immutable 方法摘要，禁止缓存中断/失败结果；容量、淘汰、命中和重解释必须可观察，且不得跨规则/JDK/图实例复用 |
 | PERF-11 | 开发回归分为快速契约层和阶段全量层：代码变更先运行受影响单测/夹具，只有阶段门运行代表性回归工件与外部评测器；快速层不得替代阶段全量层，阶段全量层必须固定 JAR、JDK、规则、预算和参数 |
+| PERF-12 | 动态候选调度必须优先覆盖不同 entry/sink family 和可构造 plan，稳定去重后才消费剩余预算；不能靠降低静态深度、删除规则或隐藏 timeout 提速 |
+| PERF-13 | 任何新增缓存必须有输入身份、容量、失效、命中/淘汰指标；不缓存失败、取消、超时或不完整结论 |

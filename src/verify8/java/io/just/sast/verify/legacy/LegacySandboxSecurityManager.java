@@ -452,8 +452,12 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
         Path path = normalize(Paths.get(name));
         String actions = permission.getActions();
-        if (actions.indexOf("readlink") >= 0) {
-            throw new SecurityException("symbolic-link permission denied: " + path);
+        if (actions.indexOf("readlink") >= 0
+                && !Boolean.TRUE.equals(resolving.get())) {
+            // NIO may request readlink while the manager resolves an explicitly trusted
+            // readable root. Allow only that re-entrant boundary check; a target's direct
+            // Files.readSymbolicLink call arrives with the guard clear and remains denied.
+            throw new SecurityException("symbolic-link permission denied");
         }
         boolean write = actions.indexOf("write") >= 0 || actions.indexOf("delete") >= 0;
         if (write && !safeUnder(path, writableRoot, writableRealRoot)) {
@@ -481,6 +485,14 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
                     && safeUnder(resolvedPath, realRoot, realRoot)) {
                 return true;
             }
+            // A managed JDK may expose java.home through a junction. Windows can reject the
+            // handle used by toRealPath from inside a SecurityManager even though the same
+            // process can read the runtime. Rebase the explicitly trusted root without
+            // resolving the root again, and reject every link/reparse component below it.
+            if (!realRoot.equals(readableRoots.get(i))
+                    && managedRootRead(path, readableRoots.get(i), realRoot)) {
+                return true;
+            }
             // On managed Windows hosts a real-path query can be denied for a freshly
             // materialized classpath tree.  Reads may use a lexical fallback only below an
             // explicit root; every component is still checked for a symbolic link. Writes
@@ -490,6 +502,33 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             }
         }
         return false;
+    }
+
+    private boolean managedRootRead(Path path, Path lexicalRoot, Path realRoot) {
+        if (!under(path, lexicalRoot) || realRoot.equals(lexicalRoot)) {
+            return false;
+        }
+        boolean alreadyResolving = Boolean.TRUE.equals(resolving.get());
+        resolving.set(Boolean.TRUE);
+        try {
+            Path relative = lexicalRoot.relativize(path);
+            Path current = lexicalRoot;
+            for (Path component : relative) {
+                current = current.resolve(component);
+                if (isLinkOrReparsePoint(current)) {
+                    return false;
+                }
+            }
+            return under(realRoot.resolve(relative), realRoot);
+        } catch (RuntimeException e) {
+            return false;
+        } finally {
+            if (alreadyResolving) {
+                resolving.set(Boolean.TRUE);
+            } else {
+                resolving.remove();
+            }
+        }
     }
 
     private Path resolveForRead(Path path) {
@@ -515,10 +554,10 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         resolving.set(Boolean.TRUE);
         try {
             Path relative = root.relativize(path);
+            // The root itself is an explicit launcher-owned capability (java.home may be a
+            // managed symlink). Only descendants must be link-free so an input path cannot
+            // escape the selected root through a nested junction/reparse point.
             Path current = root;
-            if (isLinkOrReparsePoint(current)) {
-                return false;
-            }
             for (Path component : relative) {
                 current = current.resolve(component);
                 if (isLinkOrReparsePoint(current)) {
@@ -614,6 +653,17 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         try {
             return path.toRealPath();
         } catch (Exception ignored) {
+            // Some Windows providers reject GetFinalPathNameByHandle for a managed
+            // symlink. Resolve a direct link target before the manager is installed so the
+            // child can still validate reads against the immutable real root.
+            try {
+                if (Files.isSymbolicLink(path)) {
+                    Path link = Files.readSymbolicLink(path);
+                    return normalize(link.isAbsolute() ? link : path.getParent().resolve(link));
+                }
+            } catch (Exception ignoredLink) {
+                // Keep the lexical root; the caller will fail closed if it cannot validate it.
+            }
             return path;
         }
     }

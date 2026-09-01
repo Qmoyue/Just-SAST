@@ -30,21 +30,27 @@ public final class ReportIndexWriter {
                 .append("| Completeness | `").append(markdown(stats.completeness())).append("` |\n")
                 .append("| Chain proof completeness | `")
                 .append(markdown(stats.chainProofCompleteness())).append("` |\n")
-                .append("| Dynamic verification | `").append(markdown(stats.verification())).append("` |\n\n")
+                .append("| Dynamic verification | `").append(markdown(stats.verification())).append("` |\n")
+                .append("| Isolation level | `")
+                .append(markdown(stats.dynamicVerification().isolationLevel())).append("` |\n")
+                .append("| Isolation capabilities | `")
+                .append(markdown(String.join(",", stats.dynamicVerification().isolationCapabilities())))
+                .append("` |\n\n")
                 .append("## Read first\n\n")
                 .append("- [Findings overview](findings/findings.md) — grouped static findings.\n")
                 .append("- [Payload review](verification/payload.md) — ysoserial-style readable chain plans; inert and safe.\n")
                 .append("- [Dynamic verification](verification/dynamic-verification.json) — persistent status and evidence.\n")
                 .append("- [Machine-readable payload view](verification/payload.json) — the same chain view for agents.\n\n")
+                .append("- [Dependency inventory](evidence/dependencies.csv) — deterministic component identities; see `meta/dependencies.sbom.json` for CycloneDX.\n\n")
                 .append("## Artifact map\n\n")
                 .append("### findings/\n\n")
                 .append("Static findings in CSV, SARIF, JSON, HTML, and Markdown forms.\n\n")
                 .append("### verification/\n\n")
                 .append("Dynamic results plus the safe payload review. `SINK_BLOCKED` means the real prefix reached the canary boundary and the sink body was not entered; `CONCRETE_REACHED` means a concrete trigger ran without an exact canary.\n\n")
                 .append("### evidence/\n\n")
-                .append("Per-hop edges, sink outcomes, calibrations, and dormant-gadget evidence.\n\n")
+                .append("Per-hop edges, sink outcomes, calibrations, dormant-gadget evidence, and dependency inventory.\n\n")
                 .append("### meta/\n\n")
-                .append("Scan metadata and the complete inert construction plan.\n\n");
+                .append("Scan metadata, path-free scan identity, SBOM and the complete inert construction plan.\n\n");
 
         appendVerificationSummary(markdown, stats.dynamicVerification());
         if (!stats.completenessReasons().isEmpty()) {

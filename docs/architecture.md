@@ -293,3 +293,93 @@ rules:
 动态验证的设计参考 [JDD](https://zxlfd.github.io/papers/jdd.pdf) 的 bottom-up gadget search 与 dataflow-aided object construction 思路，并参考 [FLASH（USENIX Security 2025）](https://www.usenix.org/system/files/usenixsecurity25-zhang-yiheng.pdf) 对反序列化引导调用图和按需可控性分析的讨论。Just 只借鉴其“真实前置链 + 按需可控性”原则，不执行最终危险能力，也不把论文中的完整 exploit 生成器带入默认 CLI。
 
 这些限制必须进入报告和版本说明，不能通过增加参数、降低扫描深度、删除动态验证或测试样本特判来掩盖。
+
+## 12. 2026-09 安全、确定性与产品化增量
+
+### 12.1 研究结论与 Just 的边界
+
+JDD（IEEE S&P 2024）的有效可迁移部分是 bottom-up gadget fragment、IOCD 字段依赖、
+支配关系反馈和只改变 sink 相关字段的对象构造调度；JDD 不是宿主机 OS sandbox，不能把
+它的动态 fuzz 设计写成隔离能力。[JDD 论文](https://yuanxzhang.github.io/paper/jdd-oakland24.pdf)
+和其[公开实现](https://github.com/fdu-sec/JDD)均应按“对象构造/可利用性研究”理解。
+
+FLASH（USENIX Security 2025）给出的可迁移原则是以反序列化可控 receiver 驱动调用图，
+对可控对象采用较宽的 CHA/代理展开、对不可控对象采用更精确的 points-to 约束，并对反射
+边做需求驱动恢复。[FLASH 论文](https://www.usenix.org/system/files/usenixsecurity25-zhang-yiheng.pdf)
+支持 Just 的 source/sink 导向范围，但不授权把未知反射目标升级为确定调用。
+
+GCMiner、ODDFUZZ、Gadgecy 和 Sleeping Giants 分别提示：对象生成需要遵循运行时覆盖反馈，
+依赖版本存在前置条件，休眠 gadget 会随依赖/入口变化被激活。因此 Just 将这些研究迁移为
+字段/控制约束、可解释的动态候选调度、dependency inventory 和 baseline/diff 方向；不迁移
+攻击 payload 生成或真实 sink 执行。
+
+### 12.2 隔离后端的能力模型
+
+`OsIsolation.Backend` 的 `available` 只表示后端可以被调用，不表示它已经达到生产安全边界。
+实现和报告应区分：
+
+| 能力级别 | 最低语义 | 可否作为生产级动态前置条件 |
+| --- | --- | --- |
+| `NONE` | 没有可验证的外部边界 | 否，必须 `UNTESTABLE` |
+| `PROCESS_RESOURCE` | 独立进程、进程树和资源限制 | 否，只能作为风险降低信息 |
+| `OS_NAMESPACE` | namespace/只读挂载/独立 scratch/进程树 | 仍需 seccomp、cgroup 和文件策略证据 |
+| `OS_STRICT` | OS namespace + cgroup + syscall allowlist + 文件/网络策略 + readiness/cleanup 证明 | 是，且必须在目标 runner 验收 |
+
+Linux 的严格后端优先调用预配置的 nsjail 或等价 runner，并要求 private user/mount/pid/net/
+ipc/uts namespace、只读输入、受限 scratch、cgroup v2 的 memory/pids/cpu、seccomp allowlist、
+`no_new_privs` 和可用时的 Landlock。nsjail 的 namespace/cgroup/seccomp 能力见其[官方仓库](https://github.com/google/nsjail)。
+bubblewrap 是低层 namespace 工具；其[官方文档](https://github.com/containers/bubblewrap)
+明确提示安全性取决于调用参数和挂载资源，故无 seccomp/cgroup/文件策略证明时只能报告
+`OS_NAMESPACE`，不能报告 `OS_STRICT`。
+
+Just 的 nsjail strict 适配还要求部署者提供准备好的只读 root image 及其外部 digest（配置键
+`JUST_NSAJAIL_ROOT`/`JUST_NSAJAIL_ROOT_DIGEST`，或等价 JVM 属性），不会把宿主机 `/` 当作
+“只读即安全”的根目录；JDK、probe、目标和 scratch 作为显式挂载进入该 image。子 probe 在
+加载目标类之前复核 namespace、nobody uid、`no_new_privs`、seccomp 和 cgroup controller，任一
+证明缺失即 `UNTESTABLE`。bubblewrap 只接受显式 namespace opt-in，且仍不升级为 strict。
+
+seccomp 只缩小 syscall 集，Linux 文档明确指出它不是完整 sandbox；Landlock 是可继承、可叠加
+的文件/网络权限边界；cgroup v2 负责资源与进程数量，不替代身份和文件策略。[seccomp](https://www.kernel.org/doc/html/v6.6/userspace-api/seccomp_filter.html)、
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html) 和[cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+必须作为独立能力分别探测，任何一项缺失都不得静默降级为严格隔离。
+
+Windows 的 Job Object 只管理进程树和资源，不能单独限制 token、ACL 或网络。[Job Object 文档](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+和[AppContainer/受限进程接口](https://learn.microsoft.com/en-us/windows/win32/secauthz/createprocessinsandbox)
+要求 restricted token/低完整性、默认拒绝 ACL、能力白名单和网络策略共同成立。Just 的 Windows
+进程资源后端因此不会冒充生产 OS sandbox；strict dynamic 必须由可验证的外部 Windows runner
+提供。JDK Security Manager 只属于 Java 层兼容门，JDK 24+ 不能依赖它作为 OS 隔离。
+
+### 12.3 动态证据向量
+
+置信度不再把所有“动态运行过”合并为一个正向加分，而是由以下五个正交维度组成：
+
+```text
+confidence = static structure
+           + construction/field constraints
+           + runtime observation
+           + isolation strength
+           - unresolved/completeness penalties
+```
+
+其中 `SINK_BLOCKED` 是“同一 entry/sink 绑定的真实前置链抵达精确 canary 边界”；
+`SAFE_EFFECT_OBSERVED` 只说明 Just 自有 inert/mock adapter 观察到了失真效果，必须低于
+真实边界且保留 `sink_distorted=true`；`CONCRETE_REACHED` 和 `EXECUTED` 只能作为前缀或入口
+返回证据。隔离级别不足时，不得因为有终态文本而抬高动态可信度。`FAILED/TIMEOUT/UNTESTABLE`
+不删除静态候选，只降低对应维度并保留原因。
+
+### 12.4 确定性与性能
+
+所有有界遍历在消耗预算前使用 `ValueOrigin`、调用点、字段、dispatch、chain 和 note 的
+canonical key 排序；黑板在阶段屏障输出 canonical snapshot。动态验证默认不自动重试 timeout，
+重试必须显式开启并计入预算，避免动态进程启动成本掩盖静态优化。
+
+产品化能力采用同一身份模型：`artifact digest + dependency digests + rules digest + target
+JDK + engine version + parameters`。增量 cache 只能恢复相同身份的规范化报告；baseline/suppression
+按语义链身份匹配且默认只标记不删除 evidence；依赖输出提供坐标、版本、hash、direct/nested
+关系和 SBOM 兼容结构，但没有外部漏洞数据库时不生成 CVE 结论。发布构建固定输出时间并提供
+可选签名 profile，密钥不进入仓库，缺少密钥时不宣称签名成功。`--cache` 是显式报告级缓存：
+命中前校验 artifact/dependency/rules/JDK/参数身份，只有 `COMPLETE` 且没有失败、超时、不可测
+或截断动态终态的报告才可写入缓存；缓存不与 baseline/suppression 组合，以免复用错误的差异策略。
+
+这些能力的测试采用“快速契约 → Maven → 平台/语料阶段门 → 最终全量”的顺序。跨平台只在
+对应 runner 实际提供权限和能力时标记通过；否则必须以 `UNTESTABLE`/平台限制写入报告。

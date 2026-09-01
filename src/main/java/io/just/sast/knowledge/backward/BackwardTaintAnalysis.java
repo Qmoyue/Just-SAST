@@ -3,6 +3,7 @@ package io.just.sast.knowledge.backward;
 import io.just.sast.analysis.taint.ForwardOrigins;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.analysis.taint.ValueOrigin;
+import io.just.sast.analysis.taint.ValueOriginOrder;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
@@ -364,7 +365,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (depthFromTop < 0 || depthFromTop >= state.stack().size()) {
                 continue;
             }
-            for (ValueOrigin origin : state.stack().get(state.stack().size() - 1 - depthFromTop).origins()) {
+            for (ValueOrigin origin : ValueOriginOrder.sorted(
+                    state.stack().get(state.stack().size() - 1 - depthFromTop).origins())) {
                 if (produced >= MAX_CHAINS_PER_SINK) {
                     break;
                 }
@@ -605,7 +607,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     method.descriptor(), argumentOrdinal);
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
-            for (ValueOrigin argOrigin : argOrigins) {
+            for (ValueOrigin argOrigin : ValueOriginOrder.sorted(argOrigins)) {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }
@@ -659,7 +661,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     "serialized-proxy-handler", handler.descriptor(), null);
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
-            for (ValueOrigin receiver : receivers) {
+            for (ValueOrigin receiver : ValueOriginOrder.sorted(receivers)) {
                 if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
                     break;
                 }
@@ -779,7 +781,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                             "lambda-sam", implementation.descriptor(), ordinal);
                     trace.hops.add(hop);
                     int unresolvedBefore = trace.unresolved;
-                    for (ValueOrigin value : values) {
+                    for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
                         if (abortIfInterrupted(trace)) {
                             break;
                         }
@@ -955,7 +957,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (before == null || before.stack().isEmpty()) {
                 return false;
             }
-            for (ValueOrigin candidate : before.stack().get(before.stack().size() - 1).origins()) {
+            for (ValueOrigin candidate : ValueOriginOrder.sorted(
+                    before.stack().get(before.stack().size() - 1).origins())) {
                 if (lambdaParameterMatches(candidate, slot, method, result, visiting)) {
                     return true;
                 }
@@ -980,7 +983,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         trace.hops.add(hop);
         int unresolvedBefore = trace.unresolved;
         int produced = 0;
-        for (ValueOrigin value : values) {
+        for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
             if (abortIfInterrupted(trace)) {
                 break;
             }
@@ -1036,7 +1039,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private boolean lambdaReceiverMatches(Node samCall, Node factory,
                                           ForwardOrigins.Result callerResult) {
         ValueOrigin factoryOrigin = new ValueOrigin.CallResult(factory.id());
-        for (ValueOrigin receiver : support.argOriginAtOrdinal(samCall, -1, callerResult)) {
+        for (ValueOrigin receiver : ValueOriginOrder.sorted(
+                support.argOriginAtOrdinal(samCall, -1, callerResult))) {
             if (sameLambdaOrigin(receiver, factoryOrigin, callerResult,
                     support.enclosingMethod(samCall), new HashSet<>())) {
                 return true;
@@ -1062,7 +1066,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (before == null || before.stack().isEmpty()) {
                 return false;
             }
-            for (ValueOrigin candidate : before.stack().get(before.stack().size() - 1).origins()) {
+            for (ValueOrigin candidate : ValueOriginOrder.sorted(
+                    before.stack().get(before.stack().size() - 1).origins())) {
                 if (sameLambdaOrigin(candidate, expected, result, method, visiting)) {
                     return true;
                 }
@@ -1297,7 +1302,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         Op op = method.insnAt(offset).op();
         int produced = 0;
         if (op == Op.NEWARRAY || op == Op.ANEWARRAY || op == Op.MULTIANEWARRAY) {
-            for (ValueOrigin element : result.arrayElements().getOrDefault(new ValueOrigin.Insn(offset), Set.of())) {
+            for (ValueOrigin element : ValueOriginOrder.sorted(
+                    result.arrayElements().getOrDefault(new ValueOrigin.Insn(offset), Set.of()))) {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }
@@ -1316,7 +1322,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (abortIfInterrupted(trace)) {
                 break;
             }
-            for (ValueOrigin operand : state.stack().get(i).origins()) {
+            for (ValueOrigin operand : ValueOriginOrder.sorted(state.stack().get(i).origins())) {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }
@@ -1378,7 +1384,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             // 可控 receiver → 返回值可控（GadgetInspector 对象语义）
             int receiverDepth = state.stack().size() - 1 - Descriptor.paramCount(call.descriptor());
             if (receiverDepth >= 0 && receiverDepth < state.stack().size()) {
-                for (ValueOrigin receiverOrigin : state.stack().get(receiverDepth).origins()) {
+                for (ValueOrigin receiverOrigin : ValueOriginOrder.sorted(
+                        state.stack().get(receiverDepth).origins())) {
                     if (abortIfInterrupted(trace)) {
                         break;
                     }
@@ -1432,7 +1439,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (stackIndex < 0 || stackIndex >= state.stack().size()) {
                 continue;
             }
-            for (ValueOrigin origin : state.stack().get(stackIndex).origins()) {
+            for (ValueOrigin origin : ValueOriginOrder.sorted(
+                    state.stack().get(stackIndex).origins())) {
                 if (abortIfInterrupted(trace)) {
                     return produced;
                 }
@@ -1448,7 +1456,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private int controlledProxyResult(Node call, MethodInfo caller, int depth, Trace trace,
                                       SinkMark mark, ForwardOrigins.State state) {
         int produced = 0;
-        for (ValueOrigin receiver : receiverOrigins(call, state)) {
+        for (ValueOrigin receiver : ValueOriginOrder.sorted(receiverOrigins(call, state))) {
             if (abortIfInterrupted(trace)) {
                 break;
             }
@@ -1461,8 +1469,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 continue;
             }
             ForwardOrigins.Result allocationOrigins = originsOf(allocationMethod);
-            for (ValueOrigin handlerOrigin : support.argOriginAtOrdinal(allocation, 2,
-                    allocationOrigins)) {
+            for (ValueOrigin handlerOrigin : ValueOriginOrder.sorted(
+                    support.argOriginAtOrdinal(allocation, 2, allocationOrigins))) {
                 String handlerType = concreteType(handlerOrigin, allocationMethod);
                 if (handlerType == null) {
                     continue;
@@ -1490,8 +1498,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     if (returnState == null || returnState.stack().isEmpty()) {
                         continue;
                     }
-                    for (ValueOrigin returned : returnState.stack()
-                            .get(returnState.stack().size() - 1).origins()) {
+                    for (ValueOrigin returned : ValueOriginOrder.sorted(returnState.stack()
+                            .get(returnState.stack().size() - 1).origins())) {
                         if (abortIfInterrupted(trace)) {
                             break;
                         }
@@ -1520,7 +1528,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (state == null || state.stack().isEmpty()) {
                 continue;
             }
-            for (ValueOrigin returned : state.stack().get(state.stack().size() - 1).origins()) {
+            for (ValueOrigin returned : ValueOriginOrder.sorted(
+                    state.stack().get(state.stack().size() - 1).origins())) {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }
@@ -1561,7 +1570,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             if (before == null || before.stack().isEmpty()) {
                 return null;
             }
-            for (ValueOrigin candidate : before.stack().get(before.stack().size() - 1).origins()) {
+            for (ValueOrigin candidate : ValueOriginOrder.sorted(
+                    before.stack().get(before.stack().size() - 1).origins())) {
                 Node allocation = proxyAllocationOf(candidate, method, visiting);
                 if (allocation != null) {
                     return allocation;
@@ -1658,7 +1668,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     fieldRead.owner());
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
-            for (ValueOrigin valueOrigin : state.stack().get(state.stack().size() - 1).origins()) {
+            for (ValueOrigin valueOrigin : ValueOriginOrder.sorted(
+                    state.stack().get(state.stack().size() - 1).origins())) {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }

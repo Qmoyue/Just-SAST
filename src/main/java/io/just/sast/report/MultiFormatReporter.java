@@ -130,7 +130,10 @@ public final class MultiFormatReporter {
                 .append("\"schema_version\":1,")
                 .append("\"capability\":\"").append(escJson(summary.capability())).append("\"")
                 .append(",\"backend\":\"").append(escJson(summary.backend())).append("\"")
-                .append(",\"jdk\":\"").append(escJson(summary.jdk())).append("\"")
+                .append(",\"isolation_level\":\"").append(escJson(summary.isolationLevel())).append("\"")
+                .append(",\"isolation_capabilities\":");
+        appendStrings(sb, summary.isolationCapabilities());
+        sb.append(",\"jdk\":\"").append(escJson(summary.jdk())).append("\"")
                 .append(",\"policy_digest\":\"").append(escJson(summary.policyDigest())).append("\"")
                 .append(",\"artifact_sha256\":\"").append(escJson(summary.artifactHash())).append("\"")
                 .append(",\"sink_distorted\":").append(summary.sinkDistorted())
@@ -169,6 +172,19 @@ public final class MultiFormatReporter {
                     .append('}');
         }
         sb.append("]}");
+    }
+
+    private static void appendStrings(StringBuilder sb, List<String> values) {
+        sb.append('[');
+        if (values != null) {
+            for (int i = 0; i < values.size(); i++) {
+                if (i > 0) {
+                    sb.append(',');
+                }
+                sb.append('"').append(escJson(values.get(i))).append('"');
+            }
+        }
+        sb.append(']');
     }
 
     private static void appendCounts(StringBuilder sb, Map<String, Integer> counts) {

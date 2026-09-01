@@ -6,26 +6,38 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            java: '17'
+          - os: ubuntu-latest
+            java: '21'
+          - os: windows-latest
+            java: '17'
+          - os: windows-latest
+            java: '21'
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ matrix.java }}
           cache: maven
       - run: mvn -B test
       - run: mvn -B package -DskipTests
       - name: Verify packaged artifacts and CLI smoke path
-        shell: bash
         run: |
-          sha256sum target/just-sast-0.2.0.jar target/just-sast-0.2.0-verify8.jar
           java -jar target/just-sast-0.2.0.jar --help
-          java -jar target/just-sast-0.2.0.jar scan \
-            --jar target/just-sast-0.2.0.jar \
-            --output target/ci-smoke \
-            --no-verify
+          java -jar target/just-sast-0.2.0.jar scan --jar target/just-sast-0.2.0.jar --output target/ci-smoke --no-verify
+      - name: Verify packaged hashes
+        shell: bash
+        run: sha256sum target/just-sast-0.2.0.jar target/just-sast-0.2.0-verify8.jar
+        if: runner.os != 'Windows'
       - name: Verify packaged dynamic protocol
+        if: runner.os == 'Linux' && matrix.java == '17'
         shell: bash
         run: |
           java -jar target/just-sast-0.2.0.jar scan \
@@ -34,6 +46,7 @@ jobs:
             --verify-budget=1
           test -f target/ci-dynamic/verification/dynamic-verification.json
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux' && matrix.java == '17'
         with:
           name: just-sast
           path: |

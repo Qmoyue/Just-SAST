@@ -25,7 +25,9 @@ public record VerificationSummary(
         boolean sinkDistorted,
         boolean sandboxReady,
         String cleanup,
-        String artifactHash) {
+        String artifactHash,
+        String isolationLevel,
+        List<String> isolationCapabilities) {
 
     public record ChainResult(
             int rank,
@@ -83,7 +85,8 @@ public record VerificationSummary(
                                int selected, Map<String, Integer> statusCounts,
                                Map<String, Integer> detailCounts, List<ChainResult> results) {
         this(capability, budget, constructible, rejected, selected, statusCounts, detailCounts,
-                results, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false, "UNKNOWN", "UNKNOWN");
+                results, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false, "UNKNOWN", "UNKNOWN",
+                "UNKNOWN", List.of());
     }
 
     /** Compatibility constructor retained for callers that already provide runtime metadata. */
@@ -94,7 +97,7 @@ public record VerificationSummary(
                                boolean sinkDistorted, boolean sandboxReady, String cleanup) {
         this(capability, budget, constructible, rejected, selected, statusCounts, detailCounts,
                 results, backend, jdk, policyDigest, sinkDistorted, sandboxReady, cleanup,
-                "UNKNOWN");
+                "UNKNOWN", "UNKNOWN", List.of());
     }
 
     public VerificationSummary {
@@ -108,6 +111,16 @@ public record VerificationSummary(
         policyDigest = normalize(policyDigest);
         cleanup = normalize(cleanup);
         artifactHash = normalize(artifactHash);
+        isolationLevel = normalize(isolationLevel);
+        java.util.TreeSet<String> capabilities = new java.util.TreeSet<>();
+        if (isolationCapabilities != null) {
+            for (String isolationCapability : isolationCapabilities) {
+                if (isolationCapability != null && !isolationCapability.isBlank()) {
+                    capabilities.add(isolationCapability);
+                }
+            }
+        }
+        isolationCapabilities = List.copyOf(capabilities);
         statusCounts = immutableCounts(statusCounts);
         detailCounts = immutableCounts(detailCounts);
         List<ChainResult> ordered = new ArrayList<>(results == null ? List.of() : results);
@@ -119,7 +132,7 @@ public record VerificationSummary(
     public static VerificationSummary empty(String capability, int budget) {
         return new VerificationSummary(capability, budget, 0, 0, 0,
                 Map.of(), Map.of(), List.of(), "UNKNOWN", "UNKNOWN", "UNKNOWN",
-                false, false, "UNKNOWN", "UNKNOWN");
+                false, false, "UNKNOWN", "UNKNOWN", "UNKNOWN", List.of());
     }
 
     private static String normalize(String value) {
@@ -135,6 +148,6 @@ public record VerificationSummary(
                 }
             });
         }
-        return Map.copyOf(sorted);
+        return java.util.Collections.unmodifiableMap(sorted);
     }
 }

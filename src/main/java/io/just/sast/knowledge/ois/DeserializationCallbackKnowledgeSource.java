@@ -3,6 +3,7 @@ package io.just.sast.knowledge.ois;
 import io.just.sast.analysis.taint.ForwardOrigins;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.analysis.taint.ValueOrigin;
+import io.just.sast.analysis.taint.ValueOriginOrder;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
@@ -161,7 +162,8 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
             if (depth < 0 || depth >= state.stack().size()) {
                 continue;
             }
-            for (ValueOrigin origin : state.stack().get(state.stack().size() - 1 - depth).origins()) {
+            for (ValueOrigin origin : ValueOriginOrder.sorted(
+                    state.stack().get(state.stack().size() - 1 - depth).origins())) {
                 if (origin instanceof ValueOrigin.Param p && p.slot() == 1) {
                     return true; // 回调参数直接驱动
                 }
@@ -341,7 +343,8 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
             return false; // 状态未知：保守保留
         }
         boolean sawInline = false;
-        for (ValueOrigin origin : state.stack().get(state.stack().size() - 1).origins()) {
+        for (ValueOrigin origin : ValueOriginOrder.sorted(
+                state.stack().get(state.stack().size() - 1).origins())) {
             if (!(origin instanceof ValueOrigin.Insn insn)) {
                 return false; // 参数/字段/调用结果来源：可能是任意子类
             }

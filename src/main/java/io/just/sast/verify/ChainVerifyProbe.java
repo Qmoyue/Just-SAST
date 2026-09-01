@@ -61,6 +61,7 @@ public final class ChainVerifyProbe {
     private static String safeSinkCategory = "";
     private static String safeSinkDisposition = "CANARY_BOUNDARY";
     private static String safeSinkPolicyDigest = "";
+    private static String safeIsolationPolicyDigest = "";
     private static String safeScratchRoot = ".";
     /** Set only when the declarative graph used the probe-owned reflective proxy adapter. */
     private static boolean graphAdapterUsed;
@@ -108,6 +109,11 @@ public final class ChainVerifyProbe {
             System.exit(3);
             return;
         }
+        if (!strictOsAttestation()) {
+            emit("SANDBOX_UNAVAILABLE: OS_ATTESTATION_FAILED");
+            System.exit(3);
+            return;
+        }
         // 解析链跳
         List<String[]> fieldLinks = parseFieldLinks(args.length > 1 ? args[1] : "");
 
@@ -143,6 +149,7 @@ public final class ChainVerifyProbe {
         safeSinkCategory = safeProperty("just.verify.sink-category", "");
         safeSinkDisposition = safeProperty("just.verify.sink-disposition", "CANARY_BOUNDARY");
         safeSinkPolicyDigest = safeProperty("just.verify.sink-policy-digest", "");
+        safeIsolationPolicyDigest = safeProperty("just.verify.isolation-policy-digest", "");
         safeScratchRoot = safeProperty("java.io.tmpdir", ".");
 
         try {
@@ -1594,6 +1601,9 @@ public final class ChainVerifyProbe {
     private static void emit(String token, String status) {
         String safeStatus = status == null ? "UNTESTABLE: null-status"
                 : status.replace('\r', ' ').replace('\n', ' ');
+        if (safeStatus.startsWith("SANDBOX_READY")) {
+            safeStatus += "|policy=" + safeIsolationPolicyDigest;
+        }
         if (safeStatus.length() > 4096) {
             safeStatus = safeStatus.substring(0, 4096);
         }
@@ -2100,6 +2110,44 @@ public final class ChainVerifyProbe {
             }
         }
         return false;
+    }
+
+    /**
+     * Verify the strict Linux claims from inside the child before any target class is loaded.
+     * Namespace presence alone is not enough: the attestation also requires the configured
+     * nobody uid, no_new_privs, seccomp filter mode and the cgroup-v2 controllers requested by
+     * the launcher. Other capability levels intentionally remain usable without this Linux-only
+     * probe and are reported as their weaker, explicit level.
+     */
+    private static boolean strictOsAttestation() {
+        if (!"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
+            return true;
+        }
+        if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
+                .contains("linux")) {
+            return false;
+        }
+        try {
+            for (String namespace : List.of("user", "mnt", "pid", "net", "ipc", "uts")) {
+                if (!Files.exists(Path.of("/proc/self/ns", namespace))) {
+                    return false;
+                }
+            }
+            String status = Files.readString(Path.of("/proc/self/status"));
+            if (!status.matches("(?s).*\\nUid:\\s+65534(?:\\s|$).*")) {
+                return false;
+            }
+            if (!status.matches("(?s).*\\nNoNewPrivs:\\s+1(?:\\s|$).*")) {
+                return false;
+            }
+            if (!status.matches("(?s).*\\nSeccomp:\\s+[12](?:\\s|$).*")) {
+                return false;
+            }
+            String controllers = Files.readString(Path.of("/sys/fs/cgroup/cgroup.controllers"));
+            return List.of("cpu", "memory", "pids").stream().allMatch(controllers::contains);
+        } catch (IOException | RuntimeException ignored) {
+            return false;
+        }
     }
 
     private static String safeProperty(String key, String fallback) {
