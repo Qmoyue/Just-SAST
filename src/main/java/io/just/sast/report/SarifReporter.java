@@ -5,6 +5,8 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.VerificationSummary;
+import io.just.sast.chain.ChainRanking;
+import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ConfidenceScorer;
 import io.just.sast.config.RuleSet;
 
@@ -13,7 +15,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -78,10 +79,12 @@ public final class SarifReporter {
         Map<String, VerificationSummary.ChainResult> verificationByKey = verificationByKey(verification);
         boolean structuredVerification = verification != null;
         List<Chain> orderedChains = new ArrayList<>(chains);
-        orderedChains.sort(Comparator.comparingInt((Chain c) ->
-                        hasConfirmed(verificationByKey.get(c.key()), stableNotes, c,
-                                structuredVerification) ? 0 : 1)
-                .thenComparingInt(c -> c.hops().size()).thenComparing(Chain::key));
+        // All report projections must consume the same deterministic evidence tuple.  The
+        // former SARIF-only "high confidence, then shortest path" order could disagree with
+        // CSV/JSON/Markdown when two variants shared a dynamic status but differed in
+        // construction, completeness, dispatch, or static evidence.  High-confidence remains
+        // visible as a property; it is not a second, format-specific ranking contract.
+        orderedChains.sort(ChainRanking.comparator(stableNotes, verificationByKey, Set.of()));
         for (Chain chain : orderedChains) {
             if (calibrations.containsKey(chain.key())) {
                 continue;
@@ -91,16 +94,20 @@ public final class SarifReporter {
                 continue; // 同组变体只报一次（与 findings.csv 折叠口径一致）
             }
             List<String> chainNotes = stableNotes.getOrDefault(chain.key(), List.of());
+            if (chainNotes == null) {
+                chainNotes = List.of();
+            }
             VerificationSummary.ChainResult verificationResult = verificationByKey.get(chain.key());
+            ChainPrecision.Assessment precision = ChainPrecision.assess(chain, chainNotes,
+                    verificationResult);
             String confidence = verificationResult != null ? verificationResult.status()
                     : structuredVerification ? "NOT_SELECTED"
-                    : chainNotes.stream().anyMatch(n -> n.startsWith("verify:sink-blocked"))
-                    ? "SINK_BLOCKED"
-                    : chainNotes.stream().anyMatch(n -> n.startsWith("verify:confirmed"))
-                    ? "CONFIRMED" : ConfidenceScorer.score(chain, chainNotes);
+                    : legacyConfidence(chain, chainNotes);
             String message = escape(chain.entryKind() + " → " + chain.sinkClass().replace('/', '.')
                     + "." + chain.sinkMethod());
             String props = "\"confidence\":\"" + escape(confidence) + "\""
+                    + ",\"high_confidence\":"
+                    + ChainPrecision.isHighConfidence(chain, chainNotes, verificationResult)
                     + ",\"entry_kind\":\"" + escape(chain.entryKind()) + "\""
                     + ",\"entry_descriptor\":\"" + escape(entryDescriptor(chain)) + "\""
                     + ",\"sink_descriptor\":\"" + escape(sinkDescriptor(chain)) + "\""
@@ -120,6 +127,8 @@ public final class SarifReporter {
                     + (verificationResult != null && verificationResult.sinkDistorted())
                     + ",\"sandbox_ready\":"
                     + (verificationResult != null && verificationResult.sandboxReady())
+                    + ",\"precision\":"
+                    + ChainPrecision.toJson(precision, SarifReporter::escape)
                     + ",\"construction\":"
                     + ReportEvidence.constructionJson(chain, chainNotes, verificationResult);
             if (!chainNotes.isEmpty()) {
@@ -144,6 +153,17 @@ public final class SarifReporter {
         sb.append("  }]\n");
         sb.append("}");
         AtomicFiles.writeUtf8(layout.findings().resolve("findings.sarif"), sb.toString());
+    }
+
+    private static String legacyConfidence(Chain chain, List<String> notes) {
+        if (notes.stream().anyMatch("verify:confirmed"::equals)
+                && !notes.stream().anyMatch("verify:sink-blocked"::equals)) {
+            // Keep the legacy display label for downstream SARIF consumers; ordering uses
+            // the normalized SINK_BLOCKED tier through ChainRanking.
+            return "CONFIRMED";
+        }
+        String status = ConfidenceScorer.statusFromNotes(notes);
+        return status.isBlank() ? ConfidenceScorer.score(chain, notes) : status;
     }
 
     /** 入口方法首行（ENTRY 跳携带描述符；层次/行号缺失输出空段——不造假日行号）。 */
@@ -203,26 +223,6 @@ public final class SarifReporter {
         }
         return s.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
-    }
-
-    private static boolean hasConfirmedNote(Map<String, List<String>> notes, Chain chain) {
-        return notes.getOrDefault(chain.key(), List.of()).stream()
-                .anyMatch(n -> n.startsWith("verify:sink-blocked") || n.startsWith("verify:confirmed")
-                        || n.equals("verify:segment-confirmed"));
-    }
-
-    private static boolean hasConfirmed(VerificationSummary.ChainResult result,
-                                        Map<String, List<String>> notes, Chain chain,
-                                        boolean structuredVerification) {
-        if (result != null) {
-            return "SINK_BLOCKED".equals(result.status())
-                    || "SAFE_SINK_EXECUTED".equals(result.status())
-                    || "SAFE_EFFECT_OBSERVED".equals(result.status());
-        }
-        if (structuredVerification) {
-            return false;
-        }
-        return hasConfirmedNote(notes, chain);
     }
 
     private static Map<String, VerificationSummary.ChainResult> verificationByKey(

@@ -51,7 +51,8 @@ public final class ConfidenceScorer {
         // An authenticated exact canary boundary is direct runtime evidence. It must not be
         // demoted by a static unresolved-hop penalty or a probe-side construction warning;
         // those limitations remain visible in the evidence vector and notes.
-        if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
+        String runtimeStatus = statusFromNotes(notes);
+        if ("SINK_BLOCKED".equals(runtimeStatus)) {
             return hasNote(notes, "degrade:sink-canary-non-strict-os")
                     ? "DEGRADED(SINK_CANARY_NON_STRICT_OS)" : "FEASIBLE";
         }
@@ -63,13 +64,13 @@ public final class ConfidenceScorer {
         }
         // Safe adapter effects deliberately remain degraded because they are not target
         // effects. Concrete and entry-return observations are weaker prefix evidence.
-        if (hasNote(notes, "verify:safe-effect-observed")) {
+        if ("SAFE_EFFECT_OBSERVED".equals(runtimeStatus)) {
             return "DEGRADED(SAFE_EFFECT_DISTORTED)";
         }
-        if (hasNote(notes, "verify:concrete-reached")) {
+        if ("CONCRETE_REACHED".equals(runtimeStatus)) {
             return "DEGRADED(CONCRETE_TRIGGER_ONLY)";
         }
-        if (hasNote(notes, "verify:executed")) {
+        if ("EXECUTED".equals(runtimeStatus)) {
             return "DEGRADED(ENTRY_RETURN_ONLY)";
         }
         if (!degradations.isEmpty()) {
@@ -102,16 +103,12 @@ public final class ConfidenceScorer {
             points += notes.stream().filter(n -> n != null && n.startsWith("pattern:")).count()
                     * PATTERN_BONUS;
             // 动态验证证据：真实边界 > 具体触发前缀 > 段归因 > 安全 adapter > 入口返回。
-            if (notes.stream().anyMatch(n -> n.equals("verify:sink-blocked")
-                    || n.equals("verify:confirmed"))) {
-                points += SINK_BLOCKED_BONUS;
-            } else if (notes.stream().anyMatch(n -> n.equals("verify:segment-confirmed"))) {
-                points += SEGMENT_CONFIRMED_BONUS;
-            } else if (notes.stream().anyMatch(n -> n.equals("verify:concrete-reached"))) {
-                points += 2;
-            } else if (notes.stream().anyMatch(n -> n.equals("verify:safe-effect-observed"))) {
-                points += 1;
-            }
+            points += switch (statusFromNotes(notes)) {
+                case "SINK_BLOCKED" -> SINK_BLOCKED_BONUS;
+                case "CONCRETE_REACHED" -> 2;
+                case "SAFE_EFFECT_OBSERVED", "EXECUTED" -> 1;
+                default -> 0;
+            };
         }
         return points;
     }
@@ -120,28 +117,58 @@ public final class ConfidenceScorer {
     public static int dynamicRank(String status, List<String> notes) {
         String value = status == null ? "" : status;
         if (value.isBlank()) {
-            if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
-                return DYNAMIC_SINK_BOUNDARY;
-            }
-            if (hasNote(notes, "verify:concrete-reached")) {
-                return DYNAMIC_CONCRETE_TRIGGER;
-            }
-            if (hasNote(notes, "verify:safe-effect-observed")) {
-                return DYNAMIC_SAFE_ADAPTER;
-            }
-            if (hasNote(notes, "verify:executed")) {
-                return DYNAMIC_ENTRY_RETURN;
-            }
-            return DYNAMIC_NOT_SELECTED;
+            value = statusFromNotes(notes);
         }
         return switch (value) {
-            case "SINK_BLOCKED", "SAFE_SINK_EXECUTED" -> DYNAMIC_SINK_BOUNDARY;
+            case "SINK_BLOCKED" -> DYNAMIC_SINK_BOUNDARY;
             case "CONCRETE_REACHED" -> DYNAMIC_CONCRETE_TRIGGER;
-            case "SAFE_EFFECT_OBSERVED" -> DYNAMIC_SAFE_ADAPTER;
+            // SAFE_SINK_EXECUTED is a pre-2.0 compatibility label.  It described an
+            // adapter-owned operation, never entry into the target sink body, so old reports
+            // must not be allowed to outrank the authenticated canary boundary.
+            case "SAFE_EFFECT_OBSERVED", "SAFE_SINK_EXECUTED" -> DYNAMIC_SAFE_ADAPTER;
             case "EXECUTED" -> DYNAMIC_ENTRY_RETURN;
             case "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE" -> DYNAMIC_NEGATIVE_OR_UNTESTABLE;
             default -> DYNAMIC_NOT_SELECTED;
         };
+    }
+
+    /** True only for the authenticated canary boundary; compatibility labels are weaker. */
+    public static boolean isSinkBoundaryStatus(String status) {
+        return "SINK_BLOCKED".equals(status);
+    }
+
+    /** Safe adapter labels are explicitly distorted and never mean target sink execution. */
+    public static boolean isSafeAdapterStatus(String status) {
+        return "SAFE_EFFECT_OBSERVED".equals(status)
+                || "SAFE_SINK_EXECUTED".equals(status);
+    }
+
+    /**
+     * Normalize legacy chain notes into the same closed dynamic status used by reports and
+     * ranking.  Notes are an extension compatibility input, so null and unknown values are
+     * ignored; precedence follows the evidence contract rather than lexical note order.
+     */
+    public static String statusFromNotes(List<String> notes) {
+        if (notes == null || notes.isEmpty()) {
+            return "";
+        }
+        if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
+            return "SINK_BLOCKED";
+        }
+        if (hasNote(notes, "verify:segment-confirmed")
+                || hasNote(notes, "verify:concrete-reached")) {
+            return "CONCRETE_REACHED";
+        }
+        if (hasNote(notes, "verify:safe-effect-observed")) {
+            return "SAFE_EFFECT_OBSERVED";
+        }
+        if (hasNote(notes, "verify:executed")) {
+            return "EXECUTED";
+        }
+        if (notes.stream().anyMatch(note -> note != null && note.startsWith("degrade:partial-path"))) {
+            return "PARTIAL";
+        }
+        return "";
     }
 
     /** Compact evidence vector for callers that need an auditable reason, not just a label. */
@@ -198,16 +225,13 @@ public final class ConfidenceScorer {
         // the penalty back after removing runtime notes so this vector has disjoint dimensions:
         // static positives, construction, runtime, and uncertainty.
         int staticScore = Math.max(0, evidenceScore(chain, staticNotes) + unresolvedPenalty);
-        String runtime = stableNotes.stream().anyMatch("verify:sink-blocked"::equals)
-                || stableNotes.stream().anyMatch("verify:confirmed"::equals)
-                ? "SINK_CANARY_BOUNDARY"
-                : stableNotes.stream().anyMatch("verify:concrete-reached"::equals)
-                ? "CONCRETE_TRIGGER"
-                : stableNotes.stream().anyMatch("verify:safe-effect-observed"::equals)
-                ? "SAFE_EFFECT_DISTORTED"
-                : stableNotes.stream().anyMatch("verify:executed"::equals)
-                ? "ENTRY_RETURN"
-                : "NONE";
+        String runtime = switch (statusFromNotes(stableNotes)) {
+            case "SINK_BLOCKED" -> "SINK_CANARY_BOUNDARY";
+            case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER";
+            case "SAFE_EFFECT_OBSERVED" -> "SAFE_EFFECT_DISTORTED";
+            case "EXECUTED" -> "ENTRY_RETURN";
+            default -> "NONE";
+        };
         int runtimeScore = switch (runtime) {
             case "SINK_CANARY_BOUNDARY" -> SINK_BLOCKED_BONUS;
             case "CONCRETE_TRIGGER" -> 2;

@@ -63,6 +63,11 @@ public final class BytecodeFrontend {
      * fat jar 原始 byte[] 的存活时间，也避免为每个 class 提交一个长期挂起的 Future。
      */
     public LoadResult loadStreaming(List<Path> targets) {
+        return loadStreaming(targets, 0);
+    }
+
+    /** Load using a target JDK feature for multi-release archive selection. */
+    public LoadResult loadStreaming(List<Path> targets, int targetFeature) {
         try (ParsingSession session = new ParsingSession()) {
             StreamingAccumulator accumulator = new StreamingAccumulator(session);
             if (targets == null) {
@@ -71,7 +76,7 @@ public final class BytecodeFrontend {
             for (Path target : targets) {
                 try {
                     JarReader.StreamResult stream = jarReader.streamDetailed(target,
-                            accumulator::accept);
+                            accumulator::accept, targetFeature);
                     accumulator.addReasons(stream.completenessReasons());
                 } catch (IOException e) {
                     accumulator.diagnostics.add(new ParseDiagnostic(target.toString(), e.getMessage()));
@@ -85,12 +90,17 @@ public final class BytecodeFrontend {
 
     /** 读取输入文件但不解析，供调用方在不重复读取/解析目标的情况下规划外部类切片。 */
     public Inputs read(List<Path> targets) {
+        return read(targets, 0);
+    }
+
+    /** Read raw class inputs using a target JDK feature for multi-release selection. */
+    public Inputs read(List<Path> targets, int targetFeature) {
         List<ParseDiagnostic> diagnostics = new ArrayList<>();
         List<String> completenessReasons = new ArrayList<>();
         List<ClassBytes> inputs = new ArrayList<>();
         for (Path target : targets) {
             try {
-                JarReader.ReadResult read = jarReader.readDetailed(target);
+                JarReader.ReadResult read = jarReader.readDetailed(target, targetFeature);
                 completenessReasons.addAll(read.completenessReasons());
                 inputs.addAll(read.classes());
             } catch (IOException e) {

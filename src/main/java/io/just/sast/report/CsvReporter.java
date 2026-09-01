@@ -6,6 +6,7 @@ import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.SinkOutcome;
 import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.chain.ChainIds;
+import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ChainRanking;
 import io.just.sast.chain.ConfidenceScorer;
 
@@ -55,6 +56,17 @@ public final class CsvReporter {
     public void write(ReportLayout layout, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
                       Map<String, String> calibrations, Map<String, List<String>> chainNotes,
                       VerificationSummary verification) throws IOException {
+        write(layout, chains, outcomes, calibrations, chainNotes, verification, null);
+    }
+
+    /**
+     * Report with optional phase timings. The map is a diagnostic sink for the pipeline; it
+     * never participates in ordering or output and can be omitted by standalone consumers.
+     */
+    public void write(ReportLayout layout, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
+                      Map<String, String> calibrations, Map<String, List<String>> chainNotes,
+                      VerificationSummary verification, Map<String, Long> timings) throws IOException {
+        long phaseStart = System.nanoTime();
         chains = chains == null ? List.of() : chains;
         outcomes = outcomes == null ? Map.of() : outcomes;
         calibrations = calibrations == null ? Map.of() : calibrations;
@@ -62,7 +74,9 @@ public final class CsvReporter {
         regions.attach(cpgGraph);
         Files.createDirectories(layout.findings());
         Files.createDirectories(layout.evidence());
+        recordTiming(timings, "prepare", phaseStart);
         // 按 (entry, sink, category) 折叠：代表链取最短路径，其余计入 variant_count
+        phaseStart = System.nanoTime();
         Map<String, List<Chain>> groups = new java.util.LinkedHashMap<>();
         for (Chain chain : chains) {
             if (calibrations.containsKey(chain.key())) {
@@ -70,14 +84,26 @@ public final class CsvReporter {
             }
             groups.computeIfAbsent(pairKey(chain), k -> new ArrayList<>()).add(chain);
         }
-        for (List<Chain> group : groups.values()) {
-            group.sort(chainOrder());
-        }
         Map<String, VerificationSummary.ChainResult> verificationByKey = verificationByKey(verification);
+        for (List<Chain> group : groups.values()) {
+            // The representative must describe the same variant as the strongest dynamic
+            // evidence.  A shortest unverified variant paired with a longer SINK_BLOCKED
+            // result produces a misleading row (status from one path, path text from another)
+            // and can make a high-confidence finding impossible to audit.  With no dynamic
+            // evidence this comparator falls back to the historical shortest-path order.
+            group.sort((left, right) -> {
+                int comparison = ChainRanking.compare(left, right, stableChainNotes,
+                        verificationByKey, Set.of());
+                return comparison != 0 ? comparison : chainOrder().compare(left, right);
+            });
+        }
+        recordTiming(timings, "group", phaseStart);
+        phaseStart = System.nanoTime();
         // 高可用链置顶：置信度 → 质量（无未解析） → 链长 → 变体数
         List<List<Chain>> sortedGroups = new ArrayList<>(groups.values());
-        sortedGroups.sort((a, b) -> compareGroups(a, b, stableChainNotes,
-                verification, verificationByKey));
+        sortedGroups.sort((a, b) -> compareGroups(a, b, stableChainNotes, verificationByKey));
+        recordTiming(timings, "sort", phaseStart);
+        phaseStart = System.nanoTime();
         List<SinkOutcome> orderedOutcomes = new ArrayList<>(outcomes.values());
         orderedOutcomes.sort(Comparator.comparing(CsvReporter::sinkKey));
         List<Map.Entry<String, String>> orderedCalibrations = new ArrayList<>(calibrations.entrySet());
@@ -86,16 +112,27 @@ public final class CsvReporter {
         for (Chain chain : chains) {
             chainsByKey.putIfAbsent(chain.key(), chain);
         }
+        recordTiming(timings, "order", phaseStart);
         // Keep only the grouped Chain objects in memory. Rows are encoded directly into each
         // file; materializing findings + edges + every variant duplicated large strings and
         // made reporting a second memory peak after analysis had already completed.
+        phaseStart = System.nanoTime();
         writeFindings(layout.findings().resolve("findings.csv"), sortedGroups, stableChainNotes,
                 verification, verificationByKey);
+        recordTiming(timings, "findings", phaseStart);
+        phaseStart = System.nanoTime();
         writeEdges(layout.evidence().resolve("edges.csv"), sortedGroups);
+        recordTiming(timings, "edges", phaseStart);
+        phaseStart = System.nanoTime();
         writeChains(layout.evidence().resolve("chains.csv"), chains, calibrations);
+        recordTiming(timings, "chains", phaseStart);
+        phaseStart = System.nanoTime();
         writeSinks(layout.evidence().resolve("sinks.csv"), orderedOutcomes);
+        recordTiming(timings, "sinks", phaseStart);
+        phaseStart = System.nanoTime();
         writeCalibrations(layout.evidence().resolve("calibrations.csv"), chainsByKey,
                 orderedCalibrations);
+        recordTiming(timings, "calibrations", phaseStart);
     }
 
     private void writeFindings(Path file, List<List<Chain>> groups,
@@ -108,13 +145,20 @@ public final class CsvReporter {
                 Chain representative = group.get(0);
                 List<String> groupNotes = new ArrayList<>();
                 for (Chain variant : group) {
-                    groupNotes.addAll(chainNotes.getOrDefault(variant.key(), List.of()));
+                    List<String> variantNotes = chainNotes.getOrDefault(variant.key(), List.of());
+                    if (variantNotes != null) {
+                        groupNotes.addAll(variantNotes);
+                    }
                 }
                 String chainId = groupId(representative, i + 1);
                 VerificationSummary.ChainResult groupVerification = verificationForGroup(group, results);
+                boolean groupHighConfidence = group.stream().anyMatch(variant ->
+                        ChainPrecision.isHighConfidence(variant,
+                                chainNotes.getOrDefault(variant.key(), List.of()),
+                                results.get(variant.key())));
                 writeRow(writer, findingRow(chainId, representative, group.size(),
                         Map.of(representative.key(), groupNotes), groupVerification,
-                        verification != null));
+                        verification != null, groupHighConfidence));
             }
         });
     }
@@ -195,30 +239,14 @@ public final class CsvReporter {
     }
 
     private static String groupId(Chain chain, int sequence) {
-        return ChainIds.id(chain.key()) + "-" + String.format("%04d", sequence);
-    }
-
-    /** 组内任一变体有结构化确认状态，兼容旧版静态注释。 */
-    private static boolean hasConfirmedNote(List<Chain> group, Map<String, List<String>> chainNotes,
-                                            Map<String, VerificationSummary.ChainResult> results) {
-        for (Chain c : group) {
-            VerificationSummary.ChainResult result = results.get(c.key());
-            if (result != null && ("SINK_BLOCKED".equals(result.status())
-                    || "SAFE_SINK_EXECUTED".equals(result.status()))) {
-                return true;
-            }
-            List<String> notes = chainNotes.get(c.key());
-            if (notes != null) {
-                for (String n : notes) {
-                    // 子进程确认与段归因确认（完整链的内段被子进程证实）均置顶
-                    if (n.startsWith("verify:sink-blocked") || n.startsWith("verify:confirmed")
-                            || n.equals("verify:segment-confirmed")) {
-                        return true;
-                    }
-                }
-            }
+        String sequenceText = Integer.toString(Math.max(0, sequence));
+        String chainId = ChainIds.id(chain.key());
+        StringBuilder result = new StringBuilder(chainId.length() + 5)
+                .append(chainId).append('-');
+        for (int i = sequenceText.length(); i < 4; i++) {
+            result.append('0');
         }
-        return false;
+        return result.append(sequenceText).toString();
     }
 
     private static String pairKey(Chain chain) {
@@ -231,16 +259,9 @@ public final class CsvReporter {
     /** 组排序：SINK_BLOCKED 链置顶 → 证据分值降序 → 链长（短优先） → 变体数（多优先）。 */
     private static int compareGroups(List<Chain> g1, List<Chain> g2,
                                      Map<String, List<String>> chainNotes,
-                                     VerificationSummary verification,
                                      Map<String, VerificationSummary.ChainResult> verificationByKey) {
         Chain c1 = g1.get(0);
         Chain c2 = g2.get(0);
-        // SINK_BLOCKED 优先（真实前缀抵达 canary、但 sink body 未进入的链排最前）
-        boolean confirmed1 = hasConfirmedNote(g1, chainNotes, verificationByKey);
-        boolean confirmed2 = hasConfirmedNote(g2, chainNotes, verificationByKey);
-        if (confirmed1 != confirmed2) {
-            return confirmed1 ? -1 : 1;
-        }
         int cmp = ChainRanking.compare(c1, c2, chainNotes, verificationByKey, Set.of());
         if (cmp != 0) {
             return cmp;
@@ -274,7 +295,7 @@ public final class CsvReporter {
             + "entry_class,entry_method,entry_descriptor,entry_kind,sink_class,sink_method,sink_kind,"
             + "sink_descriptor,sink_role,chain_length,unresolved_hops,variant_count,patterns,path,evidence,rank_evidence,verify,"
             + "construction_status,construction_type,construction_fields,construction_trigger,construction_sink_control,"
-            + "construction_reasons,verification_status,sink_distorted,sandbox_ready";
+            + "construction_reasons,verification_status,sink_distorted,sandbox_ready,precision,high_confidence";
 
     private static final String EDGES_HEADER = "chain_id,step,from_class,from_method,to_class,to_method,"
             + "edge_kind,field,reason";
@@ -295,10 +316,14 @@ public final class CsvReporter {
     private Row findingRow(String chainId, Chain chain, int variantCount,
                            Map<String, List<String>> chainNotes,
                            VerificationSummary.ChainResult verification,
-                           boolean structuredVerification) {
+                           boolean structuredVerification,
+                           boolean highConfidence) {
         List<String> notes = chainNotes.getOrDefault(chain.key(), List.of());
+        if (notes == null) {
+            notes = List.of();
+        }
         String patterns = notes.stream()
-                .filter(n -> n.startsWith("pattern:"))
+                .filter(n -> n != null && n.startsWith("pattern:"))
                 .map(n -> n.substring("pattern:".length()))
                 .reduce((a, b) -> a + "|" + b)
                 .orElse("");
@@ -306,6 +331,7 @@ public final class CsvReporter {
         String quality = chain.unresolvedHops() > 0 ? "PARTIAL(unresolved=" + chain.unresolvedHops() + ")" : "COMPLETE";
         String path = pathSummary(chain);
         String evidence = ConfidenceScorer.evidenceDecomposition(chain, notes);
+        String precision = ChainPrecision.assess(chain, notes, verification).compact();
         io.just.sast.blackboard.ConstructionSummary construction =
                 ReportEvidence.construction(chain, notes, verification);
         return new Row(chainId, chain.ruleId(), chain.category(), chain.severity(), confidence,
@@ -324,7 +350,8 @@ public final class CsvReporter {
                 String.join("|", construction.reasons()),
                 verification == null ? "NOT_SELECTED" : verification.status(),
                 verification != null && verification.sinkDistorted() ? "true" : "false",
-                verification != null && verification.sandboxReady() ? "true" : "false");
+                verification != null && verification.sandboxReady() ? "true" : "false",
+                precision, Boolean.toString(highConfidence));
     }
 
     /** 验证候选摘要（GadgetHunter Vars/Flow/Runtime 静态子集 + 动态验证结果）。 */
@@ -347,11 +374,8 @@ public final class CsvReporter {
                     + verifySummary(chain);
         }
         String base = verifySummary(chain);
-        if (notes == null) {
-            return base;
-        }
         for (String note : notes) {
-            if (note.startsWith("verify:")) {
+            if (note != null && note.startsWith("verify:")) {
                 return note.substring("verify:".length()).toUpperCase() + ";" + base;
             }
         }
@@ -394,14 +418,10 @@ public final class CsvReporter {
         if (result == null) {
             return Integer.MAX_VALUE;
         }
-        return switch (result.status()) {
-            case "SINK_BLOCKED", "SAFE_SINK_EXECUTED" -> 0;
-            case "CONCRETE_REACHED" -> 1;
-            case "SAFE_EFFECT_OBSERVED" -> 2;
-            case "EXECUTED" -> 3;
-            case "PARTIAL", "TIMEOUT", "FAILED", "UNTESTABLE" -> 4;
-            default -> 5;
-        };
+        int order = ConfidenceScorer.dynamicRank(result.status(), List.of());
+        return result.sandboxReady()
+                ? order
+                : Math.max(order, ConfidenceScorer.DYNAMIC_NEGATIVE_OR_UNTESTABLE);
     }
 
     private static String sinkInvocationKind(Chain chain) {
@@ -543,9 +563,14 @@ public final class CsvReporter {
     private static void writeCsv(Path file, String header, CsvBody body) throws IOException {
         Path temp = AtomicFiles.tempSibling(file);
         boolean committed = false;
-        try (java.io.BufferedWriter writer = openCsv(temp, header)) {
-            body.write(writer);
-            writer.flush();
+        try {
+            // Close the writer before REPLACE_EXISTING. Keeping a Windows handle open across
+            // the move made the findings file wait on AV/file-lock handling even when its body
+            // was tiny.
+            try (java.io.BufferedWriter writer = openCsv(temp, header)) {
+                body.write(writer);
+                writer.flush();
+            }
             AtomicFiles.commit(temp, file);
             committed = true;
         } finally {
@@ -572,5 +597,13 @@ public final class CsvReporter {
             return v;
         }
         return '"' + v.replace("\"", "\"\"") + '"';
+    }
+
+    private static void recordTiming(Map<String, Long> timings, String phase, long startedNanos) {
+        if (timings != null && phase != null) {
+            timings.put(phase, Math.max(0L,
+                    java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime()
+                            - startedNanos)));
+        }
     }
 }

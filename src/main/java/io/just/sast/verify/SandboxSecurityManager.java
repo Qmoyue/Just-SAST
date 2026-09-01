@@ -48,6 +48,10 @@ public final class SandboxSecurityManager extends SecurityManager {
     /** Kryo/other serializer construction may need reflective access before target entry. */
     private static final ThreadLocal<Integer> SOURCE_ADAPTER_DEPTH =
             ThreadLocal.withInitial(() -> 0);
+    /** Fixed adapter-owned command/network capabilities; target frames never enter these scopes. */
+    private static final ThreadLocal<Path> SAFE_REAL_EXECUTABLE = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> SAFE_REAL_NETWORK =
+            ThreadLocal.withInitial(() -> false);
 
     SandboxSecurityManager(Path writableRoot, List<Path> readableRoots) {
         this.writableRoot = normalize(writableRoot);
@@ -291,6 +295,9 @@ public final class SandboxSecurityManager extends SecurityManager {
     /** Entered by the probe before an OIS/OOS operation that may bootstrap accessors. */
     static void beginSerializationBootstrap() {
         SecurityManager current = System.getSecurityManager();
+        if (current == null) {
+            return;
+        }
         if (!(current instanceof SandboxSecurityManager manager)
                 || !manager.trustedProbeCaller()) {
             throw new SecurityException("serialization bootstrap is probe-only");
@@ -310,6 +317,9 @@ public final class SandboxSecurityManager extends SecurityManager {
     /** Entered only around Proxy.newProxyInstance class generation. */
     static void beginProxyBootstrap() {
         SecurityManager current = System.getSecurityManager();
+        if (current == null) {
+            return;
+        }
         if (!(current instanceof SandboxSecurityManager manager)
                 || !manager.trustedProbeCaller()) {
             throw new SecurityException("proxy bootstrap is probe-only");
@@ -329,6 +339,9 @@ public final class SandboxSecurityManager extends SecurityManager {
     /** Enter only while the trusted probe builds an inert serializer input. */
     static void beginSourceAdapter() {
         SecurityManager current = System.getSecurityManager();
+        if (current == null) {
+            return;
+        }
         if (!(current instanceof SandboxSecurityManager manager)
                 || !manager.trustedProbeCaller()) {
             throw new SecurityException("source adapter is probe-only");
@@ -343,6 +356,40 @@ public final class SandboxSecurityManager extends SecurityManager {
         } else {
             SOURCE_ADAPTER_DEPTH.set(depth - 1);
         }
+    }
+
+    /** Allow one verifier-owned fixed executable to be started by SAFE_REAL only. */
+    static void beginSafeRealExec(Path executable) {
+        SecurityManager current = System.getSecurityManager();
+        if (current == null) {
+            return;
+        }
+        if (!(current instanceof SandboxSecurityManager manager)
+                || !manager.trustedProbeCaller() || executable == null) {
+            throw new SecurityException("safe-real command is probe-only");
+        }
+        SAFE_REAL_EXECUTABLE.set(executable.toAbsolutePath().normalize());
+    }
+
+    static void endSafeRealExec() {
+        SAFE_REAL_EXECUTABLE.remove();
+    }
+
+    /** Allow one literal loopback round trip by the verifier-owned adapter. */
+    static void beginSafeRealNetwork() {
+        SecurityManager current = System.getSecurityManager();
+        if (current == null) {
+            return;
+        }
+        if (!(current instanceof SandboxSecurityManager manager)
+                || !manager.trustedProbeCaller()) {
+            throw new SecurityException("safe-real network is probe-only");
+        }
+        SAFE_REAL_NETWORK.set(true);
+    }
+
+    static void endSafeRealNetwork() {
+        SAFE_REAL_NETWORK.remove();
     }
 
     /**
@@ -488,6 +535,9 @@ public final class SandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkExec(String cmd) {
+        if (safeRealExecutableAllowed(cmd)) {
+            return;
+        }
         throw new SecurityException("exec denied: " + cmd);
     }
 
@@ -498,22 +548,68 @@ public final class SandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkConnect(String host, int port) {
+        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host)) {
+            return;
+        }
         throw new SecurityException("connect denied: " + host + ":" + port);
     }
 
     @Override
     public void checkListen(int port) {
+        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get())) {
+            return;
+        }
         throw new SecurityException("listen denied: " + port);
     }
 
     @Override
     public void checkAccept(String host, int port) {
+        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host)) {
+            return;
+        }
         throw new SecurityException("accept denied: " + host + ":" + port);
     }
 
     @Override
     public void checkMulticast(java.net.InetAddress address) {
         throw new SecurityException("multicast denied: " + address);
+    }
+
+    private boolean safeRealExecutableAllowed(String command) {
+        Path allowed = SAFE_REAL_EXECUTABLE.get();
+        if (allowed == null || !trustedProbeCaller() || command == null || command.isBlank()) {
+            return false;
+        }
+        try {
+            Path candidate = Path.of(command).toAbsolutePath().normalize();
+            return candidate.equals(allowed) && Files.isRegularFile(candidate)
+                    && !ArchiveLink.isLink(candidate);
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static boolean loopback(String host) {
+        if (host == null) {
+            return false;
+        }
+        String value = host.strip().toLowerCase(Locale.ROOT);
+        return value.equals("127.0.0.1") || value.equals("localhost")
+                || value.equals("::1") || value.equals("0:0:0:0:0:0:0:1");
+    }
+
+    private static final class ArchiveLink {
+        private static boolean isLink(Path path) {
+            if (Files.isSymbolicLink(path)) {
+                return true;
+            }
+            try {
+                return Boolean.TRUE.equals(Files.getAttribute(path, "dos:reparsePoint",
+                        LinkOption.NOFOLLOW_LINKS));
+            } catch (IOException | RuntimeException ignored) {
+                return false;
+            }
+        }
     }
 
     private void checkFile(FilePermission permission) {

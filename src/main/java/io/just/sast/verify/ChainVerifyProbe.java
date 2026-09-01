@@ -1,5 +1,7 @@
 package io.just.sast.verify;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.ObjectOutputStream;
 import java.io.ObjectStreamClass;
 import java.io.ObjectStreamConstants;
@@ -11,9 +13,15 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Collections;
@@ -62,7 +70,19 @@ public final class ChainVerifyProbe {
     private static String safeSinkDisposition = "CANARY_BOUNDARY";
     private static String safeSinkPolicyDigest = "";
     private static String safeIsolationPolicyDigest = "";
+    /** Captured before target code loads; the parent rejects an unknown proof protocol. */
+    private static String safeAttestationVersion = "";
     private static String safeScratchRoot = ".";
+    /** Captured before target code loads; SAFE_REAL may start only this fixed executable. */
+    private static Path safeJavaExecutable;
+    /** One-time parent secret and probe-owned authenticated result file. */
+    private static final String RESULT_CHANNEL_PREFIX = "JUST_VERIFY_RESULT_V1:";
+    private static final int RESULT_SECRET_HEX_LENGTH = 64;
+    private static String resultChannelSecret = "";
+    private static OutputStream resultChannel;
+    private static boolean resultChannelBroken;
+    /** Whether the child installed the kernel filesystem policy requested by its runner. */
+    private static boolean landlockReady = true;
     /** Set only when the declarative graph used the probe-owned reflective proxy adapter. */
     private static boolean graphAdapterUsed;
     /**
@@ -104,6 +124,7 @@ public final class ChainVerifyProbe {
         protocolNonce = safeProperty("just.verify.nonce", "");
         protocolArtifactFingerprint = safeProperty("just.verify.artifact-fingerprint", "");
         graphAdapterUsed = false;
+        initializeResultChannel();
         if (!awaitIsolationReady()) {
             emit("SANDBOX_UNAVAILABLE: isolation-ready-timeout-or-missing");
             System.exit(3);
@@ -113,6 +134,14 @@ public final class ChainVerifyProbe {
             emit("SANDBOX_UNAVAILABLE: OS_ATTESTATION_FAILED");
             System.exit(3);
             return;
+        }
+        if (Boolean.parseBoolean(safeProperty("just.verify.landlock-required", "false"))) {
+            landlockReady = installLandlock();
+            if (!landlockReady) {
+                emit("SANDBOX_UNAVAILABLE: LANDLOCK_ATTESTATION_FAILED");
+                System.exit(3);
+                return;
+            }
         }
         // 解析链跳
         List<String[]> fieldLinks = parseFieldLinks(args.length > 1 ? args[1] : "");
@@ -150,17 +179,31 @@ public final class ChainVerifyProbe {
         safeSinkDisposition = safeProperty("just.verify.sink-disposition", "CANARY_BOUNDARY");
         safeSinkPolicyDigest = safeProperty("just.verify.sink-policy-digest", "");
         safeIsolationPolicyDigest = safeProperty("just.verify.isolation-policy-digest", "");
+        safeAttestationVersion = safeProperty("just.verify.attestation-version", "");
         safeScratchRoot = safeProperty("java.io.tmpdir", ".");
+        safeJavaExecutable = locateSafeJavaExecutable();
+        if ("SAFE_REAL".equals(safeSinkMode)
+                && !"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
+            emit("SANDBOX_UNAVAILABLE: SAFE_REAL_REQUIRES_OS_STRICT");
+            System.exit(3);
+            return;
+        }
 
         try {
             installApplicationLoader();
-            try {
-                SandboxSecurityManager.install(java.nio.file.Path.of(
-                        System.getProperty("java.io.tmpdir", ".")));
-            } catch (Throwable sandboxFailure) {
-                emit("SANDBOX_UNAVAILABLE: " + sandboxFailure.getClass().getSimpleName());
-                System.exit(3);
-                return;
+            // JDK 24+ has no supported Security Manager boundary.  The parent has already
+            // authenticated OS_STRICT before releasing this child; continue without the JVM
+            // policy and keep all adapter effects fixed/owned by this probe.  On older JDKs the
+            // deny-by-default manager remains a useful defense-in-depth layer.
+            if (Runtime.version().feature() < 24) {
+                try {
+                    SandboxSecurityManager.install(java.nio.file.Path.of(
+                            System.getProperty("java.io.tmpdir", ".")));
+                } catch (Throwable sandboxFailure) {
+                    emit("SANDBOX_UNAVAILABLE: " + sandboxFailure.getClass().getSimpleName());
+                    System.exit(3);
+                    return;
+                }
             }
             // The parent authenticates this marker only after the OS backend has attached to
             // this exact child. Require both the agent-owned canary attestation and its
@@ -176,7 +219,11 @@ public final class ChainVerifyProbe {
                 System.exit(3);
                 return;
             }
-            emit("SANDBOX_READY: " + safeProperty("just.verify.backend", "unknown"));
+            emit("SANDBOX_READY: " + safeProperty("just.verify.backend", "unknown")
+                    + "|landlock=" + (Boolean.parseBoolean(
+                    safeProperty("just.verify.landlock-required", "false"))
+                    ? (landlockReady ? "1" : "0") : "na")
+                    + "|attestation=" + safeAttestationVersion);
             // The gate keeps its token in bootstrap memory; do not leave the attestation in the
             // mutable system-properties map where target code could read or replace it.
             System.clearProperty("just.verify.canary-token");
@@ -1555,8 +1602,14 @@ public final class ChainVerifyProbe {
         if (!io.just.sast.verify.boot.SinkCanaryGate.wasReached()) {
             return false;
         }
-        if (observeSafeEffect(sinkClass, sinkMethod)) {
-            emit(token, "SAFE_EFFECT_OBSERVED:" + safeSinkDisposition + adapterSuffix());
+        SafeSinkAdapter.AdapterResult safeEffect = observeSafeEffect(sinkClass, sinkMethod);
+        if (safeEffect != null && safeEffect.effectObserved()
+                && safeSinkDisposition.equals(safeEffect.decision().disposition().name())) {
+            emit(token, "SAFE_EFFECT_OBSERVED:" + safeSinkDisposition
+                    + ";mode=" + safeSinkMode
+                    + ";effect=" + safeEffect.effect()
+                    + ";effect_digest=" + SafeSinkAdapter.effectDigest(safeEffect.effect())
+                    + adapterSuffix());
             System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
                     + " (canary-latched; safe effect observed; target body not entered)");
             return true;
@@ -1567,29 +1620,49 @@ public final class ChainVerifyProbe {
     }
 
     /** Run only the fixed adapter effect after the target sink frame has been unwound. */
-    private static boolean observeSafeEffect(String sinkClass, String sinkMethod) {
-        if (!"SAFE_EXEC".equals(safeSinkMode)
+    private static SafeSinkAdapter.AdapterResult observeSafeEffect(String sinkClass,
+                                                                    String sinkMethod) {
+        if (!("SAFE_EXEC".equals(safeSinkMode) || "SAFE_REAL".equals(safeSinkMode))
                 || "CANARY_BOUNDARY".equals(safeSinkDisposition)
                 || "DENIED".equals(safeSinkDisposition)
                 || safeSinkPolicyDigest.isBlank()) {
-            return false;
+            return null;
         }
         try {
             Path scratch = Path.of(safeScratchRoot).toAbsolutePath().normalize();
-            SafeSinkAdapter.Policy policy = SafeSinkAdapter.safeExecution(scratch);
+            SafeSinkAdapter.Policy policy = "SAFE_REAL".equals(safeSinkMode)
+                    ? SafeSinkAdapter.safeRealExecution(scratch)
+                    : SafeSinkAdapter.safeExecution(scratch);
             if (!policy.digest().equals(safeSinkPolicyDigest)) {
                 System.err.println("SAFE_EFFECT_NOT_OBSERVED: policy-digest-mismatch");
-                return false;
+                return null;
             }
             SafeSinkAdapter.Sink sink = new SafeSinkAdapter.Sink(safeSinkCategory,
                     sinkClass.replace('.', '/'), sinkMethod, "");
-            SafeSinkAdapter.AdapterResult result = SafeSinkAdapter.observe(policy, sink, null);
-            return result.effectObserved()
-                    && safeSinkDisposition.equals(result.decision().disposition().name());
+            return SafeSinkAdapter.observe(policy, sink, null, safeJavaExecutable);
         } catch (RuntimeException failure) {
             System.err.println("SAFE_EFFECT_NOT_OBSERVED: "
                     + failure.getClass().getSimpleName());
-            return false;
+            return null;
+        }
+    }
+
+    private static Path locateSafeJavaExecutable() {
+        try {
+            Path home = Path.of(System.getProperty("java.home", "."));
+            String executable = System.getProperty("os.name", "")
+                    .toLowerCase(java.util.Locale.ROOT).contains("win") ? "java.exe" : "java";
+            Path candidate = home.resolve("bin").resolve(executable).toAbsolutePath().normalize();
+            if (!Files.isRegularFile(candidate)) {
+                return null;
+            }
+            if (!Files.isRegularFile(candidate, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(candidate)) {
+                return null;
+            }
+            return candidate;
+        } catch (RuntimeException ignored) {
+            return null;
         }
     }
 
@@ -1610,13 +1683,114 @@ public final class ChainVerifyProbe {
         if (!protocolRunId.isBlank() && !protocolChainFingerprint.isBlank()
                 && !protocolSinkFingerprint.isBlank() && !protocolNonce.isBlank()
                 && !protocolArtifactFingerprint.isBlank()) {
-            System.out.println("JUST_VERIFY_V2:" + (token == null ? "" : token) + ":"
+            String frame = "JUST_VERIFY_V2:" + (token == null ? "" : token) + ":"
                     + protocolRunId + ":" + protocolChainFingerprint + ":"
                     + protocolSinkFingerprint + ":" + protocolNonce + ":"
-                    + protocolArtifactFingerprint + ":" + safeStatus);
+                    + protocolArtifactFingerprint + ":" + safeStatus;
+            writeResultFrame(frame);
+            System.out.println(frame);
             return;
         }
         System.out.println(PROTOCOL_PREFIX + (token == null ? "" : token) + ":" + safeStatus);
+    }
+
+    /**
+     * Establish the result channel before any target class can run.  The parent writes one
+     * one-time secret to stdin; the probe owns the newly-created file and authenticates every
+     * V2 frame.  Failure is fail-closed in the parent, while stdout remains diagnostic only.
+     */
+    private static void initializeResultChannel() {
+        // Unlike protocol labels, this is a filesystem path and may legitimately exceed the
+        // short metadata-property bound used for tokens/categories.  Keep it bounded and
+        // reject control characters before resolving it.
+        String resultFile = boundedPathProperty("just.verify.result-file");
+        if (resultFile == null || resultFile.isBlank()) {
+            return;
+        }
+        try {
+            String secret = readResultSecret();
+            if (!validResultSecret(secret)) {
+                resultChannelBroken = true;
+                return;
+            }
+            Path path = Path.of(resultFile).toAbsolutePath().normalize();
+            resultChannel = Files.newOutputStream(path, StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE);
+            resultChannelSecret = secret;
+        } catch (Exception failure) {
+            resultChannelBroken = true;
+            closeResultChannel();
+        }
+    }
+
+    private static String readResultSecret() throws IOException {
+        InputStream input = System.in;
+        byte[] buffer = new byte[RESULT_SECRET_HEX_LENGTH + 2];
+        int length = 0;
+        try {
+            while (length < buffer.length) {
+                int value = input.read();
+                if (value < 0 || value == '\n') {
+                    break;
+                }
+                if (value != '\r') {
+                    buffer[length++] = (byte) value;
+                }
+            }
+        } finally {
+            input.close();
+        }
+        if (length != RESULT_SECRET_HEX_LENGTH) {
+            return "";
+        }
+        return new String(buffer, 0, length, StandardCharsets.US_ASCII);
+    }
+
+    private static boolean validResultSecret(String secret) {
+        return secret != null && secret.matches("[0-9a-fA-F]{" + RESULT_SECRET_HEX_LENGTH + "}");
+    }
+
+    private static void writeResultFrame(String frame) {
+        if (resultChannel == null || resultChannelBroken || !validResultSecret(resultChannelSecret)) {
+            return;
+        }
+        try {
+            String line = RESULT_CHANNEL_PREFIX + resultMac(frame) + ":" + frame + "\n";
+            resultChannel.write(line.getBytes(StandardCharsets.UTF_8));
+            resultChannel.flush();
+        } catch (IOException | RuntimeException failure) {
+            resultChannelBroken = true;
+            closeResultChannel();
+        }
+    }
+
+    private static String resultMac(String frame) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(resultChannelSecret.getBytes(StandardCharsets.US_ASCII),
+                    "HmacSHA256"));
+            byte[] digest = mac.doFinal(frame.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(digest.length * 2);
+            for (byte value : digest) {
+                hex.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
+            }
+            return hex.toString();
+        } catch (GeneralSecurityException impossible) {
+            return "";
+        }
+    }
+
+    private static void closeResultChannel() {
+        if (resultChannel == null) {
+            return;
+        }
+        try {
+            resultChannel.close();
+        } catch (IOException ignored) {
+            // The parent will reject an incomplete/unauthenticated channel.
+        } finally {
+            resultChannel = null;
+        }
     }
 
     private static boolean protocolBound() {
@@ -2144,8 +2318,95 @@ public final class ChainVerifyProbe {
                 return false;
             }
             String controllers = Files.readString(Path.of("/sys/fs/cgroup/cgroup.controllers"));
-            return List.of("cpu", "memory", "pids").stream().allMatch(controllers::contains);
+            if (!List.of("cpu", "memory", "pids").stream().allMatch(controllers::contains)) {
+                return false;
+            }
+            if (!cgroupLimitsAttested()) {
+                return false;
+            }
+            if ("true".equalsIgnoreCase(safeProperty("just.verify.loopback", "false"))) {
+                return java.net.NetworkInterface.getByInetAddress(
+                        java.net.InetAddress.getLoopbackAddress()) != null;
+            }
+            return true;
         } catch (IOException | RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Verify effective cgroup-v2 placement and finite limits, rather than trusting the host
+     * controller list alone.  A strict launcher that only exposes the controller files but
+     * leaves this process in an unlimited parent cgroup is not a resource boundary.
+     */
+    private static boolean cgroupLimitsAttested() {
+        try {
+            Path mount = Path.of("/sys/fs/cgroup");
+            Path cgroupFile = Path.of("/proc/self/cgroup");
+            if (!Files.isDirectory(mount) || !Files.isRegularFile(cgroupFile)) {
+                return false;
+            }
+            String relative = "";
+            for (String line : Files.readString(cgroupFile).split("\\R")) {
+                if (line.startsWith("0::")) {
+                    relative = line.substring(3).trim();
+                    break;
+                }
+            }
+            if (relative.isBlank()) {
+                return false;
+            }
+            Path group = mount.resolve(relative.startsWith("/")
+                    ? relative.substring(1) : relative).normalize();
+            if (!group.startsWith(mount) || !Files.isDirectory(group)) {
+                return false;
+            }
+            String pid = Long.toString(ProcessHandle.current().pid());
+            if (!Files.readString(group.resolve("cgroup.procs")).lines()
+                    .map(String::strip).anyMatch(pid::equals)) {
+                return false;
+            }
+            long memory = finiteCgroupValue(Files.readString(group.resolve("memory.max")));
+            long pids = finiteCgroupValue(Files.readString(group.resolve("pids.max")));
+            String[] cpu = Files.readString(group.resolve("cpu.max")).strip().split("\\s+");
+            long quota = cpu.length > 0 && !"max".equals(cpu[0])
+                    ? finiteCgroupValue(cpu[0]) : -1L;
+            return memory > 0L && pids > 0L && quota > 0L;
+        } catch (IOException | RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static long finiteCgroupValue(String value) {
+        if (value == null || value.isBlank() || "max".equals(value.strip())) {
+            return -1L;
+        }
+        try {
+            long parsed = Long.parseLong(value.strip());
+            return parsed > 0L ? parsed : -1L;
+        } catch (NumberFormatException ignored) {
+            return -1L;
+        }
+    }
+
+    /** Install the child-side Landlock filesystem policy before loading target classes. */
+    private static boolean installLandlock() {
+        try {
+            List<Path> writable = new ArrayList<>();
+            Path temp = Path.of(System.getProperty("java.io.tmpdir", "."))
+                    .toAbsolutePath().normalize();
+            if (Files.isDirectory(temp)) {
+                writable.add(temp);
+            }
+            String resultFile = boundedPathProperty("just.verify.result-file");
+            if (!resultFile.isBlank()) {
+                Path parent = Path.of(resultFile).toAbsolutePath().normalize().getParent();
+                if (parent != null && Files.isDirectory(parent) && !writable.contains(parent)) {
+                    writable.add(parent);
+                }
+            }
+            return LinuxLandlock.install(writable);
+        } catch (RuntimeException failure) {
             return false;
         }
     }
@@ -2155,6 +2416,15 @@ public final class ChainVerifyProbe {
         if (value == null || value.isBlank() || value.length() > 96
                 || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
             return fallback;
+        }
+        return value;
+    }
+
+    private static String boundedPathProperty(String key) {
+        String value = System.getProperty(key, "");
+        if (value == null || value.isBlank() || value.length() > 4096
+                || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+            return "";
         }
         return value;
     }

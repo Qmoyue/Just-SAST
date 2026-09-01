@@ -54,7 +54,7 @@ Just 的核心任务是：从 JAR/WAR/class 目录中提取 Java 字节码事实
 | `frontend.asm` | 读取工件、解析 ASM、选择目标 JDK、生成事实 | 污点推理、链排序、报告格式 |
 | `model` | 保存类、方法、字段、调用和指令事实 | 类路径扫描和全局缓存策略 |
 | `cpg` / `analysis` | 图索引、CFG、层次、来源传播和可达性 | 直接写最终报告 |
-| `blackboard` | 事实、链、事件、阶段屏障和确定性合并 | 解释某个攻击面的细节 |
+| `blackboard` | 事实、事件、阶段屏障和确定性合并；由私有 `ChainStore` 独占链身份、合并、校准和注记状态 | 解释某个攻击面的细节 |
 | `knowledge` | 以知识源形式提供 source/sink/回调/组合/校准语义 | 直接调用另一个知识源 |
 | `verify` | 独立子 JVM 中构造和观察安全触发 | 替代静态分析或执行 exploit |
 | `report` | 将结果持久化为稳定格式 | 重新推导链或修改置信度事实 |
@@ -106,6 +106,8 @@ Controller 按 `Phase` 和 `KnowledgeSource.priority()` 调度，阶段内使用
 - `CALIBRATION`：按优先级做可行性校准、剪枝、模式标注和动态验证。
 
 跨阶段事件延迟投递，避免在生产者尚未完成时消费不完整事实。知识源只通过 Blackboard 合作，禁止互相持有和调用实现类。
+
+Blackboard 不再同时维护链列表、语义身份索引、校准表和注记表。`ChainStore` 将这些必须一起变更的状态作为一个私有 cohesive owner：等价链替换时同步转移 key、calibration 和 notes，读取时只暴露不可变快照。Blackboard 仍拥有事实、事件和扫描级状态，因此知识源的公开协作接口不变，也不会因并行链发现顺序改变事件发布边界。
 
 | 知识源 | 阶段 | 责任 |
 | --- | --- | --- |
@@ -202,6 +204,8 @@ just-out/
 ```
 
 所有格式从同一份规范化链路视图渲染；Markdown 面向人读，JSON 面向 agent，CSV/SARIF 面向导入和审计，旁车证据不重新推导静态结论。
+
+动态状态先由 `ConfidenceScorer.statusFromNotes` 对历史注记做兼容归一化，再由 `ChainRanking` 统一生成排序证据；CSV、SARIF、多格式报告和验证候选选择不能各自解释 `confirmed`、safe adapter 或 prefix。缺失或损坏的扩展注记按“无额外证据”处理，不得使报告失败或把弱证据升格。
 
 `findings.csv` 是折叠后的主链，`chains.csv` 保留路径变体；`edges.csv` 负责解释逐跳语义；`calibrations.csv` 让拒绝原因可审计。动态和完整性旁车文件不改变既有 findings JSON 数组契约。
 

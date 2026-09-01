@@ -6,7 +6,7 @@ import picocli.CommandLine.Command;
 /** Just 主入口。 */
 @Command(name = "just-sast",
         description = "轻量字节码 SAST：挖掘 Java 反序列化 gadget 链",
-        subcommands = {ScanCommand.class, DiffCommand.class},
+        subcommands = {ScanCommand.class, DiffCommand.class, PerformanceCommand.class},
         mixinStandardHelpOptions = true, version = "just-sast 0.2.0")
 public final class JustMain implements Runnable {
 

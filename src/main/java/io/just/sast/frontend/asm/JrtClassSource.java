@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
-import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystemNotFoundException;
 import java.nio.file.FileSystems;
@@ -16,10 +15,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.spi.FileSystemProvider;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 /**
@@ -41,17 +41,33 @@ public final class JrtClassSource implements JdkClassSource {
 
     private final ClassFileReader reader = new ClassFileReader();
     private final FileSystem jrt;
-    private final Map<String, String> moduleIndex = new HashMap<>();
-    private boolean fullIndexBuilt;
+    /** Non-null only for external images; the runtime JRT filesystem must never be closed here. */
+    private final URLClassLoader ownerLoader;
+    /** Class-to-module hits are shared by lazy hierarchy lookups. */
+    private final Map<String, String> moduleIndex = new ConcurrentHashMap<>();
+    /** Negative lookups must also be memoized; optional framework types are often repeated. */
+    private final Set<String> missingClasses = ConcurrentHashMap.newKeySet();
+    /** Package-to-module candidates avoid walking every configured module on the first miss. */
+    private final Map<String, List<String>> packageIndex = new ConcurrentHashMap<>();
+    private volatile boolean fullIndexBuilt;
+    private final int feature;
+    private volatile boolean closed;
 
-    private JrtClassSource(FileSystem jrt) {
+    private JrtClassSource(FileSystem jrt, int feature) {
+        this(jrt, feature, null);
+    }
+
+    private JrtClassSource(FileSystem jrt, int feature, URLClassLoader ownerLoader) {
         this.jrt = jrt;
+        this.feature = Math.max(0, feature);
+        this.ownerLoader = ownerLoader;
     }
 
     /** 运行时 JDK 自身的 jrt 文件系统（JVM 启动即存在）。 */
     public static JrtClassSource runtime() {
         try {
-            return new JrtClassSource(FileSystems.getFileSystem(URI.create("jrt:/")));
+            return new JrtClassSource(FileSystems.getFileSystem(URI.create("jrt:/")),
+                    Runtime.version().feature());
         } catch (FileSystemNotFoundException e) {
             throw new IllegalStateException("运行时无 jrt 文件系统（非模块化 JDK？）", e);
         }
@@ -69,13 +85,19 @@ public final class JrtClassSource implements JdkClassSource {
         }
         URLClassLoader loader = new URLClassLoader(new URL[] {jrtFsJar.toUri().toURL()},
                 ClassLoader.getPlatformClassLoader());
-        for (FileSystemProvider candidate : ServiceLoader.load(FileSystemProvider.class, loader)) {
-            if ("jrt".equalsIgnoreCase(candidate.getScheme())) {
-                FileSystem fs = candidate.newFileSystem(URI.create("jrt:/"),
-                        Map.of("java.home", jdkHome.toAbsolutePath().toString()));
-                return new JrtClassSource(fs);
+        try {
+            for (FileSystemProvider candidate : ServiceLoader.load(FileSystemProvider.class, loader)) {
+                if ("jrt".equalsIgnoreCase(candidate.getScheme())) {
+                    FileSystem fs = candidate.newFileSystem(URI.create("jrt:/"),
+                            Map.of("java.home", jdkHome.toAbsolutePath().toString()));
+                    return new JrtClassSource(fs, readFeature(jdkHome), loader);
+                }
             }
+        } catch (IOException | RuntimeException failure) {
+            closeQuietly(loader);
+            throw failure;
         }
+        closeQuietly(loader);
         throw new IOException("jrt-fs.jar 中未找到 jrt FileSystemProvider: " + jrtFsJar);
     }
 
@@ -121,38 +143,182 @@ public final class JrtClassSource implements JdkClassSource {
         }
     }
 
-    private String moduleOf(String internalName) throws IOException {
-        if (moduleIndex.containsKey(internalName)) {
-            return moduleIndex.get(internalName);
+    /** Feature represented by this JRT image, used for multi-release archive selection. */
+    public int feature() {
+        return feature;
+    }
+
+    /** Close only resources owned by external(Path); runtime() remains process-owned. */
+    @Override
+    public void close() {
+        if (ownerLoader == null || closed) {
+            return;
+        }
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                jrt.close();
+            } catch (IOException | RuntimeException e) {
+                JustLogger.debug("外部 JDK jrt 文件系统关闭失败: {}", e.getMessage());
+            }
+            closeQuietly(ownerLoader);
+        }
+    }
+
+    @Override
+    public String moduleOf(String internalName) {
+        try {
+            return moduleOfChecked(internalName);
+        } catch (IOException failure) {
+            JustLogger.debug("JRT 模块查询失败 {}: {}", internalName, failure.getMessage());
+            return null;
+        } catch (RuntimeException ignored) {
+            // The JRT provider is allowed to reject a missing package or a malformed
+            // descriptor with a provider-specific runtime exception.  Module lookup is
+            // optional metadata; an application-owned or array name is simply not a JRT
+            // class and must not flood a normal scan with one debug line per reference.
+            return null;
+        }
+    }
+
+    private String moduleOfChecked(String internalName) throws IOException {
+        if (internalName == null || internalName.isBlank()
+                || internalName.indexOf('[') >= 0
+                || (internalName.startsWith("L") && internalName.endsWith(";"))) {
+            return null;
+        }
+        String cached = moduleIndex.get(internalName);
+        if (cached != null) {
+            return cached;
+        }
+        if (missingClasses.contains(internalName)) {
+            return null;
         }
         Path inJavaBase = jrt.getPath("modules", "java.base", internalName + ".class");
         if (Files.exists(inJavaBase)) {
             moduleIndex.put(internalName, "java.base");
             return "java.base";
         }
-        if (!fullIndexBuilt) {
-            buildFullIndex();
-            fullIndexBuilt = true;
+        for (String module : modulesForPackage(packageName(internalName))) {
+            Path classFile = jrt.getPath("modules", module, internalName + ".class");
+            if (Files.exists(classFile)) {
+                moduleIndex.putIfAbsent(internalName, module);
+                return moduleIndex.get(internalName);
+            }
         }
-        return moduleIndex.get(internalName); // 不存在则 null
-    }
-
-    private void buildFullIndex() throws IOException {
-        Path modules = jrt.getPath("modules");
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(modules)) {
-            for (Path module : ds) {
-                if (!Files.isDirectory(module)) {
-                    continue;
-                }
-                String moduleName = module.getFileName().toString();
-                try (Stream<Path> walk = Files.walk(module)) {
-                    walk.filter(p -> p.toString().endsWith(".class")).forEach(p -> {
-                        String rel = module.relativize(p).toString().replace('\\', '/');
-                        String className = rel.substring(0, rel.length() - 6);
-                        moduleIndex.putIfAbsent(className, moduleName);
-                    });
+        if (!fullIndexBuilt) {
+            // Unknown JDK names used to trigger a walk of every module.  Just's default
+            // deserialization model has a bounded module surface; indexing only that surface
+            // keeps a missing optional type from turning one lookup into a full JRT scan.
+            synchronized (this) {
+                if (!fullIndexBuilt) {
+                    buildFullIndex(DESER_MODULES);
+                    fullIndexBuilt = true;
                 }
             }
+        }
+        String result = moduleIndex.get(internalName);
+        if (result == null) {
+            missingClasses.add(internalName);
+        }
+        return result;
+    }
+
+    /**
+     * JRT exposes a package index. Querying it is O(number of modules containing the package),
+     * while walking every class below /modules is O(the whole image). Keep a sorted immutable
+     * list so external and runtime images have identical lookup order.
+     */
+    private List<String> modulesForPackage(String packageName) {
+        if (packageName == null || packageName.isBlank()) {
+            return List.of();
+        }
+        List<String> cached = packageIndex.get(packageName);
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            Path packagePath = jrt.getPath("packages", packageName);
+            if (!Files.isDirectory(packagePath)) {
+                packageIndex.put(packageName, List.of());
+                return List.of();
+            }
+            List<String> modules;
+            try (Stream<Path> children = Files.list(packagePath)) {
+                modules = children.map(path -> path.getFileName().toString())
+                        .sorted().toList();
+            }
+            List<String> stable = List.copyOf(modules);
+            packageIndex.putIfAbsent(packageName, stable);
+            return packageIndex.get(packageName);
+        } catch (IOException e) {
+            // The package index is an optimization, not a correctness boundary.  Providers
+            // for older/external images may expose /modules but not /packages; let moduleOf
+            // fall back to the bounded deserialization-module index instead of turning a JDK
+            // lookup into a silent load failure.
+            JustLogger.debug("JRT package index unavailable {}: {}", packageName, e.getMessage());
+            return List.of();
+        } catch (RuntimeException ignored) {
+            // Some JRT providers throw NPE/IllegalArgumentException for a package that is
+            // absent from the image.  Treat that as an ordinary negative lookup; package
+            // indexing is an optimization and never a semantic proof.
+            packageIndex.putIfAbsent(packageName, List.of());
+            return List.of();
+        }
+    }
+
+    private static String packageName(String internalName) {
+        int slash = internalName.lastIndexOf('/');
+        return slash < 0 ? "" : internalName.substring(0, slash);
+    }
+
+    private static int readFeature(java.nio.file.Path jdkHome) {
+        try {
+            java.nio.file.Path release = jdkHome.resolve("release");
+            if (java.nio.file.Files.isRegularFile(release)) {
+                for (String line : java.nio.file.Files.readAllLines(release)) {
+                    if (!line.startsWith("JAVA_VERSION=")) {
+                        continue;
+                    }
+                    String version = line.substring("JAVA_VERSION=".length())
+                            .replace("\"", "").trim();
+                    String normalized = version.startsWith("1.") ? version.substring(2)
+                            : version.split("[.+-]", 2)[0];
+                    int dot = normalized.indexOf('.');
+                    return Integer.parseInt(dot < 0 ? normalized : normalized.substring(0, dot));
+                }
+            }
+        } catch (IOException | RuntimeException ignored) {
+            // An unknown image version falls back to the scanner runtime selection.
+        }
+        return 0;
+    }
+
+    private void buildFullIndex(List<String> modulesToIndex) throws IOException {
+        Path modules = jrt.getPath("modules");
+        for (String moduleName : modulesToIndex) {
+            Path module = modules.resolve(moduleName);
+            if (!Files.isDirectory(module)) {
+                continue;
+            }
+            try (Stream<Path> walk = Files.walk(module)) {
+                walk.filter(p -> p.toString().endsWith(".class")).forEach(p -> {
+                    String rel = module.relativize(p).toString().replace('\\', '/');
+                    String className = rel.substring(0, rel.length() - 6);
+                    moduleIndex.putIfAbsent(className, moduleName);
+                });
+            }
+        }
+    }
+
+    private static void closeQuietly(URLClassLoader loader) {
+        try {
+            loader.close();
+        } catch (IOException | RuntimeException e) {
+            JustLogger.debug("外部 JDK jrt 类加载器关闭失败: {}", e.getMessage());
         }
     }
 
@@ -177,6 +343,8 @@ public final class JrtClassSource implements JdkClassSource {
                 });
             }
         }
+        result.sort(java.util.Comparator.comparing(ClassBytes::className)
+                .thenComparing(ClassBytes::origin));
         return result;
     }
 }

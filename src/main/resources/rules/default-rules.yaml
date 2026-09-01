@@ -606,7 +606,7 @@ rules:
 
   - id: JUST-SINK-LOADLIBRARY
     kind: sink
-    category: CODE_EXEC
+    category: NATIVE
     severity: MEDIUM
     match:
       call: { owner: "java/lang/System", name: "load" }
@@ -978,7 +978,7 @@ rules:
 
   - id: JUST-SINK-NATIVE-LOADLIBRARY
     kind: sink
-    category: CODE_EXEC
+    category: NATIVE
     severity: MEDIUM
     match:
       call: { owner: "java/lang/System", name: "loadLibrary" }
@@ -986,7 +986,7 @@ rules:
 
   - id: JUST-SINK-NATIVE-RUNTIME-LOAD
     kind: sink
-    category: CODE_EXEC
+    category: NATIVE
     severity: MEDIUM
     match:
       call: { owner: "java/lang/Runtime", name: ~"load|loadLibrary" }

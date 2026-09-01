@@ -34,6 +34,22 @@ class YamlRuleLoaderTest {
     }
 
     @Test
+    void nativeLibraryRulesRemainNativeCapabilities() throws IOException {
+        RuleSet set = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+
+        assertEquals("NATIVE", set.sinks().stream()
+                .filter(rule -> "JUST-SINK-LOADLIBRARY".equals(rule.id()))
+                .findFirst().orElseThrow().category());
+        assertEquals("NATIVE", set.sinks().stream()
+                .filter(rule -> "JUST-SINK-NATIVE-LOADLIBRARY".equals(rule.id()))
+                .findFirst().orElseThrow().category());
+        assertEquals("NATIVE", set.sinks().stream()
+                .filter(rule -> "JUST-SINK-NATIVE-RUNTIME-LOAD".equals(rule.id()))
+                .findFirst().orElseThrow().category());
+    }
+
+    @Test
     void secondaryDeserializeBridgesAreTypedSources() throws IOException {
         Path rules = Path.of("src/main/resources/rules/default-rules.yaml");
         RuleSet set = new YamlRuleLoader().load(Files.newInputStream(rules));

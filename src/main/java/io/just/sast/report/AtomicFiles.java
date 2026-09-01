@@ -8,10 +8,20 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Small report-output boundary: a failed writer must not publish a plausible partial file. */
 final class AtomicFiles {
+
+    /*
+     * Report temp names do not carry security material and are never published. UUID.randomUUID
+     * nevertheless initializes the platform SecureRandom on the first report write; on some
+     * Windows hosts that blocks for several seconds and made a tiny findings report look like
+     * an analysis bottleneck. CREATE_NEW remains the collision guard; the process id, monotonic
+     * clock and counter provide a cheap per-process namespace without touching entropy sources.
+     */
+    private static final AtomicLong TEMP_COUNTER = new AtomicLong();
+    private static final String PROCESS_TOKEN = Long.toUnsignedString(ProcessHandle.current().pid(), 36);
 
     private AtomicFiles() {
     }
@@ -23,8 +33,10 @@ final class AtomicFiles {
             throw new IOException("report target has no parent: " + target);
         }
         Files.createDirectories(parent);
+        long counter = TEMP_COUNTER.incrementAndGet();
+        String token = Long.toUnsignedString(System.nanoTime(), 36) + "-" + counter;
         return parent.resolve("." + absolute.getFileName() + ".tmp-"
-                + UUID.randomUUID());
+                + PROCESS_TOKEN + "-" + token);
     }
 
     static BufferedWriter newUtf8Writer(Path temp) throws IOException {

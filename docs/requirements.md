@@ -50,7 +50,7 @@ Just 面向两类输入：
 | FR-16 | 链校准包含类型流、PASM、序列化可行性、catch 可达性、字段依赖和约束矛盾检查；校准不能替代静态证据 |
 | FR-17 | 动态验证默认开启，采用 fork-per-chain 子 JVM、真实序列化/反序列化前置链、对象图构造、真实触发模式和 sink canary；`--no-verify` 显式关闭 |
 | FR-18 | 动态状态至少区分 `SINK_BLOCKED`、`SAFE_EFFECT_OBSERVED`、`CONCRETE_REACHED`、`EXECUTED`、`PARTIAL`、`FAILED`、`UNTESTABLE`；`SINK_BLOCKED` 必须有入口归因的 canary/精确 sink 边界证据，`SAFE_EFFECT_OBSERVED` 必须绑定安全 adapter 的 policy/效果证据，且危险 sink 方法体不继续执行 |
-| FR-19 | 动态验证必须持久化候选选择、能力、状态、证据、尝试次数、耗时和失败原因；静态候选不能因动态失败而消失 |
+| FR-19 | 动态验证必须持久化候选选择、能力、状态、证据、尝试次数、耗时和失败原因；静态候选不能因动态失败而消失；缺失或损坏的扩展注记必须按无额外证据处理 |
 | FR-20 | 输出分类目录、`index.md`、CSV、JSON、SARIF 2.1.0、HTML、Markdown、扫描元数据、动态汇总，以及人/agent 可读且不可直接执行的 payload 视图和 plan |
 | FR-21 | `diff` 依据规则、入口和 sink 的语义身份比较扫描，不依赖并行顺序和变体编号 |
 | FR-22 | 退出码为：`0` 成功，`2` 参数/输入错误，`3` 扫描内部错误 |
@@ -58,6 +58,7 @@ Just 面向两类输入：
 | FR-24 | `--cache`、baseline/suppression 和 dependency inventory 必须以 artifact/dependency/rules/JDK/engine/parameters 身份键控；身份不匹配时 fail closed，cache 只接受完整成功报告 |
 | FR-25 | 依赖清单可输出 SPDX/CycloneDX 兼容的坐标、hash 和嵌套关系；无外部漏洞数据库时不生成 CVE/安全结论 |
 | FR-26 | 动态置信度必须区分真实 canary 边界、safe adapter 失真效果、具体触发前缀、入口返回和不可测状态；安全 adapter 不能与真实边界同级 |
+| FR-27 | 链身份、语义合并、校准和链注记必须由单一状态 owner 管理；所有报告投影与验证候选排序必须消费同一动态状态归一化和 evidence tuple |
 
 ## 3. 规则与扩展契约
 
@@ -152,7 +153,7 @@ payload writer 只输出构造计划和证据，不生成可直接投递的攻�
 | NFR-13 | CPG/CFG 的紧凑表示必须保留调用、字段、控制流、异常、lambda、分发和完整性语义；所有删除的冗余结构有等价回归 |
 | NFR-14 | 分析预算必须按 sink/阶段记录消耗和截断；`COMPLETE` 不得由单条链状态推导，扫描覆盖、链证明和动态能力必须独立输出 |
 | NFR-15 | 动态验证必须 fail closed，结构化记录精确 JDK、sandbox/canary 能力、终止原因、子进程清理和 native 状态；不执行最终危险 sink |
-| NFR-16 | 报告格式从同一规范化结果模型派生，支持大工件流式写出和稳定 schema；人读 Markdown 与 agent JSON 不得各自重新推导结论 |
+| NFR-16 | 报告格式从同一规范化结果模型派生，支持大工件流式写出和稳定 schema；人读 Markdown 与 agent JSON 不得各自重新推导结论；兼容注记不能造成格式间排序分叉 |
 | NFR-17 | 测试覆盖真实子进程边界、跨 JDK/平台、敌意 Jar、确定性、超时/OOM/输出溢出和性能退化；回归语料只作为外部校准，不进入生产特判 |
 | NFR-18 | 固定静态扫描基线的性能目标为同输入历史基线的 `<=1.5x`；默认 end-to-end 动态成本必须单独报告，不能用关闭验证隐藏静态回退 |
 | NFR-19 | 性能优化采用 source/sink 导向的需求驱动范围、方法/类型/字段/控制约束键控的有界缓存、稳定索引和可取消预算；不得因“命中测试样本”写入包名、类名、WP 或单条链特判 |

@@ -22,6 +22,7 @@ import io.just.sast.model.ClassInfo;
 import io.just.sast.model.Descriptor;
 import io.just.sast.model.HandleRef;
 import io.just.sast.model.InvokeDynamicRef;
+import io.just.sast.model.InsnFact;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
@@ -40,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -71,6 +73,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
 
     /** 每 sink 链上限；全局黑板负责跨 sink 去重，避免并行 worker 持有大批临时链。 */
     private static final int MAX_CHAINS_PER_SINK = 20;
+    /** Dead-end reuse is a performance cache only; cap it independently of sink count. */
+    private static final int MAX_WORKER_DEAD_ENDS = 200_000;
     /** 每 sink 步数预算：须覆盖分发图扇出（层次修复后图正确变宽），全局预算另行兜底。 */
     private static final int STEP_BUDGET = 200_000;
     /** 全局步数兜底（终止保证）：须随分发图规模放宽，图表越大首达探索越多。per-sink 并行下按核数摊薄墙钟。 */
@@ -89,17 +93,27 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private static final int MAX_MERGED_CALLERS = 300;
     /** Bound the wildcard callback family supplied by an external serialized proxy. */
     private static final int MAX_SERIALIZED_PROXY_CALLBACK_SITES = 256;
+    /** Bound interface callback expansion for proxies assembled outside the artifact. */
+    private static final int MAX_SERIALIZED_PROXY_INTERFACE_SITES = 256;
     /** Bound structural lambda bridge discovery; ordinary interface calls remain demand-driven. */
     private static final int MAX_LAMBDA_BRIDGE_STATES = 512;
     private static final int MAX_LAMBDA_BRIDGE_DEPTH = 8;
     private static final int MAX_LAMBDA_SAM_ROUTES = 256;
+    /** Bound body-level return recovery; models remain the cheaper first choice. */
+    private static final int MAX_CALLEE_RETURN_TARGETS = 8;
+    private static final int MAX_CALLEE_RETURN_SITES = 24;
+    /** Do not interpret large/platform bodies as a fallback for every call-result origin. */
+    private static final int MAX_CALLEE_RETURN_BODY_INSNS = 256;
 
     /** V11：按闭包大小调整的每 sink 预算；实例级，避免同 JVM 多扫描互相污染。 */
     private int stepBudgetAdjusted = STEP_BUDGET;
     /** 每个 sink 独立的死胡同缓存；不能跨 sink 复用，因为路径跳数、预算和规则上下文不同。 */
     private record DeadKey(String methodKey, ValueOrigin origin) {}
-    private record CallerSite(Node call, MethodInfo caller, String methodKey) {}
+    private record CallerSite(Node call, MethodInfo caller, String methodKey, int entryDepth) {}
     private record CallerSites(List<CallerSite> sites, boolean merged) {}
+    private record ParamRoute(MethodInfo caller, Node call, List<ValueOrigin> origins,
+                              Integer argumentOrdinal, HopKind hopKind, String reason) {}
+    private record ParamRoutes(List<ParamRoute> routes, int unresolved) {}
     private record LambdaCarrier(MethodInfo method, int slot, int depth) {}
     private record LambdaSamRoute(Node factory, Node samCall, MethodInfo samHost) {}
 
@@ -138,19 +152,62 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     }
     private final ThreadLocal<WorkerOriginCache> localOriginResults =
             ThreadLocal.withInitial(WorkerOriginCache::new);
+    /**
+     * The caller/argument mapping for a target parameter is scan-invariant, while the path
+     * walk that consumes it is sink-local.  Cache the immutable mapping per worker so a large
+     * sink set does not repeat receiver feasibility, reflection precondition, and origin-set
+     * ordering work.  This is deliberately bounded and local: it cannot change semantics or
+     * retain an entire dependency closure after a worker finishes.
+     */
+    private static final int MAX_WORKER_PARAM_ROUTE_ENTRIES = 8_192;
+    private record ParamRouteKey(MethodInfo method, int slot) {}
+    private static final class WorkerParamRouteCache {
+        private final Map<ParamRouteKey, ParamRoutes> values = new HashMap<>();
+        private final Deque<ParamRouteKey> order = new ArrayDeque<>();
+
+        private ParamRoutes get(ParamRouteKey key) {
+            return values.get(key);
+        }
+
+        private void put(ParamRouteKey key, ParamRoutes value) {
+            if (key == null || value == null || values.containsKey(key)) {
+                return;
+            }
+            while (values.size() >= MAX_WORKER_PARAM_ROUTE_ENTRIES && !order.isEmpty()) {
+                values.remove(order.removeFirst());
+            }
+            values.put(key, value);
+            order.addLast(key);
+        }
+
+        private void clear() {
+            values.clear();
+            order.clear();
+        }
+    }
+    private final ThreadLocal<WorkerParamRouteCache> localParamRoutes =
+            ThreadLocal.withInitial(WorkerParamRouteCache::new);
     /** 方法/入口槽的调用者列表只依赖冻结图，按方法缓存后不再为每个 sink 重建和排序。 */
     private final java.util.concurrent.ConcurrentHashMap<String, CallerSites> callerSitesCache =
             new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.concurrent.ConcurrentHashMap<String, Set<String>> ancestorTypesCache =
+    /** Completed sink traces are published only after the parallel analysis barrier. */
+    private final java.util.concurrent.ConcurrentHashMap<Long, List<Chain>> pendingSinkChains =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, List<String>> ancestorTypesCache =
             new java.util.concurrent.ConcurrentHashMap<>();
     /** Factory + SAM-shape keyed immutable routes; route discovery is shared across sink workers. */
     private record LambdaRouteKey(long factoryId, String samDescriptor) {}
     private final java.util.concurrent.ConcurrentHashMap<LambdaRouteKey, List<LambdaSamRoute>> lambdaRoutesCache =
             new java.util.concurrent.ConcurrentHashMap<>();
+    private record ProxyInterfaceMetadataKey(String handlerKey, String methodName) {}
+    private final java.util.concurrent.ConcurrentHashMap<ProxyInterfaceMetadataKey, Set<Integer>>
+            proxyInterfaceFeasibleOffsets = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, Optional<Rule.MagicEntryRule>> entryRuleCache =
             new java.util.concurrent.ConcurrentHashMap<>();
     /** 双向剪枝：入口下游闭包（与链剪枝共享同一份，黑板分发）。 */
     private Set<String> entryReaching = Set.of();
+    /** An external serialized proxy may supply a handler only after a real deserialize root. */
+    private boolean deserializeRootPresent;
     private Blackboard bb;
     private OriginSupport support;
     /** 只用于统计，不参与热路径预算判定；预算按稳定 sink 序号预分配，结果可复现。 */
@@ -176,6 +233,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         this.bb = blackboard;
         this.support = blackboard.originSupport();
         this.entryReaching = support.entryDownstream(blackboard.graph());
+        this.deserializeRootPresent = hasDeserializeRoot(blackboard.graph());
         // V11 大语料自适应：闭包越大→每 sink 预算越小（总预算不变但分配更均匀），大语料不超线性
         if (entryReaching.size() > 100_000) {
             stepBudgetAdjusted = 50_000;
@@ -187,6 +245,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         totalSteps.reset();
         callerSitesCache.clear();
         ancestorTypesCache.clear();
+        pendingSinkChains.clear();
         JustLogger.info("入口下游闭包：{} 个方法（每 sink 上限 {}）", entryReaching.size(), stepBudgetAdjusted);
     }
 
@@ -218,6 +277,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         FairBudgetAllocator budgetAllocator = new FairBudgetAllocator(
                 GLOBAL_BUDGET, stepBudgetAdjusted, sinks.size());
         Runnable worker = () -> {
+            // Keep the cache worker-local for allocation-free lookup, but clear it at the
+            // sink boundary below.  A dead-end result also depends on the current trace's
+            // sink/entry context and on which bounded frontier was already explored; sharing
+            // it across sinks would make the result depend on worker scheduling.
+            localDeadEnds.get().clear();
+            localParamRoutes.get().clear();
             while (true) {
                 int i = cursor.getAndIncrement();
                 if (i >= sinks.size()) {
@@ -225,13 +290,10 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
                 SinkTask task = sinks.get(i);
                 int perSinkBudget = budgetAllocator.claim(i);
-                localDeadEnds.get().clear();
                 try {
                     analyzeSink(task.callId(), task.mark(), perSinkBudget);
                 } catch (Throwable e) {
                     JustLogger.error("反向污点 sink 分析失败（已隔离）: {}", e.toString());
-                } finally {
-                    localDeadEnds.get().clear();
                 }
             }
         };
@@ -282,6 +344,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
             lease.close();
         }
+        publishPendingSinkChains();
         if (support.constantProofBudgetExceeded()) {
             bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
         }
@@ -308,6 +371,86 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         return entry != null && "lifecycle".equalsIgnoreCase(entry.direction());
     }
 
+    /**
+     * A typed Method collection is an external callback boundary. Its selected
+     * getter has no ordinary caller edge in the scanned artifact, so it is
+     * activated on demand by the forward engine instead of being inserted into
+     * the broad entry closure. Keep the backward sink gate in agreement with
+     * that bounded semantic family.
+     */
+    private boolean isMethodCollectionTarget(MethodInfo method) {
+        if (method == null || support.methodCollectionTargetMethods().isEmpty()) {
+            return false;
+        }
+        String key = OriginSupport.methodKey(method);
+        return support.methodCollectionTargetMethods().stream()
+                .anyMatch(node -> key.equals(OriginSupport.methodKeyOf(
+                        node.owner(), node.name(), node.descriptor())));
+    }
+
+    /**
+     * Check the threat-model root once per scan.  A serializable handler is not an attacker
+     * source by itself; it becomes one only when the same artifact contains an actual
+     * deserialization boundary.  Keeping this fact separate from {@code entryReaching} is
+     * important because the external-proxy index is intentionally admitted lazily.
+     */
+    private boolean hasDeserializeRoot(io.just.sast.cpg.graph.Graph graph) {
+        for (Node methodNode : graph.nodesOfType(NodeType.METHOD)) {
+            if (isPlatformOwner(methodNode.owner())) {
+                continue;
+            }
+            Optional<Rule.MagicEntryRule> entry = bb.ruleEngine().matchingEntry(
+                    methodNode.owner(), methodNode.name(), methodNode.descriptor());
+            if (entry.isPresent() && "deserialize".equalsIgnoreCase(entry.get().direction())
+                    && !"proxyInvoke".equals(entry.get().entryKind())) {
+                return true;
+            }
+        }
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            if (OriginSupport.isOisRead(call)) {
+                return true;
+            }
+            Optional<Rule.SourceRule> source = bb.ruleEngine().matchingSource(
+                    call.owner(), call.name(), call.descriptor());
+            if (source.isPresent() && isUnconditionalDeserializeSource(source.get())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isUnconditionalDeserializeSource(Rule.SourceRule source) {
+        return source != null && !"serialize".equalsIgnoreCase(source.bridge())
+                && (source.tainted() == null || source.tainted().isEmpty());
+    }
+
+    /**
+     * A serializable InvocationHandler is an object-graph value, not a global entry.  Once a
+     * real deserialize root and a resolved interface callback are both present, its own
+     * serialized fields are a valid reverse boundary even when the proxy object is assembled
+     * outside the scanned artifact.  The site check keeps an unrelated handler from becoming
+     * a standalone finding and remains independent of framework/package names.
+     */
+    private boolean externalProxyObjectBoundaryAvailable(MethodInfo handler) {
+        if (!deserializeRootPresent || handler == null
+                || support.serializedProxyInterfaceCallSites().isEmpty()) {
+            return false;
+        }
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            MethodInfo caller = support.enclosingMethod(call);
+            if (caller == null || !entryReaching.contains(OriginSupport.methodKey(caller))) {
+                continue;
+            }
+            ForwardOrigins.Result result = originsOf(caller);
+            Set<ValueOrigin> receivers = support.argOriginAtOrdinal(call, -1, result);
+            if (receivers.stream().anyMatch(value -> !(value instanceof ValueOrigin.Constant)
+                    && !(value instanceof ValueOrigin.Unknown))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean isPlatformOwner(String owner) {
         return owner != null && (owner.startsWith("java/") || owner.startsWith("javax/")
                 || owner.startsWith("jdk/") || owner.startsWith("sun/")
@@ -322,12 +465,19 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             return;
         }
         if (!entryReaching.contains(OriginSupport.methodKey(method))
-                && !isLifecycleEntryHost(method)) {
+                && !isLifecycleEntryHost(method)
+                && !isMethodCollectionTarget(method)) {
             // sink 宿主方法不在入口下游集内：可证明无链。
             // lifecycle trigger（equals/hashCode/toString 等）本身不是反序列化根，
             // 但仍需生成候选交给 calibration 的 no-trigger 门；否则“无触发调用”的
             // 触发器会在分析阶段被静默丢弃，报告无法解释该候选为何不成立。
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
+            return;
+        }
+        ForwardOrigins.Result result = originsOf(method);
+        ForwardOrigins.State state = result.stateBefore().get(call.prop("offset"));
+        if (state == null) {
+            bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_STATE"));
             return;
         }
         // catch 可达性守卫（U1/U4，可判定才剪）：sink 位于 CCE handler 且守卫区为"类型安全的 Class.cast"
@@ -336,17 +486,11 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
             return;
         }
-        if (support.sinkPathProvablyUnreachable(method, (Integer) call.prop("offset"))) {
+        if (support.sinkPathProvablyUnreachable(method, (Integer) call.prop("offset"), result)) {
             // The normal taint transfer remains deliberately path-insensitive.  This exact
             // local feasibility pass only suppresses a sink when every entry-to-sink path
             // requires a proven-impossible branch/reflective continuation/cast.
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
-            return;
-        }
-        ForwardOrigins.Result result = originsOf(method);
-        ForwardOrigins.State state = result.stateBefore().get(call.prop("offset"));
-        if (state == null) {
-            bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_STATE"));
             return;
         }
         int paramCount = Descriptor.paramCount(call.descriptor());
@@ -399,7 +543,27 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         }
         totalSteps.add(trace.steps);
         localDeadEnds.get().clear();
+        List<Chain> completedChains = trace.completedChains();
+        if (!completedChains.isEmpty()) {
+            pendingSinkChains.put(callNodeId, completedChains);
+        }
         bb.recordOutcome(callNodeId, outcome(call, mark, produced, trace.steps, trace.unresolved, trace.tooLong, verdict));
+    }
+
+    /** Publish worker-local findings in sink-id order so finite downstream phases see one input. */
+    private void publishPendingSinkChains() {
+        List<Long> callIds = new ArrayList<>(pendingSinkChains.keySet());
+        callIds.sort(Long::compareTo);
+        for (Long callId : callIds) {
+            List<Chain> chains = pendingSinkChains.get(callId);
+            if (chains == null) {
+                continue;
+            }
+            for (Chain chain : chains) {
+                bb.addChain(chain);
+            }
+        }
+        pendingSinkChains.clear();
     }
 
     /** Return the forward summary once per method visited by the current sink trace. */
@@ -501,7 +665,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         }
         trace.visited.remove(memoKey);
         // 子树内发生过深度/预算截断的"无链"结论是探索不完整，不是可证明无链——不记忆化
-        if (produced == 0 && memoizable && !nearBudget && trace.truncated == truncatedBefore) {
+        if (produced == 0 && memoizable && !nearBudget && trace.truncated == truncatedBefore
+                && localDead.size() < MAX_WORKER_DEAD_ENDS) {
             localDead.add(memoKey);
         }
         return produced;
@@ -512,15 +677,22 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         trace.steps++;
         if (slot == 0 && !method.isStatic() && support.isSerializedProxyHandler(method)) {
             int external = controlledSerializedProxyHandler(method, depth, trace, mark);
+            if (external == 0 && !support.serializedProxyInterfaceCallSites().isEmpty()) {
+                external = controlledSerializedProxyInterfaceHandler(method, depth, trace, mark);
+            }
             if (external > 0) {
                 return external;
+            }
+            if (externalProxyObjectBoundaryAvailable(method)) {
+                return completeChain(mark, "proxyInvoke", method, trace,
+                        "serialized-proxy-handler-object");
             }
         }
         Rule.MagicEntryRule entry = entryRuleOf(method);
         if (entry != null && slot == 0 && !"proxyInvoke".equals(entry.entryKind())) {
             // 入口对象本身由反序列化构造，可控（对象图语义的根）。
             // InvocationHandler.invoke is intentionally excluded: the proxy callback
-            // must be justified by controlledSerializedProxyHandler() or ordinary
+            // must be justified by a serialized-proxy callback bridge or ordinary
             // in-artifact Proxy.newProxyInstance flow, never by a global root.
             return completeChain(mark, entry.entryKind(), method, trace, "this-object");
         }
@@ -535,79 +707,24 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         if (lambdaProduced > 0) {
             return lambdaProduced;
         }
-        Node methodNode = bb.graph().findMethodNode(method.owner(), method.name(), method.descriptor());
-        if (methodNode == null) {
-            return 0;
-        }
-        // 调用点收集：自身入边；为空时并入祖先类型（传递接口/父类链）上同名方法的入边
-        // （接口实现数超 CHA 上限时分发边未物化，具体实现类须经祖先方法节点反查调用点——同前向引擎语义）
-        CallerSites callerSites = callerSitesOf(method, methodNode);
-        List<CallerSite> callSites = callerSites.sites();
-        boolean merged = callerSites.merged();
-        int callerCap = merged ? MAX_MERGED_CALLERS : MAX_CALLERS;
+        ParamRoutes routes = parameterRoutes(method, slot);
+        trace.unresolved += routes.unresolved();
         int produced = 0;
-        int callers = 0;
         // 入口距离优先（JDD bottom-up / FLASH 入口导向的探索序）：离反序列化入口近的调用者先走，
-        // 链在预算内更快闭合——预算截断下的可复现优先级，替代边序的随机性
-        for (CallerSite callerSite : callSites) {
+        // 链在预算内更快闭合——预算截断下的可复现优先级，替代边序的随机性。参数路由已在
+        // worker-local cache 中完成所有与 sink 无关的资格判断；此处只消费不可变来源集合。
+        for (ParamRoute route : routes.routes()) {
             if (abortIfInterrupted(trace)) {
                 break;
             }
-            if (callers >= callerCap || trace.produced >= MAX_CHAINS_PER_SINK) {
-                break;
-            }
-            Node callerCall = callerSite.call();
-            MethodInfo callerMethod = callerSite.caller();
-            if (callerMethod == null) {
-                trace.unresolved++;
-                continue;
-            }
-            if (!entryReaching.contains(callerSite.methodKey())) {
-                continue; // 调用者祖先链不可达入口：可证明无链，剪枝
-            }
-            // An argument reaching a virtual/interface call does not make every
-            // implementation receiver possible.  When the receiver is a concrete NEW
-            // or a field freshly initialized by a dominating local write, honor JVM
-            // resolution here as well as in the forward engine.  Unknown aliases remain
-            // conservative, which preserves ordinary deserialization object graphs.
-            if (!method.isStatic() && !support.receiverMayDispatchTo(callerCall, callerMethod,
-                    method.owner(), method.name(), method.descriptor())) {
-                continue;
-            }
-            // A reflective lookup/invocation is a call edge only after its exact local
-            // preconditions hold.  The backward sink itself lives in the reflected target,
-            // so checking only the target method misses a failed Class.get* lookup (and a
-            // null/inaccessible Method.invoke) in the caller.  This is a generic CFG proof;
-            // unknown metadata remains conservative.
-            if (support.sinkPathProvablyUnreachable(callerMethod, callerCall.offset())) {
-                continue;
-            }
-            callers++;
-            ForwardOrigins.Result callerResult = originsOf(callerMethod);
-            boolean nativeCallback = support.nativeCallbackSite(callerCall, method);
-            boolean reflectiveInvoke = isReflectiveMethodInvoke(callerCall);
-            Set<ValueOrigin> argOrigins = nativeCallback
-                    ? support.nativeTargetArgumentAt(callerCall, method, slot, callerResult)
-                    : reflectiveInvoke
-                    ? support.reflectiveTargetArgumentAt(callerCall, method, slot, callerResult)
-                    : support.argOriginAt(callerCall, callerMethod, slot, callerResult);
-            if (argOrigins.isEmpty()) {
-                continue;
-            }
-            // 类型流可断言类型同一性的前提是"纯参数直传"（调用方把自己的参数原样传入）；
-            // 来源含派生（调用结果/指令产物/字段读——passthrough 会合法换类型，如 method.getDeclaringClass()）
-            // 时 argOrdinal 置空，chain-validator 的类型流校验据此跳过该跳（历史回归：CC BeanMap 链被误拒）
-            boolean directParam = argOrigins.stream().allMatch(o -> o instanceof ValueOrigin.Param);
-            Integer argumentOrdinal = directParam
-                    ? Descriptor.paramOrdinal(method.descriptor(), method.isStatic(), slot) : null;
-            HopKind hopKind = nativeCallback ? HopKind.NATIVE_CALLBACK : HopKind.VIRTUAL_DISPATCH;
-            String reason = nativeCallback ? "native-callback" : "call";
+            MethodInfo callerMethod = route.caller();
+            Node callerCall = route.call();
             ChainHop hop = new ChainHop(callerMethod.owner(), callerMethod.name(),
-                    method.owner(), method.name(), hopKind, null, reason,
-                    method.descriptor(), argumentOrdinal);
+                    method.owner(), method.name(), route.hopKind(), null, route.reason(),
+                    method.descriptor(), route.argumentOrdinal());
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
-            for (ValueOrigin argOrigin : ValueOriginOrder.sorted(argOrigins)) {
+            for (ValueOrigin argOrigin : route.origins()) {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }
@@ -620,6 +737,89 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             trace.unresolved = unresolvedBefore;
         }
         return produced;
+    }
+
+    /**
+     * Build the sink-independent reverse routes for one target parameter.  The old code did
+     * this work on every sink trace, including descriptor mapping, receiver precision, and
+     * origin-set sorting.  Keeping the resulting route list immutable preserves the original
+     * path semantics while making the hot trace loop proportional to actual controllable
+     * origins rather than to repeated call-site qualification.
+     */
+    private ParamRoutes parameterRoutes(MethodInfo method, int slot) {
+        ParamRouteKey key = new ParamRouteKey(method, slot);
+        WorkerParamRouteCache cache = localParamRoutes.get();
+        ParamRoutes cached = cache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Node methodNode = bb.graph().findMethodNode(method.owner(), method.name(), method.descriptor());
+        if (methodNode == null) {
+            ParamRoutes empty = new ParamRoutes(List.of(), 0);
+            cache.put(key, empty);
+            return empty;
+        }
+        CallerSites callerSites = callerSitesOf(method, methodNode);
+        int callerCap = callerSites.merged() ? MAX_MERGED_CALLERS : MAX_CALLERS;
+        List<ParamRoute> routes = new ArrayList<>();
+        int unresolved = 0;
+        int callers = 0;
+        for (CallerSite callerSite : callerSites.sites()) {
+            if (callers >= callerCap) {
+                break;
+            }
+            Node callerCall = callerSite.call();
+            MethodInfo callerMethod = callerSite.caller();
+            if (callerMethod == null) {
+                unresolved++;
+                continue;
+            }
+            if (!entryReaching.contains(callerSite.methodKey())) {
+                continue;
+            }
+            ForwardOrigins.Result callerResult = originsOf(callerMethod);
+            if (callerResult == null) {
+                unresolved++;
+                continue;
+            }
+            if (!method.isStatic() && !support.receiverMayDispatchTo(callerCall, callerMethod,
+                    method.owner(), method.name(), method.descriptor(), callerResult)) {
+                continue;
+            }
+            if (support.sinkPathProvablyUnreachable(callerMethod, callerCall.offset(), callerResult)) {
+                continue;
+            }
+            callers++;
+            boolean nativeCallback = support.nativeCallbackSite(callerCall, method);
+            boolean reflectiveInvoke = isReflectiveMethodInvoke(callerCall);
+            Set<ValueOrigin> argOrigins = nativeCallback
+                    ? support.nativeTargetArgumentAt(callerCall, method, slot, callerResult)
+                    : reflectiveInvoke
+                    ? support.reflectiveTargetArgumentAt(callerCall, method, slot, callerResult)
+                    : support.argOriginAt(callerCall, callerMethod, slot, callerResult);
+            if (argOrigins.isEmpty()) {
+                continue;
+            }
+            boolean directParam = argOrigins.stream().allMatch(o -> o instanceof ValueOrigin.Param);
+            Integer argumentOrdinal = directParam
+                    ? Descriptor.paramOrdinal(method.descriptor(), method.isStatic(), slot) : null;
+            String receiverPrecision = support.receiverPrecision(callerCall, callerMethod,
+                    method.owner(), method.name(), method.descriptor(), callerResult);
+            String receiverReason = switch (receiverPrecision) {
+                case "CONCRETE" -> "receiver-exact";
+                case "SEALED_SET" -> "receiver-sealed-set";
+                case "POINTS_TO_BOUNDED" -> "receiver-points-to-bounded";
+                case "CHA_BOUNDED" -> "receiver-cha-bounded";
+                default -> "receiver-unknown";
+            };
+            String reason = nativeCallback ? "native-callback;" + receiverReason : receiverReason;
+            routes.add(new ParamRoute(callerMethod, callerCall,
+                    ValueOriginOrder.sorted(argOrigins), argumentOrdinal,
+                    nativeCallback ? HopKind.NATIVE_CALLBACK : HopKind.VIRTUAL_DISPATCH, reason));
+        }
+        ParamRoutes result = new ParamRoutes(List.copyOf(routes), unresolved);
+        cache.put(key, result);
+        return result;
     }
 
     /**
@@ -647,10 +847,10 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     || !entryReaching.contains(OriginSupport.methodKey(caller))) {
                 continue;
             }
-            if (support.sinkPathProvablyUnreachable(caller, invoke.offset())) {
+            ForwardOrigins.Result callerOrigins = originsOf(caller);
+            if (support.sinkPathProvablyUnreachable(caller, invoke.offset(), callerOrigins)) {
                 continue;
             }
-            ForwardOrigins.Result callerOrigins = originsOf(caller);
             Set<ValueOrigin> receivers = support.argOriginAtOrdinal(invoke, 0, callerOrigins);
             if (receivers.isEmpty()) {
                 continue;
@@ -677,6 +877,274 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
         }
         return produced;
+    }
+
+    /**
+     * Reverse a serialized handler receiver through interface calls whose proxy object is
+     * outside the scan unit.  This is a structural JVM contract: only resolved interface
+     * call sites and serializable InvocationHandler implementations participate, and the
+     * bounded method-name analysis filters mutually exclusive handler branches.
+     */
+    private int controlledSerializedProxyInterfaceHandler(MethodInfo handler, int depth,
+                                                            Trace trace, SinkMark mark) {
+        int produced = 0;
+        int inspected = 0;
+        String handlerKey = OriginSupport.methodKey(handler);
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
+            if (inspected++ >= MAX_SERIALIZED_PROXY_INTERFACE_SITES) {
+                bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_INTERFACE_SITE_CAP:"
+                        + MAX_SERIALIZED_PROXY_INTERFACE_SITES);
+                break;
+            }
+            if (!proxyInterfaceCallbackMayReach(handler, call.name(), -1)) {
+                continue;
+            }
+            MethodInfo caller = support.enclosingMethod(call);
+            if (caller == null) {
+                continue;
+            }
+            String callerKey = OriginSupport.methodKey(caller);
+            if (!entryReaching.contains(callerKey) && !handlerKey.equals(callerKey)) {
+                continue;
+            }
+            ForwardOrigins.Result callerOrigins = originsOf(caller);
+            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+                continue;
+            }
+            Set<ValueOrigin> receivers = support.argOriginAtOrdinal(call, -1, callerOrigins);
+            if (receivers.isEmpty()) {
+                continue;
+            }
+            bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_INTERFACE_WILDCARD");
+            ChainHop hop = new ChainHop(caller.owner(), caller.name(), handler.owner(),
+                    handler.name(), HopKind.VIRTUAL_DISPATCH, null,
+                    "serialized-proxy-interface", handler.descriptor(), null);
+            int unresolvedBefore = trace.unresolved;
+            trace.hops.add(hop);
+            for (ValueOrigin receiver : ValueOriginOrder.sorted(receivers)) {
+                if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                    break;
+                }
+                if (!(receiver instanceof ValueOrigin.Constant)
+                        && !(receiver instanceof ValueOrigin.Unknown)) {
+                    produced += controlled(receiver, caller, depth + 1, trace, mark);
+                }
+            }
+            trace.hops.remove(trace.hops.size() - 1);
+            trace.unresolved = unresolvedBefore;
+            if (trace.produced >= MAX_CHAINS_PER_SINK) {
+                break;
+            }
+        }
+        return produced;
+    }
+
+    /**
+     * Reverse a handler field only through callbacks whose requested method can reach that
+     * exact field read.  Receiver-wide handler bridging is intentionally avoided: an
+     * InvocationHandler is a shared runtime contract, while the serialized object fields are
+     * the only bytecode-local evidence that ties a callback to a handler state.
+     */
+    private int controlledSerializedProxyInterfaceFieldReceiver(ValueOrigin.FieldRead field,
+                                                                  MethodInfo handler,
+                                                                  int depth, Trace trace,
+                                                                  SinkMark mark) {
+        List<Integer> fieldOffsets = new ArrayList<>();
+        for (InsnFact instruction : handler.instructions()) {
+            if (!instruction.op().isFieldRead() || instruction.fieldRef() == null
+                    || !field.owner().equals(instruction.fieldRef().owner())
+                    || !field.field().equals(instruction.fieldRef().name())
+                    || (field.descriptor() != null && !field.descriptor().isBlank()
+                    && !field.descriptor().equals(instruction.fieldRef().descriptor()))) {
+                continue;
+            }
+            fieldOffsets.add(instruction.offset());
+        }
+        if (fieldOffsets.isEmpty()) {
+            return 0;
+        }
+        int produced = 0;
+        int inspected = 0;
+        String handlerKey = OriginSupport.methodKey(handler);
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
+            if (inspected++ >= MAX_SERIALIZED_PROXY_INTERFACE_SITES) {
+                bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_INTERFACE_SITE_CAP:"
+                        + MAX_SERIALIZED_PROXY_INTERFACE_SITES);
+                break;
+            }
+            boolean allowed = false;
+            for (int fieldOffset : fieldOffsets) {
+                if (proxyInterfaceCallbackMayReach(handler, call.name(), fieldOffset)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                continue;
+            }
+            MethodInfo caller = support.enclosingMethod(call);
+            if (caller == null) {
+                continue;
+            }
+            String callerKey = OriginSupport.methodKey(caller);
+            if (!entryReaching.contains(callerKey) && !handlerKey.equals(callerKey)) {
+                continue;
+            }
+            ForwardOrigins.Result callerOrigins = originsOf(caller);
+            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+                continue;
+            }
+            Set<ValueOrigin> receivers = support.argOriginAtOrdinal(call, -1, callerOrigins);
+            if (receivers.isEmpty()) {
+                continue;
+            }
+            bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_INTERFACE_WILDCARD");
+            ChainHop hop = new ChainHop(caller.owner(), caller.name(), handler.owner(),
+                    handler.name(), HopKind.VIRTUAL_DISPATCH, null,
+                    "serialized-proxy-interface", handler.descriptor(), null);
+            int unresolvedBefore = trace.unresolved;
+            trace.hops.add(hop);
+            for (ValueOrigin receiver : ValueOriginOrder.sorted(receivers)) {
+                if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                    break;
+                }
+                if (receiver instanceof ValueOrigin.Constant
+                        || receiver instanceof ValueOrigin.Unknown) {
+                    continue;
+                }
+                produced += controlled(receiver, caller, depth + 1, trace, mark);
+            }
+            trace.hops.remove(trace.hops.size() - 1);
+            trace.unresolved = unresolvedBefore;
+            if (trace.produced >= MAX_CHAINS_PER_SINK) {
+                break;
+            }
+        }
+        return produced;
+    }
+
+    /**
+     * Map an InvocationHandler Object[] element to the argument at the corresponding
+     * external interface call.  The array index is known for the common constant-index form;
+     * unknown indexes conservatively consider every argument of the bounded call site.
+     */
+    private int controlledSerializedProxyInterfaceArgument(MethodInfo handler, int offset,
+                                                             ForwardOrigins.State state,
+                                                             int depth, Trace trace,
+                                                             SinkMark mark) {
+        if (!support.isSerializedProxyHandler(handler) || state == null
+                || state.stack().isEmpty()) {
+            return 0;
+        }
+        Integer arrayIndex = constantStackIndex(state);
+        int produced = 0;
+        int inspected = 0;
+        String handlerKey = OriginSupport.methodKey(handler);
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            if (abortIfInterrupted(trace)) {
+                break;
+            }
+            if (inspected++ >= MAX_SERIALIZED_PROXY_INTERFACE_SITES) {
+                bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_INTERFACE_SITE_CAP:"
+                        + MAX_SERIALIZED_PROXY_INTERFACE_SITES);
+                break;
+            }
+            if (!proxyInterfaceCallbackMayReach(handler, call.name(), offset)) {
+                continue;
+            }
+            MethodInfo caller = support.enclosingMethod(call);
+            if (caller == null) {
+                continue;
+            }
+            String callerKey = OriginSupport.methodKey(caller);
+            if (!entryReaching.contains(callerKey) && !handlerKey.equals(callerKey)) {
+                continue;
+            }
+            ForwardOrigins.Result callerOrigins = originsOf(caller);
+            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+                continue;
+            }
+            int argumentCount = Descriptor.paramCount(call.descriptor());
+            int first = arrayIndex == null ? 0 : arrayIndex;
+            int last = arrayIndex == null ? argumentCount - 1 : arrayIndex;
+            if (first < 0 || first >= argumentCount) {
+                continue;
+            }
+            for (int ordinal = first; ordinal <= last; ordinal++) {
+                for (ValueOrigin value : ValueOriginOrder.sorted(
+                        support.argOriginAtOrdinal(call, ordinal, callerOrigins))) {
+                    if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                        break;
+                    }
+                    if (value instanceof ValueOrigin.Constant
+                            || value instanceof ValueOrigin.Unknown) {
+                        continue;
+                    }
+                    bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_INTERFACE_WILDCARD");
+                    ChainHop hop = new ChainHop(caller.owner(), caller.name(), handler.owner(),
+                            handler.name(), HopKind.VIRTUAL_DISPATCH, null,
+                            "serialized-proxy-interface", handler.descriptor(), ordinal);
+                    int unresolvedBefore = trace.unresolved;
+                    trace.hops.add(hop);
+                    produced += controlled(value, caller, depth + 1, trace, mark);
+                    trace.hops.remove(trace.hops.size() - 1);
+                    trace.unresolved = unresolvedBefore;
+                }
+            }
+        }
+        return produced;
+    }
+
+    private Set<Integer> proxyInterfaceFeasibleOffsets(MethodInfo handler, String methodName) {
+        if (handler == null || methodName == null || methodName.isBlank()) {
+            return Set.of();
+        }
+        ProxyInterfaceMetadataKey key = new ProxyInterfaceMetadataKey(
+                OriginSupport.methodKey(handler), methodName);
+        Set<Integer> cached = proxyInterfaceFeasibleOffsets.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Set<Integer> computed = ForwardEngine.proxyMethodFeasibleOffsets(handler,
+                Set.of(methodName), support::cfg);
+        Set<Integer> result = computed == null ? Set.of() : Set.copyOf(computed);
+        proxyInterfaceFeasibleOffsets.putIfAbsent(key, result);
+        if (result.isEmpty()) {
+            bb.markIncomplete("BACKWARD_SERIALIZED_PROXY_INTERFACE_METADATA");
+        }
+        return result;
+    }
+
+    private boolean proxyInterfaceCallbackMayReach(MethodInfo handler, String methodName,
+                                                     int offset) {
+        Set<Integer> feasible = proxyInterfaceFeasibleOffsets(handler, methodName);
+        // Empty metadata denotes an analysis boundary, not proof of an impossible callback.
+        return feasible.isEmpty() || offset < 0 || feasible.contains(offset);
+    }
+
+    private static Integer constantStackIndex(ForwardOrigins.State state) {
+        if (state == null || state.stack().isEmpty()) {
+            return null;
+        }
+        Integer answer = null;
+        for (ValueOrigin origin : state.stack().get(state.stack().size() - 1).origins()) {
+            if (!(origin instanceof ValueOrigin.Constant constant)
+                    || !(constant.value() instanceof Number number)) {
+                return null;
+            }
+            int value = number.intValue();
+            if (answer != null && answer != value) {
+                return null;
+            }
+            answer = value;
+        }
+        return answer;
     }
 
     /** Native callback sites are explicit semantic callers, not graph call edges. */
@@ -760,11 +1228,13 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
                 Node samCall = route.samCall();
                 MethodInfo samHost = route.samHost();
-                if (!entryReaching.contains(OriginSupport.methodKey(samHost))
-                        || support.sinkPathProvablyUnreachable(samHost, samCall.offset())) {
+                if (!entryReaching.contains(OriginSupport.methodKey(samHost))) {
                     continue;
                 }
                 ForwardOrigins.Result samResult = originsOf(samHost);
+                if (support.sinkPathProvablyUnreachable(samHost, samCall.offset(), samResult)) {
+                    continue;
+                }
                 int samCount = Descriptor.paramCount(samCall.descriptor());
                 for (int ordinal = 0; ordinal < samCount; ordinal++) {
                     int samSlot = lambdaParameterSlot(implementation, explicitCaptured, ordinal);
@@ -1131,19 +1601,16 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     }
                 }
             }
-            List<Node> ordered = new ArrayList<>(sites);
-            ordered.sort(java.util.Comparator
-                    .comparingInt((Node site) -> {
-                        MethodInfo caller = support.enclosingMethod(site);
-                        return caller != null ? support.entryDepthOf(OriginSupport.methodKey(caller)) : Integer.MAX_VALUE;
-                    })
-                    .thenComparingLong(Node::id));
-            List<CallerSite> prepared = new ArrayList<>(ordered.size());
-            for (Node site : ordered) {
+            List<CallerSite> prepared = new ArrayList<>(sites.size());
+            for (Node site : sites) {
                 MethodInfo caller = support.enclosingMethod(site);
-                prepared.add(new CallerSite(site, caller,
-                        caller == null ? "" : OriginSupport.methodKey(caller)));
+                String callerKey = caller == null ? "" : OriginSupport.methodKey(caller);
+                int entryDepth = caller == null ? Integer.MAX_VALUE
+                        : support.entryDepthOf(callerKey);
+                prepared.add(new CallerSite(site, caller, callerKey, entryDepth));
             }
+            prepared.sort(java.util.Comparator.comparingInt(CallerSite::entryDepth)
+                    .thenComparingLong(site -> site.call().id()));
             return new CallerSites(List.copyOf(prepared), merged);
         });
     }
@@ -1205,14 +1672,16 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
             }
         }
-        if (isJavaBeanMethod(method.name()) && Descriptor.paramCount(method.descriptor()) == 0) {
-            for (Node site : support.methodCollectionInvokeSites()) {
-                String hostKey = OriginSupport.methodKeyOf(
-                        site.methodOwner(), site.methodName(), site.methodDescriptor());
-                if (entryReaching.contains(hostKey)
-                        && support.reflectiveInvokeMayReach(method, site)) {
-                    out.add(site);
-                }
+        for (Node site : support.methodCollectionSitesOf(method)) {
+            // Opaque iterator/list collections retain the historical JavaBean-only family;
+            // concrete Class metadata sites can select any bounded public method relevant to
+            // the current sink.  The reverse index keeps this lookup independent of the
+            // number of other collection targets in the graph.
+            String hostKey = OriginSupport.methodKeyOf(
+                    site.methodOwner(), site.methodName(), site.methodDescriptor());
+            if (entryReaching.contains(hostKey)
+                    && support.reflectiveInvokeMayReach(method, site)) {
+                out.add(site);
             }
         }
     }
@@ -1253,8 +1722,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     }
 
     /** 祖先类型集合：传递接口 + 父类链（含自身之外的全部祖先，去自身）。 */
-    private Set<String> ancestorTypes(String owner) {
-        Set<String> cached = ancestorTypesCache.get(owner);
+    private List<String> ancestorTypes(String owner) {
+        List<String> cached = ancestorTypesCache.get(owner);
         if (cached != null) {
             return cached;
         }
@@ -1283,7 +1752,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
             queue.addAll(bb.hierarchy().transitiveInterfaces(cur));
         }
-        Set<String> immutable = Set.copyOf(result);
+        List<String> immutable = new ArrayList<>(result);
+        immutable.sort(String::compareTo);
+        immutable = List.copyOf(immutable);
         ancestorTypesCache.put(owner, immutable);
         return immutable;
     }
@@ -1301,6 +1772,20 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         }
         Op op = method.insnAt(offset).op();
         int produced = 0;
+        if (op == Op.NEW) {
+            produced += controlledAllocatedObject(new ValueOrigin.Insn(offset), method,
+                    result, depth, trace, mark);
+            if (trace.produced >= MAX_CHAINS_PER_SINK) {
+                return produced;
+            }
+        }
+        if (op == Op.AALOAD && support.isSerializedProxyHandler(method)) {
+            produced += controlledSerializedProxyInterfaceArgument(method, offset, state,
+                    depth, trace, mark);
+            if (trace.produced >= MAX_CHAINS_PER_SINK) {
+                return produced;
+            }
+        }
         if (op == Op.NEWARRAY || op == Op.ANEWARRAY || op == Op.MULTIANEWARRAY) {
             for (ValueOrigin element : ValueOriginOrder.sorted(
                     result.arrayElements().getOrDefault(new ValueOrigin.Insn(offset), Set.of()))) {
@@ -1330,6 +1815,63 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 if (trace.produced >= MAX_CHAINS_PER_SINK) {
                     return produced;
                 }
+            }
+        }
+        return produced;
+    }
+
+    /**
+     * Recover values carried by a locally allocated object.  This is the reverse counterpart
+     * of the forward container model: a {@code new List}; followed by {@code add(value)} or a
+     * field write is not itself attacker-controlled, but it can carry an attacker-controlled
+     * element into a later modeled read.  Matching the receiver origin exactly keeps this
+     * bounded to the allocation under analysis and avoids class-wide container widening.
+     */
+    private int controlledAllocatedObject(ValueOrigin.Insn allocation, MethodInfo method,
+                                          ForwardOrigins.Result result, int depth,
+                                          Trace trace, SinkMark mark) {
+        int produced = 0;
+        int inspected = 0;
+        for (Node call : bb.graph().callsOfMethod(OriginSupport.methodKey(method))) {
+            if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                break;
+            }
+            if (call.offset() <= allocation.offset() || inspected++ >= MAX_CALLEE_RETURN_SITES) {
+                continue;
+            }
+            Rule.ModelRule model = bb.ruleEngine().matchingModel(
+                    call.owner(), call.name(), call.descriptor()).orElse(null);
+            if (model == null || !model.actions().containsKey("this")
+                    || !model.actions().getOrDefault("this", List.of()).stream()
+                    .anyMatch(source -> source != null && source.startsWith("arg"))) {
+                continue;
+            }
+            Set<ValueOrigin> receivers = support.argOriginAtOrdinal(call, -1, result);
+            if (!receivers.contains(allocation)) {
+                continue;
+            }
+            for (String source : model.actions().getOrDefault("this", List.of())) {
+                Integer ordinal = modelArgOrdinal(source);
+                if (ordinal == null) {
+                    continue;
+                }
+                Set<ValueOrigin> values = support.argOriginAtOrdinal(call, ordinal, result);
+                if (values.isEmpty()) {
+                    continue;
+                }
+                ChainHop hop = new ChainHop(method.owner(), method.name(), call.owner(),
+                        call.name(), HopKind.DIRECT_CALL, null,
+                        "model:" + model.id(), call.descriptor(), ordinal);
+                int unresolvedBefore = trace.unresolved;
+                trace.hops.add(hop);
+                for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
+                    if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                        break;
+                    }
+                    produced += controlled(value, method, depth + 1, trace, mark);
+                }
+                trace.hops.remove(trace.hops.size() - 1);
+                trace.unresolved = unresolvedBefore;
             }
         }
         return produced;
@@ -1377,6 +1919,10 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             // constant for this interface method (the common proxy FP shape).
             return controlledProxyResult(call, method, depth, trace, mark, state);
         }
+        int modeled = controlledModelReturn(call, method, result, state, depth, trace, mark);
+        if (modeled > 0 || trace.produced >= MAX_CHAINS_PER_SINK) {
+            return modeled;
+        }
         int produced = 0;
         String kind = call.invokeKind();
         boolean calleeStatic = isStaticLike(kind);
@@ -1404,7 +1950,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }
-                for (ValueOrigin argOrigin : support.argOriginAt(call, method, slot, result)) {
+                for (ValueOrigin argOrigin : ValueOriginOrder.sorted(
+                        support.argOriginAt(call, method, slot, result))) {
                     if (abortIfInterrupted(trace)) {
                         break;
                     }
@@ -1418,6 +1965,142 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 }
                 slot += argSlots.get(i);
             }
+        }
+        if (produced > 0 || trace.produced >= MAX_CHAINS_PER_SINK) {
+            return produced;
+        }
+        // Body recovery is the expensive compatibility fallback for small application
+        // accessors.  Run it only after the cheap receiver/argument summaries fail and never
+        // interpret platform bodies, whose opaque implementation details do not add a sound
+        // application-side source boundary.
+        return controlledCalleeReturns(call, method, depth, trace, mark);
+    }
+
+    /** Reverse a declarative return summary before applying the deliberately conservative passthrough. */
+    private int controlledModelReturn(Node call, MethodInfo caller, ForwardOrigins.Result result,
+                                      ForwardOrigins.State state, int depth, Trace trace,
+                                      SinkMark mark) {
+        Rule.ModelRule model = bb.ruleEngine().matchingModel(
+                call.owner(), call.name(), call.descriptor()).orElse(null);
+        if (model == null || model.actions() == null) {
+            return 0;
+        }
+        List<String> sources = model.actions().getOrDefault("return", List.of());
+        if (sources.isEmpty()) {
+            return 0;
+        }
+        int produced = 0;
+        for (String source : sources) {
+            if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                break;
+            }
+            Set<ValueOrigin> origins = modelSourceOrigins(source, call, caller, result, state);
+            if (origins.isEmpty()) {
+                continue;
+            }
+            ChainHop hop = new ChainHop(caller.owner(), caller.name(), call.owner(), call.name(),
+                    HopKind.DIRECT_CALL, null, "model:" + model.id(), call.descriptor(),
+                    modelArgOrdinal(source));
+            int unresolvedBefore = trace.unresolved;
+            trace.hops.add(hop);
+            for (ValueOrigin origin : ValueOriginOrder.sorted(origins)) {
+                if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                    break;
+                }
+                produced += controlled(origin, caller, depth + 1, trace, mark);
+            }
+            trace.hops.remove(trace.hops.size() - 1);
+            trace.unresolved = unresolvedBefore;
+        }
+        return produced;
+    }
+
+    private Set<ValueOrigin> modelSourceOrigins(String source, Node call, MethodInfo caller,
+                                                ForwardOrigins.Result result,
+                                                ForwardOrigins.State state) {
+        if (source == null) {
+            return Set.of();
+        }
+        if ("this".equals(source)) {
+            return isStaticLike(call.invokeKind()) ? Set.of() : receiverOrigins(call, state);
+        }
+        Integer ordinal = modelArgOrdinal(source);
+        return ordinal == null ? Set.of() : support.argOriginAtOrdinal(call, ordinal, result);
+    }
+
+    private static Integer modelArgOrdinal(String source) {
+        if (source == null || !source.startsWith("arg") || source.length() <= 3) {
+            return null;
+        }
+        try {
+            int ordinal = Integer.parseInt(source.substring(3));
+            return ordinal < 0 ? null : ordinal;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Analyze a loaded callee's return instructions when no model has closed the value flow.
+     * This handles small application/dependency accessors (for example a getter returning a
+     * serialized field) without pretending that opaque JDK/native bodies are observable.
+     */
+    private int controlledCalleeReturns(Node call, MethodInfo caller, int depth,
+                                        Trace trace, SinkMark mark) {
+        List<Edge> edges = call.out().stream()
+                .filter(edge -> edge.type() == EdgeType.INVOKES || edge.type() == EdgeType.DISPATCHES)
+                .sorted(java.util.Comparator.comparing((Edge edge) -> OriginSupport.methodKeyOf(
+                                edge.to().owner(), edge.to().name(), edge.to().descriptor()))
+                        .thenComparing(edge -> edge.type().name()))
+                .toList();
+        int produced = 0;
+        int targets = 0;
+        for (Edge edge : edges) {
+            if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK
+                    || targets++ >= MAX_CALLEE_RETURN_TARGETS) {
+                break;
+            }
+            MethodInfo target = support.methodOf(edge.to().owner(), edge.to().name(),
+                    edge.to().descriptor());
+            if (target == null || target.instructions().isEmpty()
+                    || isPlatformOwner(target.owner())
+                    || target.instructions().size() > MAX_CALLEE_RETURN_BODY_INSNS
+                    || Modifier.isAbstract(target.access()) || Modifier.isNative(target.access())
+                    || "<init>".equals(target.name())) {
+                continue;
+            }
+            ForwardOrigins.Result targetResult = originsOf(target);
+            ChainHop hop = new ChainHop(caller.owner(), caller.name(), target.owner(),
+                    target.name(), edge.type() == EdgeType.DISPATCHES
+                    ? HopKind.VIRTUAL_DISPATCH : HopKind.DIRECT_CALL,
+                    null, "return-body", target.descriptor(), null);
+            int unresolvedBefore = trace.unresolved;
+            trace.hops.add(hop);
+            int sites = 0;
+            for (InsnFact instruction : target.instructions()) {
+                if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK
+                        || sites++ >= MAX_CALLEE_RETURN_SITES) {
+                    break;
+                }
+                if (!instruction.op().isReturn() || instruction.op() == Op.RETURN
+                        || instruction.op() == Op.ATHROW) {
+                    continue;
+                }
+                ForwardOrigins.State returnState = targetResult.stateBefore()
+                        .get(instruction.offset());
+                if (returnState == null || returnState.stack().isEmpty()) {
+                    continue;
+                }
+                for (ValueOrigin returned : ValueOriginOrder.sorted(returnState.stack()
+                        .get(returnState.stack().size() - 1).origins())) {
+                    if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK) {
+                        break;
+                    }
+                    produced += controlled(returned, target, depth + 1, trace, mark);
+                }
+            }
+            trace.hops.remove(trace.hops.size() - 1);
+            trace.unresolved = unresolvedBefore;
         }
         return produced;
     }
@@ -1631,7 +2314,15 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     fieldRead.owner());
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
-            produced += controlled(fieldRead.receiver(), method, depth + 1, trace, mark);
+            if (support.isSerializedProxyHandler(method)
+                    && fieldRead.receiver() instanceof ValueOrigin.Param receiver
+                    && receiver.slot() == 0) {
+                produced += controlledSerializedProxyInterfaceFieldReceiver(fieldRead, method,
+                        depth, trace, mark);
+            }
+            if (produced == 0) {
+                produced += controlled(fieldRead.receiver(), method, depth + 1, trace, mark);
+            }
             trace.hops.remove(trace.hops.size() - 1);
             trace.unresolved = unresolvedBefore;
             if (produced > 0) {
@@ -1725,7 +2416,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 entryClass, entryName, entryKind,
                 trace.sinkOwner, trace.sinkMethod, hops, trace.unresolved, trace.sinkDescriptor,
                 mark.role().name());
-        if (!bb.addChain(chain)) {
+        if (!trace.recordChain(chain)) {
             return 0;
         }
         trace.produced++;
@@ -1793,12 +2484,15 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
 
     /** 一次回溯的路径与统计。truncated：深度/预算截断发生次数（子树结论作废判定）。 */
     private static final class Trace {
+        private static final int MAX_VARIANTS_PER_SEMANTIC_CHAIN = 4;
         final String sinkOwner;
         final String sinkMethod;
         final String sinkDescriptor;
         final int stepBudget;
         final List<ChainHop> hops = new ArrayList<>();
         final Set<DeadKey> visited = new HashSet<>();
+        /** Semantic identity is local to a sink before publication; values are stable snapshots. */
+        final Map<String, List<Chain>> completed = new TreeMap<>();
         /**
          * A trace revisits the same canonical MethodInfo while following fields and
          * passthrough arguments.  Cache its stable key locally so the hot recursion does not
@@ -1826,6 +2520,51 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             String key = OriginSupport.methodKey(method);
             methodKeys.put(method, key);
             return key;
+        }
+
+        boolean recordChain(Chain chain) {
+            String semantic = io.just.sast.blackboard.ChainMerge.semanticKey(chain);
+            List<Chain> variants = completed.computeIfAbsent(semantic,
+                    ignored -> new ArrayList<>(1));
+            for (Chain existing : variants) {
+                if (existing.key().equals(chain.key())) {
+                    return false;
+                }
+            }
+            if (variants.isEmpty()) {
+                variants.add(chain);
+                return true;
+            }
+            if (variants.size() < MAX_VARIANTS_PER_SEMANTIC_CHAIN) {
+                variants.add(chain);
+            } else {
+                // Keep a bounded, deterministic evidence sample. The preferred variant is
+                // always retained; alternate hop reasons are secondary annotations.
+                int worst = 0;
+                for (int index = 1; index < variants.size(); index++) {
+                    Chain currentWorst = variants.get(worst);
+                    Chain candidate = variants.get(index);
+                    if (io.just.sast.blackboard.ChainMerge.preferred(currentWorst, candidate)
+                            == currentWorst) {
+                        worst = index;
+                    }
+                }
+                Chain currentWorst = variants.get(worst);
+                if (io.just.sast.blackboard.ChainMerge.preferred(currentWorst, chain) == chain) {
+                    variants.set(worst, chain);
+                }
+            }
+            variants.sort(java.util.Comparator.comparing(Chain::key));
+            return false;
+        }
+
+        List<Chain> completedChains() {
+            List<Chain> result = new ArrayList<>();
+            for (List<Chain> variants : completed.values()) {
+                result.addAll(variants);
+            }
+            result.sort(java.util.Comparator.comparing(Chain::key));
+            return List.copyOf(result);
         }
     }
 }

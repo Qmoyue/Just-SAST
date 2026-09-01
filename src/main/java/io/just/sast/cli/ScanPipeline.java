@@ -59,14 +59,14 @@ public final class ScanPipeline {
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, false, false, null, null);
+                verifyBudget, false, false, false, null, null);
     }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget, boolean safeExec) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, safeExec, false, null, null);
+                verifyBudget, safeExec, false, false, null, null);
     }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
@@ -74,7 +74,7 @@ public final class ScanPipeline {
                                  int verifyBudget, boolean safeExec,
                                  boolean requireStrictIsolation) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, safeExec, requireStrictIsolation, null, null);
+                verifyBudget, safeExec, false, requireStrictIsolation, null, null);
     }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
@@ -82,7 +82,17 @@ public final class ScanPipeline {
                                  int verifyBudget, boolean safeExec,
                                  boolean requireStrictIsolation, Path baseline,
                                  Path suppressions) throws Exception {
-        long start = System.currentTimeMillis();
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
+                safeExec, false, requireStrictIsolation, baseline, suppressions);
+    }
+
+    /** Full pipeline entry point with an explicit adapter-owned SAFE_REAL mode. */
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec, boolean safeReal,
+                                 boolean requireStrictIsolation, Path baseline,
+                                 Path suppressions) throws Exception {
+        long start = System.nanoTime();
         Map<String, Long> phaseMs = new java.util.LinkedHashMap<>();
         resetHeapPeaks();
 
@@ -120,6 +130,15 @@ public final class ScanPipeline {
         if (safeExec && !verify) {
             throw new UsageException("--safe-exec 需要启用动态验证（不能与 --no-verify 同时使用）");
         }
+        if (safeReal && !verify) {
+            throw new UsageException("--safe-real-sink 需要启用动态验证（不能与 --no-verify 同时使用）");
+        }
+        if (safeExec && safeReal) {
+            throw new UsageException("--safe-exec 与 --safe-real-sink 不能同时使用");
+        }
+        if (safeReal && !requireStrictIsolation) {
+            throw new UsageException("--safe-real-sink 必须同时使用 --require-os-isolation");
+        }
         if (requireStrictIsolation && !verify) {
             throw new UsageException("--require-os-isolation 需要启用动态验证（不能与 --no-verify 同时使用）");
         }
@@ -149,7 +168,7 @@ public final class ScanPipeline {
         }
 
         // 构建期：JDK 类来源（--jdk-home 指定目标版本——Java 9+ 真挂载目标镜像，否则用运行时 jrt）
-        long frontendStart = System.currentTimeMillis();
+        long frontendStart = System.nanoTime();
         JdkClassSource jdkSource;
         if (jdkHome != null) {
             TargetJdkSource targetJdk;
@@ -164,12 +183,14 @@ public final class ScanPipeline {
             JrtClassSource jrt = JrtClassSource.runtime();
             jdkSource = jrt;
         }
+        try {
         BytecodeFrontend frontend = new BytecodeFrontend();
         // 先解析 target/deps；完整模式随后只把应用引用、规则类型和 magic-entry 方法
         // 所需的 JDK 类体放进 CPG，避免对同一批应用字节重复读取/解析。
         // 把原始 ClassBytes 限制在独立 helper 的生命周期内。完整扫描需要的只是
         // ClassInfo；否则 JDK 切片规划期间 input 仍会把整批 fat-jar byte[] 挂住。
-        LoadResult applicationLoad = loadApplication(frontend, targets);
+        int targetFeature = jdkFeature(jdkSource);
+        LoadResult applicationLoad = loadApplication(frontend, targets, targetFeature);
         LoadResult load;
         if (fast) {
             load = applicationLoad;
@@ -186,9 +207,9 @@ public final class ScanPipeline {
                 JustLogger.warn("目标编译版本低于运行时 JDK——建议用 --jdk-home 指定目标版本（当前用运行时库，假阳风险）");
             }
         }
-        phaseMs.put("frontend", System.currentTimeMillis() - frontendStart);
+        phaseMs.put("frontend", elapsedMs(frontendStart));
 
-        long cpgStart = System.currentTimeMillis();
+        long cpgStart = System.nanoTime();
         ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), jdkSource);
         BuiltCpg cpg = new CpgBuilder().build(load);
         int callEdges = new CallGraphBuilder(hierarchy).build(cpg.graph());
@@ -196,57 +217,74 @@ public final class ScanPipeline {
         JustLogger.info("CPG 构建完成：节点 {}，边 {}，调用边 {}，字段写入 {} 组",
                 cpg.graph().nodeCount(), cpg.graph().edgeCount(), callEdges,
                 cpg.fieldWriters().fieldCount());
-        phaseMs.put("cpg", System.currentTimeMillis() - cpgStart);
+        phaseMs.put("cpg", elapsedMs(cpgStart));
 
         // 分析期（黑板串行三阶段：ANALYSIS → COMPOSITION → CALIBRATION）
-        long analysisStart = System.currentTimeMillis();
+        long analysisStart = System.nanoTime();
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
-                        verifyBudget, jdkHome, load.targetMajorVersion(), safeExec,
+                        verifyBudget, jdkHome, load.targetMajorVersion(), safeExec, safeReal,
                         requireStrictIsolation));
         new Controller(blackboard, KnowledgeSources.discover()).run();
         for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
             phaseMs.put(timing.getKey(), timing.getValue());
         }
-        phaseMs.put("analysis", System.currentTimeMillis() - analysisStart);
+        phaseMs.put("analysis", elapsedMs(analysisStart));
+        // Publish a non-overlapping static phase for the performance harness.  The aggregate
+        // analysis timer includes calibration, while the verifier publishes its own child
+        // process duration; subtracting that one explicit interval avoids charging dynamic
+        // process startup to static p50/p95 and keeps the default scan on a single pass.
+        long preReportMs = elapsedMs(start);
+        long dynamicMs = phaseMs.getOrDefault("verify", 0L);
+        phaseMs.put("static", Math.max(0L, preReportMs - dynamicMs));
 
         // 报告期
-        long reportStart = System.currentTimeMillis();
+        long reportStart = System.nanoTime();
         ReportLayout reportLayout = ReportLayout.create(output);
+        // Freeze the blackboard views once at the report boundary.  Each reporter previously
+        // requested fresh defensive copies of chains/calibrations/outcomes and rebuilt the
+        // chain-note map independently.  On a large closure that turned reporting into a
+        // repeated synchronization/copy pass without changing any emitted byte.
+        List<Chain> reportChains = blackboard.chains();
+        Map<Long, io.just.sast.blackboard.SinkOutcome> reportOutcomes = blackboard.sinkOutcomes();
+        Map<String, String> reportCalibrations = blackboard.chainCalibrations();
+        Map<String, List<String>> reportNotes = blackboardNotes(blackboard);
+        io.just.sast.blackboard.VerificationSummary reportVerification =
+                blackboard.verificationSummary();
         CsvReporter reporter = new CsvReporter();
         io.just.sast.report.MultiFormatReporter multiFormatReporter = new io.just.sast.report.MultiFormatReporter();
         reporter.withGraph(cpg.graph());
-        long csvReportStart = System.currentTimeMillis();
-        reporter.write(reportLayout, blackboard.chains(), blackboard.sinkOutcomes(),
-                blackboard.chainCalibrations(), blackboardNotes(blackboard),
-                blackboard.verificationSummary());
-        phaseMs.put("report.csv", System.currentTimeMillis() - csvReportStart);
+        long csvReportStart = System.nanoTime();
+        Map<String, Long> csvTimings = new java.util.LinkedHashMap<>();
+        reporter.write(reportLayout, reportChains, reportOutcomes, reportCalibrations,
+                reportNotes, reportVerification, csvTimings);
+        phaseMs.put("report.csv", elapsedMs(csvReportStart));
+        for (Map.Entry<String, Long> timing : csvTimings.entrySet()) {
+            phaseMs.put("report.csv." + timing.getKey(), timing.getValue());
+        }
         // C1: SARIF 2.1.0 + E1-E3: JSON/HTML/Markdown 多格式输出
-        long sarifReportStart = System.currentTimeMillis();
+        long sarifReportStart = System.nanoTime();
         new io.just.sast.report.SarifReporter().withHierarchy(hierarchy).withRules(ruleSet).write(
-                reportLayout, blackboard.chains(), blackboard.chainCalibrations(), blackboardNotes(blackboard),
-                blackboard.verificationSummary());
-        phaseMs.put("report.sarif", System.currentTimeMillis() - sarifReportStart);
-        long multiFormatReportStart = System.currentTimeMillis();
-        multiFormatReporter.write(reportLayout, blackboard.chains(),
-                blackboard.chainCalibrations(), blackboardNotes(blackboard),
-                blackboard.verificationSummary());
-        phaseMs.put("report.multi_format", System.currentTimeMillis() - multiFormatReportStart);
-        long payloadReportStart = System.currentTimeMillis();
-        new io.just.sast.report.PayloadPlanWriter().write(reportLayout, blackboard.chains(),
-                blackboard.chainCalibrations(), blackboardNotes(blackboard),
-                blackboard.verificationSummary());
-        phaseMs.put("report.payload", System.currentTimeMillis() - payloadReportStart);
-        long inventoryStart = System.currentTimeMillis();
+                reportLayout, reportChains, reportCalibrations, reportNotes, reportVerification);
+        phaseMs.put("report.sarif", elapsedMs(sarifReportStart));
+        long multiFormatReportStart = System.nanoTime();
+        multiFormatReporter.write(reportLayout, reportChains, reportCalibrations, reportNotes,
+                reportVerification);
+        phaseMs.put("report.multi_format", elapsedMs(multiFormatReportStart));
+        long payloadReportStart = System.nanoTime();
+        new io.just.sast.report.PayloadPlanWriter().write(reportLayout, reportChains,
+                reportCalibrations, reportNotes, reportVerification);
+        phaseMs.put("report.payload", elapsedMs(payloadReportStart));
+        long inventoryStart = System.nanoTime();
         String dependencyInventoryHash = new io.just.sast.report.DependencyInventoryWriter().write(reportLayout, target,
                 scanDeps, targetArtifactHash, load.targetMajorVersion(), dependencyHashes);
-        phaseMs.put("report.inventory", System.currentTimeMillis() - inventoryStart);
+        phaseMs.put("report.inventory", elapsedMs(inventoryStart));
         new io.just.sast.report.ScanIdentityWriter().write(reportLayout, targetArtifactHash,
                 dependencyIdentity, dependencyInventoryHash, rules, jdkHome,
                 load.targetMajorVersion(), fast, verify, verifyBudget, safeExec,
-                requireStrictIsolation);
+                safeReal, requireStrictIsolation);
         new io.just.sast.report.BaselineSuppressionWriter().write(reportLayout, baseline,
-                suppressions, blackboard.chains(), blackboard.chainCalibrations());
+                suppressions, reportChains, reportCalibrations);
         JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
 
         // sink/entry 统计从图直接产出（与引擎同一 RuleEngine 实例，access 过滤口径一致）
@@ -263,22 +301,23 @@ public final class ScanPipeline {
                 entryCount++;
             }
         }
-        phaseMs.put("report", System.currentTimeMillis() - reportStart);
-        Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes = blackboard.sinkOutcomes();
+        phaseMs.put("report", elapsedMs(reportStart));
+        Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes = reportOutcomes;
         List<String> completenessReasons = completenessReasons(load, cpg.graph(), outcomes,
-                blackboard.completenessReasons(), fast, jdkHome);
+                blackboard.completenessReasons(), fast, jdkHome, targetFeature);
         ScanStatistics scanStats = new ScanStatistics(
                 load.filesScanned(), load.classCount(), load.diagnosticCount(),
-                sinkCount, entryCount, blackboard.chains().size(),
-                System.currentTimeMillis() - start,
+                sinkCount, entryCount, reportChains.size(),
+                elapsedMs(start),
                 (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1024 / 1024,
                 heapPeakMb(),
                 completenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
-                completenessReasons, phaseMs, scanMetrics(cpg, blackboard),
+                completenessReasons, phaseMs, scanMetrics(cpg, blackboard, reportChains, reportNotes,
+                        reportVerification),
                 verify ? blackboard.verificationStatus() : "DISABLED",
-                verify ? blackboard.verificationSummary()
+                verify ? reportVerification
                         : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget),
-                chainProofCompleteness(blackboard.chains(), outcomes, completenessReasons),
+                chainProofCompleteness(reportChains, outcomes, completenessReasons),
                 targetArtifactHash);
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
@@ -290,6 +329,11 @@ public final class ScanPipeline {
         blackboard.originSupport().clearForwardOriginCache();
         cpg.index().clearCfgCache();
         return new ScanResult(ExitCode.OK.code(), blackboard.chains(), scanStats);
+        } finally {
+            // External --jdk-home JRT images own a FileSystem and URLClassLoader.  Close them
+            // on both normal and exceptional exits; runtime() deliberately implements a no-op.
+            jdkSource.close();
+        }
     }
 
     private static void resetHeapPeaks() {
@@ -326,8 +370,19 @@ public final class ScanPipeline {
         return bytes / 1024 / 1024;
     }
 
-    private static LoadResult loadApplication(BytecodeFrontend frontend, List<Path> targets) {
-        return frontend.loadStreaming(targets);
+    private static LoadResult loadApplication(BytecodeFrontend frontend, List<Path> targets,
+                                              int targetFeature) {
+        return frontend.loadStreaming(targets, targetFeature);
+    }
+
+    private static int jdkFeature(JdkClassSource source) {
+        if (source instanceof TargetJdkSource target) {
+            return target.feature();
+        }
+        if (source instanceof JrtClassSource runtime) {
+            return runtime.feature();
+        }
+        return 0;
     }
 
     /**
@@ -364,11 +419,16 @@ public final class ScanPipeline {
     private static List<String> completenessReasons(LoadResult load, io.just.sast.cpg.graph.Graph graph,
                                                      Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes,
                                                      java.util.Set<String> analysisReasons,
-                                                     boolean fast, Path jdkHome) {
+                                                     boolean fast, Path jdkHome, int targetFeature) {
         LinkedHashSet<String> reasons = new LinkedHashSet<>(load.completenessReasons());
         reasons.addAll(analysisReasons);
         if (fast) {
             reasons.add("FAST_MODE");
+        }
+        if (jdkHome != null && targetFeature <= 0) {
+            // Multi-release selection and verifier runtime choice cannot be called target
+            // accurate when an external image exposes no readable feature metadata.
+            reasons.add("JDK_FEATURE_UNKNOWN");
         }
         if (load.diagnosticCount() > 0) {
             reasons.add("PARSE_DIAGNOSTICS");
@@ -424,7 +484,10 @@ public final class ScanPipeline {
                 || reason.startsWith("COMPOSITION_");
     }
 
-    private static Map<String, Long> scanMetrics(BuiltCpg cpg, Blackboard blackboard) {
+    private static Map<String, Long> scanMetrics(BuiltCpg cpg, Blackboard blackboard,
+                                                 List<Chain> chains,
+                                                 Map<String, List<String>> chainNotes,
+                                                 io.just.sast.blackboard.VerificationSummary verification) {
         Map<String, Long> metrics = new java.util.LinkedHashMap<>();
         metrics.put("graph_nodes", (long) cpg.graph().nodeCount());
         metrics.put("graph_edges", (long) cpg.graph().edgeCount());
@@ -432,7 +495,7 @@ public final class ScanPipeline {
         metrics.put("cpg_cfg_builds", cpg.index().cfgBuilds());
         metrics.put("cpg_cfg_cache_hits", cpg.index().cfgCacheHits());
         metrics.put("cpg_cfg_cache_size", (long) cpg.index().cfgCacheSize());
-        metrics.put("blackboard_chains", (long) blackboard.chains().size());
+        metrics.put("blackboard_chains", (long) (chains == null ? 0 : chains.size()));
         metrics.put("blackboard_calibrations", (long) blackboard.calibrationCount());
         metrics.put("forward_origin_cache_size",
                 (long) blackboard.originSupport().forwardOriginCacheSize());
@@ -442,9 +505,14 @@ public final class ScanPipeline {
                 blackboard.originSupport().forwardOriginCacheHits());
         metrics.put("forward_origin_analysis_runs",
                 blackboard.originSupport().forwardOriginAnalysisRuns());
-        io.just.sast.blackboard.VerificationSummary verification = blackboard.verificationSummary();
+        verification = verification == null ? blackboard.verificationSummary() : verification;
         metrics.put("verification_constructible", (long) verification.constructible());
         metrics.put("verification_rejected", (long) verification.rejected());
+        metrics.put("verification_construction_deferred", (chains == null ? List.<Chain>of() : chains).stream()
+                .map(chain -> chainNotes == null ? List.<String>of()
+                        : chainNotes.getOrDefault(chain.key(), List.of()))
+                .filter(notes -> notes.contains("verify:construction-deferred"))
+                .count());
         metrics.put("verification_selected", (long) verification.selected());
         metrics.put("verification_results", (long) verification.results().size());
         metrics.put("verification_attempts", verification.results().stream()
@@ -520,10 +588,32 @@ public final class ScanPipeline {
         YamlRuleLoader loader = new YamlRuleLoader();
         if (rulesFile != null) {
             try (InputStream in = Files.newInputStream(rulesFile)) {
-                return loader.load(in);
+                RuleSet custom = loader.load(in);
+                // Container summaries are part of the scanner's JVM value-flow contract,
+                // not a requirement every project-specific sink file must duplicate. Keep
+                // user sinks/entries/sources authoritative, while supplying missing generic
+                // Map/List/Deque summaries from the bundled rule data. An identical custom
+                // matcher wins by omission; a more specific custom matcher is still selected
+                // by RuleEngine's normal specificity ordering.
+                RuleSet bundled = loadBundledRules(loader);
+                List<Rule.ModelRule> models = new ArrayList<>(custom.models());
+                for (Rule.ModelRule model : bundled.models()) {
+                    if (models.stream().noneMatch(existing -> existing.call().equals(model.call()))) {
+                        models.add(model);
+                    }
+                }
+                return new RuleSet(custom.sinks(), custom.magicEntries(), custom.sources(),
+                        models, custom.fragments());
             }
         }
+        return loadBundledRules(loader);
+    }
+
+    private static RuleSet loadBundledRules(YamlRuleLoader loader) throws IOException {
         try (InputStream in = ScanPipeline.class.getResourceAsStream("/rules/default-rules.yaml")) {
+            if (in == null) {
+                throw new IOException("内置规则文件不存在: /rules/default-rules.yaml");
+            }
             return loader.load(in);
         }
     }
@@ -573,6 +663,11 @@ public final class ScanPipeline {
         if (name != null && !name.isEmpty() && !name.startsWith("~")) {
             seeds.add(name);
         }
+    }
+
+    private static long elapsedMs(long startedNanos) {
+        long elapsed = Math.max(0L, System.nanoTime() - startedNanos);
+        return elapsed / 1_000_000L;
     }
 
     /** 将可配置的 magic-entry Match 映射为 frontend 不依赖 Rule 类型的轻量种子。 */

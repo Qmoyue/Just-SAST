@@ -16,7 +16,10 @@ import java.util.Enumeration;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.stream.Stream;
+import java.util.jar.Manifest;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipException;
 import java.util.zip.ZipFile;
@@ -63,8 +66,13 @@ public final class JarReader {
     }
 
     public ReadResult readDetailed(Path target) throws IOException {
+        return readDetailed(target, runtimeFeature());
+    }
+
+    /** Read using the class-file view selected by a target JDK feature version. */
+    public ReadResult readDetailed(Path target, int targetFeature) throws IOException {
         List<ClassBytes> out = new ArrayList<>();
-        StreamResult result = streamDetailed(target, out::add);
+        StreamResult result = streamDetailed(target, out::add, targetFeature);
         return new ReadResult(out, result.completenessReasons());
     }
 
@@ -73,13 +81,24 @@ public final class JarReader {
      * 可以用固定大小批次解析大型 fat jar，而不是把整个工件的原始字节挂到 CPG 构建前。
      */
     public StreamResult streamDetailed(Path target, ClassConsumer consumer) throws IOException {
+        return streamDetailed(target, consumer, runtimeFeature());
+    }
+
+    /**
+     * Stream a JAR while applying the standard multi-release selection rule.  The selected
+     * feature is a policy input, not the scanner runtime version; callers scanning against an
+     * external JDK must pass that JDK's feature.  Directories and single class files are
+     * unaffected.
+     */
+    public StreamResult streamDetailed(Path target, ClassConsumer consumer,
+                                       int targetFeature) throws IOException {
         if (target == null || consumer == null) {
             throw new IllegalArgumentException("target and consumer are required");
         }
         if (!Files.exists(target)) {
             throw new IOException("目标不存在: " + target);
         }
-        ReaderState state = new ReaderState(consumer);
+        ReaderState state = new ReaderState(consumer, targetFeature);
         if (Files.isDirectory(target)) {
             readDirectory(target, target.getFileName().toString(), state);
         } else {
@@ -160,6 +179,7 @@ public final class JarReader {
                 entries.add(enumeration.nextElement());
             }
             entries.sort(Comparator.comparing(ZipEntry::getName));
+            MultiReleaseSelection multiRelease = multiReleaseSelection(zip, entries, state);
             for (ZipEntry entry : entries) {
                 if (!state.observeEntry(entry)) {
                     if (state.budgetExceeded()) {
@@ -176,16 +196,16 @@ public final class JarReader {
                     state.reasons.add("UNSAFE_ENTRY_PATH");
                     continue;
                 }
-                if (path.startsWith(SKIPPED_MULTIRELEASE)) {
-                    state.reasons.add("MULTI_RELEASE_SKIPPED");
-                    continue; // multi-release 变体暂不解析
+                if (multiRelease.skip(path)) {
+                    continue;
                 }
                 if (entry.isDirectory()) {
                     continue;
                 }
                 if (path.endsWith(".class")) {
                     try (var input = zip.getInputStream(entry)) {
-                        state.emit(new ClassBytes(stripClassPrefix(path), state.readBytes(input),
+                        String classPath = multiRelease.logicalPath(path);
+                        state.emit(new ClassBytes(stripClassPrefix(classPath), state.readBytes(input),
                                 origin + "!" + path));
                     }
                 } else if (isNestedLib(path)) {
@@ -238,6 +258,8 @@ public final class JarReader {
         checkedInput.unread(signature);
         try (ZipInputStream zip = new ZipInputStream(checkedInput)) {
             ZipEntry entry;
+            boolean multiRelease = false;
+            boolean sawVersionedClass = false;
             while ((entry = zip.getNextEntry()) != null) {
                 if (!state.observeEntry(entry)) {
                     if (state.budgetExceeded()) {
@@ -255,10 +277,22 @@ public final class JarReader {
                     continue;
                 }
                 if (path.startsWith(SKIPPED_MULTIRELEASE)) {
-                    state.reasons.add("MULTI_RELEASE_SKIPPED");
+                    if (VersionedPath.parse(path) != null) {
+                        sawVersionedClass = true;
+                    }
                     continue;
                 }
                 if (entry.isDirectory()) {
+                    continue;
+                }
+                if ("META-INF/MANIFEST.MF".equalsIgnoreCase(path)) {
+                    try {
+                        multiRelease = "true".equalsIgnoreCase(new Manifest(
+                                new java.io.ByteArrayInputStream(state.readBytes(zip)))
+                                .getMainAttributes().getValue("Multi-Release"));
+                    } catch (IOException | RuntimeException malformedManifest) {
+                        state.reasons.add("MULTI_RELEASE_MANIFEST_INVALID");
+                    }
                     continue;
                 }
                 if (path.endsWith(".class")) {
@@ -272,6 +306,12 @@ public final class JarReader {
                     readNestedJar(zip, origin + "!" + path, depth + 1, state);
                 }
             }
+            // ZipInputStream cannot select a versioned replacement after the base class has
+            // already streamed past.  Keep the base view for bounded memory usage, but make
+            // the nested multi-release limitation explicit instead of reporting COMPLETE.
+            if (multiRelease && sawVersionedClass) {
+                state.reasons.add("MULTI_RELEASE_NESTED_UNSELECTED");
+            }
         } catch (ZipException corrupt) {
             state.markArchiveCorrupt();
             JustLogger.warn("损坏嵌套 ZIP/JAR，跳过剩余内容 {}: {}", origin, corrupt.getMessage());
@@ -280,14 +320,16 @@ public final class JarReader {
 
     private static final class ReaderState {
         private final ClassConsumer consumer;
+        private final int targetFeature;
         private final Set<String> reasons = new LinkedHashSet<>();
         private final Set<String> emittedClassNames = new LinkedHashSet<>();
         private final ArchiveLimits.Tracker archiveBudget = new ArchiveLimits.Tracker();
         private int emitted;
         private boolean budgetExceeded;
 
-        private ReaderState(ClassConsumer consumer) {
+        private ReaderState(ClassConsumer consumer, int targetFeature) {
             this.consumer = consumer;
+            this.targetFeature = targetFeature > 0 ? targetFeature : runtimeFeature();
         }
 
         private boolean atCapacity() {
@@ -451,5 +493,125 @@ public final class JarReader {
 
     private static String classNameFromPath(String path) {
         return path.endsWith(".class") ? path.substring(0, path.length() - 6) : path;
+    }
+
+    private static int runtimeFeature() {
+        try {
+            return Runtime.version().feature();
+        } catch (RuntimeException ignored) {
+            return 8;
+        }
+    }
+
+    /**
+     * Selection view for a single ZipFile.  The manifest is read before classes, so a valid
+     * multi-release archive never emits its base class before a versioned replacement.  A
+     * versioned path is kept under its logical class name; the archive origin still retains the
+     * physical path for diagnostics.
+     */
+    private static MultiReleaseSelection multiReleaseSelection(ZipFile zip,
+                                                                List<ZipEntry> entries,
+                                                                ReaderState state) {
+        boolean enabled = false;
+        ZipEntry manifest = null;
+        for (ZipEntry entry : entries) {
+            if ("META-INF/MANIFEST.MF".equalsIgnoreCase(entry.getName())) {
+                manifest = entry;
+                break;
+            }
+        }
+        if (manifest != null) {
+            try (InputStream input = zip.getInputStream(manifest)) {
+                byte[] bytes = state.readBytes(input);
+                enabled = "true".equalsIgnoreCase(new Manifest(
+                        new java.io.ByteArrayInputStream(bytes)).getMainAttributes()
+                        .getValue("Multi-Release"));
+            } catch (Exception failure) {
+                // A malformed manifest must not cause a versioned class to masquerade as a
+                // normal application class. Keep the base-only view and make the boundary
+                // visible to completeness/report consumers.
+                state.reasons.add("MULTI_RELEASE_MANIFEST_INVALID");
+            }
+        }
+        return MultiReleaseSelection.create(entries, state.targetFeature, enabled);
+    }
+
+    private static final class MultiReleaseSelection {
+        private final Map<String, String> selectedByLogicalPath;
+        private final Set<String> selectedPhysicalPaths;
+
+        private MultiReleaseSelection(Map<String, String> selectedByLogicalPath,
+                                      Set<String> selectedPhysicalPaths) {
+            this.selectedByLogicalPath = selectedByLogicalPath;
+            this.selectedPhysicalPaths = selectedPhysicalPaths;
+        }
+
+        private static MultiReleaseSelection create(List<ZipEntry> entries, int targetFeature,
+                                                    boolean enabled) {
+            Map<String, VersionedPath> best = new HashMap<>();
+            if (enabled && targetFeature >= 9) {
+                for (ZipEntry entry : entries) {
+                    VersionedPath candidate = VersionedPath.parse(entry.getName());
+                    if (candidate == null || candidate.version() > targetFeature) {
+                        continue;
+                    }
+                    VersionedPath previous = best.get(candidate.logicalPath());
+                    if (previous == null || candidate.version() > previous.version()
+                            || (candidate.version() == previous.version()
+                            && candidate.physicalPath().compareTo(previous.physicalPath()) < 0)) {
+                        best.put(candidate.logicalPath(), candidate);
+                    }
+                }
+            }
+            Map<String, String> selected = new HashMap<>();
+            Set<String> physical = new java.util.HashSet<>();
+            for (VersionedPath path : best.values()) {
+                selected.put(path.logicalPath(), path.physicalPath());
+                physical.add(path.physicalPath());
+            }
+            return new MultiReleaseSelection(Map.copyOf(selected), Set.copyOf(physical));
+        }
+
+        private boolean skip(String path) {
+            if (path == null) {
+                return true;
+            }
+            VersionedPath versioned = VersionedPath.parse(path);
+            if (versioned != null) {
+                return !selectedPhysicalPaths.contains(path);
+            }
+            if (path.startsWith(SKIPPED_MULTIRELEASE)) {
+                return true;
+            }
+            return selectedByLogicalPath.containsKey(path);
+        }
+
+        private String logicalPath(String path) {
+            VersionedPath versioned = VersionedPath.parse(path);
+            return versioned == null ? path : versioned.logicalPath();
+        }
+    }
+
+    private record VersionedPath(String physicalPath, String logicalPath, int version) {
+        private static VersionedPath parse(String path) {
+            if (path == null || !path.startsWith(SKIPPED_MULTIRELEASE)) {
+                return null;
+            }
+            String rest = path.substring(SKIPPED_MULTIRELEASE.length());
+            int slash = rest.indexOf('/');
+            if (slash <= 0 || slash == rest.length() - 1) {
+                return null;
+            }
+            int version;
+            try {
+                version = Integer.parseInt(rest.substring(0, slash));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+            if (version < 9 || !rest.substring(slash + 1).endsWith(".class")) {
+                return null;
+            }
+            return new VersionedPath(path, rest.substring(slash + 1), version);
+        }
     }
 }

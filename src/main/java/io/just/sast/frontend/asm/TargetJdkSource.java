@@ -8,9 +8,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -24,12 +24,14 @@ public final class TargetJdkSource implements JdkClassSource {
 
     private final ClassFileReader reader = new ClassFileReader();
     /** 内部名 → 所在 jar 路径（Java 8 模式） */
-    private final Map<String, Path> classToJar = new HashMap<>();
+    /** Lazy Java 8 lookups can happen from parallel hierarchy queries. */
+    private final Map<String, Path> classToJar = new ConcurrentHashMap<>();
     private final List<Path> coreJars = new ArrayList<>();
     private boolean legacyIndexBuilt;
     /** Java 9+ 模式的目标镜像 */
     private final JrtClassSource jrtDelegate;
     private final String jdkDescription;
+    private final int feature;
 
     public TargetJdkSource(Path jdkHome) throws IOException {
         Path home = jdkHome.toAbsolutePath().normalize();
@@ -43,6 +45,7 @@ public final class TargetJdkSource implements JdkClassSource {
         }
         if (Files.exists(rtJar)) {
             jdkDescription = detectLegacyVersion(home) + "（rt.jar 模式）";
+            feature = detectFeature(home);
             coreJars.add(rtJar);
             // 辅助 jar：jce / jsse / charsets / resources（反序列化相关类可能分布在多个 jar）
             Path libDir = rtJar.getParent();
@@ -63,6 +66,7 @@ public final class TargetJdkSource implements JdkClassSource {
         if (Files.exists(home.resolve("release"))) {
             jrtDelegate = JrtClassSource.external(home);
             jdkDescription = readReleaseVersion(home) + "（jrt-fs 外部挂载）";
+            feature = jrtDelegate.feature();
             JustLogger.info("目标 JDK 来源：{}（读取目标镜像，非运行时）", jdkDescription);
             return;
         }
@@ -83,6 +87,11 @@ public final class TargetJdkSource implements JdkClassSource {
         }
     }
 
+    @Override
+    public String moduleOf(String internalName) {
+        return jrtDelegate == null ? null : jrtDelegate.moduleOf(internalName);
+    }
+
     /** 按内部名读取原始 class，避免完整模式预先 materialize 整个 JDK。 */
     public ClassBytes loadBytes(String internalName) {
         if (jrtDelegate != null) {
@@ -95,15 +104,18 @@ public final class TargetJdkSource implements JdkClassSource {
             if (jarPath == null) {
                 return null;
             }
-            classToJar.put(internalName, jarPath);
+            classToJar.putIfAbsent(internalName, jarPath);
+            jarPath = classToJar.get(internalName);
         }
         try (ZipFile zip = new ZipFile(jarPath.toFile())) {
             ZipEntry entry = zip.getEntry(internalName + ".class");
             if (entry == null) {
                 return null;
             }
-            return new ClassBytes(internalName, zip.getInputStream(entry).readAllBytes(),
-                    "jdk:" + jarPath.getFileName());
+            try (var input = zip.getInputStream(entry)) {
+                return new ClassBytes(internalName, input.readAllBytes(),
+                        "jdk:" + jarPath.getFileName());
+            }
         } catch (Exception e) {
             JustLogger.debug("目标 JDK 类加载失败 {}: {}", internalName, e.getMessage());
             return null;
@@ -128,19 +140,36 @@ public final class TargetJdkSource implements JdkClassSource {
                     }
                     String className = name.substring(0, name.length() - 6);
                     classToJar.putIfAbsent(className, jar);
-                    result.add(new ClassBytes(className,
-                            zip.getInputStream(entry).readAllBytes(), "jdk:" + jar.getFileName()));
+                    try (var input = zip.getInputStream(entry)) {
+                        result.add(new ClassBytes(className, input.readAllBytes(),
+                                "jdk:" + jar.getFileName()));
+                    }
                 }
             }
         }
         if (jrtDelegate == null) {
             legacyIndexBuilt = true;
         }
+        result.sort(java.util.Comparator.comparing(ClassBytes::className)
+                .thenComparing(ClassBytes::origin));
         return result;
     }
 
     public String description() {
         return jdkDescription;
+    }
+
+    /** Feature represented by the selected target JDK, or zero when metadata is unavailable. */
+    public int feature() {
+        return feature;
+    }
+
+    /** Release an externally mounted JRT image; legacy rt.jar sources own no open handle. */
+    @Override
+    public void close() {
+        if (jrtDelegate != null) {
+            jrtDelegate.close();
+        }
     }
 
     private Path findInJars(String internalName) {
@@ -199,6 +228,34 @@ public final class TargetJdkSource implements JdkClassSource {
     private static String readReleaseVersion(Path home) {
         String version = readVersionFromRelease(home.resolve("release"));
         return version != null ? "JDK " + version : "JDK 9+";
+    }
+
+    private static int detectFeature(Path home) {
+        for (Path release : List.of(home.resolve("release"), home.resolve("jre").resolve("release"))) {
+            String version = readVersionFromRelease(release);
+            if (version == null || version.isBlank()) {
+                continue;
+            }
+            try {
+                String normalized = version.startsWith("1.") ? version.substring(2)
+                        : version.split("[.+-]", 2)[0];
+                int dot = normalized.indexOf('.');
+                return Integer.parseInt(dot < 0 ? normalized : normalized.substring(0, dot));
+            } catch (RuntimeException ignored) {
+                // Try the directory-name fallback below.
+            }
+        }
+        String name = home.getFileName() == null ? "" : home.getFileName().toString().toLowerCase();
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("(?:jdk|jre)[^0-9]*(\\d+)")
+                .matcher(name);
+        if (matcher.find()) {
+            try {
+                return Integer.parseInt(matcher.group(1));
+            } catch (RuntimeException ignored) {
+                // Unknown feature; keep the explicit zero sentinel.
+            }
+        }
+        return 0;
     }
 
     private static String readVersionFromRelease(Path releaseFile) {

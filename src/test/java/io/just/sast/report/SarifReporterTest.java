@@ -67,6 +67,7 @@ class SarifReporterTest {
         assertTrue(sarif.contains("\"startLine\": 42"), sarif);
         // 指纹存在
         assertTrue(sarif.contains("\"partialFingerprints\""), sarif);
+        assertTrue(sarif.contains("\"precision\":{"), sarif);
         assertTrue(sarif.contains("\"construction\":{"), sarif);
         // OASIS 规范 schema
         assertTrue(sarif.contains("docs.oasis-open.org/sarif"), sarif);
@@ -96,5 +97,31 @@ class SarifReporterTest {
         String sarif = Files.readString(out.resolve("findings.sarif"));
         assertTrue(sarif.contains("\"confidence\":\"CONFIRMED\""),
                 "verify:confirmed 注记应映射 CONFIRMED（与 findings.csv 口径一致）:\n" + sarif);
+    }
+
+    @Test
+    void usesSharedEvidenceOrderWhenFoldingVariants(@TempDir Path tmp) throws Exception {
+        Chain shortest = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",
+                "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Gadget", "readObject", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "call", "()V", null),
+                new ChainHop("app/Gadget", "readObject", "app/Gadget", "readObject",
+                        HopKind.ENTRY, null, "readObject", "(Ljava/io/ObjectInputStream;)V", null)), 0);
+        Chain longer = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",
+                "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Gadget", "readObject", "app/Mid", "run",
+                        HopKind.DIRECT_CALL, null, "delegates", "()V", null),
+                new ChainHop("app/Mid", "run", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "call", "()V", null),
+                new ChainHop("app/Gadget", "readObject", "app/Gadget", "readObject",
+                        HopKind.ENTRY, null, "readObject", "(Ljava/io/ObjectInputStream;)V", null)), 0);
+
+        Path out = tmp.resolve("sarif-order");
+        new SarifReporter().withRules(rules()).write(out, List.of(shortest, longer), Map.of(), Map.of());
+        String sarif = Files.readString(out.resolve("findings.sarif"));
+        assertTrue(sarif.contains("\"chain_length\":3")
+                        && !sarif.contains("\"chain_length\":2"),
+                "SARIF must choose the same strongest variant as the shared evidence tuple:\n"
+                        + sarif);
     }
 }

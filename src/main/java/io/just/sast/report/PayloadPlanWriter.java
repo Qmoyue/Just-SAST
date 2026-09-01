@@ -7,6 +7,7 @@ import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.chain.ChainRanking;
+import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ConfidenceScorer;
 import io.just.sast.verify.FieldDependencyPlan;
 
@@ -33,7 +34,8 @@ public final class PayloadPlanWriter {
 
     private record PlanView(Chain chain, FieldDependencyPlan fields, List<String> notes,
                             VerificationSummary.ChainResult verification,
-                            String construction, ConstructionSummary constructionSummary) {
+                            String construction, boolean highConfidence,
+                            ConstructionSummary constructionSummary) {
     }
 
     public void write(Path outDir, List<Chain> chains, Map<String, String> calibrations,
@@ -73,6 +75,7 @@ public final class PayloadPlanWriter {
             String construction = constructionStatus(chain, chainNotes);
             views.add(new PlanView(chain, fields, List.copyOf(chainNotes),
                     verified.get(chain.key()), construction,
+                    ChainPrecision.isHighConfidence(chain, chainNotes, verified.get(chain.key())),
                     ConstructionSummary.summarize(chain, chainNotes, verified.get(chain.key()))));
         }
 
@@ -88,7 +91,7 @@ public final class PayloadPlanWriter {
             }
             PlanView view = views.get(i);
             appendPlan(json, view.chain(), view.fields(), view.notes(), view.verification(),
-                    view.construction(), view.constructionSummary());
+                    view.construction(), view.highConfidence(), view.constructionSummary());
         }
         json.append("\n  ]\n}\n");
         AtomicFiles.writeUtf8(layout.meta().resolve("payload-plan.json"), json.toString());
@@ -100,6 +103,7 @@ public final class PayloadPlanWriter {
                                    List<String> notes,
                                    VerificationSummary.ChainResult verification,
                                    String construction,
+                                   boolean highConfidence,
                                    ConstructionSummary constructionSummary) {
         json.append("    {")
                 .append("\"chain_key\":\"").append(esc(chain.key())).append("\"")
@@ -117,6 +121,7 @@ public final class PayloadPlanWriter {
                 .append(esc(ChainRanking.evidence(chain, Map.of(chain.key(), notes),
                         verification == null ? Map.of() : Map.of(chain.key(), verification), Set.of())
                         .explanation())).append("\"")
+                .append(",\"high_confidence\":").append(highConfidence)
                 .append(",\"construction\":{\"status\":\"").append(construction)
                 .append("\",\"strategy\":\"INERT_REFLECTIVE_OBJECT_GRAPH\"")
                 .append(",\"encoded_fields\":\"").append(esc(fields.encodedFields())).append("\"")
@@ -238,6 +243,8 @@ public final class PayloadPlanWriter {
                 .append(indent).append("  \"rule_id\":\"").append(esc(chain.ruleId())).append("\",\n")
                 .append(indent).append("  \"confidence\":\"")
                 .append(esc(ConfidenceScorer.score(chain, view.notes()))).append("\",\n")
+                .append(indent).append("  \"high_confidence\":")
+                .append(view.highConfidence()).append(",\n")
                 .append(indent).append("  \"display_path\":\"")
                 .append(esc(displayPath(chain, verification))).append("\",\n")
                 .append(indent).append("  \"entry\":{\"class\":\"")
@@ -321,7 +328,8 @@ public final class PayloadPlanWriter {
                     .append(displayTitle(chain)).append("\n\n")
                     .append("- Rule: `").append(escMarkdown(chain.ruleId())).append("`\n")
                     .append("- Confidence: `").append(escMarkdown(
-                            ConfidenceScorer.score(chain, view.notes()))).append("`\n")
+                             ConfidenceScorer.score(chain, view.notes()))).append("`\n")
+                    .append("- High confidence: `").append(view.highConfidence()).append("`\n")
                     .append("- Verification: `").append(escMarkdown(
                             verification == null ? "NOT_SELECTED" : verification.status()))
                     .append("` (`").append(escMarkdown(verification == null ? "NONE"

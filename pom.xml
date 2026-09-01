@@ -116,7 +116,7 @@
               <goal>unpack-dependencies</goal>
             </goals>
             <configuration>
-              <includeArtifactIds>asm</includeArtifactIds>
+              <includeArtifactIds>asm,jna</includeArtifactIds>
               <includeScope>runtime</includeScope>
               <outputDirectory>${project.build.directory}/verify8-classes</outputDirectory>
             </configuration>

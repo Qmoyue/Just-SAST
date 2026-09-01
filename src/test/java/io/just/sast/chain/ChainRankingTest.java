@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Arrays;
 
 import io.just.sast.blackboard.ObjectGraphPlan;
 
@@ -52,6 +53,21 @@ class ChainRankingTest {
     }
 
     @Test
+    void compatibilityAndSegmentNotesUseSharedDynamicTiers() {
+        Chain legacy = chain("legacy", "TERMINAL");
+        Chain segment = chain("segment", "TERMINAL");
+        Chain plain = chain("plain", "TERMINAL");
+
+        assertTrue(ChainRanking.compare(legacy, plain,
+                Map.of(legacy.key(), List.of("verify:confirmed")), Map.of(), Set.of()) < 0);
+        assertTrue(ChainRanking.compare(segment, plain,
+                Map.of(segment.key(), List.of("verify:segment-confirmed")), Map.of(), Set.of()) < 0);
+        assertTrue(ChainRanking.compare(legacy, segment,
+                Map.of(legacy.key(), List.of("verify:confirmed"),
+                        segment.key(), List.of("verify:segment-confirmed")), Map.of(), Set.of()) < 0);
+    }
+
+    @Test
     void malformedDeclaredPlanDoesNotReceiveConstructibleRank() {
         ObjectGraphPlan partial = new ObjectGraphPlan(
                 List.of(new ObjectGraphPlan.Node("entry", "app/Entry",
@@ -65,6 +81,30 @@ class ChainRankingTest {
 
         assertEquals(2, evidence.constructionRank());
         assertTrue(evidence.explanation().contains("construction=PLAN_PARTIAL"));
+    }
+
+    @Test
+    void nullCompatibilityNotesRemainAWeakButSortableCandidate() {
+        Chain candidate = chain("null-note", "TERMINAL");
+
+        ChainRanking.Evidence evidence = ChainRanking.evidence(candidate,
+                Map.of(candidate.key(), Arrays.asList(null, "degrade:partial-construct")),
+                Map.of(), Set.of());
+
+        assertEquals(2, evidence.constructionRank());
+        assertTrue(evidence.explanation().contains("construction=PARTIAL")
+                || evidence.explanation().contains("construction=PLAN_PARTIAL"));
+    }
+
+    @Test
+    void nullNoteListIsTreatedAsNoEvidence() {
+        Chain candidate = chain("null-list", "TERMINAL");
+
+        ChainRanking.Evidence evidence = ChainRanking.evidence(candidate,
+                java.util.Collections.singletonMap(candidate.key(), null), Map.of(), Set.of());
+
+        assertEquals(3, evidence.constructionRank());
+        assertTrue(evidence.explanation().contains("construction=UNKNOWN"));
     }
 
     private static Chain chain(String name, String role) {

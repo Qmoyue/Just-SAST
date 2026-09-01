@@ -35,6 +35,9 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
     /** Kryo/other serializer construction may need bounded reflective bootstrap access. */
     private static final ThreadLocal<Integer> SOURCE_ADAPTER_DEPTH =
             new ThreadLocal<Integer>();
+    /** Fixed adapter-owned command/network capabilities; target frames never enter these scopes. */
+    private static final ThreadLocal<Path> SAFE_REAL_EXECUTABLE = new ThreadLocal<Path>();
+    private static final ThreadLocal<Boolean> SAFE_REAL_NETWORK = new ThreadLocal<Boolean>();
 
     private LegacySandboxSecurityManager(Path writableRoot, List<Path> readableRoots) {
         this.writableRoot = normalize(writableRoot);
@@ -250,6 +253,39 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
     }
 
+    static void beginSafeRealExec(Path executable) {
+        SecurityManager current = System.getSecurityManager();
+        if (current == null) {
+            return;
+        }
+        if (!(current instanceof LegacySandboxSecurityManager)
+                || !((LegacySandboxSecurityManager) current).trustedProbeCaller()
+                || executable == null) {
+            throw new SecurityException("safe-real command is probe-only");
+        }
+        SAFE_REAL_EXECUTABLE.set(executable.toAbsolutePath().normalize());
+    }
+
+    static void endSafeRealExec() {
+        SAFE_REAL_EXECUTABLE.remove();
+    }
+
+    static void beginSafeRealNetwork() {
+        SecurityManager current = System.getSecurityManager();
+        if (current == null) {
+            return;
+        }
+        if (!(current instanceof LegacySandboxSecurityManager)
+                || !((LegacySandboxSecurityManager) current).trustedProbeCaller()) {
+            throw new SecurityException("safe-real network is probe-only");
+        }
+        SAFE_REAL_NETWORK.set(Boolean.TRUE);
+    }
+
+    static void endSafeRealNetwork() {
+        SAFE_REAL_NETWORK.remove();
+    }
+
     static void beginProxyBootstrap() {
         SecurityManager current = System.getSecurityManager();
         if (!(current instanceof LegacySandboxSecurityManager)
@@ -417,6 +453,9 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkExec(String cmd) {
+        if (safeRealExecutableAllowed(cmd)) {
+            return;
+        }
         throw new SecurityException("exec denied: " + cmd);
     }
 
@@ -427,22 +466,54 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkConnect(String host, int port) {
+        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host)) {
+            return;
+        }
         throw new SecurityException("connect denied: " + host + ":" + port);
     }
 
     @Override
     public void checkListen(int port) {
+        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get())) {
+            return;
+        }
         throw new SecurityException("listen denied: " + port);
     }
 
     @Override
     public void checkAccept(String host, int port) {
+        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host)) {
+            return;
+        }
         throw new SecurityException("accept denied: " + host + ":" + port);
     }
 
     @Override
     public void checkMulticast(java.net.InetAddress address) {
         throw new SecurityException("multicast denied: " + address);
+    }
+
+    private boolean safeRealExecutableAllowed(String command) {
+        Path allowed = SAFE_REAL_EXECUTABLE.get();
+        if (allowed == null || !trustedProbeCaller() || command == null || command.length() == 0) {
+            return false;
+        }
+        try {
+            Path candidate = Paths.get(command).toAbsolutePath().normalize();
+            return candidate.equals(allowed) && Files.isRegularFile(candidate)
+                    && !Files.isSymbolicLink(candidate);
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static boolean loopback(String host) {
+        if (host == null) {
+            return false;
+        }
+        String value = host.trim().toLowerCase(Locale.ROOT);
+        return "127.0.0.1".equals(value) || "localhost".equals(value)
+                || "::1".equals(value) || "0:0:0:0:0:0:0:1".equals(value);
     }
 
     private void checkFile(FilePermission permission) {

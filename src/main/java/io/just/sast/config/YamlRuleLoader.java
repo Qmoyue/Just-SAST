@@ -8,7 +8,9 @@ import org.yaml.snakeyaml.constructor.SafeConstructor;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -250,12 +252,14 @@ public final class YamlRuleLoader {
                 matchOf(call.get("owner")),
                 matchOf(call.get("name")),
                 matchNullable(call.get("descriptor")));
-        Map<String, List<String>> actions = new HashMap<>();
+        Map<String, List<String>> actions = new LinkedHashMap<>();
         Object actionsObj = ruleMap.get("actions");
         if (!(actionsObj instanceof Map<?, ?> actionsMap) || actionsMap.isEmpty()) {
             throw new IOException("model 规则 " + id + " 缺少非空 actions 映射");
         }
-        for (Map.Entry<?, ?> e : actionsMap.entrySet()) {
+        List<Map.Entry<?, ?>> actionEntries = new ArrayList<>(actionsMap.entrySet());
+        actionEntries.sort(java.util.Comparator.comparing(e -> String.valueOf(e.getKey())));
+        for (Map.Entry<?, ?> e : actionEntries) {
             if (e.getKey() == null) {
                 throw new IOException("model 规则 " + id + " 的 action 目标不能为空");
             }
@@ -279,7 +283,8 @@ public final class YamlRuleLoader {
             }
             actions.put(target, List.copyOf(sources));
         }
-        return new Rule.ModelRule(id, callMatcher, Map.copyOf(actions));
+        return new Rule.ModelRule(id, callMatcher,
+                Collections.unmodifiableMap(new LinkedHashMap<>(actions)));
     }
 
     @SuppressWarnings("unchecked")

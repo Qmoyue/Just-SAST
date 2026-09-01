@@ -68,6 +68,41 @@ class SafeSinkAdapterTest {
     }
 
     @Test
+    void nativeApiCannotBeReclassifiedByAGenericCodeExecutionRule() {
+        SafeSinkAdapter.Decision decision = SafeSinkAdapter.decide(
+                SafeSinkAdapter.safeExecution(Path.of(".")),
+                new SafeSinkAdapter.Sink("CODE_EXEC", "java/lang/System", "load", ""));
+
+        assertEquals(SafeSinkAdapter.Capability.NATIVE, decision.capability());
+        assertEquals(SafeSinkAdapter.Disposition.CANARY_BOUNDARY, decision.disposition());
+        assertFalse(decision.adapterSelected());
+    }
+
+    @Test
+    void remoteNamingAndRmiRemainBoundaryOnlyInSafeReal(@TempDir Path scratch) {
+        SafeSinkAdapter.Policy policy = SafeSinkAdapter.safeRealExecution(scratch);
+
+        SafeSinkAdapter.Decision jndi = SafeSinkAdapter.decide(policy,
+                new SafeSinkAdapter.Sink("JNDI_LOOKUP", "javax/naming/InitialContext",
+                        "lookup", "(Ljava/lang/String;)Ljava/lang/Object;"));
+        SafeSinkAdapter.Decision jrmp = SafeSinkAdapter.decide(policy,
+                new SafeSinkAdapter.Sink("JRMP", "java/rmi/registry/Registry", "lookup",
+                        "(Ljava/lang/String;)Ljava/lang/Object;"));
+        SafeSinkAdapter.Decision genericRmi = SafeSinkAdapter.decide(policy,
+                new SafeSinkAdapter.Sink("CALL", "java/rmi/server/RemoteObject", "invoke", "()V"));
+
+        assertEquals(SafeSinkAdapter.Capability.REMOTE_LOOKUP, jndi.capability());
+        assertEquals(SafeSinkAdapter.Capability.REMOTE_LOOKUP, jrmp.capability());
+        assertEquals(SafeSinkAdapter.Capability.REMOTE_LOOKUP, genericRmi.capability());
+        assertEquals(SafeSinkAdapter.Disposition.CANARY_BOUNDARY, jndi.disposition());
+        assertEquals(SafeSinkAdapter.Disposition.CANARY_BOUNDARY, jrmp.disposition());
+        assertEquals(SafeSinkAdapter.Disposition.CANARY_BOUNDARY, genericRmi.disposition());
+        assertFalse(jndi.adapterSelected());
+        assertFalse(jrmp.adapterSelected());
+        assertFalse(genericRmi.adapterSelected());
+    }
+
+    @Test
     void safeExecutionObservesOnlyFixedAdapterEffects(@TempDir Path scratch) throws Exception {
         SafeSinkAdapter.Policy policy = SafeSinkAdapter.safeExecution(scratch);
 
@@ -84,9 +119,9 @@ class SafeSinkAdapterTest {
 
         assertTrue(command.effectObserved());
         assertEquals("INERT_COMMAND_RECORDED", command.effect());
-        assertTrue(network.effectObserved());
+        assertTrue(network.effectObserved(), String.valueOf(network));
         assertTrue(data.effectObserved());
-        assertTrue(file.effectObserved());
+        assertTrue(file.effectObserved(), String.valueOf(file));
         assertEquals("JUST_SAFE_EFFECT\n",
                 Files.readString(scratch.resolve("just-safe-effect.marker")));
         assertFalse(reflection.effectObserved(), "reflection remains canary-only");
@@ -152,5 +187,34 @@ class SafeSinkAdapterTest {
         assertNotEquals(firstPolicy.digest(), SafeSinkAdapter.boundary().digest());
         assertEquals(firstPolicy.digest(),
                 SafeSinkAdapter.policyDigest(SafeSinkAdapter.Mode.SAFE_EXEC));
+    }
+
+    @Test
+    void safeRealUsesOnlyAdapterOwnedEffects(@TempDir Path scratch) throws Exception {
+        SafeSinkAdapter.Policy policy = SafeSinkAdapter.safeRealExecution(scratch);
+        Path javaHome = Path.of(System.getProperty("java.home"));
+        String executableName = System.getProperty("os.name", "").toLowerCase()
+                .contains("win") ? "java.exe" : "java";
+        Path java = javaHome.resolve("bin").resolve(executableName);
+
+        SafeSinkAdapter.AdapterResult command = SafeSinkAdapter.observe(policy,
+                new SafeSinkAdapter.Sink("COMMAND_EXEC", "java/lang/Runtime", "exec", ""),
+                null, java);
+        SafeSinkAdapter.AdapterResult network = SafeSinkAdapter.observe(policy,
+                new SafeSinkAdapter.Sink("SSRF", "java/net/Socket", "connect", ""), null, java);
+        SafeSinkAdapter.AdapterResult file = SafeSinkAdapter.observe(policy,
+                new SafeSinkAdapter.Sink("FILE_WRITE", "java/nio/file/Files", "write", ""),
+                null, java);
+
+        assertTrue(command.effectObserved(), String.valueOf(command));
+        assertEquals(SafeSinkAdapter.Disposition.REAL_COMMAND,
+                command.decision().disposition());
+        assertTrue(network.effectObserved());
+        assertEquals(SafeSinkAdapter.Disposition.REAL_LOOPBACK,
+                network.decision().disposition());
+        assertTrue(file.effectObserved());
+        assertEquals("REAL_SCRATCH_FILE_WRITE", file.effect());
+        assertTrue(Files.isRegularFile(scratch.resolve("just-safe-effect.marker")));
+        assertNotEquals(policy.digest(), SafeSinkAdapter.policyDigest(SafeSinkAdapter.Mode.SAFE_EXEC));
     }
 }

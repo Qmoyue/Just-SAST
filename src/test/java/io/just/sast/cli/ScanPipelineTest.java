@@ -394,6 +394,90 @@ class ScanPipelineTest {
     }
 
     @Test
+    void resolvesMethodHandleLookupsWithStaticVirtualAndConstructorArguments(@TempDir Path tmp)
+            throws Exception {
+        String sinks = """
+                package app;
+                public final class Sinks {
+                    private Sinks() {}
+                    public static void fire(String value) throws Exception {
+                        Runtime.getRuntime().exec(value);
+                    }
+                }
+                """;
+        String target = """
+                package app;
+                public final class Target {
+                    public void fire(String value) throws Exception {
+                        Sinks.fire(value);
+                    }
+                }
+                """;
+        String constructed = """
+                package app;
+                public final class Constructed {
+                    public Constructed(String value) throws Exception {
+                        Sinks.fire(value);
+                    }
+                }
+                """;
+        String entry = """
+                package app;
+                public final class HandleGadget implements java.io.Serializable {
+                    private String command;
+                    private void readObject(java.io.ObjectInputStream in) throws Throwable {
+                        in.defaultReadObject();
+                        java.lang.invoke.MethodHandles.Lookup lookup =
+                                java.lang.invoke.MethodHandles.lookup();
+                        java.lang.invoke.MethodHandle statik = lookup.findStatic(
+                                Sinks.class, "fire",
+                                java.lang.invoke.MethodType.methodType(void.class, String.class));
+                        statik.invokeExact(command);
+                        java.lang.invoke.MethodHandle virtual = lookup.findVirtual(
+                                Target.class, "fire",
+                                java.lang.invoke.MethodType.methodType(void.class, String.class));
+                        virtual.invokeExact(new Target(), command);
+                        java.lang.invoke.MethodHandle ctor = lookup.findConstructor(
+                                Constructed.class,
+                                java.lang.invoke.MethodType.methodType(void.class, String.class));
+                        ctor.invokeExact(command);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-METHODHANDLE-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "app/Sinks", name: "fire", descriptor: "(Ljava/lang/String;)V" }
+                    tainted: [{arg: 0}]
+                  - id: T-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                """;
+        Path jar = compileToJar(tmp.resolve("method-handle.jar"), Map.of(
+                "app.Sinks", sinks, "app.Target", target,
+                "app.Constructed", constructed, "app.HandleGadget", entry));
+        Path rulesFile = tmp.resolve("method-handle-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/HandleGadget,readObject")
+                        && findings.contains("T-METHODHANDLE-SINK")
+                        && findings.contains("app/Sinks,fire"),
+                "MethodHandle 的 static/virtual/constructor lookup 应将直接参数投影到精确 sink：\n"
+                        + findings);
+    }
+
+    @Test
     void serializedProxyHandlerIsNotAStandaloneDeserializationRoot(@TempDir Path tmp)
             throws Exception {
         String handler = """
@@ -656,6 +740,66 @@ class ScanPipelineTest {
                         && findings.contains("app/MapHandler.invoke")
                         && findings.contains("fake/ObjectUtil,deserialize"),
                 "外部序列化 Proxy handler 应将 Map 字段值传递到二次反序列化 sink：\n" + findings);
+    }
+
+    @Test
+    void classMethodArraySelectsBoundedReflectiveTarget(@TempDir Path tmp) throws Exception {
+        String target = """
+                package app;
+                public class Target {
+                    public static void fire(String value) { Sinks.accept(value); }
+                    public void other(String value) { Sinks.accept(value); }
+                }
+                """;
+        String sinks = """
+                package app;
+                public final class Sinks {
+                    private Sinks() {}
+                    public static void accept(String value) {}
+                }
+                """;
+        String gadget = """
+                package app;
+                public class ArrayGadget implements java.io.Serializable {
+                    private String command;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        in.defaultReadObject();
+                        java.lang.reflect.Method[] methods = Target.class.getDeclaredMethods();
+                        for (java.lang.reflect.Method method : methods) {
+                            if ("fire".equals(method.getName())) {
+                                method.invoke(null, new Object[] { command });
+                            }
+                        }
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-ARRAY-TARGET-SINK
+                    kind: sink
+                    category: COMMAND_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "app/Sinks", name: "accept" }
+                    tainted: [{arg: 0}]
+                  - id: T-ARRAY-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                """;
+        Path jar = compileToJar(tmp.resolve("method-array.jar"), Map.of(
+                "app.Target", target, "app.Sinks", sinks, "app.ArrayGadget", gadget));
+        Path rulesFile = tmp.resolve("method-array-rules.yaml");
+        Files.writeString(rulesFile, rules);
+        Path out = tmp.resolve("out");
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, true, 20);
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/ArrayGadget,readObject")
+                        && findings.contains("app/Sinks,accept"),
+                "Class.getDeclaredMethods()[i] 应在有界 Class 元数据下恢复目标方法并传递参数：\n"
+                        + findings);
     }
 
     @Test

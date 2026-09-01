@@ -4,6 +4,7 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ConstructionSummary;
 import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.chain.ChainRanking;
+import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ConfidenceScorer;
 
 import java.io.BufferedWriter;
@@ -27,6 +28,8 @@ public final class MultiFormatReporter {
 
     /** Per-chain evidence memo shared by JSON/HTML/Markdown in one report pass. */
     private record ChainView(String confidence, ChainRanking.Evidence ranking,
+                             ChainPrecision.Assessment precision,
+                             boolean highConfidence,
                              ConstructionSummary construction) {
     }
 
@@ -134,6 +137,8 @@ public final class MultiFormatReporter {
                 .append(",\"isolation_capabilities\":");
         appendStrings(sb, summary.isolationCapabilities());
         sb.append(",\"jdk\":\"").append(escJson(summary.jdk())).append("\"")
+                .append(",\"attestation_version\":\"")
+                .append(escJson(summary.attestationVersion())).append("\"")
                 .append(",\"policy_digest\":\"").append(escJson(summary.policyDigest())).append("\"")
                 .append(",\"artifact_sha256\":\"").append(escJson(summary.artifactHash())).append("\"")
                 .append(",\"sink_distorted\":").append(summary.sinkDistorted())
@@ -234,7 +239,12 @@ public final class MultiFormatReporter {
                             .append("\",\"sink_role\":\"").append(escJson(c.sinkRole()))
                             .append("\",\"ranking_evidence\":\"")
                             .append(escJson(view.ranking().explanation()))
-                            .append("\",\"construction\":")
+                            .append("\",\"precision\":")
+                            .append(ChainPrecision.toJson(view.precision(), MultiFormatReporter::escJson,
+                                    view.highConfidence()))
+                            .append(",\"high_confidence\":")
+                            .append(Boolean.toString(view.highConfidence()))
+                            .append(",\"construction\":")
                             .append(ReportEvidence.constructionJson(view.construction()))
                             .append(",\"chain_length\":").append(Integer.toString(c.hops().size()))
                             .append(",\"unresolved_hops\":").append(Integer.toString(c.unresolvedHops()))
@@ -271,7 +281,7 @@ public final class MultiFormatReporter {
             writer.write("<h1>Just SAST — Gadget Chain Findings</h1>\n");
             writer.append("<p>Total: ").append(Long.toString(chains.stream()
                     .filter(c -> !calibrations.containsKey(c.key())).count())).append(" chains</p>\n");
-            writer.write("<table><tr><th>#</th><th>Rule</th><th>Confidence</th><th>Verification</th><th>Entry</th><th>Sink</th><th>Sink role</th><th>Construction</th><th>Sink control</th><th>Rank evidence</th><th>Hops</th></tr>\n");
+            writer.write("<table><tr><th>#</th><th>Rule</th><th>Confidence</th><th>Verification</th><th>High confidence</th><th>Entry</th><th>Sink</th><th>Sink role</th><th>Construction</th><th>Sink control</th><th>Precision</th><th>Rank evidence</th><th>Hops</th></tr>\n");
             int seq = 0;
             for (Chain c : chains) {
                 if (calibrations.containsKey(c.key())) {
@@ -288,11 +298,13 @@ public final class MultiFormatReporter {
                         .append("</td><td class='").append(conf.contains("DEGRADED") ? "DEGRADED" : "FEASIBLE").append("'>").append(conf)
                         .append("</td><td>").append(escHtml(verificationStatus(result, cn,
                                 structuredVerification)))
+                        .append("</td><td>").append(Boolean.toString(view.highConfidence()))
                         .append("</td><td>").append(escHtml(c.entryClass().replace('/', '.'))).append(".").append(escHtml(c.entryMethod()))
                         .append("</td><td>").append(escHtml(c.sinkClass().replace('/', '.'))).append(".").append(escHtml(c.sinkMethod()))
                         .append("</td><td>").append(escHtml(c.sinkRole()))
                         .append("</td><td>").append(escHtml(construction.overallStatus()))
                         .append("</td><td>").append(escHtml(construction.sinkControlStatus()))
+                        .append("</td><td>").append(escHtml(view.precision().compact()))
                         .append("</td><td>").append(escHtml(view.ranking().explanation()))
                         .append("</td><td>").append(Integer.toString(c.hops().size())).append("</td></tr>\n");
             }
@@ -311,7 +323,7 @@ public final class MultiFormatReporter {
             writer.write("# Just SAST — Gadget Chain Findings\n\n");
             long count = chains.stream().filter(c -> !calibrations.containsKey(c.key())).count();
             writer.append("**Total**: ").append(Long.toString(count)).append(" chains\n\n");
-            writer.write("| # | Rule | Confidence | Verification | Entry | Sink | Sink role | Construction | Sink control | Rank evidence | Hops |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
+            writer.write("| # | Rule | Confidence | Verification | High confidence | Entry | Sink | Sink role | Construction | Sink control | Precision | Rank evidence | Hops |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
             int seq = 0;
             for (Chain c : chains) {
                 if (calibrations.containsKey(c.key())) {
@@ -327,11 +339,13 @@ public final class MultiFormatReporter {
                         .append(" | ").append(escMd(view.confidence()))
                         .append(" | ").append(escMd(verificationStatus(result, cn,
                                 structuredVerification)))
+                        .append(" | ").append(Boolean.toString(view.highConfidence()))
                         .append(" | `").append(escMd(c.entryClass().replace('/', '.'))).append(".").append(escMd(c.entryMethod())).append("`")
                         .append(" | `").append(escMd(c.sinkClass().replace('/', '.'))).append(".").append(escMd(c.sinkMethod())).append("`")
                         .append(" | ").append(escMd(c.sinkRole()))
                         .append(" | ").append(escMd(construction.overallStatus()))
                         .append(" | ").append(escMd(construction.sinkControlStatus()))
+                        .append(" | ").append(escMd(view.precision().compact()))
                         .append(" | ").append(escMd(view.ranking().explanation()))
                         .append(" | ").append(Integer.toString(c.hops().size())).append(" |\n");
             }
@@ -430,6 +444,8 @@ public final class MultiFormatReporter {
             views.put(chain.key(), new ChainView(
                     ConfidenceScorer.score(chain, chainNotes),
                     ChainRanking.evidence(chain, notes, verification, Set.of()),
+                    ChainPrecision.assess(chain, chainNotes, result),
+                    ChainPrecision.isHighConfidence(chain, chainNotes, result),
                     ReportEvidence.construction(chain, chainNotes, result)));
         }
         return views;

@@ -12,7 +12,6 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -30,32 +29,42 @@ public final class Blackboard {
     /** 扫描输入（管线编排期注入；知识源经黑板读取，无全局属性通道）。 */
     public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                              int verifyBudget, Path jdkHome, int targetMajorVersion,
-                             boolean safeExec, boolean requireStrictIsolation) {
+                             boolean safeExec, boolean safeReal,
+                             boolean requireStrictIsolation) {
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget) {
-            this(target, deps, fast, verify, verifyBudget, null, 0, false, false);
+            this(target, deps, fast, verify, verifyBudget, null, 0, false, false, false);
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget, Path jdkHome) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, 0, false, false);
+            this(target, deps, fast, verify, verifyBudget, jdkHome, 0, false, false, false);
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget, Path jdkHome, int targetMajorVersion) {
             this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
-                    false, false);
+                    false, false, false);
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget, Path jdkHome, int targetMajorVersion,
                           boolean safeExec) {
             this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
-                    safeExec, false);
+                    safeExec, false, false);
+        }
+
+        /** Compatibility constructor retained for callers before SAFE_REAL was added. */
+        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
+                          int verifyBudget, Path jdkHome, int targetMajorVersion,
+                          boolean safeExec, boolean requireStrictIsolation) {
+            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
+                    safeExec, false, requireStrictIsolation);
         }
 
         public static ScanInputs fastDefault(Path target) {
-            return new ScanInputs(target, List.of(), true, true, 20, null, 0, false, false);
+            return new ScanInputs(target, List.of(), true, true, 20, null, 0,
+                    false, false, false);
         }
     }
 
@@ -71,20 +80,14 @@ public final class Blackboard {
     /** 共享规则匹配引擎（随 RuleSet 一次构建，缓存随黑板生命周期）。 */
     private final RuleEngine ruleEngine;
 
-    private final List<Chain> chains = new ArrayList<>();
-    private final Set<String> chainKeys = new HashSet<>();
-    /** One sorted publication snapshot avoids re-sorting the same chain set in every source. */
-    private long chainRevision;
-    private long sortedChainRevision = -1L;
-    private List<Chain> sortedChainSnapshot = List.of();
+    /** Single owner for chain identity, merge, calibration and note state. */
+    private final ChainStore chainStore = new ChainStore();
     /** sink 裁决（backward-taint 并行分析写）：CALL 节点 id → 裁决，报告层产出 sinks.csv。 */
     private final Map<Long, SinkOutcome> sinkOutcomes = new java.util.concurrent.ConcurrentHashMap<>();
     /** 链校准（CALIBRATION 写）：链 key → 拒绝理由；报告层过滤被拒绝的链。 */
-    private final Map<String, String> chainCalibrations = new HashMap<>();
-    /** 链级注释（按链 key 归属，如 gadget 模式标注），报告层输出。 */
-    private final Map<String, List<String>> chainNotes = new HashMap<>();
+    /** 链级注释和校准由 chainStore 持有，避免 Blackboard 维护平行 key map。 */
     /** Versioned, typed extension facts; each snapshot is immutable and isolated by class. */
-    private final Map<Class<?>, List<BlackboardFact>> facts = new HashMap<>();
+    private final Map<Class<?>, List<BlackboardFact>> facts = new java.util.HashMap<>();
     /** Publication log preserves cross-type ordering for consumers that need deterministic replay. */
     private final List<BlackboardFact> factLog = new ArrayList<>();
     private long factRevision;
@@ -158,27 +161,15 @@ public final class Blackboard {
 
     /** 记录链；按 key 去重（backward 的 per-sink 并行可能并发调用，方法级同步）。返回是否为新链。 */
     public synchronized boolean addChain(Chain chain) {
-        if (chain == null) {
-            return false;
-        }
-        if (chainKeys.add(chain.key())) {
-            chains.add(chain);
-            chainRevision++;
-            sortedChainRevision = -1L;
+        ChainStore.AddResult result = chainStore.add(chain);
+        if (result.publishFoundEvent()) {
             publish(Event.of(EventType.CHAIN_FOUND, -1, chain));
-            return true;
         }
-        return false;
+        return result.accepted();
     }
 
-    public synchronized List<Chain> chains() {
-        if (sortedChainRevision != chainRevision) {
-            List<Chain> snapshot = new ArrayList<>(chains);
-            snapshot.sort(java.util.Comparator.comparing(Chain::key));
-            sortedChainSnapshot = List.copyOf(snapshot);
-            sortedChainRevision = chainRevision;
-        }
-        return sortedChainSnapshot;
+    public List<Chain> chains() {
+        return chainStore.snapshot();
     }
 
     /**
@@ -186,10 +177,8 @@ public final class Blackboard {
      * chains.  Analysis workers may discover equivalent paths in different orders, while
      * composition/calibration have finite caps and therefore need one stable input order.
      */
-    synchronized void sortChainsForPhase() {
-        chains.sort(java.util.Comparator.comparing(Chain::key));
-        sortedChainSnapshot = List.copyOf(chains);
-        sortedChainRevision = chainRevision;
+    void sortChainsForPhase() {
+        chainStore.sortForPhase();
     }
 
     // ---- sink 裁决 ----
@@ -206,22 +195,20 @@ public final class Blackboard {
 
     // ---- 校准与注释 ----
 
-    public synchronized void calibrateChain(String chainKey, String reason) {
-        if (chainKey != null && !chainKey.isBlank() && reason != null && !reason.isBlank()) {
-            chainCalibrations.put(chainKey, reason);
-        }
+    public void calibrateChain(String chainKey, String reason) {
+        chainStore.calibrate(chainKey, reason);
     }
 
-    public synchronized String calibrationOf(String chainKey) {
-        return chainCalibrations.get(chainKey);
+    public String calibrationOf(String chainKey) {
+        return chainStore.calibrationOf(chainKey);
     }
 
-    public synchronized Map<String, String> chainCalibrations() {
-        return java.util.Collections.unmodifiableMap(new java.util.TreeMap<>(chainCalibrations));
+    public Map<String, String> chainCalibrations() {
+        return chainStore.calibrations();
     }
 
     public int calibrationCount() {
-        return chainCalibrations.size();
+        return chainStore.calibrationCount();
     }
 
     /** 记录一次可能导致结果欠完备的分析边界；同一原因只保留一次。 */
@@ -270,22 +257,12 @@ public final class Blackboard {
     }
 
     /** 链级注释（gadget 模式标注等），附着到具体链 key。 */
-    public synchronized void chainNote(String chainKey, String note) {
-        if (chainKey != null && !chainKey.isBlank() && note != null && !note.isBlank()) {
-            List<String> notes = chainNotes.computeIfAbsent(chainKey, k -> new ArrayList<>(1));
-            if (!notes.contains(note)) {
-                notes.add(note);
-                notes.sort(String::compareTo);
-            }
-        }
+    public void chainNote(String chainKey, String note) {
+        chainStore.note(chainKey, note);
     }
 
-    public synchronized List<String> chainNotesOf(String chainKey) {
-        List<String> list = chainNotes.get(chainKey);
-        if (list == null || list.isEmpty()) {
-            return List.of();
-        }
-        return List.copyOf(list);
+    public List<String> chainNotesOf(String chainKey) {
+        return chainStore.notesOf(chainKey);
     }
 
     private static Set<String> sortedSet(Set<String> values) {

@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -21,14 +24,29 @@ class JrtExternalMountTest {
     @Test
     void mountsExternalImageAndLoadsCoreClass() throws Exception {
         Path home = Path.of(System.getProperty("java.home"));
-        JrtClassSource jrt = JrtClassSource.external(home);
-        ClassInfo object = jrt.load("java/lang/Object");
-        assertNotNull(object, "外部挂载应能读 java/lang/Object");
-        assertEquals("java/lang/Object", object.internalName());
-        assertNotNull(jrt.load("com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"),
-                "反序列化相关的 TemplatesImpl 位于 java.xml，模块切片不能遗漏");
-        assertTrue(jrt.listAll(JrtClassSource.DESER_MODULES).size() > 1000,
-                "全量枚举模块类应达到千级");
+        try (JrtClassSource jrt = JrtClassSource.external(home)) {
+            ClassInfo object = jrt.load("java/lang/Object");
+            assertNotNull(object, "外部挂载应能读 java/lang/Object");
+            assertEquals("java/lang/Object", object.internalName());
+            assertEquals("java.base", jrt.moduleOf("java/lang/Object"));
+            assertNotNull(jrt.load("com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"),
+                    "反序列化相关的 TemplatesImpl 位于 java.xml，模块切片不能遗漏");
+            assertEquals("java.xml", jrt.moduleOf(
+                    "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"));
+            assertEquals(null, jrt.moduleOf("not/a/real/JdkClass"));
+            assertTrue(jrt.listAll(JrtClassSource.DESER_MODULES).size() > 1000,
+                    "全量枚举模块类应达到千级");
+        }
+    }
+
+    @Test
+    void demandSliceRetainsDeclaredInternalTemplateSink() {
+        JrtClassSource jrt = JrtClassSource.runtime();
+        String template = "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl";
+        var selection = JdkClassSelector.selectDemandDriven(jrt::loadBytes, -1,
+                Map.of(), Set.of(template), List.of());
+        assertTrue(selection.classes().stream().anyMatch(bytes -> template.equals(bytes.className())),
+                "声明式 sink owner 必须作为有界 JDK 类型种子保留");
     }
 
     @Test
@@ -40,14 +58,15 @@ class JrtExternalMountTest {
         Assumptions.assumeTrue(Files.exists(home.resolve("lib").resolve("jrt-fs.jar")),
                 "Java 8 走 rt.jar 路线，无 jrt-fs.jar");
         int targetMajor = releaseMajor(home);
-        JrtClassSource jrt = JrtClassSource.external(home);
-        // java/lang/Record 于 JDK 16 引入：目标 <16 应缺失、≥16 应存在（与运行时版本无关）
-        ClassInfo record = jrt.load("java/lang/Record");
-        if (targetMajor < 16) {
-            assertTrue(record == null, "JDK " + targetMajor + " 镜像不应含 java/lang/Record"
-                    + "（若读到说明挂载的是运行时而非目标镜像）");
-        } else {
-            assertNotNull(record, "JDK " + targetMajor + " 镜像应含 java/lang/Record");
+        try (JrtClassSource jrt = JrtClassSource.external(home)) {
+            // java/lang/Record 于 JDK 16 引入：目标 <16 应缺失、≥16 应存在（与运行时版本无关）
+            ClassInfo record = jrt.load("java/lang/Record");
+            if (targetMajor < 16) {
+                assertTrue(record == null, "JDK " + targetMajor + " 镜像不应含 java/lang/Record"
+                        + "（若读到说明挂载的是运行时而非目标镜像）");
+            } else {
+                assertNotNull(record, "JDK " + targetMajor + " 镜像应含 java/lang/Record");
+            }
         }
     }
 

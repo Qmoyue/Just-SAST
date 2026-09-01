@@ -404,6 +404,12 @@ public final class ForwardOrigins {
      * times.  This bounded identity cache is local to the calling worker, so the hot path skips
      * key construction and CHM bookkeeping without retaining an unbounded copy per thread.
      */
+    /*
+     * Keep the cache at the original bounded size.  A 32K experiment did not produce a
+     * repeatable wall-time win and increased worker-local heap; an unproven capacity increase
+     * is not an acceptable performance optimization.  The useful hot-path optimization is the
+     * identity fast path above and the caller-side reuse of already computed origin results.
+     */
     private static final int MAX_THREAD_LOCAL_CACHE_ENTRIES = 8_192;
     private final AtomicLong cacheGeneration = new AtomicLong();
     private final ConcurrentLinkedQueue<LocalCache> metricCaches = new ConcurrentLinkedQueue<>();
@@ -416,6 +422,13 @@ public final class ForwardOrigins {
     private static final class LocalCache {
         private long generation = Long.MIN_VALUE;
         private final IdentityHashMap<MethodInfo, Result> values = new IdentityHashMap<>();
+        /**
+         * The canonical cache is keyed by a structural string so independent CPG views can
+         * share a summary.  Rebuilding that string on every local-cache miss is measurable in
+         * large reverse traces. Keep the bounded key beside the bounded identity result cache;
+         * it is evicted with the same method and never becomes a second unbounded index.
+         */
+        private final IdentityHashMap<MethodInfo, String> keys = new IdentityHashMap<>();
         /** FIFO admission order; evict a bounded prefix instead of flushing all hot summaries. */
         private final Deque<MethodInfo> admissionOrder = new ArrayDeque<>();
         private MethodInfo lastMethod;
@@ -447,6 +460,7 @@ public final class ForwardOrigins {
         long generation = cacheGeneration.get();
         if (local.generation != generation) {
             local.values.clear();
+            local.keys.clear();
             local.admissionOrder.clear();
             local.lastMethod = null;
             local.lastResult = null;
@@ -465,7 +479,8 @@ public final class ForwardOrigins {
                 return localResult;
             }
         }
-        String key = CfgKey.of(method);
+        String localKey = method == null ? null : local.keys.get(method);
+        final String key = localKey == null ? CfgKey.of(method) : localKey;
         Result result = cache.get(key);
         if (result != null) {
             local.cacheHits++;
@@ -511,9 +526,11 @@ public final class ForwardOrigins {
             while (evictions-- > 0 && !local.admissionOrder.isEmpty()) {
                 MethodInfo victim = local.admissionOrder.removeFirst();
                 local.values.remove(victim);
+                local.keys.remove(victim);
             }
         }
         if (method != null) {
+            local.keys.put(method, key);
             Result previous = local.values.put(method, result);
             if (previous == null) {
                 local.admissionOrder.addLast(method);
@@ -1199,9 +1216,18 @@ public final class ForwardOrigins {
         }
         long combined = (long) a.size() + b.size();
         if (combined <= MAX_ORIGIN_SET) {
-            // 保留 a 的 LinkedHashSet 顺序；来源遍历顺序参与稳定代表路径选择。
-            if (a.containsAll(b)) {
+            // Reuse the already immutable superset whenever possible.  The previous code
+            // always asked the smaller/older set whether it contained the newer set; that
+            // check is guaranteed to fail when b is larger and then allocates a merged set
+            // even when b already contains a.  Besides the allocation, the failed probe was
+            // visible as a large containsAll/hashCode hotspot in branch-heavy dependencies.
+            // Keeping the larger set preserves the same may-origin union and deterministic
+            // iteration order; only the allocation strategy changes.
+            if (a.size() >= b.size() && a.containsAll(b)) {
                 return new OriginUnion(a, false);
+            }
+            if (b.size() > a.size() && b.containsAll(a)) {
+                return new OriginUnion(b, false);
             }
             LinkedHashSet<ValueOrigin> merged = new LinkedHashSet<>(a);
             merged.addAll(b);

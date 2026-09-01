@@ -7,17 +7,21 @@ import com.sun.jna.platform.win32.BaseTSD;
 import com.sun.jna.win32.StdCallLibrary;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.stream.Stream;
 
 /**
  * Selects the strongest small OS boundary that is available on the current host.
@@ -29,6 +33,9 @@ import java.security.NoSuchAlgorithmException;
  * an untrusted target in the scanner JVM's process boundary.</p>
  */
 public final class OsIsolation {
+
+    /** Wire-level version of the child-side isolation attestation. */
+    public static final String ATTESTATION_VERSION = "JUST_OS_ATTESTATION_V1";
 
     /** Capability levels are facts about the selected backend, not marketing labels. */
     public enum Level {
@@ -47,6 +54,10 @@ public final class OsIsolation {
     private static final int JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     private static final int MAX_CHILD_PROCESSES = 64;
     private static final long MAX_PROCESS_MEMORY = 768L * 1024L * 1024L;
+    private static final long MAX_ROOT_DIGEST_BYTES = 8L * 1024L * 1024L * 1024L;
+    private static final Set<String> STRICT_PRODUCTION_CAPABILITIES = Set.of(
+            "runner_attestation", "process_tree", "resource_limits",
+            "filesystem_policy", "network_policy");
 
     private OsIsolation() {
     }
@@ -62,6 +73,16 @@ public final class OsIsolation {
         /** Wrap a child command when the backend needs a namespace launcher. */
         List<String> command(List<String> childCommand, Path scratchDirectory);
 
+        /**
+         * Wrap a child command with the requested network shape. The two-argument method is
+         * retained for extensions; SAFE_REAL uses the explicit loopback variant so a backend
+         * cannot accidentally widen a boundary merely because an adapter was enabled.
+         */
+        default List<String> command(List<String> childCommand, Path scratchDirectory,
+                                     boolean loopbackOnly) {
+            return command(childCommand, scratchDirectory);
+        }
+
         /** Attach containment after start and before the child ready marker is released. */
         Session attach(Process process) throws IOException;
 
@@ -75,16 +96,23 @@ public final class OsIsolation {
             return Set.of();
         }
 
+        /** Version of the child-side proof contract, not a claim about sandbox strength. */
+        default String attestationVersion() {
+            return ATTESTATION_VERSION;
+        }
+
         /** True only when all production preconditions have been checked by this backend. */
         default boolean productionReady() {
-            return level() == Level.OS_STRICT;
+            return level() == Level.OS_STRICT
+                    && capabilities().containsAll(STRICT_PRODUCTION_CAPABILITIES);
         }
 
         /** Digest of the immutable backend policy, excluding host-specific paths. */
         default String policyDigest() {
             List<String> names = new ArrayList<>(capabilities());
             Collections.sort(names);
-            return digest(id() + "|" + level() + "|" + names);
+            return digest(id() + "|" + level() + "|attestation="
+                    + attestationVersion() + "|" + names);
         }
     }
 
@@ -201,12 +229,18 @@ public final class OsIsolation {
                     return unavailable("nsjail-seccomp-profile-invalid");
                 }
                 byte[] contents = Files.readAllBytes(profile);
-                if (!strictHostCapabilities() || !executableAcceptsStrictFlags(executable)) {
+                String actualRootDigest = preparedRootDigest(root);
+                if (!actualRootDigest.equalsIgnoreCase(rootDigest.trim())) {
+                    return unavailable("nsjail-prepared-root-digest-mismatch");
+                }
+                if (!strictHostCapabilities() || !LinuxLandlock.hostAvailable()
+                        || !executableAcceptsStrictFlags(executable)) {
                     return unavailable("nsjail-host-capabilities-unavailable");
                 }
-                return new NsjailBackend(executable, profile, root,
+                        return new NsjailBackend(executable, profile, root,
                         digest("nsjail-v2|profile=" + hex(contents)
-                                + "|root=" + rootDigest.toLowerCase(Locale.ROOT)));
+                                + "|root=" + actualRootDigest
+                                + "|attestation=" + ATTESTATION_VERSION));
             } catch (IOException | RuntimeException failure) {
                 return unavailable("nsjail-seccomp-profile-unreadable");
             }
@@ -246,13 +280,30 @@ public final class OsIsolation {
             try {
                 process = new ProcessBuilder(executable.toString(), "--help")
                         .redirectErrorStream(true)
-                        .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                         .start();
                 if (!process.waitFor(2, TimeUnit.SECONDS)) {
                     process.destroyForcibly();
                     return false;
                 }
-                return process.exitValue() == 0;
+                byte[] output;
+                try (InputStream stream = process.getInputStream()) {
+                    output = stream.readNBytes(64 * 1024);
+                }
+                if (process.exitValue() != 0) {
+                    return false;
+                }
+                String help = new String(output, StandardCharsets.US_ASCII);
+                for (String option : List.of("--disable_clone_newuser", "--disable_clone_newns",
+                        "--disable_clone_newpid", "--disable_clone_newnet",
+                        "--disable_clone_newipc", "--disable_clone_newuts", "--user",
+                        "--group", "--bindmount_ro", "--bindmount", "--tmpfsmount",
+                        "--cgroup_mem_max", "--cgroup_pids_max", "--cgroup_cpu_ms_per_sec",
+                        "--use_cgroupv2", "--seccomp_policy", "--time_limit")) {
+                    if (!help.contains(option)) {
+                        return false;
+                    }
+                }
+                return true;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 if (process != null) {
@@ -291,8 +342,9 @@ public final class OsIsolation {
         public Set<String> capabilities() {
             return Set.of("user_namespace", "mount_namespace", "pid_namespace",
                     "network_namespace", "ipc_namespace", "uts_namespace", "readonly_root",
-                    "scratch_write", "cgroup_v2_limits", "seccomp_allowlist",
-                    "no_new_privs", "parent_death_cleanup");
+                    "scratch_write", "cgroup_v2_limits", "seccomp_allowlist", "landlock",
+                    "no_new_privs", "parent_death_cleanup", "runner_attestation",
+                    "process_tree", "resource_limits", "filesystem_policy", "network_policy");
         }
 
         @Override
@@ -302,24 +354,30 @@ public final class OsIsolation {
 
         @Override
         public List<String> command(List<String> childCommand, Path scratchDirectory) {
+            return command(childCommand, scratchDirectory, false);
+        }
+
+        @Override
+        public List<String> command(List<String> childCommand, Path scratchDirectory,
+                                    boolean loopbackOnly) {
             String scratch = scratchDirectory.toAbsolutePath().normalize().toString();
             List<String> wrapped = new ArrayList<>();
             wrapped.add(executable.toString());
             wrapped.add("--mode");
             wrapped.add("o");
             wrapped.add("--quiet");
-            wrapped.add("--clone_newuser");
-            wrapped.add("--clone_newns");
-            wrapped.add("--clone_newpid");
-            wrapped.add("--clone_newnet");
-            wrapped.add("--clone_newipc");
-            wrapped.add("--clone_newuts");
-            wrapped.add("--uid");
+            // nsjail enables these namespaces by default. Its current CLI only exposes
+            // disable_* switches; passing invented clone_new* flags would make the strict
+            // launcher fail before it ever reaches the child.
+            wrapped.add("--user");
             wrapped.add("65534");
-            wrapped.add("--gid");
+            wrapped.add("--group");
             wrapped.add("65534");
-            wrapped.add("--disable_setgroups");
-            wrapped.add("--iface_no_lo");
+            // SAFE_REAL network effects need a loopback-only interface. The default canary
+            // path keeps loopback disabled, so enabling this is an explicit policy choice.
+            if (!loopbackOnly) {
+                wrapped.add("--iface_no_lo");
+            }
             wrapped.add("--bindmount_ro");
             // Never expose the host root: read-only is not confidentiality. The prepared root
             // image must contain the runtime system libraries and directory layout; only the
@@ -348,9 +406,11 @@ public final class OsIsolation {
             wrapped.add(Integer.toString(MAX_CHILD_PROCESSES));
             wrapped.add("--cgroup_cpu_ms_per_sec");
             wrapped.add("800");
+            wrapped.add("--use_cgroupv2");
             wrapped.add("--seccomp_policy");
             wrapped.add(seccompProfile.toString());
-            wrapped.add("--keep_env");
+            // Do not inherit JAVA_TOOL_OPTIONS, LD_PRELOAD, proxy credentials, or other
+            // host-controlled variables into a production verification jail.
             wrapped.add("--time_limit");
             wrapped.add("8");
             wrapped.add("--");
@@ -501,11 +561,18 @@ public final class OsIsolation {
 
         @Override
         public String policyDigest() {
-            return digest("bwrap-v2|namespace|readonly-root|private-scratch|no-network|no-capabilities");
+            return digest("bwrap-v2|namespace|readonly-root|private-scratch|no-network|"
+                    + "no-capabilities|attestation=" + attestationVersion());
         }
 
         @Override
         public List<String> command(List<String> childCommand, Path scratchDirectory) {
+            return command(childCommand, scratchDirectory, false);
+        }
+
+        @Override
+        public List<String> command(List<String> childCommand, Path scratchDirectory,
+                                    boolean loopbackOnly) {
             String scratch = scratchDirectory.toAbsolutePath().normalize().toString();
             List<String> wrapped = new ArrayList<>();
             wrapped.add(executable.toString());
@@ -522,6 +589,8 @@ public final class OsIsolation {
             wrapped.add("/proc");
             wrapped.add("--dev");
             wrapped.add("/dev");
+            // bwrap remains a no-network namespace. SAFE_REAL is rejected before launch
+            // unless a strict backend is selected, so it must not widen this fallback.
             wrapped.add("--unshare-net");
             wrapped.add("--unshare-user");
             wrapped.add("--uid");
@@ -615,7 +684,8 @@ public final class OsIsolation {
 
         @Override
         public String policyDigest() {
-            return digest("windows-job-v1|process-tree|memory-limit|kill-on-close|jvm-policy");
+            return digest("windows-job-v1|process-tree|memory-limit|kill-on-close|jvm-policy|"
+                    + "attestation=" + attestationVersion());
         }
 
         @Override
@@ -821,6 +891,72 @@ public final class OsIsolation {
         } catch (NoSuchAlgorithmException impossible) {
             return "sha256-unavailable";
         }
+    }
+
+    /**
+     * Compute a path-independent digest for a prepared root image.  The configured digest is a
+     * claim supplied by the deployment, so strict mode verifies the image contents before using
+     * it in the policy identity.  Symlinks/reparse points are rejected instead of being hashed as
+     * aliases; otherwise a later target read could escape the image that was attested here.
+     */
+    static String preparedRootDigest(Path root) throws IOException {
+        if (root == null || !Files.isDirectory(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                || ArchiveLink.isLink(root)) {
+            throw new IOException("prepared-root-not-directory");
+        }
+        List<Path> entries;
+        try (Stream<Path> walk = Files.walk(root)) {
+            entries = walk.sorted(Comparator.comparing(path -> relativePath(root, path))).toList();
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            long contentBytes = 0L;
+            for (Path entry : entries) {
+                if (ArchiveLink.isLink(entry)) {
+                    throw new IOException("prepared-root-link:" + relativePath(root, entry));
+                }
+                BasicFileAttributes attributes = Files.readAttributes(entry,
+                        BasicFileAttributes.class, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                String relative = relativePath(root, entry);
+                byte type = attributes.isDirectory() ? (byte) 'd'
+                        : attributes.isRegularFile() ? (byte) 'f'
+                        : attributes.isSymbolicLink() ? (byte) 'l' : (byte) 'o';
+                updateDigest(digest, new byte[] {type});
+                updateDigest(digest, relative.getBytes(StandardCharsets.UTF_8));
+                updateDigest(digest, new byte[] {0});
+                updateDigest(digest, Long.toString(attributes.size())
+                        .getBytes(StandardCharsets.US_ASCII));
+                updateDigest(digest, new byte[] {0});
+                if (!attributes.isRegularFile()) {
+                    continue;
+                }
+                if (attributes.size() > MAX_ROOT_DIGEST_BYTES - contentBytes) {
+                    throw new IOException("prepared-root-too-large");
+                }
+                contentBytes += attributes.size();
+                try (InputStream input = Files.newInputStream(entry)) {
+                    byte[] buffer = new byte[64 * 1024];
+                    int read;
+                    while ((read = input.read(buffer)) >= 0) {
+                        if (read > 0) {
+                            digest.update(buffer, 0, read);
+                        }
+                    }
+                }
+            }
+            return hex(digest.digest());
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IOException("SHA-256 unavailable", impossible);
+        }
+    }
+
+    private static String relativePath(Path root, Path entry) {
+        String relative = root.relativize(entry).toString().replace('\\', '/');
+        return relative.isEmpty() ? "." : relative;
+    }
+
+    private static void updateDigest(MessageDigest digest, byte[] bytes) {
+        digest.update(bytes, 0, bytes.length);
     }
 
     private static String hex(byte[] bytes) {

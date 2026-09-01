@@ -3,12 +3,14 @@ package io.just.sast.verify;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import io.just.sast.util.ArchiveLimits;
 
@@ -21,13 +23,16 @@ import io.just.sast.util.ArchiveLimits;
  * the target call boundary.  In the explicit {@link Mode#SAFE_EXEC} mode, {@link #observe}
  * performs only a fixed inert/mock operation owned by this class.  It never forwards target
  * arguments, invokes a target method, starts a process, opens a socket, loads code, or follows
- * a target-provided path.</p>
+ * a target-provided path.  {@link Mode#SAFE_REAL} is an explicit, strict-runner-only mode:
+ * it performs a small adapter-owned operation with fixed arguments after the canary has
+ * latched.  A positive safe-real result is an adapter effect, not RCE evidence.</p>
  */
 public final class SafeSinkAdapter {
 
     public enum Mode {
         BOUNDARY,
-        SAFE_EXEC
+        SAFE_EXEC,
+        SAFE_REAL
     }
 
     /** Broad capability families used by the policy, independent of rule ids. */
@@ -36,6 +41,8 @@ public final class SafeSinkAdapter {
         FILE,
         NETWORK,
         DATA,
+        /** Remote naming/RMI lookup remains canary-only even in SAFE_REAL. */
+        REMOTE_LOOKUP,
         REFLECTION,
         CODE_EXECUTION,
         NATIVE,
@@ -49,6 +56,10 @@ public final class SafeSinkAdapter {
         SCRATCH_FILESYSTEM,
         LOOPBACK_MOCK,
         IN_MEMORY,
+        REAL_COMMAND,
+        REAL_SCRATCH_FILESYSTEM,
+        REAL_LOOPBACK,
+        REAL_IN_MEMORY,
         DENIED
     }
 
@@ -74,8 +85,8 @@ public final class SafeSinkAdapter {
                     : scratchRoot.toAbsolutePath().normalize();
             adapterCapabilities = adapterCapabilities == null
                     ? Set.of() : Set.copyOf(adapterCapabilities);
-            if (mode == Mode.SAFE_EXEC && scratchRoot == null) {
-                throw new IllegalArgumentException("safe-exec requires a scratch root");
+            if ((mode == Mode.SAFE_EXEC || mode == Mode.SAFE_REAL) && scratchRoot == null) {
+                throw new IllegalArgumentException("safe sink mode requires a scratch root");
             }
         }
 
@@ -135,10 +146,28 @@ public final class SafeSinkAdapter {
         return new Policy(Mode.SAFE_EXEC, root, DEFAULT_SAFE_CAPABILITIES);
     }
 
+    /**
+     * Create the explicit adapter-owned effect policy. The parent verifier must additionally
+     * require an authenticated {@code OS_STRICT} backend before this policy can reach a child.
+     */
+    public static Policy safeRealExecution(Path scratchRoot) {
+        Path root = requireScratchRoot(scratchRoot);
+        return new Policy(Mode.SAFE_REAL, root, DEFAULT_SAFE_CAPABILITIES);
+    }
+
     public static String policyDigest(Mode mode) {
-        return mode == Mode.SAFE_EXEC
-                ? new Policy(Mode.SAFE_EXEC, Path.of("."), DEFAULT_SAFE_CAPABILITIES).digest()
-                : boundary().digest();
+        return switch (mode == null ? Mode.BOUNDARY : mode) {
+            case SAFE_EXEC -> new Policy(Mode.SAFE_EXEC, Path.of("."),
+                    DEFAULT_SAFE_CAPABILITIES).digest();
+            case SAFE_REAL -> new Policy(Mode.SAFE_REAL, Path.of("."),
+                    DEFAULT_SAFE_CAPABILITIES).digest();
+            case BOUNDARY -> boundary().digest();
+        };
+    }
+
+    /** Stable digest of the adapter-owned effect label, never of target data. */
+    public static String effectDigest(String effect) {
+        return sha256(effect == null ? "" : effect);
     }
 
     /** Classify from a rule category first, then use conservative owner/name fallbacks. */
@@ -147,7 +176,16 @@ public final class SafeSinkAdapter {
             return Capability.UNKNOWN;
         }
         String category = sink.category().toLowerCase(Locale.ROOT);
-        if (containsAny(category, "native", "jni")) {
+        String owner = sink.owner().toLowerCase(Locale.ROOT);
+        String method = sink.method().toLowerCase(Locale.ROOT);
+        // Native loading is a stronger safety boundary than a user-provided category.  Keep
+        // the API identity check ahead of generic CODE_EXEC labels so an imperfect/custom rule
+        // cannot accidentally authorize a library load as a code-execution adapter effect.
+        boolean nativeApi = (owner.equals("java/lang/system")
+                || owner.equals("java/lang/runtime")
+                || owner.endsWith("/runtime"))
+                && (method.equals("load") || method.equals("loadlibrary"));
+        if (nativeApi || containsAny(category, "native", "jni")) {
             return Capability.NATIVE;
         }
         if (containsAny(category, "template", "script", "spel", "expression", "code")) {
@@ -162,15 +200,17 @@ public final class SafeSinkAdapter {
         if (containsAny(category, "file", "path", "filesystem", "xxe")) {
             return Capability.FILE;
         }
-        if (containsAny(category, "ssrf", "network", "jndi", "ldap", "rmi", "jrmp")) {
+        if (containsAny(category, "jndi", "ldap", "rmi", "jrmp", "remote-lookup",
+                "remote_lookup")) {
+            return Capability.REMOTE_LOOKUP;
+        }
+        if (containsAny(category, "ssrf", "network")) {
             return Capability.NETWORK;
         }
         if (containsAny(category, "sql", "database", "jdbc", "message", "jms")) {
             return Capability.DATA;
         }
 
-        String owner = sink.owner().toLowerCase(Locale.ROOT);
-        String method = sink.method().toLowerCase(Locale.ROOT);
         if (owner.contains("processbuilder") || owner.contains("runtime")
                 || owner.endsWith("/processimpl") || method.equals("exec")) {
             return Capability.COMMAND;
@@ -178,8 +218,19 @@ public final class SafeSinkAdapter {
         if (owner.contains("file") || owner.contains("/files") || owner.contains("path")) {
             return Capability.FILE;
         }
+        // RMI/JRMP/JNDI is a remote lookup boundary even when the rule category is generic.
+        // Keep this check independent of the socket/url fallback: java/rmi/* classes do not
+        // necessarily contain a socket-like owner token.
+        if (owner.startsWith("java/rmi/") || owner.contains("/rmi/")
+                || owner.contains("jrmp") || owner.contains("jndi")
+                || owner.contains("naming")) {
+            return Capability.REMOTE_LOOKUP;
+        }
         if (owner.contains("socket") || owner.contains("url") || owner.contains("http")
                 || owner.contains("naming") || owner.contains("jndi")) {
+            if (owner.contains("rmi")) {
+                return Capability.REMOTE_LOOKUP;
+            }
             return Capability.NETWORK;
         }
         if (method.equals("invoke") && (owner.contains("method") || owner.contains("constructor"))) {
@@ -211,7 +262,7 @@ public final class SafeSinkAdapter {
             return new Decision(capability, Disposition.CANARY_BOUNDARY, true, true,
                     policy.digest(), "adapter-unavailable");
         }
-        return new Decision(capability, dispositionOf(capability), true, true,
+        return new Decision(capability, dispositionOf(capability, policy.mode()), true, true,
                 policy.digest(), "safe-adapter-preflight");
     }
 
@@ -236,6 +287,16 @@ public final class SafeSinkAdapter {
      * capabilities are represented in memory rather than delegated to the host OS.</p>
      */
     public static AdapterResult observe(Policy policy, Sink sink, Path requestedPath) {
+        return observe(policy, sink, requestedPath, null);
+    }
+
+    /**
+     * Observe with a verifier-owned executable for the fixed command effect. The executable is
+     * captured before target code loads; it is never obtained from target arguments or mutable
+     * target properties.
+     */
+    static AdapterResult observe(Policy policy, Sink sink, Path requestedPath,
+                                 Path fixedJavaExecutable) {
         AdapterResult preflight = preflight(policy, sink, requestedPath);
         Decision decision = preflight.decision();
         if (!decision.adapterSelected()) {
@@ -247,6 +308,10 @@ public final class SafeSinkAdapter {
                 case SCRATCH_FILESYSTEM -> observeScratchFilesystem(policy, decision);
                 case LOOPBACK_MOCK -> observeLoopbackMock(decision);
                 case IN_MEMORY -> observeInMemory(decision);
+                case REAL_COMMAND -> observeRealCommand(decision, fixedJavaExecutable);
+                case REAL_SCRATCH_FILESYSTEM -> observeRealScratchFilesystem(policy, decision);
+                case REAL_LOOPBACK -> observeRealLoopback(decision);
+                case REAL_IN_MEMORY -> observeRealInMemory(decision);
                 default -> preflight;
             };
         } catch (IOException | RuntimeException failure) {
@@ -302,10 +367,125 @@ public final class SafeSinkAdapter {
                 "IN_MEMORY_VALUE_OBSERVED");
     }
 
+    /**
+     * Start only the verifier's own Java executable with a fixed {@code -version} argument.
+     * This is a real process effect, but it is not the target command and carries no target
+     * argument. The strict OS runner is the outer boundary; the Java permission gate is only
+     * a second line of defense on runtimes that still support it.
+     */
+    private static AdapterResult observeRealCommand(Decision decision, Path executable)
+            throws IOException {
+        Path fixed = canonicalExecutable(executable);
+        if (fixed == null) {
+            return denied(decision, "fixed-helper-missing");
+        }
+        Process process = null;
+        try {
+            SandboxSecurityManager.beginSafeRealExec(fixed);
+            process = new ProcessBuilder(fixed.toString(), "-version")
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+            boolean finished = process.waitFor(2L, TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                return denied(decision, "fixed-helper-timeout");
+            }
+            return new AdapterResult(decision, process.exitValue() == 0,
+                    process.exitValue() == 0
+                            ? "REAL_FIXED_JAVA_COMMAND" : "REAL_FIXED_COMMAND_FAILED");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            return denied(decision, "fixed-helper-interrupted");
+        } finally {
+            SandboxSecurityManager.endSafeRealExec();
+        }
+    }
+
+    /** A real write remains confined to the already validated scratch root. */
+    private static AdapterResult observeRealScratchFilesystem(Policy policy, Decision decision)
+            throws IOException {
+        AdapterResult result = observeScratchFilesystem(policy, decision);
+        if (!result.effectObserved()) {
+            return result;
+        }
+        return new AdapterResult(result.decision(), true, "REAL_SCRATCH_FILE_WRITE");
+    }
+
+    /**
+     * A real loopback round trip uses literal loopback and fixed bytes. The OS runner must
+     * expose only the loopback interface for this mode; no DNS or external address is used.
+     */
+    private static AdapterResult observeRealLoopback(Decision decision) throws IOException {
+        byte[] request = "JUST_LOOPBACK_REQUEST".getBytes(StandardCharsets.US_ASCII);
+        SandboxSecurityManager.beginSafeRealNetwork();
+        try (java.net.ServerSocket server = new java.net.ServerSocket()) {
+            server.bind(new java.net.InetSocketAddress(
+                    java.net.InetAddress.getLoopbackAddress(), 0));
+            try (java.net.Socket client = new java.net.Socket()) {
+                client.connect(server.getLocalSocketAddress(), 500);
+                try (java.net.Socket accepted = server.accept()) {
+                    accepted.setSoTimeout(500);
+                    client.setSoTimeout(500);
+                    client.getOutputStream().write(request);
+                    client.getOutputStream().flush();
+                    byte[] received = accepted.getInputStream().readNBytes(request.length);
+                    accepted.getOutputStream().write(received);
+                    accepted.getOutputStream().flush();
+                    byte[] echoed = client.getInputStream().readNBytes(request.length);
+                    return new AdapterResult(decision,
+                            java.util.Arrays.equals(request, received)
+                                    && java.util.Arrays.equals(request, echoed),
+                            "REAL_LOOPBACK_ROUND_TRIP");
+                }
+            }
+        } finally {
+            SandboxSecurityManager.endSafeRealNetwork();
+        }
+    }
+
+    private static AdapterResult observeRealInMemory(Decision decision) {
+        java.util.Map<String, String> store = new java.util.HashMap<>();
+        store.put("just-safe-key", "JUST_SAFE_VALUE");
+        return new AdapterResult(decision,
+                "JUST_SAFE_VALUE".equals(store.get("just-safe-key")),
+                "REAL_IN_MEMORY_VALUE");
+    }
+
+    private static AdapterResult denied(Decision decision, String reason) {
+        Decision denied = new Decision(decision.capability(), Disposition.DENIED, false, true,
+                decision.policyDigest(), reason);
+        return new AdapterResult(denied, false, "NO_EFFECT_EXECUTED");
+    }
+
+    private static Path canonicalExecutable(Path executable) {
+        if (executable == null) {
+            return null;
+        }
+        try {
+            Path path = executable.toAbsolutePath().normalize();
+            // A trusted JDK launcher may be exposed through a managed directory
+            // link (for example a Jabba java.home). Do not require toRealPath:
+            // Windows can deny that metadata lookup while still allowing the
+            // exact launcher to execute. The final object is still checked
+            // without following a link/reparse point.
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+                    || ArchiveLimits.isLinkOrReparsePoint(path)) {
+                return null;
+            }
+            return path;
+        } catch (RuntimeException failure) {
+            return null;
+        }
+    }
+
     /** Canonical containment check for an adapter-provided file path. */
     public static boolean isWithinScratch(Policy policy, Path candidate) {
         if (policy == null || policy.scratchRoot() == null || candidate == null
-                || policy.mode() != Mode.SAFE_EXEC) {
+                || (policy.mode() != Mode.SAFE_EXEC && policy.mode() != Mode.SAFE_REAL)) {
             return false;
         }
         try {
@@ -372,7 +552,16 @@ public final class SafeSinkAdapter {
         }
     }
 
-    private static Disposition dispositionOf(Capability capability) {
+    private static Disposition dispositionOf(Capability capability, Mode mode) {
+        if (mode == Mode.SAFE_REAL) {
+            return switch (capability) {
+                case COMMAND -> Disposition.REAL_COMMAND;
+                case FILE -> Disposition.REAL_SCRATCH_FILESYSTEM;
+                case NETWORK -> Disposition.REAL_LOOPBACK;
+                case DATA -> Disposition.REAL_IN_MEMORY;
+                default -> Disposition.CANARY_BOUNDARY;
+            };
+        }
         return switch (capability) {
             case COMMAND -> Disposition.INERT_COMMAND;
             case FILE -> Disposition.SCRATCH_FILESYSTEM;

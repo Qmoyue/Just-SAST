@@ -114,6 +114,21 @@ class ParallelVerifierTest {
     }
 
     @Test
+    void strictReadyEvidenceCarriesKernelFilesystemAttestation() {
+        ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
+                "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
+        String prefix = "JUST_VERIFY_V2:token:run:chain-fingerprint:sink-fingerprint:nonce:artifact:";
+        ParallelVerifier.ProtocolEvidence evidence = ParallelVerifier.protocolEvidence(
+                prefix + "SANDBOX_READY: LINUX_NSJAIL_STRICT|landlock=1|policy=policy-digest",
+                identity);
+
+        assertTrue(evidence.ready());
+        assertTrue(evidence.landlockReady());
+        assertEquals("LINUX_NSJAIL_STRICT", evidence.readyBackend());
+        assertEquals("policy-digest", evidence.readyPolicyDigest());
+    }
+
+    @Test
     void anyTamperedV2FrameInvalidatesTheWholeAttempt() {
         ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
                 "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
@@ -125,6 +140,50 @@ class ParallelVerifierTest {
                         + prefix + "SINK_BLOCKED: sink", identity);
 
         assertFalse(evidence.bindingValid(), "坏帧之后不能被后续好帧重新认证");
+    }
+
+    @Test
+    void resultChannelAuthenticatesProbeFramesAndRejectsTampering(@TempDir Path tmp)
+            throws Exception {
+        ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
+                "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
+        String secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        String prefix = "JUST_VERIFY_V2:token:run:chain-fingerprint:sink-fingerprint:nonce:artifact:";
+        String ready = prefix + "SANDBOX_READY: backend|policy=policy-digest";
+        String terminal = prefix + "SINK_BLOCKED: sink";
+        String content = "JUST_VERIFY_RESULT_V1:" + ParallelVerifier.resultMac(secret, ready)
+                + ":" + ready + "\n"
+                + "JUST_VERIFY_RESULT_V1:" + ParallelVerifier.resultMac(secret, terminal)
+                + ":" + terminal + "\n";
+        Path result = tmp.resolve("verification.result");
+        Files.writeString(result, content, java.nio.charset.StandardCharsets.US_ASCII);
+
+        ParallelVerifier.ProtocolEvidence valid = ParallelVerifier.protocolEvidence(
+                result, identity, secret);
+        assertTrue(valid.bindingValid());
+        assertTrue(valid.ready());
+        assertEquals("SINK_BLOCKED: sink", valid.terminal());
+
+        Files.writeString(result, content.replace("SINK_BLOCKED: sink", "SINK_BLOCKED: forged"),
+                java.nio.charset.StandardCharsets.US_ASCII);
+        ParallelVerifier.ProtocolEvidence tampered = ParallelVerifier.protocolEvidence(
+                result, identity, secret);
+        assertFalse(tampered.bindingValid(), "未重新计算 HMAC 的目标输出不能伪造终态");
+    }
+
+    @Test
+    void readyEventCarriesTheVersionedIsolationAttestation() {
+        ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
+                "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
+        String prefix = "JUST_VERIFY_V2:token:run:chain-fingerprint:sink-fingerprint:nonce:artifact:";
+        ParallelVerifier.ProtocolEvidence evidence = ParallelVerifier.protocolEvidence(
+                prefix + "SANDBOX_READY: backend|landlock=1|policy=policy-digest"
+                        + "|attestation=" + OsIsolation.ATTESTATION_VERSION,
+                identity);
+
+        assertTrue(evidence.ready());
+        assertEquals(OsIsolation.ATTESTATION_VERSION, evidence.attestationVersion());
+        assertTrue(evidence.landlockReady());
     }
 
     @Test
@@ -164,6 +223,15 @@ class ParallelVerifierTest {
         assertEquals("BOUNDARY", boundary.policyMode());
         assertEquals("SAFE_EXEC", safe.policyMode());
         assertNotEquals(boundary.policyDigest(), safe.policyDigest());
+    }
+
+    @Test
+    void batchDeadlineCoversQueuedWorkerWaves() {
+        assertEquals(11, ParallelVerifier.batchTimeoutSeconds(1, 4));
+        assertEquals(11, ParallelVerifier.batchTimeoutSeconds(4, 4));
+        assertEquals(19, ParallelVerifier.batchTimeoutSeconds(5, 4));
+        assertEquals(43, ParallelVerifier.batchTimeoutSeconds(20, 4));
+        assertEquals(0, ParallelVerifier.batchTimeoutSeconds(0, 4));
     }
 
     @Test

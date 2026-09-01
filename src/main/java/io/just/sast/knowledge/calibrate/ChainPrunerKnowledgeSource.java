@@ -226,13 +226,20 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
                 .append(chain.entryMethod()).append('|')
                 .append(entryDescriptor(chain)).append('|');
         List<ChainHop> hops = chain.hops();
-        for (int i = 1; i < hops.size(); i++) {
+        for (int i = 0; i < hops.size(); i++) {
             ChainHop hop = hops.get(i);
             if (hop.kind() == HopKind.ENTRY) {
                 continue;
             }
-            sb.append(hop.toOwner()).append('.').append(hop.toName()).append('.')
-                    .append(hop.field() != null ? hop.field() : "").append(';');
+            // Keep the complete typed hop identity.  A destination-only family key can
+            // collapse a nested callback onto an unrelated handler with the same signature;
+            // ChainMerge already removes producer-specific reasons before this stage.
+            sb.append(hop.fromOwner()).append('.').append(hop.fromName()).append("->")
+                    .append(hop.toOwner()).append('.').append(hop.toName()).append('.')
+                    .append(hop.kind()).append('.')
+                    .append(hop.field() != null ? hop.field() : "").append('.')
+                    .append(hop.desc() != null ? hop.desc() : "").append('.')
+                    .append(hop.argOrdinal() == null ? "" : hop.argOrdinal()).append(';');
         }
         return sb.toString();
     }

@@ -87,6 +87,10 @@ class MultiFormatReporterTest {
         String json = Files.readString(temp.resolve("findings.json"));
         assertTrue(json.contains("\"verification_status\":\"SINK_BLOCKED\""));
         assertTrue(json.contains("\"verification_evidence\":\"SINK_CANARY_BOUNDARY\""));
+        assertTrue(json.contains("\"precision\":")
+                && json.contains("\"high_confidence\":false"));
+        assertTrue(!json.contains("]}\",\"construction\":"),
+                "findings.json must remain valid JSON around the nested precision object");
         assertTrue(json.endsWith("\n]"));
         assertTrue(Files.readString(temp.resolve("findings.html")).contains("SINK_BLOCKED"));
         assertTrue(Files.readString(temp.resolve("findings.md")).contains("SINK_BLOCKED"));

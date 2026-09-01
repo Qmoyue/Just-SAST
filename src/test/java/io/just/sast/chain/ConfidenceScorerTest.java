@@ -115,6 +115,19 @@ class ConfidenceScorerTest {
                 List.of("verify:executed")));
         assertTrue(ConfidenceScorer.dynamicRank("SAFE_EFFECT_OBSERVED", List.of())
                 > ConfidenceScorer.dynamicRank("SINK_BLOCKED", List.of()));
+        assertTrue(ConfidenceScorer.dynamicRank("SAFE_SINK_EXECUTED", List.of())
+                > ConfidenceScorer.dynamicRank("SINK_BLOCKED", List.of()),
+                "legacy adapter label must not become a sink-boundary confirmation");
+    }
+
+    @Test
+    void legacyNotesNormalizeByEvidencePrecedence() {
+        assertEquals("EXECUTED", ConfidenceScorer.statusFromNotes(List.of("verify:executed")));
+        assertEquals("CONCRETE_REACHED", ConfidenceScorer.statusFromNotes(
+                java.util.Arrays.asList(null, "verify:safe-effect-observed",
+                        "verify:segment-confirmed")));
+        assertEquals("SINK_BLOCKED", ConfidenceScorer.statusFromNotes(
+                java.util.Arrays.asList("verify:executed", "verify:confirmed")));
     }
 
     @Test

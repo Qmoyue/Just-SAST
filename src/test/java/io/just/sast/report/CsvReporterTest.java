@@ -104,5 +104,7 @@ class CsvReporterTest {
         assertTrue(findings.contains("status=SINK_BLOCKED"),
                 "分组代表链未被动态确认的变体不应覆盖已确认变体");
         assertTrue(findings.contains("rank=2"), findings);
+        assertTrue(findings.contains("app/Gadget.readObject -> app/Sink.run -> java/lang/Runtime.exec"),
+                "代表路径必须与被选作最强证据的动态变体一致");
     }
 }

@@ -42,6 +42,15 @@ public final class ScanCache {
                                       Path jdkHome, boolean fast, boolean verify,
                                       int verifyBudget, boolean safeExec,
                                       boolean requireStrictIsolation) throws IOException {
+        return preflight(target, dependencies, rules, jdkHome, fast, verify, verifyBudget,
+                safeExec, false, requireStrictIsolation);
+    }
+
+    /** Preflight identity including the explicit adapter-owned SAFE_REAL mode. */
+    public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
+                                      Path jdkHome, boolean fast, boolean verify,
+                                      int verifyBudget, boolean safeExec, boolean safeReal,
+                                      boolean requireStrictIsolation) throws IOException {
         validateInput(target, true);
         if (dependencies != null) {
             for (Path dependency : dependencies) {
@@ -58,7 +67,8 @@ public final class ScanCache {
         List<String> dependencyHashes = dependencyHashes(dependencies);
         String dependencyIdentity = dependencyIdentityFromHashes(dependencyHashes);
         String cacheKey = ScanIdentityWriter.cacheKey(artifactHash, dependencyIdentity, rules,
-                jdkHome, fast, verify, verifyBudget, safeExec, requireStrictIsolation);
+                jdkHome, fast, verify, verifyBudget, safeExec, safeReal,
+                requireStrictIsolation);
         return new Preflight(artifactHash, dependencyIdentity, dependencyHashes, cacheKey);
     }
 

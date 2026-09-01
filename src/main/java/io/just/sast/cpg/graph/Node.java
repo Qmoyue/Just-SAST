@@ -95,8 +95,17 @@ public final class Node {
     }
 
     private static Integer integer(Object value) {
-        return value instanceof Number number ? number.intValue()
-                : value == null ? null : Integer.valueOf(value.toString());
+        // Do not use a conditional expression mixing a primitive branch and null here.
+        // Java's type inference can unbox the null branch, which made compact CALL/METHOD
+        // nodes without an offset fail during construction instead of representing the
+        // legitimate "not applicable" value.
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        return Integer.valueOf(value.toString());
     }
 
     private static Map<String, Object> extras(Map<String, Object> values) {

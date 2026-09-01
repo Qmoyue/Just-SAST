@@ -3,6 +3,7 @@ package io.just.sast.knowledge.engine;
 import io.just.sast.analysis.taint.ForwardOrigins;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.analysis.taint.ValueOrigin;
+import io.just.sast.analysis.taint.ValueOriginOrder;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
@@ -53,7 +54,8 @@ import java.util.Set;
  *   按上限展开实现类 addThis/addParam
  * - threadProxy：receiver 为 Proxy.newProxyInstance 结果时，handler 实参的解析目标类 addThis
  * - reflectiveResolve：Method.invoke 的 Method 对象来自 getMethod/getDeclaredMethod 且方法名
- *   为常量时，向同名方法 addParam/addThis
+ *   为常量时，向同名方法 addParam/addThis；MethodHandle lookup 的目标由 Class、名称、
+ *   调用描述符约束后，按直接参数向目标方法投影
  *
  * model 规则（YAML 声明式摘要）在两轮中都消费：actions 的 this←argN 为容器投毒（Map.put 语义）、
  * return←src 为透传（Map.get 语义）。
@@ -78,6 +80,8 @@ public final class ForwardEngine {
     private static final int MAX_PATH_ALTERNATIVES = 8;
     /** External Method-collection callbacks are a bounded semantic wildcard. */
     private static final int MAX_SERIALIZED_PROXY_CALLBACK_SITES = 256;
+    /** External interface callbacks share the same finite dispatch boundary. */
+    private static final int MAX_SERIALIZED_PROXY_INTERFACE_SITES = 256;
     /**
      * Keep the callback metadata bounded by the already bounded Method collection.  The
      * names are not benchmark knowledge: they are the names recovered from the typed
@@ -102,6 +106,8 @@ public final class ForwardEngine {
     private static final int DEFAULT_METHOD_PASS_CAP = 1_000_000;
     /** 死胡同缓存清理阈值（条目数超过即清除过期版本）。 */
     private static final int DEAD_END_SWEEP = 65_536;
+    /** Avoid walking the full dead-end map for every fact-version insertion. */
+    private static final int DEAD_END_SWEEP_BURST = 4_096;
     /**
      * 事实：键 → 前向路径（首元素为 ENTRY hop）。引擎由一个 ANALYSIS 知识源独占，
      * 因而这里使用普通容器；并行化的知识源之间不会共享此实例。把单所有者状态写成
@@ -136,6 +142,8 @@ public final class ForwardEngine {
      * fact versions are monotone and stale entries are intentionally lazy-invalidated.
      */
     private static final int MAX_CANDIDATE_MEMO_ENTRIES = 65_536;
+    /** Batch eviction keeps the bounded memo from turning into an O(n) hot-path operation. */
+    private static final int MAX_CANDIDATE_MEMO_BURST = 4_096;
     private final Map<CandidateKey, CandidateMemo> candidateMemoCache = new HashMap<>();
 
     /** Result of the bounded symbolic Method-name interpreter used by proxy callbacks. */
@@ -145,6 +153,7 @@ public final class ForwardEngine {
     /** Per-handler callback branch metadata; computed lazily after OriginSupport indexing. */
     private record SerializedProxyCallbackMetadata(Set<Integer> feasibleOffsets,
                                                    boolean complete) {}
+    private record SerializedProxyInterfaceMetadataKey(String handlerKey, String methodName) {}
 
     /** 死胡同缓存：值为记录时的主事实版本（替代 frontier 不会令其失效）。 */
     private final Map<TaintKey, Long> deadEnds = new HashMap<>();
@@ -170,6 +179,8 @@ public final class ForwardEngine {
     /** Sink-relevant lambda factory callers → ordinary bridge targets needed by forward demand. */
     private final Map<String, Set<String>> lambdaDemandTargetsByCaller = new HashMap<>();
     private boolean lambdaDemandIndexed;
+    /** Number of late callback implementations admitted to the forward demand workset. */
+    private int dynamicCallbackDemandAdds;
 
     /** 反序列化可达方法集（前向 BFS 边界：只在该子集内传播；两轮共用，首轮构建）。 */
     private final Set<String> reachable = new HashSet<>();
@@ -182,9 +193,18 @@ public final class ForwardEngine {
      * real deserialization and external-callback roots.  It is never used to erase the
      * reachable set or to change backward findings.
     */
+    /**
+     * Sink-relevant scheduler workset.  It is seeded once from the static graph, then may
+     * grow when a bounded semantic edge (reflection/proxy/native) resolves a target that was
+     * not reachable through an ordinary call edge.  Keeping this separate from {@link
+     * #reachable} preserves the cheap demand filter while avoiding a false negative at a
+     * semantically discovered target.
+     */
     private Set<String> forwardDemand;
     private static final int REACHABLE_CAP = 200_000;
     private static final int INTERFACE_EXPAND_CAP = 2000;
+    /** Keep runtime callback expansion finite on interface-heavy dependency closures. */
+    private static final int DYNAMIC_CALLBACK_DEMAND_CAP = 2000;
     private static final int RAW_DISPATCH_CAP = 10_000;
     private static final int REFLECTIVE_REACHABLE_CAP = 2000;
     /** lambda 绑定：方法#实参槽 → 该参数将持有的 lambda 实现方法（含接口实参→实现参数的槽位偏移）。 */
@@ -224,6 +244,9 @@ public final class ForwardEngine {
     private final IdentityHashMap<Node, CallRules> callRulesCache = new IdentityHashMap<>();
     private final Map<String, SerializedProxyCallbackMetadata> serializedProxyCallbackMetadata =
             new HashMap<>();
+    /** Per-handler/method-name branch metadata for externally assembled proxy callbacks. */
+    private final Map<SerializedProxyInterfaceMetadataKey, Set<Integer>>
+            serializedProxyInterfaceFeasibleOffsets = new HashMap<>();
     /**
      * Bounded identity cache for repeated forward worklist visits to the same method summary.
      *
@@ -744,7 +767,7 @@ public final class ForwardEngine {
                 .anyMatch(reason -> reason.startsWith("SINK_REACHABILITY_CAP:"));
         if (sinkIndexCapped) {
             bb.markIncomplete("FORWARD_DEMAND_FALLBACK:SINK_REACHABILITY_CAP");
-            forwardDemand = Set.copyOf(reachable);
+            forwardDemand = new HashSet<>(reachable);
             return;
         }
 
@@ -763,6 +786,13 @@ public final class ForwardEngine {
             }
             if ((!isJdkOwner(method.owner()) && isDeserializationEntry(method))
                     || support.deserializationCallbackEntries().contains(key)) {
+                roots.add(key);
+            }
+            // A reflective-only path has no ordinary sink distance: Method.invoke is the
+            // missing graph edge by design.  Admit only hosts whose statically recovered
+            // Class literal can reach a configured sink, keeping the optimization intact
+            // for unrelated reflection-heavy library code.
+            if (hasSinkRelevantReflectiveSite(key)) {
                 roots.add(key);
             }
         }
@@ -850,68 +880,117 @@ public final class ForwardEngine {
             }
         }
 
-        boolean changed;
-        do {
+        /*
+         * Demand is a monotone minimum-cost closure.  The old fixed-point loop rebuilt a
+         * snapshot of every demanded method and rescanned every field on every round.  On a
+         * large dependency closure that turns a bounded reverse BFS into O(rounds * fields +
+         * rounds * callers), even though a field only needs to be inspected when one of its
+         * readers first becomes demanded or gets a cheaper cost.  A worklist is equivalent:
+         * every successful cost decrease schedules exactly the three reverse relations that
+         * can derive new demand (ordinary callers, field writers and lambda bridge targets).
+         * The queue is seeded in lexical order so the resulting minimum-cost map and all
+         * completeness decisions remain independent of HashMap iteration order.
+         */
+        Map<String, List<String>> fieldsReadByMethod = new HashMap<>();
+        for (Map.Entry<String, Set<String>> entry : fieldReaders.entrySet()) {
+            List<String> readers = new ArrayList<>(entry.getValue());
+            readers.sort(String::compareTo);
+            for (String reader : readers) {
+                if (reachable.contains(reader)) {
+                    fieldsReadByMethod.computeIfAbsent(reader, ignored -> new ArrayList<>(1))
+                            .add(entry.getKey());
+                }
+            }
+        }
+        for (List<String> fields : fieldsReadByMethod.values()) {
+            fields.sort(String::compareTo);
+        }
+        Map<String, List<String>> orderedFieldWriters = new HashMap<>();
+        for (Map.Entry<String, Set<String>> entry : fieldWritersByField.entrySet()) {
+            List<String> writers = new ArrayList<>(entry.getValue());
+            writers.sort(String::compareTo);
+            orderedFieldWriters.put(entry.getKey(), List.copyOf(writers));
+        }
+
+        List<String> initialDemand = new ArrayList<>(demandCosts.keySet());
+        initialDemand.sort(String::compareTo);
+        Deque<String> demandWork = new ArrayDeque<>(initialDemand);
+        Set<String> queuedDemand = new HashSet<>(initialDemand);
+        while (!demandWork.isEmpty()) {
             if (cancellationRequested()) {
                 return;
             }
-            changed = false;
+            String demandedMethod = demandWork.removeFirst();
+            queuedDemand.remove(demandedMethod);
+            Integer currentCostValue = demandCosts.get(demandedMethod);
+            if (currentCostValue == null) {
+                continue;
+            }
+            int currentCost = currentCostValue;
+
             // Return/argument facts flow back through ordinary callers.
-            List<Map.Entry<String, Integer>> snapshot = new ArrayList<>(demandCosts.entrySet());
-            for (Map.Entry<String, Integer> demand : snapshot) {
-                String callee = demand.getKey();
-                int calleeCost = demand.getValue();
-                for (Node caller : callers.getOrDefault(callee, List.of())) {
+            int callerCost = currentCost + 1;
+            if (callerCost <= MAX_HOPS) {
+                for (Node caller : callers.getOrDefault(demandedMethod, List.of())) {
                     String callerKey = methodNodeKey(caller);
-                    int callerCost = calleeCost + 1;
-                    if (callerCost <= MAX_HOPS && reachable.contains(callerKey)
-                            && fitsForwardDemandDepth(callerKey, callerCost)
-                            && addDemandCost(demanded, demandCosts, callerKey, callerCost)) {
-                        changed = true;
+                    if (!reachable.contains(callerKey)
+                            || !fitsForwardDemandDepth(callerKey, callerCost)
+                            || !addDemandCost(demanded, demandCosts, callerKey, callerCost)) {
+                        continue;
+                    }
+                    if (queuedDemand.add(callerKey)) {
+                        demandWork.addLast(callerKey);
                     }
                 }
             }
+
             // A serialized field can be written in one method and consumed in a different
-            // method without an ordinary call edge.  Add its writers when any exact reader
-            // is demanded; the existing field fact index then performs the forward transfer.
-            for (Map.Entry<String, Set<String>> entry : fieldWritersByField.entrySet()) {
-                Set<String> readers = fieldReaders.getOrDefault(entry.getKey(), Set.of());
-                int readerCost = readers.stream()
-                        .map(demandCosts::get)
-                        .filter(cost -> cost != null)
-                        .min(Integer::compareTo)
-                        .orElse(Integer.MAX_VALUE);
-                if (readerCost != Integer.MAX_VALUE) {
-                    int writerCost = readerCost + 1;
-                    for (String writer : entry.getValue()) {
-                        if (writerCost <= MAX_HOPS && fitsForwardDemandDepth(writer, writerCost)
-                                && addDemandCost(demanded, demandCosts, writer, writerCost)) {
-                            changed = true;
+            // method without an ordinary call edge.  Reverse only the fields read by this
+            // newly processed method; unrelated fields no longer pay a full scan per round.
+            int writerCost = currentCost + 1;
+            if (writerCost <= MAX_HOPS) {
+                for (String field : fieldsReadByMethod.getOrDefault(demandedMethod, List.of())) {
+                    for (String writer : orderedFieldWriters.getOrDefault(field, List.of())) {
+                        if (!fitsForwardDemandDepth(writer, writerCost)
+                                || !addDemandCost(demanded, demandCosts, writer, writerCost)) {
+                            continue;
+                        }
+                        if (queuedDemand.add(writer)) {
+                            demandWork.addLast(writer);
                         }
                     }
                 }
             }
+
             // A LambdaMetafactory edge points from the factory to the implementation, but a
             // lambda passed into a static/virtual bridge has no ordinary reverse call edge
             // from the later SAM invocation. Admit only bridge targets of factories whose
             // implementation is already sink-relevant; ordinary dependency lambdas remain
             // outside the demand workset.
-            for (Map.Entry<String, Set<String>> entry : lambdaDemandTargetsByCaller.entrySet()) {
-                Integer callerCost = demandCosts.get(entry.getKey());
-                if (callerCost == null) {
-                    continue;
-                }
-                int targetCost = callerCost + 1;
-                for (String target : entry.getValue()) {
-                    if (targetCost <= MAX_HOPS && reachable.contains(target)
-                            && addDemandCost(demanded, demandCosts, target, targetCost)) {
-                        changed = true;
+            Set<String> lambdaTargets = lambdaDemandTargetsByCaller.get(demandedMethod);
+            if (lambdaTargets != null) {
+                int targetCost = currentCost + 1;
+                if (targetCost <= MAX_HOPS) {
+                    List<String> orderedTargets = new ArrayList<>(lambdaTargets);
+                    orderedTargets.sort(String::compareTo);
+                    for (String target : orderedTargets) {
+                        if (!reachable.contains(target)
+                                || !addDemandCost(demanded, demandCosts, target, targetCost)) {
+                            continue;
+                        }
+                        if (queuedDemand.add(target)) {
+                            demandWork.addLast(target);
+                        }
                     }
                 }
             }
-        } while (changed);
+        }
 
-        forwardDemand = Set.copyOf(demanded);
+        // Keep this set mutable: reflective/semantic resolution can discover a sink-relevant
+        // method after the initial ordinary-call demand pass.  The set is still owned by this
+        // single-threaded engine and only grows through admitDynamicDemand(), so iteration
+        // order and the bounded scheduler remain deterministic.
+        forwardDemand = new HashSet<>(demanded);
         io.just.sast.util.JustLogger.info(
                 "前向需求范围：可达 {} 个方法，调度 {} 个方法，sink 种子 {} 个，入口/语义根 {} 个",
                 reachable.size(), forwardDemand.size(),
@@ -942,29 +1021,32 @@ public final class ForwardEngine {
             factoriesByCaller.computeIfAbsent(callerKey, ignored -> new ArrayList<>(1))
                     .add(factory);
         }
-        for (Map.Entry<String, List<Node>> group : factoriesByCaller.entrySet()) {
+        List<String> callerKeys = new ArrayList<>(factoriesByCaller.keySet());
+        callerKeys.sort(String::compareTo);
+        for (String callerKey : callerKeys) {
             if (cancellationRequested()) {
                 return;
             }
-            MethodInfo caller = resolveMethodKey(group.getKey());
+            List<Node> factories = factoriesByCaller.getOrDefault(callerKey, List.of());
+            MethodInfo caller = resolveMethodKey(callerKey);
             if (caller == null) {
                 continue;
             }
             ForwardOrigins.Result result = origins(caller, null);
             Map<Long, Node> relevantFactories = new HashMap<>();
-            for (Node factory : group.getValue()) {
+            for (Node factory : factories) {
                 relevantFactories.put(factory.id(), factory);
             }
             // Scan each consumer once. The previous factory-first loop revisited the same
             // call/argument state for every sink-relevant factory in one method, which is
             // disproportionately expensive in generated lambda-heavy dependency jars.
-            for (Node consumer : bb.graph().callsOfMethod(group.getKey())) {
+            for (Node consumer : bb.graph().callsOfMethod(callerKey)) {
                 boolean isFactory = relevantFactories.containsKey(consumer.id());
                 Set<Long> matchedFactories = new HashSet<>();
                 int argumentCount = Descriptor.paramCount(consumer.descriptor());
                 for (int ordinal = 0; ordinal < argumentCount; ordinal++) {
                     Set<ValueOrigin> values = support.argOriginAtOrdinal(consumer, ordinal, result);
-                    for (ValueOrigin value : values) {
+                    for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
                         collectRelevantLambdaFactories(value, relevantFactories, caller, result,
                                 matchedFactories, new HashSet<>());
                     }
@@ -976,10 +1058,10 @@ public final class ForwardEngine {
                     if (edge.type() != EdgeType.INVOKES && edge.type() != EdgeType.DISPATCHES) {
                         continue;
                     }
-                    String target = methodNodeKey(edge.to());
+                        String target = methodNodeKey(edge.to());
                     if (reachable.contains(target)) {
                         lambdaDemandTargetsByCaller
-                                .computeIfAbsent(group.getKey(), ignored -> new HashSet<>())
+                                .computeIfAbsent(callerKey, ignored -> new HashSet<>())
                                 .add(target);
                     }
                 }
@@ -1031,7 +1113,8 @@ public final class ForwardEngine {
             if (before == null || before.stack().isEmpty()) {
                 return;
             }
-            for (ValueOrigin candidate : before.stack().get(before.stack().size() - 1).origins()) {
+            for (ValueOrigin candidate : ValueOriginOrder.sorted(
+                    before.stack().get(before.stack().size() - 1).origins())) {
                 collectRelevantLambdaFactories(candidate, relevantFactories, method, result,
                         matches, visiting);
             }
@@ -1118,7 +1201,9 @@ public final class ForwardEngine {
 
     /** 精扫重入队（受影响方法）：已污点类的全部方法 + 参数/返回事实方法 + 已污点字段的读者。 */
     private void requeueAffected() {
-        for (String cls : thisTainted.keySet()) {
+        List<String> taintedClasses = new ArrayList<>(thisTainted.keySet());
+        taintedClasses.sort(String::compareTo);
+        for (String cls : taintedClasses) {
             if (cancellationRequested()) {
                 return;
             }
@@ -1135,20 +1220,32 @@ public final class ForwardEngine {
                 }
             }
         }
-        for (String key : paramTainted.keySet()) {
+        List<String> taintedParameters = new ArrayList<>(paramTainted.keySet());
+        taintedParameters.sort(String::compareTo);
+        for (String key : taintedParameters) {
             if (cancellationRequested()) {
                 return;
             }
             activateAndEnqueue(key.substring(0, key.lastIndexOf('#')));
         }
-        returnTainted.keySet().forEach(this::activateAndEnqueue);
-        for (Map.Entry<String, List<ChainHop>> e : fieldTainted.entrySet()) {
+        List<String> taintedReturns = new ArrayList<>(returnTainted.keySet());
+        taintedReturns.sort(String::compareTo);
+        for (String key : taintedReturns) {
+            activateAndEnqueue(key);
+        }
+        List<String> taintedFields = new ArrayList<>(fieldTainted.keySet());
+        taintedFields.sort(String::compareTo);
+        for (String field : taintedFields) {
             if (cancellationRequested()) {
                 return;
             }
-            Set<String> readers = fieldReaders.get(e.getKey());
+            Set<String> readers = fieldReaders.get(field);
             if (readers != null) {
-                readers.forEach(this::activateAndEnqueue);
+                List<String> orderedReaders = new ArrayList<>(readers);
+                orderedReaders.sort(String::compareTo);
+                for (String reader : orderedReaders) {
+                    activateAndEnqueue(reader);
+                }
             }
         }
     }
@@ -1453,7 +1550,8 @@ public final class ForwardEngine {
                 if (state == null || state.stack().isEmpty()) {
                     continue;
                 }
-                for (ValueOrigin value : state.stack().get(state.stack().size() - 1).origins()) {
+                for (ValueOrigin value : ValueOriginOrder.sorted(
+                        state.stack().get(state.stack().size() - 1).origins())) {
                     if (cancellationRequested()) {
                         return;
                     }
@@ -1476,7 +1574,8 @@ public final class ForwardEngine {
                 if (state == null || state.stack().size() < 3) {
                     continue;
                 }
-                for (ValueOrigin value : state.stack().get(state.stack().size() - 1).origins()) {
+                for (ValueOrigin value : ValueOriginOrder.sorted(
+                        state.stack().get(state.stack().size() - 1).origins())) {
                     if (cancellationRequested()) {
                         return;
                     }
@@ -1487,7 +1586,8 @@ public final class ForwardEngine {
                         if (cancellationRequested()) {
                             return;
                         }
-                        for (ValueOrigin arrayRef : state.stack().get(state.stack().size() - 3).origins()) {
+                        for (ValueOrigin arrayRef : ValueOriginOrder.sorted(
+                                state.stack().get(state.stack().size() - 3).origins())) {
                             if (cancellationRequested()) {
                                 return;
                             }
@@ -1524,7 +1624,8 @@ public final class ForwardEngine {
                 if (state == null || state.stack().isEmpty()) {
                     continue;
                 }
-                for (ValueOrigin value : state.stack().get(state.stack().size() - 1).origins()) {
+                for (ValueOrigin value : ValueOriginOrder.sorted(
+                        state.stack().get(state.stack().size() - 1).origins())) {
                     if (cancellationRequested()) {
                         return;
                     }
@@ -1559,14 +1660,15 @@ public final class ForwardEngine {
         if (sinkOffset instanceof Integer offset && !externalProxyCallbackAllows(method, offset)) {
             return;
         }
-        ForwardOrigins.State state = stateAt(method, (Integer) call.prop("offset"), ex);
+        ForwardOrigins.Result originResult = origins(method, ex);
+        ForwardOrigins.State state = originResult.stateBefore().get((Integer) call.prop("offset"));
         if (state == null) {
             return;
         }
         if (support.catchProvablyUnreachable(method, (Integer) call.prop("offset"))) {
             return; // catch 不可达守卫（与反向引擎同谓词）
         }
-        if (support.sinkPathProvablyUnreachable(method, (Integer) call.prop("offset"))) {
+        if (support.sinkPathProvablyUnreachable(method, (Integer) call.prop("offset"), originResult)) {
             // Keep the forward and backward engines on the same exact local-feasibility
             // boundary.  The taint fixed point stays path-insensitive for recall, while
             // an independently proven impossible branch is not allowed to re-introduce a
@@ -1587,7 +1689,8 @@ public final class ForwardEngine {
             if (depthFromTop < 0 || depthFromTop >= state.stack().size()) {
                 continue;
             }
-            for (ValueOrigin origin : state.stack().get(state.stack().size() - 1 - depthFromTop).origins()) {
+            for (ValueOrigin origin : ValueOriginOrder.sorted(
+                    state.stack().get(state.stack().size() - 1 - depthFromTop).origins())) {
                 if (cancellationRequested()) {
                     return;
                 }
@@ -1673,9 +1776,17 @@ public final class ForwardEngine {
             taintMemo.put(key, new TaintMemo(primaryFactVersion, path));
         } else if (!subtreeTruncated) {
             deadEnds.put(key, primaryFactVersion);
-            if (deadEnds.size() > DEAD_END_SWEEP) {
+            if (deadEnds.size() > DEAD_END_SWEEP + DEAD_END_SWEEP_BURST) {
                 long version = primaryFactVersion;
                 deadEnds.values().removeIf(v -> v < version);
+                if (deadEnds.size() > DEAD_END_SWEEP) {
+                    int remove = deadEnds.size() - DEAD_END_SWEEP;
+                    var iterator = deadEnds.keySet().iterator();
+                    while (remove-- > 0 && iterator.hasNext()) {
+                        iterator.next();
+                        iterator.remove();
+                    }
+                }
             }
         }
         return path;
@@ -1787,7 +1898,8 @@ public final class ForwardEngine {
     }
 
     private void trimCandidateMemoCache() {
-        if (candidateMemoCache.size() <= MAX_CANDIDATE_MEMO_ENTRIES) {
+        if (candidateMemoCache.size() <= MAX_CANDIDATE_MEMO_ENTRIES
+                + MAX_CANDIDATE_MEMO_BURST) {
             return;
         }
         candidateMemoCache.entrySet().removeIf(entry ->
@@ -1835,7 +1947,8 @@ public final class ForwardEngine {
         int consumed = OriginSupport.consumedCount(instruction.op());
         int start = Math.max(0, state.stack().size() - consumed);
         for (int index = start; index < state.stack().size(); index++) {
-            for (ValueOrigin operand : state.stack().get(index).origins()) {
+            for (ValueOrigin operand : ValueOriginOrder.sorted(
+                    state.stack().get(index).origins())) {
                 if (mayCarryTaint(operand)) {
                     paths.addAll(taintedCandidates(operand, method, depth + 1, ex));
                 }
@@ -1990,7 +2103,9 @@ public final class ForwardEngine {
             if (!methodPaths.isEmpty()) {
                 return methodPaths;
             }
-            return candidatePaths(thisTainted, thisTaintedAlternatives, method.owner());
+            List<List<ChainHop>> paths = new ArrayList<>(candidatePaths(thisTainted,
+                    thisTaintedAlternatives, method.owner()));
+            return distinctBestPaths(paths);
         }
         return candidatePaths(paramTainted, paramTaintedAlternatives,
                 methodKey(method, ex) + "#" + slot);
@@ -2023,10 +2138,10 @@ public final class ForwardEngine {
                     || !reachable.contains(methodKey(caller, ex))) {
                 continue;
             }
-            if (support.sinkPathProvablyUnreachable(caller, invoke.offset())) {
+            ForwardOrigins.Result callerOrigins = origins(caller, ex);
+            if (support.sinkPathProvablyUnreachable(caller, invoke.offset(), callerOrigins)) {
                 continue;
             }
-            ForwardOrigins.Result callerOrigins = origins(caller, ex);
             Set<ValueOrigin> receivers = support.argOriginAtOrdinal(invoke, 0, callerOrigins);
             if (receivers.isEmpty()) {
                 continue;
@@ -2058,6 +2173,187 @@ public final class ForwardEngine {
     }
 
     /**
+     * Connect a serialized InvocationHandler to an interface call whose proxy object is
+     * supplied by the surrounding object graph.  This is the external-proxy counterpart of
+     * {@link #threadProxy(Node, MethodInfo, int, Explore)}: there is no
+     * Proxy.newProxyInstance bytecode in the scan unit, so the callback is admitted only when
+     * the handler is serializable, the call owner is a resolved interface, and the bounded
+     * method-name interpreter accepts the requested callback name.
+     */
+    private List<ChainHop> serializedProxyInterfaceHandlerPath(MethodInfo handler, int depth,
+                                                                 Explore ex) {
+        if (!support.isSerializedProxyHandler(handler)) {
+            return null;
+        }
+        List<ChainHop> best = null;
+        int inspected = 0;
+        String handlerKey = methodKey(handler, ex);
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            if (cancellationRequested()) {
+                return best;
+            }
+            if (inspected++ >= MAX_SERIALIZED_PROXY_INTERFACE_SITES) {
+                bb.markIncomplete("FORWARD_SERIALIZED_PROXY_INTERFACE_SITE_CAP:"
+                        + MAX_SERIALIZED_PROXY_INTERFACE_SITES);
+                break;
+            }
+            if (!serializedProxyCallbackMayReach(handler, call.name(), -1)) {
+                continue;
+            }
+            MethodInfo caller = support.enclosingMethod(call);
+            String callerKey = caller == null ? "" : methodKey(caller, ex);
+            if (caller == null || (!reachable.contains(callerKey) && !callerKey.equals(handlerKey))) {
+                continue;
+            }
+            ForwardOrigins.Result callerOrigins = origins(caller, ex);
+            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+                continue;
+            }
+            Set<ValueOrigin> receivers = support.argOriginAtOrdinal(call, -1, callerOrigins);
+            if (receivers.isEmpty()) {
+                continue;
+            }
+            bb.markIncomplete("FORWARD_SERIALIZED_PROXY_INTERFACE_WILDCARD");
+            for (ValueOrigin receiver : ValueOriginOrder.sorted(receivers)) {
+                if (!mayCarryTaint(receiver)) {
+                    continue;
+                }
+                List<ChainHop> receiverPath = tainted(receiver, caller, depth + 1, ex);
+                if (receiverPath == null || receiverPath.size() >= MAX_HOPS) {
+                    if (receiverPath != null) {
+                        bb.markIncomplete("FORWARD_HOP_CAP:" + MAX_HOPS);
+                    }
+                    continue;
+                }
+                List<ChainHop> candidate = appendMethodHop(receiverPath, caller, handler.owner(),
+                        handler.name(), handler.descriptor(), HopKind.VIRTUAL_DISPATCH,
+                        "serialized-proxy-interface", null);
+                if (candidate != null && (best == null || better(best, candidate))) {
+                    best = candidate;
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Map one Object[] element supplied to InvocationHandler.invoke back to an external
+     * interface call argument.  The array index is recovered from the local CFG state; an
+     * unknown index falls back to all arguments of that bounded call site.
+     */
+    private List<ChainHop> serializedProxyInterfaceArgumentPath(MethodInfo handler, int offset,
+                                                                  ForwardOrigins.State state,
+                                                                  int depth, Explore ex) {
+        if (!support.isSerializedProxyHandler(handler) || state == null
+                || state.stack().isEmpty()) {
+            return null;
+        }
+        Integer arrayIndex = constantStackIndex(state);
+        List<ChainHop> best = null;
+        int inspected = 0;
+        String handlerKey = methodKey(handler, ex);
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            if (cancellationRequested()) {
+                return best;
+            }
+            if (inspected++ >= MAX_SERIALIZED_PROXY_INTERFACE_SITES) {
+                bb.markIncomplete("FORWARD_SERIALIZED_PROXY_INTERFACE_SITE_CAP:"
+                        + MAX_SERIALIZED_PROXY_INTERFACE_SITES);
+                break;
+            }
+            if (!serializedProxyCallbackMayReach(handler, call.name(), offset)) {
+                continue;
+            }
+            MethodInfo caller = support.enclosingMethod(call);
+            String callerKey = caller == null ? "" : methodKey(caller, ex);
+            if (caller == null || (!reachable.contains(callerKey) && !callerKey.equals(handlerKey))) {
+                continue;
+            }
+            ForwardOrigins.Result callerOrigins = origins(caller, ex);
+            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+                continue;
+            }
+            int argumentCount = Descriptor.paramCount(call.descriptor());
+            int first = arrayIndex == null ? 0 : arrayIndex;
+            int last = arrayIndex == null ? argumentCount - 1 : arrayIndex;
+            if (first < 0 || first >= argumentCount) {
+                continue;
+            }
+            for (int ordinal = first; ordinal <= last; ordinal++) {
+                Set<ValueOrigin> values = support.argOriginAtOrdinal(call, ordinal, callerOrigins);
+                for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
+                    if (cancellationRequested()) {
+                        return best;
+                    }
+                    if (!mayCarryTaint(value)) {
+                        continue;
+                    }
+                    List<ChainHop> argumentPath = tainted(value, caller, depth + 1, ex);
+                    if (argumentPath == null) {
+                        continue;
+                    }
+                    List<ChainHop> candidate = appendMethodHop(argumentPath, caller,
+                            handler.owner(), handler.name(), handler.descriptor(),
+                            HopKind.VIRTUAL_DISPATCH, "serialized-proxy-interface", ordinal);
+                    if (candidate != null && (best == null || better(best, candidate))) {
+                        best = candidate;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Cache the small method-name feasibility proof for an external proxy callback. */
+    private Set<Integer> serializedProxyFeasibleOffsets(MethodInfo handler, String methodName) {
+        if (handler == null || methodName == null || methodName.isBlank()) {
+            return Set.of();
+        }
+        SerializedProxyInterfaceMetadataKey key = new SerializedProxyInterfaceMetadataKey(
+                OriginSupport.methodKey(handler), methodName);
+        Set<Integer> cached = serializedProxyInterfaceFeasibleOffsets.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Set<Integer> computed = ForwardEngine.proxyMethodFeasibleOffsets(handler,
+                Set.of(methodName), support::cfg);
+        Set<Integer> result = computed == null ? Set.of() : Set.copyOf(computed);
+        serializedProxyInterfaceFeasibleOffsets.put(key, result);
+        if (result.isEmpty()) {
+            bb.markIncomplete("FORWARD_SERIALIZED_PROXY_INTERFACE_METADATA");
+        }
+        return result;
+    }
+
+    private boolean serializedProxyCallbackMayReach(MethodInfo handler, String methodName,
+                                                      int offset) {
+        Set<Integer> feasible = serializedProxyFeasibleOffsets(handler, methodName);
+        // Empty metadata means the bounded interpreter could not establish a finite region.
+        // Preserve soundness by retaining the callback wildcard; the completeness marker
+        // makes the loss of precision visible to ranking and reports.
+        return feasible.isEmpty() || offset < 0 || feasible.contains(offset);
+    }
+
+    private static Integer constantStackIndex(ForwardOrigins.State state) {
+        if (state == null || state.stack().isEmpty()) {
+            return null;
+        }
+        Integer answer = null;
+        for (ValueOrigin origin : state.stack().get(state.stack().size() - 1).origins()) {
+            if (!(origin instanceof ValueOrigin.Constant constant)
+                    || !(constant.value() instanceof Number number)) {
+                return null;
+            }
+            int value = number.intValue();
+            if (answer != null && answer != value) {
+                return null;
+            }
+            answer = value;
+        }
+        return answer;
+    }
+
+    /**
      * Resolve the feasible instruction region for a serialized InvocationHandler callback.
      * The handler is still a bounded wildcard because the proxy interface is external, but
      * the Method values observed by the in-artifact collection provide a finite discriminator.
@@ -2067,6 +2363,19 @@ public final class ForwardEngine {
     private boolean externalProxyCallbackAllows(MethodInfo method, int offset) {
         if (!support.isSerializedProxyHandler(method)) {
             return true;
+        }
+        boolean sawInterfaceCallback = false;
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            sawInterfaceCallback = true;
+            if (serializedProxyCallbackMayReach(method, call.name(), offset)) {
+                return true;
+            }
+        }
+        if (sawInterfaceCallback) {
+            // A resolved external interface site set is a finite discriminator.  If none of
+            // its method-name branches can reach this instruction, the instruction belongs to
+            // an unreachable proxy callback branch and must not inherit another branch's taint.
+            return false;
         }
         String key = OriginSupport.methodKey(method);
         SerializedProxyCallbackMetadata metadata = serializedProxyCallbackMetadata.get(key);
@@ -2152,14 +2461,28 @@ public final class ForwardEngine {
         if (state == null) {
             return null;
         }
+        boolean proxyReceiver = isProxyReceiver(call, method, state, ex);
         // 驱动输入侧事实（参数/receiver、lambda、代理/反射分派），但不要把输入路径
         // 直接当成返回值。返回值只能来自声明式 return model、已收敛的被调方法
         // return summary，或专门的 source 语义。
-        propagateCallArgs(call, method, depth + 1, ex);
+        if (!proxyReceiver) {
+            propagateCallArgs(call, method, depth + 1, ex);
+        }
         List<ChainHop> best = null;
         List<ChainHop> proxyReturn = proxyReturnPath(call, method, depth, ex);
         if (proxyReturn != null) {
             best = proxyReturn;
+        }
+        if (proxyReceiver) {
+            // A JDK proxy never dispatches to the implementation class recorded by the
+            // ordinary interface call graph.  Falling through to those return summaries
+            // turns a handler branch that returns a constant (or throws) into a false
+            // tainted result.  The handler-specific model above is the only valid return
+            // source; threadProxy still materializes the handler receiver for side effects.
+            if (options.threadProxy()) {
+                threadProxy(call, method, depth, ex);
+            }
+            return best;
         }
         List<ChainHop> arrayReadPath = taintedReflectiveArrayRead(call, method, depth, ex);
         if (arrayReadPath != null && (best == null || arrayReadPath.size() < best.size())) {
@@ -2188,7 +2511,12 @@ public final class ForwardEngine {
             }
             List<ChainHop> returnPath = returnTainted.get(methodNodeKey(edge.to()));
             if (returnPath != null) {
-                List<ChainHop> candidate = appendReturnHop(returnPath, method, edge);
+                // A return summary may already contain this same caller/target context when
+                // the value was learned through a serialized field plus a container read
+                // (for example Map.get inside a method that is itself the selected receiver).
+                // Reusing that summary is safe only under the explicit context predicate;
+                // otherwise the cycle guard remains strict.
+                List<ChainHop> candidate = appendReturnHop(returnPath, method, edge, true);
                 if (candidate != null && (best == null || better(best, candidate))) {
                     best = candidate;
                 }
@@ -2438,11 +2766,14 @@ public final class ForwardEngine {
                         }
                         for (Edge edge : call.out()) {
                             if (edge.type() == EdgeType.INVOKES || edge.type() == EdgeType.DISPATCHES) {
-                                if (!scheduledMethod(methodNodeKey(edge.to()))) {
+                                if (!support.receiverMayDispatchTo(call, method, edge.to().owner(),
+                                        edge.to().name(), edge.to().descriptor(), originResult)) {
                                     continue;
                                 }
-                                if (!support.receiverMayDispatchTo(call, method, edge.to().owner(),
-                                        edge.to().name(), edge.to().descriptor())) {
+                                String targetKey = methodNodeKey(edge.to());
+                                admitDynamicDispatchTarget(targetKey,
+                                        isJavaSerializationValue(receiverPath));
+                                if (!scheduledMethod(targetKey)) {
                                     continue;
                                 }
                                 List<ChainHop> targetPath = hopTo(receiverPath, method,
@@ -2466,6 +2797,14 @@ public final class ForwardEngine {
                         }
                     }
                 }
+            }
+            // A serialization callback is often invoked for a value whose return value is
+            // ignored (hashCode/equals/compareTo/toString). The ordinary return-demand path
+            // therefore never gets a chance to expand the receiver's concrete implementation.
+            // Reuse the same bounded CHA resolver here so ignored callback results can still
+            // reach an object-graph sink. This only runs for an already tainted receiver.
+            if (options.expandInterfaces() && best != null && !receiverOrigins.isEmpty()) {
+                expandInterfaces(call, method, depth, true, ex);
             }
         }
         // 实参污点传播（按被调方法实参槽遍历，wide 参数占 2 槽）
@@ -2500,7 +2839,7 @@ public final class ForwardEngine {
                                 continue;
                             }
                             if (!support.receiverMayDispatchTo(call, method, edge.to().owner(),
-                                    edge.to().name(), edge.to().descriptor())) {
+                                    edge.to().name(), edge.to().descriptor(), originResult)) {
                                 continue;
                             }
                             addParam(edge.to().owner(), edge.to().name(),
@@ -2988,7 +3327,9 @@ public final class ForwardEngine {
 
     /** model 规则消费：actions 里 return←src 为透传，this←argN 为容器投毒（类级语义）。 */    private List<ChainHop> applyModel(Rule.ModelRule model, Node call, MethodInfo method, int depth,
                                       List<ChainHop> best, Explore ex, boolean allowReturnModel) {
-        for (Map.Entry<String, List<String>> action : model.actions().entrySet()) {
+        List<Map.Entry<String, List<String>>> actions = new ArrayList<>(model.actions().entrySet());
+        actions.sort(Map.Entry.comparingByKey());
+        for (Map.Entry<String, List<String>> action : actions) {
             for (String src : action.getValue()) {
                 List<ChainHop> srcPath = modelSourcePath(src, call, method, depth, ex);
                 if (srcPath == null) {
@@ -3060,7 +3401,8 @@ public final class ForwardEngine {
     /** model 动作来源位置的污点路径：this（receiver）或 argN（第 N 实参）。 */
     private List<ChainHop> modelSourcePath(String src, Node call, MethodInfo method, int depth,
                                            Explore ex) {
-        ForwardOrigins.State state = stateAt(method, (Integer) call.prop("offset"), ex);
+        ForwardOrigins.Result originResult = origins(method, ex);
+        ForwardOrigins.State state = originResult.stateBefore().get((Integer) call.prop("offset"));
         if (state == null) {
             return null;
         }
@@ -3087,8 +3429,8 @@ public final class ForwardEngine {
             int slot = 0;
             for (int i = 0; i < argSlots.size(); i++) {
                 if (i == ordinal) {
-                    for (ValueOrigin origin : support.argOriginAt(call, method, slot,
-                            origins(method, ex))) {
+                    for (ValueOrigin origin : ValueOriginOrder.sorted(
+                            support.argOriginAt(call, method, slot, originResult))) {
                         List<ChainHop> path = tainted(origin, method, depth + 1, ex);
                         if (path != null) {
                             return path;
@@ -3108,7 +3450,8 @@ public final class ForwardEngine {
         if (src == null || call == null || method == null) {
             return List.of();
         }
-        ForwardOrigins.State state = stateAt(method, (Integer) call.prop("offset"), ex);
+        ForwardOrigins.Result originResult = origins(method, ex);
+        ForwardOrigins.State state = originResult.stateBefore().get((Integer) call.prop("offset"));
         if (state == null) {
             return List.of();
         }
@@ -3122,7 +3465,8 @@ public final class ForwardEngine {
             if (receiverDepth < 0 || receiverDepth >= state.stack().size()) {
                 return List.of();
             }
-            for (ValueOrigin receiver : state.stack().get(receiverDepth).origins()) {
+            for (ValueOrigin receiver : ValueOriginOrder.sorted(
+                    state.stack().get(receiverDepth).origins())) {
                 result.addAll(taintedCandidates(receiver, method, depth + 1, ex));
             }
         } else if (src.startsWith("arg")) {
@@ -3131,8 +3475,8 @@ public final class ForwardEngine {
             int slot = 0;
             for (int i = 0; i < argSlots.size(); i++) {
                 if (i == ordinal) {
-                    for (ValueOrigin origin : support.argOriginAt(call, method, slot,
-                            origins(method, ex))) {
+                    for (ValueOrigin origin : ValueOriginOrder.sorted(
+                            support.argOriginAt(call, method, slot, originResult))) {
                         result.addAll(taintedCandidates(origin, method, depth + 1, ex));
                     }
                     break;
@@ -3215,8 +3559,12 @@ public final class ForwardEngine {
             return List.of();
         }
         List<List<ChainHop>> result = new ArrayList<>();
-        for (List<ChainHop> receiverPath : taintedCandidates(field.receiver(), method,
-                depth + 1, ex)) {
+        List<List<ChainHop>> receiverPaths = support.isSerializedProxyHandler(method)
+                && field.receiver() instanceof ValueOrigin.Param receiver
+                && receiver.slot() == 0
+                ? serializedProxyInterfaceReceiverPaths(field, method, depth, ex)
+                : taintedCandidates(field.receiver(), method, depth + 1, ex);
+        for (List<ChainHop> receiverPath : receiverPaths) {
             if (receiverPath == null) {
                 continue;
             }
@@ -3235,6 +3583,78 @@ public final class ForwardEngine {
             result.add(List.copyOf(path));
         }
         return distinctBestPaths(result);
+    }
+
+    /**
+     * Resolve the receiver of a handler field only through callback names whose feasible CFG
+     * region contains this particular field read.  Keeping the branch discriminator at the
+     * field boundary avoids turning an unrelated {@code invokeSink} branch into a source when
+     * the only external callback actually invokes another interface method.
+     */
+    private List<List<ChainHop>> serializedProxyInterfaceReceiverPaths(
+            ValueOrigin.FieldRead field, MethodInfo handler, int depth, Explore ex) {
+        List<List<ChainHop>> paths = new ArrayList<>();
+        List<Integer> fieldOffsets = new ArrayList<>();
+        for (InsnFact instruction : handler.instructions()) {
+            if (!instruction.op().isFieldRead() || instruction.fieldRef() == null
+                    || !field.owner().equals(instruction.fieldRef().owner())
+                    || !field.field().equals(instruction.fieldRef().name())
+                    || (field.descriptor() != null && !field.descriptor().isBlank()
+                    && !field.descriptor().equals(instruction.fieldRef().descriptor()))) {
+                continue;
+            }
+            fieldOffsets.add(instruction.offset());
+        }
+        if (fieldOffsets.isEmpty()) {
+            return List.of();
+        }
+        int inspected = 0;
+        String handlerKey = methodKey(handler, ex);
+        for (Node call : support.serializedProxyInterfaceCallSites()) {
+            if (cancellationRequested()) {
+                break;
+            }
+            if (inspected++ >= MAX_SERIALIZED_PROXY_INTERFACE_SITES) {
+                bb.markIncomplete("FORWARD_SERIALIZED_PROXY_INTERFACE_SITE_CAP:"
+                        + MAX_SERIALIZED_PROXY_INTERFACE_SITES);
+                break;
+            }
+            boolean allowed = false;
+            for (int fieldOffset : fieldOffsets) {
+                if (serializedProxyCallbackMayReach(handler, call.name(), fieldOffset)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                continue;
+            }
+            MethodInfo caller = support.enclosingMethod(call);
+            String callerKey = caller == null ? "" : methodKey(caller, ex);
+            if (caller == null || (!reachable.contains(callerKey) && !callerKey.equals(handlerKey))) {
+                continue;
+            }
+            ForwardOrigins.Result callerOrigins = origins(caller, ex);
+            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+                continue;
+            }
+            for (ValueOrigin receiver : ValueOriginOrder.sorted(
+                    support.argOriginAtOrdinal(call, -1, callerOrigins))) {
+                if (!mayCarryTaint(receiver)) {
+                    continue;
+                }
+                for (List<ChainHop> receiverPath : taintedCandidates(receiver, caller,
+                        depth + 1, ex)) {
+                    List<ChainHop> candidate = appendMethodHop(receiverPath, caller,
+                            handler.owner(), handler.name(), handler.descriptor(),
+                            HopKind.VIRTUAL_DISPATCH, "serialized-proxy-interface", null);
+                    if (candidate != null) {
+                        paths.add(candidate);
+                    }
+                }
+            }
+        }
+        return distinctBestPaths(paths);
     }
 
     /** Return all bounded field/class alternatives used by sink and effect consumers. */
@@ -3591,7 +4011,8 @@ public final class ForwardEngine {
         }
         List<ChainHop> receiverPath = null;
         Set<ValueOrigin> receiverOrigins = Set.of();
-        ForwardOrigins.State state = stateAt(method, (Integer) call.prop("offset"), ex);
+        ForwardOrigins.Result originResult = origins(method, ex);
+        ForwardOrigins.State state = originResult.stateBefore().get((Integer) call.prop("offset"));
         String kind = call.invokeKind();
         if (state != null && !isStaticLike(kind)) {
             // A Proxy instance is not an arbitrary implementation of every interface
@@ -3639,7 +4060,8 @@ public final class ForwardEngine {
                 int rDepth = rState.stack().size() - 1 - Descriptor.paramCount(call.descriptor());
                 if (rDepth >= 0 && rDepth < rState.stack().size()) {
                     Set<String> preciseTypes = support.exactConcreteTypes(
-                            rState.stack().get(rDepth).origins(), method, call.offset());
+                            rState.stack().get(rDepth).origins(), method, call.offset(),
+                            originResult);
                     for (String preciseType : preciseTypes) {
                         if (cancellationRequested()) {
                             return;
@@ -3665,9 +4087,49 @@ public final class ForwardEngine {
                 return;
             }
             String resolved = target.resolvedOwner();
+            String targetKey = OriginSupport.methodKeyOf(resolved, call.name(),
+                    call.descriptor());
+            admitDynamicDispatchTarget(targetKey, serializedValue);
+            if (!scheduledMethod(targetKey)) {
+                continue;
+            }
             addParam(resolved, call.name(), call.descriptor(), 0,
                     hopTo(receiverPath, method, resolved, call.name(),
                             call.descriptor(), EdgeType.DISPATCHES));
+        }
+    }
+
+    /**
+     * Admit a CHA target discovered from a concrete serialized receiver. The initial demand
+     * graph cannot see the runtime subtype edge, and a callback may only become sink-relevant
+     * through a later reflective/container edge. Keep that late admission finite and tied to
+     * a configured serialization callback; ordinary dispatch still uses the normal sink
+     * distance gate.
+     */
+    private void admitDynamicDispatchTarget(String methodKey, boolean serializedValue) {
+        if (methodKey == null || forwardDemand == null) {
+            return;
+        }
+        MethodInfo target = resolveMethodKey(methodKey);
+        boolean callback = serializedValue && target != null
+                && bb.ruleEngine().matchingEntry(target.owner(), target.name(), target.descriptor())
+                .map(entry -> isSerializedCallbackKind(entry.entryKind()))
+                .orElse(false);
+        if (!callback && !reachable.contains(methodKey)) {
+            admitDynamicDemand(methodKey);
+            return;
+        }
+        if (!forwardDemand.contains(methodKey)) {
+            if (dynamicCallbackDemandAdds >= DYNAMIC_CALLBACK_DEMAND_CAP) {
+                bb.markIncomplete("FORWARD_DYNAMIC_CALLBACK_DEMAND_CAP:"
+                        + DYNAMIC_CALLBACK_DEMAND_CAP);
+                return;
+            }
+            dynamicCallbackDemandAdds++;
+            forwardDemand.add(methodKey);
+        }
+        if (!reachable.contains(methodKey) && target != null) {
+            activateReachable(target);
         }
     }
 
@@ -3676,7 +4138,8 @@ public final class ForwardEngine {
         if (call.out().size() > 1) {
             return;
         }
-        ForwardOrigins.State state = stateAt(method, (Integer) call.prop("offset"), null);
+        ForwardOrigins.Result originResult = origins(method, null);
+        ForwardOrigins.State state = originResult.stateBefore().get((Integer) call.prop("offset"));
         if (state != null && isProxyReceiver(call, method, state, null)) {
             return;
         }
@@ -3696,7 +4159,7 @@ public final class ForwardEngine {
             }
             String resolved = target.resolvedOwner();
             if (!support.receiverMayDispatchTo(call, method, resolved, call.name(),
-                    call.descriptor())) {
+                    call.descriptor(), originResult)) {
                 continue;
             }
             addParam(resolved, call.name(), call.descriptor(), slot,
@@ -4350,6 +4813,11 @@ public final class ForwardEngine {
 
     /** 精扫：按 Class 元对象与签名来源解析 Method/Constructor 反射调用。 */
     private void reflectiveResolve(Node call, MethodInfo method, int depth, Explore ex) {
+        if ("java/lang/invoke/MethodHandle".equals(call.owner())
+                && ("invoke".equals(call.name()) || "invokeExact".equals(call.name()))) {
+            methodHandleResolve(call, method, depth, ex);
+            return;
+        }
         if ("java/lang/reflect/Constructor".equals(call.owner())
                 && "newInstance".equals(call.name())) {
             reflectiveConstructorResolve(call, method, depth, ex);
@@ -4408,12 +4876,222 @@ public final class ForwardEngine {
                 }
                 continue;
             }
-            List<MethodInfo> targets = reflectiveTargets(targetClass, targetName, targetDescriptor);
+            List<MethodInfo> targets = reflectiveTargets(targetClass, targetName, targetDescriptor,
+                    getMethod, gmMethod, lookupOrigins);
             for (MethodInfo target : targets) {
                 propagateReflectiveInvocation(call, method, depth, ex, invokeOrigins,
                         target, 1, false, false);
             }
         }
+    }
+
+    /**
+     * Resolve a MethodHandle lookup without turning the polymorphic invoke into a whole-world
+     * call.  The bytecode descriptor at {@code invokeExact/invoke} is the handle invocation
+     * shape; for virtual/special handles its first argument is the receiver, while static
+     * handles use it unchanged.  The lookup class/name and the bounded call shape therefore
+     * provide the same kind of proof as Class.getMethod, but preserve direct argument slots.
+     */
+    private void methodHandleResolve(Node call, MethodInfo method, int depth, Explore ex) {
+        ForwardOrigins.Result invokeOrigins = origins(method, ex);
+        ForwardOrigins.State state = invokeOrigins.stateBefore().get(call.offset());
+        if (state == null) {
+            return;
+        }
+        for (ValueOrigin handleOrigin : ValueOriginOrder.sorted(receiverOrigins(call, state))) {
+            if (!(handleOrigin instanceof ValueOrigin.CallResult handleResult)
+                    || handleResult.callNodeId() < 0) {
+                continue;
+            }
+            Node lookup = support.callNode(handleResult.callNodeId());
+            if (lookup == null || !isMethodHandleLookup(lookup.name())) {
+                continue;
+            }
+            MethodInfo lookupHost = support.enclosingMethod(lookup);
+            if (lookupHost == null) {
+                continue;
+            }
+            ForwardOrigins.Result lookupOrigins = origins(lookupHost, ex);
+            int classOrdinal = 0;
+            int nameOrdinal = "findConstructor".equals(lookup.name()) ? -1 : 1;
+            int typeOrdinal = "findConstructor".equals(lookup.name()) ? 1 : 2;
+            if (support.argOriginAtOrdinal(lookup, typeOrdinal, lookupOrigins).isEmpty()) {
+                // The MethodType is part of the lookup contract.  Without a stack fact the
+                // invocation descriptor would be an unverified guess, so retain the ordinary
+                // MethodHandle capability boundary and report no target edge.
+                continue;
+            }
+            Set<String> targetClasses = new LinkedHashSet<>();
+            for (ValueOrigin classOrigin : support.argOriginAtOrdinal(lookup, classOrdinal,
+                    lookupOrigins)) {
+                String targetClass = classNameOf(classOrigin, ex);
+                if (targetClass != null) {
+                    targetClasses.add(targetClass);
+                }
+            }
+            if (targetClasses.isEmpty()) {
+                continue;
+            }
+            String targetName = null;
+            boolean exactName = "findConstructor".equals(lookup.name());
+            if (nameOrdinal >= 0) {
+                Set<ValueOrigin> names = support.argOriginAtOrdinal(lookup, nameOrdinal,
+                        lookupOrigins);
+                String candidate = null;
+                boolean ambiguous = false;
+                for (ValueOrigin nameOrigin : names) {
+                    if (!(nameOrigin instanceof ValueOrigin.Constant constant)
+                            || !(constant.value() instanceof String value)) {
+                        ambiguous = true;
+                        continue;
+                    }
+                    if (candidate != null && !candidate.equals(value)) {
+                        ambiguous = true;
+                    }
+                    candidate = value;
+                }
+                if (!ambiguous && candidate != null) {
+                    targetName = candidate;
+                    exactName = true;
+                }
+            }
+            String lookupKind = lookup.name();
+            String targetDescriptor = methodHandleTargetDescriptor(call, lookupKind);
+            if (targetDescriptor == null) {
+                continue;
+            }
+            for (String targetClass : targetClasses) {
+                String resolvedName = "findConstructor".equals(lookupKind)
+                        ? "<init>" : targetName;
+                List<MethodInfo> targets = methodHandleTargets(targetClass, resolvedName,
+                        targetDescriptor, lookupKind);
+                if (targets.isEmpty()) {
+                    continue;
+                }
+                boolean unresolvedTarget = !exactName;
+                if (unresolvedTarget) {
+                    bb.markIncomplete("FORWARD_METHODHANDLE_NAME_WILDCARD");
+                }
+                for (MethodInfo target : targets) {
+                    boolean constructor = "findConstructor".equals(lookupKind);
+                    int firstArgumentOrdinal = constructor || target.isStatic() ? 0 : 1;
+                    propagateMethodHandleInvocation(call, method, depth, ex, invokeOrigins,
+                            target, firstArgumentOrdinal, constructor, unresolvedTarget);
+                }
+            }
+        }
+    }
+
+    private static boolean isMethodHandleLookup(String name) {
+        return "findStatic".equals(name) || "findVirtual".equals(name)
+                || "findSpecial".equals(name) || "findConstructor".equals(name);
+    }
+
+    /** Remove the explicit receiver from a virtual MethodHandle invocation descriptor. */
+    private static String methodHandleTargetDescriptor(Node invoke, String lookupKind) {
+        String descriptor = invoke.descriptor();
+        if (descriptor == null || descriptor.indexOf(')') < 0) {
+            return null;
+        }
+        if ("findVirtual".equals(lookupKind) || "findSpecial".equals(lookupKind)) {
+            String first = io.just.sast.model.Descriptor.paramType(descriptor, 0);
+            if (first == null) {
+                return null;
+            }
+            int open = descriptor.indexOf('(');
+            int firstStart = open + 1;
+            int firstEnd = firstStart + first.length();
+            if (firstEnd > descriptor.indexOf(')')) {
+                return null;
+            }
+            return "(" + descriptor.substring(firstEnd, descriptor.indexOf(')')) + ")"
+                    + io.just.sast.model.Descriptor.returnType(descriptor);
+        }
+        if ("findConstructor".equals(lookupKind)) {
+            return descriptor.substring(0, descriptor.indexOf(')') + 1) + "V";
+        }
+        return descriptor;
+    }
+
+    /**
+     * Lookup targets are exact when the name is constant.  An opaque name is intentionally
+     * restricted to already configured sink methods in the target class; this gives useful
+     * evidence without expanding a MethodHandle into every public method in the hierarchy.
+     */
+    private List<MethodInfo> methodHandleTargets(String owner, String name, String descriptor,
+                                                   String lookupKind) {
+        List<MethodInfo> candidates = reflectiveTargets(owner, name, descriptor);
+        if (name != null && !name.isBlank() && candidates.isEmpty()) {
+            return List.of();
+        }
+        List<MethodInfo> result = new ArrayList<>();
+        boolean constructor = "findConstructor".equals(lookupKind);
+        boolean staticLookup = "findStatic".equals(lookupKind);
+        for (MethodInfo candidate : candidates) {
+            if (constructor && !"<init>".equals(candidate.name())) {
+                continue;
+            }
+            if (!constructor && "<init>".equals(candidate.name())) {
+                continue;
+            }
+            if (staticLookup != candidate.isStatic()) {
+                continue;
+            }
+            if (!staticLookup && candidate.isStatic()) {
+                continue;
+            }
+            result.add(candidate);
+            if (result.size() >= 32) {
+                break;
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /** Propagate taint through the direct invocation arguments of a resolved MethodHandle. */
+    private void propagateMethodHandleInvocation(Node call, MethodInfo caller, int depth,
+                                                  Explore ex, ForwardOrigins.Result invokeOrigins,
+                                                  MethodInfo target, int firstArgumentOrdinal,
+                                                  boolean constructor, boolean unresolvedTarget) {
+        if (support.sinkPathProvablyUnreachable(caller, call.offset(), invokeOrigins)) {
+            return;
+        }
+        activateReachable(target);
+        if (!constructor && !target.isStatic()) {
+            for (ValueOrigin receiver : support.argOriginAtOrdinal(call, 0, invokeOrigins)) {
+                if (!mayCarryTaint(receiver)) {
+                    continue;
+                }
+                List<ChainHop> path = tainted(receiver, caller, depth + 1, ex);
+                if (path != null) {
+                    addParam(target.owner(), target.name(), target.descriptor(), 0,
+                            hopTo(path, caller, target.owner(), target.name(),
+                                    target.descriptor(), EdgeType.INVOKES));
+                }
+            }
+        }
+        int parameters = Descriptor.paramCount(target.descriptor());
+        for (int ordinal = 0; ordinal < parameters; ordinal++) {
+            for (ValueOrigin argument : support.argOriginAtOrdinal(call,
+                    firstArgumentOrdinal + ordinal, invokeOrigins)) {
+                if (!mayCarryTaint(argument)) {
+                    continue;
+                }
+                List<ChainHop> path = tainted(argument, caller, depth + 1, ex);
+                if (path == null) {
+                    continue;
+                }
+                int slot = parameterSlot(target.descriptor(), target.isStatic(), ordinal);
+                if (slot >= 0) {
+                    addParam(target.owner(), target.name(), target.descriptor(), slot,
+                            hopTo(path, caller, target.owner(), target.name(),
+                                    target.descriptor(), EdgeType.INVOKES));
+                }
+            }
+        }
+        emitResolvedSinks(call, caller, ex, invokeOrigins, target,
+                target.isStatic() ? -1 : 0, firstArgumentOrdinal, false, constructor, depth,
+                unresolvedTarget);
     }
 
     private void reflectiveConstructorResolve(Node call, MethodInfo method, int depth, Explore ex) {
@@ -4461,14 +5139,14 @@ public final class ForwardEngine {
                                                 Explore ex, ForwardOrigins.Result invokeOrigins,
                                                 MethodInfo target, int argumentArrayOrdinal,
                                                 boolean constructor, boolean unresolvedTarget) {
-        if (support.sinkPathProvablyUnreachable(caller, call.offset())) {
+        if (support.sinkPathProvablyUnreachable(caller, call.offset(), invokeOrigins)) {
             // The reflective operation itself is behind a proven-failed lookup or a local
             // impossible guard.  Do not manufacture a target fact merely because the
             // metadata resolver found a syntactic candidate.
             return;
         }
         if (!constructor && !unresolvedTarget
-                && !support.reflectiveInvokeMayReach(target, call)) {
+                && !support.reflectiveInvokeMayReach(target, call, invokeOrigins)) {
             // Method.invoke has JVM-level receiver/access preconditions.  Exact null or
             // inaccessible targets are not dispatch edges; unknown values stay conservative
             // inside OriginSupport.reflectiveInvokeMayReach.
@@ -4527,36 +5205,71 @@ public final class ForwardEngine {
             return;
         }
         Set<ValueOrigin> targetReceivers = support.argOriginAtOrdinal(invoke, 0, invokeOrigins);
-        if (targetReceivers.isEmpty()) {
+        Set<ValueOrigin> argumentArray = support.argOriginAtOrdinal(invoke, 1, invokeOrigins);
+        if (targetReceivers.isEmpty() && argumentArray.isEmpty()) {
             return;
         }
-        bb.markIncomplete("FORWARD_METHOD_COLLECTION_TARGET_WILDCARD");
-        for (Node targetNode : support.methodCollectionTargetMethods()) {
+        boolean preciseSite = support.methodCollectionSiteIsPrecise(invoke);
+        if (!preciseSite) {
+            bb.markIncomplete("FORWARD_METHOD_COLLECTION_TARGET_WILDCARD");
+        }
+        String collectionReason = preciseSite
+                ? "method-collection-exact;receiver-exact"
+                : "method-collection;receiver-unknown";
+        for (Node targetNode : support.methodCollectionTargetMethodsOf(invoke)) {
             if (cancellationRequested()) {
                 return;
             }
             MethodInfo target = support.methodOf(targetNode.owner(), targetNode.name(),
                     targetNode.descriptor());
-            if (target == null || target.isStatic()) {
+            if (target == null) {
                 continue;
             }
             activateReachable(target);
-            for (ValueOrigin targetReceiver : targetReceivers) {
-                if (!mayCarryTaint(targetReceiver)) {
-                    continue;
-                }
-                List<ChainHop> receiverPath = tainted(targetReceiver, caller, depth + 1, ex);
-                if (receiverPath == null || receiverPath.size() >= MAX_HOPS) {
-                    if (receiverPath != null) {
-                        bb.markIncomplete("FORWARD_HOP_CAP:" + MAX_HOPS);
+            if (!target.isStatic()) {
+                for (ValueOrigin targetReceiver : targetReceivers) {
+                    if (!mayCarryTaint(targetReceiver)) {
+                        continue;
                     }
-                    continue;
+                    List<ChainHop> receiverPath = tainted(targetReceiver, caller, depth + 1, ex);
+                    if (receiverPath == null || receiverPath.size() >= MAX_HOPS) {
+                        if (receiverPath != null) {
+                            bb.markIncomplete("FORWARD_HOP_CAP:" + MAX_HOPS);
+                        }
+                        continue;
+                    }
+                    List<ChainHop> targetPath = appendMethodHop(receiverPath, caller, target.owner(),
+                            target.name(), target.descriptor(), HopKind.VIRTUAL_DISPATCH,
+                            collectionReason, null);
+                    if (targetPath != null) {
+                        addParam(target.owner(), target.name(), target.descriptor(), 0, targetPath);
+                    }
                 }
-                List<ChainHop> targetPath = appendMethodHop(receiverPath, caller, target.owner(),
-                        target.name(), target.descriptor(), HopKind.VIRTUAL_DISPATCH,
-                        "method-collection", null);
-                if (targetPath != null) {
-                    addParam(target.owner(), target.name(), target.descriptor(), 0, targetPath);
+            }
+            int parameters = Descriptor.paramCount(target.descriptor());
+            for (int ordinal = 0; ordinal < parameters; ordinal++) {
+                for (ValueOrigin argument : arrayElementOrigins(invokeOrigins, argumentArray,
+                        ordinal, !preciseSite)) {
+                    if (!mayCarryTaint(argument)) {
+                        continue;
+                    }
+                    List<ChainHop> argumentPath = tainted(argument, caller, depth + 1, ex);
+                    if (argumentPath == null || argumentPath.size() >= MAX_HOPS) {
+                        if (argumentPath != null) {
+                            bb.markIncomplete("FORWARD_HOP_CAP:" + MAX_HOPS);
+                        }
+                        continue;
+                    }
+                    int slot = parameterSlot(target.descriptor(), target.isStatic(), ordinal);
+                    if (slot < 0) {
+                        continue;
+                    }
+                    List<ChainHop> targetPath = appendMethodHop(argumentPath, caller, target.owner(),
+                            target.name(), target.descriptor(), HopKind.VIRTUAL_DISPATCH,
+                            collectionReason, ordinal);
+                    if (targetPath != null) {
+                        addParam(target.owner(), target.name(), target.descriptor(), slot, targetPath);
+                    }
                 }
             }
         }
@@ -4570,6 +5283,7 @@ public final class ForwardEngine {
      */
     private void activateReachable(MethodInfo target) {
         String root = OriginSupport.methodKey(target);
+        admitDynamicDemand(root);
         if (!reachable.add(root)) {
             return;
         }
@@ -4578,6 +5292,7 @@ public final class ForwardEngine {
         int added = 0;
         while (!work.isEmpty() && added++ < REFLECTIVE_REACHABLE_CAP) {
             String key = work.removeFirst();
+            admitDynamicDemand(key);
             for (Node call : bb.graph().callsOfMethod(key)) {
                 for (Edge edge : call.out()) {
                     if (edge.type() == EdgeType.LAMBDA && isJdkOwner(edge.to().owner())) {
@@ -4589,6 +5304,7 @@ public final class ForwardEngine {
                     }
                     String next = methodNodeKey(edge.to());
                     if (reachable.add(next)) {
+                        admitDynamicDemand(next);
                         work.addLast(next);
                     }
                 }
@@ -4599,7 +5315,78 @@ public final class ForwardEngine {
         }
     }
 
+    /**
+     * Admit only the sink-relevant part of a late semantic closure to the workset.  The
+     * initial demand pass cannot see reflection/constructor/proxy edges, but dropping every
+     * late target at {@code scheduledMethod()} turns a successfully resolved semantic edge
+     * into a silent false negative.  A method is admitted when it directly hosts a sink or
+     * has a bounded ordinary-call distance to one; unrelated helpers remain filtered out.
+     */
+    private void admitDynamicDemand(String methodKey) {
+        if (methodKey == null || forwardDemand == null
+                || (options != null && options.reachablePrune() && !reachable.contains(methodKey))) {
+            // The root is added before reachable.add(root) in activateReachable().  Semantic
+            // target activation is nevertheless allowed to seed the workset; the caller will
+            // add it to reachable immediately afterwards.
+            if (methodKey == null || forwardDemand == null) {
+                return;
+            }
+        }
+        if (sinkCallsByMethod.containsKey(methodKey)
+                || support.sinkDistanceOf(methodKey) != Integer.MAX_VALUE) {
+            forwardDemand.add(methodKey);
+        }
+    }
+
+    private boolean hasSinkRelevantReflectiveSite(String methodKey) {
+        for (Node call : bb.graph().callsOfMethod(methodKey)) {
+            List<String> classes = support.reflectiveSites().get(call.id());
+            if (classes == null) {
+                continue;
+            }
+            for (String className : classes) {
+                if (classHostsConfiguredSink(className)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean classHostsConfiguredSink(String className) {
+        if (className == null || className.isBlank()) {
+            return false;
+        }
+        Deque<String> work = new ArrayDeque<>();
+        Set<String> seen = new HashSet<>();
+        work.add(className);
+        while (!work.isEmpty()) {
+            String current = work.removeFirst();
+            if (!seen.add(current)) {
+                continue;
+            }
+            ClassInfo cls = bb.hierarchy().classInfo(current);
+            if (cls == null) {
+                continue;
+            }
+            if (cls.methods().stream().anyMatch(this::methodMatchesSink)) {
+                return true;
+            }
+            if (cls.superName() != null) {
+                work.addLast(cls.superName());
+            }
+            work.addAll(cls.interfaces());
+        }
+        return false;
+    }
+
     private List<MethodInfo> reflectiveTargets(String owner, String name, String descriptor) {
+        return reflectiveTargets(owner, name, descriptor, null, null, null);
+    }
+
+    private List<MethodInfo> reflectiveTargets(String owner, String name, String descriptor,
+                                               Node lookup, MethodInfo lookupHost,
+                                               ForwardOrigins.Result lookupOrigins) {
         ClassInfo cls = bb.hierarchy().classInfo(owner);
         if (cls == null) {
             return List.of();
@@ -4609,8 +5396,14 @@ public final class ForwardEngine {
             if (name != null && !candidate.name().equals(name)) {
                 continue;
             }
-            if (name == null && !methodMatchesSink(candidate)) {
-                continue;
+            if (name == null) {
+                if (!methodMatchesSink(candidate)) {
+                    continue;
+                }
+                if (lookup != null && !support.reflectiveNameMayMatch(lookup, lookupHost,
+                        lookupOrigins, candidate.name())) {
+                    continue;
+                }
             }
             if (descriptor != null && !descriptor.equals(candidate.descriptor())
                     && !sameParameters(candidate.descriptor(), descriptor)) {
@@ -4703,6 +5496,17 @@ public final class ForwardEngine {
                                      ForwardOrigins.Result invokeOrigins, MethodInfo target,
                                      int argumentArrayOrdinal, boolean constructor, int depth,
                                      boolean unresolvedTarget) {
+        emitResolvedSinks(call, caller, ex, invokeOrigins, target,
+                target.isStatic() ? -1 : 0, argumentArrayOrdinal, true, constructor, depth,
+                unresolvedTarget);
+    }
+
+    /** Emit configured sinks for either packed reflection arguments or direct handle arguments. */
+    private void emitResolvedSinks(Node call, MethodInfo caller, Explore ex,
+                                   ForwardOrigins.Result invokeOrigins, MethodInfo target,
+                                   int receiverOrdinal, int firstArgumentOrdinal,
+                                   boolean packedArray, boolean constructor, int depth,
+                                   boolean unresolvedTarget) {
         if (constructor) {
             return;
         }
@@ -4712,8 +5516,10 @@ public final class ForwardEngine {
             }
             List<ChainHop> path = null;
             for (Rule.TaintedPos position : rule.tainted()) {
-                if (position instanceof Rule.TaintedPos.Receiver && !target.isStatic()) {
-                    for (ValueOrigin receiver : support.argOriginAtOrdinal(call, 0, invokeOrigins)) {
+                if (position instanceof Rule.TaintedPos.Receiver && !target.isStatic()
+                        && receiverOrdinal >= 0) {
+                    for (ValueOrigin receiver : support.argOriginAtOrdinal(call, receiverOrdinal,
+                            invokeOrigins)) {
                         if (!mayCarryTaint(receiver)) {
                             continue;
                         }
@@ -4727,10 +5533,17 @@ public final class ForwardEngine {
                 } else if (position instanceof Rule.TaintedPos.Arg argument
                         && argument.index() >= 0
                         && argument.index() < Descriptor.paramCount(target.descriptor())) {
-                    Set<ValueOrigin> arrays = support.argOriginAtOrdinal(call, argumentArrayOrdinal,
-                            invokeOrigins);
-                    for (ValueOrigin source : arrayElementOrigins(invokeOrigins, arrays,
-                            argument.index(), !unresolvedTarget)) {
+                    Set<ValueOrigin> sources;
+                    if (packedArray) {
+                        Set<ValueOrigin> arrays = support.argOriginAtOrdinal(call,
+                                firstArgumentOrdinal, invokeOrigins);
+                        sources = arrayElementOrigins(invokeOrigins, arrays, argument.index(),
+                                !unresolvedTarget);
+                    } else {
+                        sources = support.argOriginAtOrdinal(call,
+                                firstArgumentOrdinal + argument.index(), invokeOrigins);
+                    }
+                    for (ValueOrigin source : sources) {
                         if (!mayCarryTaint(source)) {
                             continue;
                         }
@@ -4976,6 +5789,10 @@ public final class ForwardEngine {
             return null;
         }
         Op op = method.insnAt(offset).op();
+        List<ChainHop> best = null;
+        if (op == Op.AALOAD && support.isSerializedProxyHandler(method)) {
+            best = serializedProxyInterfaceArgumentPath(method, offset, state, depth, ex);
+        }
         if (op == Op.NEWARRAY || op == Op.ANEWARRAY || op == Op.MULTIANEWARRAY
                 || op == Op.AALOAD) {
             for (ValueOrigin element : result.arrayElements().getOrDefault(new ValueOrigin.Insn(offset), Set.of())) {
@@ -4983,8 +5800,8 @@ public final class ForwardEngine {
                     continue;
                 }
                 List<ChainHop> path = tainted(element, method, depth + 1, ex);
-                if (path != null) {
-                    return path;
+                if (path != null && (best == null || better(best, path))) {
+                    best = path;
                 }
             }
         }
@@ -4996,12 +5813,12 @@ public final class ForwardEngine {
                     continue;
                 }
                 List<ChainHop> path = tainted(operand, method, depth + 1, ex);
-                if (path != null) {
-                    return path;
+                if (path != null && (best == null || better(best, path))) {
+                    best = path;
                 }
             }
         }
-        return null;
+        return best;
     }
 
     // ---- 事实写入（键去重，全序取最小才替换；受影响方法入队） ----
@@ -5013,7 +5830,13 @@ public final class ForwardEngine {
         if (topoOrder != null) {
             return true;
         }
-        if (reachable.size() > TOPOLOGY_BUILD_CAP) {
+        // The semantic reachable set is intentionally conservative and can contain every
+        // method of a dependency closure.  The fixed-point scheduler, however, only needs
+        // the sink-demanded workset plus its bounded semantic roots.  Building the ordering
+        // over that smaller set preserves the scheduling contract while avoiding a second
+        // whole-closure adjacency pass on fat jars.
+        Set<String> schedulingSet = forwardDemand == null ? reachable : forwardDemand;
+        if (schedulingSet.size() > TOPOLOGY_BUILD_CAP) {
             // Topological ordering is a scheduling optimization, not a semantic input.
             // Building a full adjacency copy for a huge closure can cost more than the
             // bounded refinement itself, so retain deterministic queue order and expose
@@ -5023,7 +5846,7 @@ public final class ForwardEngine {
             return true;
         }
         Map<String, List<String>> succ = new HashMap<>();
-        for (String key : reachable) {
+        for (String key : schedulingSet) {
             if (cancellationRequested()) {
                 return false;
             }
@@ -5042,7 +5865,7 @@ public final class ForwardEngine {
                     if (edge.type() == EdgeType.INVOKES || edge.type() == EdgeType.DISPATCHES
                             || edge.type() == EdgeType.LAMBDA) {
                         String callee = methodNodeKey(edge.to());
-                        if (reachable.contains(callee)) {
+                        if (schedulingSet.contains(callee)) {
                             out.add(callee);
                         }
                     }
@@ -5500,7 +6323,8 @@ public final class ForwardEngine {
     private static int provenanceQuality(List<ChainHop> path) {
         int quality = 0;
         for (ChainHop hop : path) {
-            if ("serialized-proxy-handler".equals(hop.reason())) {
+            if ("serialized-proxy-handler".equals(hop.reason())
+                    || "serialized-proxy-interface".equals(hop.reason())) {
                 quality += 100;
             }
             if (hop.kind() == HopKind.ENTRY && "proxyInvoke".equals(hop.reason())) {
@@ -5513,7 +6337,8 @@ public final class ForwardEngine {
     /** Whether a path was introduced by the external serialized-proxy callback bridge. */
     private static boolean isExternalProxyPath(List<ChainHop> path) {
         return path != null && path.stream()
-                .anyMatch(hop -> "serialized-proxy-handler".equals(hop.reason()));
+                .anyMatch(hop -> "serialized-proxy-handler".equals(hop.reason())
+                        || "serialized-proxy-interface".equals(hop.reason()));
     }
 
     /**
@@ -5669,7 +6494,8 @@ public final class ForwardEngine {
         int score = 0;
         ChainHop entry = null;
         for (ChainHop hop : path) {
-            if ("serialized-proxy-handler".equals(hop.reason())) {
+            if ("serialized-proxy-handler".equals(hop.reason())
+                    || "serialized-proxy-interface".equals(hop.reason())) {
                 score += 100;
             }
             if (hop.kind() == HopKind.ENTRY) {
@@ -5693,10 +6519,11 @@ public final class ForwardEngine {
             }
             if ("serialized-field".equals(hop.reason())) {
                 score += 2;
-            } else if ("method-collection".equals(hop.reason())) {
-                // Method-collection dispatch is intentionally conservative wildcard evidence;
-                // keep it auditable but below an observed bytecode trigger bridge.
-                score -= 1;
+            } else if (hop.reason() != null && hop.reason().startsWith("method-collection")) {
+                // Exact Class metadata selection is still weaker than an explicit bytecode
+                // call edge, while the fallback path is deliberately wildcard evidence.
+                // Keep both auditable and below an observed bytecode trigger bridge.
+                score += hop.reason().contains("-exact") ? 1 : -1;
             }
         }
         if (entry != null && isJdkOwner(entry.fromOwner())

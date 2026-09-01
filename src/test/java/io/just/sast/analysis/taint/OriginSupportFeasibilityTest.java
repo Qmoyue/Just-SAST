@@ -83,6 +83,9 @@ class OriginSupportFeasibilityTest {
         assertEquals(List.of(nativeCall), support.nativeCallbackSitesOf(callback));
         assertTrue(support.nativeCallbackSite(nativeCall, callback),
                 "the same-receiver native callback must remain an explicit bounded edge");
+        assertEquals("POINTS_TO_BOUNDED", support.receiverPrecision(nativeCall, nativeMethod,
+                        owner, callback.name(), callback.descriptor(), null),
+                "JNI callback receiver must carry the same bounded precision label used by the backward path");
     }
 
     @Test
@@ -157,6 +160,79 @@ class OriginSupportFeasibilityTest {
     }
 
     @Test
+    void javaBeanSiteKeepsBothDirectionsWhenHostUsesReadAndWriteMethod() {
+        MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "run", "()V",
+                null, null);
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/beans/PropertyDescriptor", "getReadMethod", "()Ljava/lang/reflect/Method;",
+                false));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/beans/PropertyDescriptor", "getWriteMethod", "()Ljava/lang/reflect/Method;",
+                false));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        addReflectiveInvoke(method);
+        addReflectiveInvoke(method);
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        MethodInfo hostMethod = extract("fixture/BeanHost", method);
+        ClassInfo host = new ClassInfo("fixture/BeanHost", "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(hostMethod), List.of());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host), List.of(), 1, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
+
+        assertEquals(2, support.javaBeanInvokeSitesOf("fixture/Bean", "getValue").size(),
+                "同一宿主的 JavaBean 读方向必须保留");
+        assertEquals(2, support.javaBeanInvokeSitesOf("fixture/Bean", "setValue").size(),
+                "同一宿主的 JavaBean 写方向不能被读方向覆盖");
+    }
+
+    @Test
+    void indexesConstructorLookupForConstructorNewInstance() {
+        MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "run", "()V",
+                null, null);
+        method.instructions.add(new LdcInsnNode(Type.getObjectType("fixture/Target")));
+        method.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        method.instructions.add(new TypeInsnNode(Op.ANEWARRAY.code(), "java/lang/Class"));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(), "java/lang/Class",
+                "getConstructor", "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;", false));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/lang/reflect/Constructor", "newInstance", "([Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        MethodInfo hostMethod = extract("fixture/ConstructorHost", method);
+        MethodInfo constructor = emptyMethod("fixture/Target", "<init>", "()V", Modifier.PUBLIC);
+        ClassInfo host = new ClassInfo("fixture/ConstructorHost", "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(hostMethod), List.of());
+        ClassInfo target = new ClassInfo("fixture/Target", "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(constructor), List.of());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host, target.internalName(), target),
+                List.of(), 2, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
+        Node allocation = cpg.graph().nodesOfType(NodeType.CALL).stream()
+                .filter(node -> "java/lang/reflect/Constructor".equals(node.owner())
+                        && "newInstance".equals(node.name()))
+                .findFirst().orElseThrow();
+
+        assertTrue(support.reflectiveSites().getOrDefault(allocation.id(), List.of())
+                        .contains("fixture/Target"),
+                "Constructor.newInstance 也必须保留 Class.getConstructor 的精确类来源");
+    }
+
+    @Test
     void indexesSerializableInvocationHandlerForExternallyAssembledProxy() {
         String handlerOwner = "fixture/ExternalHandler";
         String descriptor = OriginSupport.SERIALIZED_PROXY_HANDLER_DESCRIPTOR;
@@ -213,5 +289,15 @@ class OriginSupportFeasibilityTest {
         node.superName = "java/lang/Object";
         node.methods.add(method);
         return new FactsExtractor().extract(node).methods().get(0);
+    }
+
+    private static void addReflectiveInvoke(MethodNode method) {
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/lang/reflect/Method", "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;", false));
+        method.instructions.add(new InsnNode(Op.POP.code()));
     }
 }

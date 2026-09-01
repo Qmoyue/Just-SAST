@@ -27,7 +27,8 @@ public record VerificationSummary(
         String cleanup,
         String artifactHash,
         String isolationLevel,
-        List<String> isolationCapabilities) {
+        List<String> isolationCapabilities,
+        String attestationVersion) {
 
     public record ChainResult(
             int rank,
@@ -86,7 +87,7 @@ public record VerificationSummary(
                                Map<String, Integer> detailCounts, List<ChainResult> results) {
         this(capability, budget, constructible, rejected, selected, statusCounts, detailCounts,
                 results, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false, "UNKNOWN", "UNKNOWN",
-                "UNKNOWN", List.of());
+                "UNKNOWN", List.of(), "UNKNOWN");
     }
 
     /** Compatibility constructor retained for callers that already provide runtime metadata. */
@@ -97,7 +98,20 @@ public record VerificationSummary(
                                boolean sinkDistorted, boolean sandboxReady, String cleanup) {
         this(capability, budget, constructible, rejected, selected, statusCounts, detailCounts,
                 results, backend, jdk, policyDigest, sinkDistorted, sandboxReady, cleanup,
-                "UNKNOWN", "UNKNOWN", List.of());
+                "UNKNOWN", "UNKNOWN", List.of(), "UNKNOWN");
+    }
+
+    /** Compatibility constructor retained for callers that provide isolation metadata. */
+    public VerificationSummary(String capability, int budget, int constructible, int rejected,
+                               int selected, Map<String, Integer> statusCounts,
+                               Map<String, Integer> detailCounts, List<ChainResult> results,
+                               String backend, String jdk, String policyDigest,
+                               boolean sinkDistorted, boolean sandboxReady, String cleanup,
+                               String artifactHash, String isolationLevel,
+                               List<String> isolationCapabilities) {
+        this(capability, budget, constructible, rejected, selected, statusCounts, detailCounts,
+                results, backend, jdk, policyDigest, sinkDistorted, sandboxReady, cleanup,
+                artifactHash, isolationLevel, isolationCapabilities, "UNKNOWN");
     }
 
     public VerificationSummary {
@@ -112,6 +126,7 @@ public record VerificationSummary(
         cleanup = normalize(cleanup);
         artifactHash = normalize(artifactHash);
         isolationLevel = normalize(isolationLevel);
+        attestationVersion = normalize(attestationVersion);
         java.util.TreeSet<String> capabilities = new java.util.TreeSet<>();
         if (isolationCapabilities != null) {
             for (String isolationCapability : isolationCapabilities) {
@@ -132,7 +147,7 @@ public record VerificationSummary(
     public static VerificationSummary empty(String capability, int budget) {
         return new VerificationSummary(capability, budget, 0, 0, 0,
                 Map.of(), Map.of(), List.of(), "UNKNOWN", "UNKNOWN", "UNKNOWN",
-                false, false, "UNKNOWN", "UNKNOWN", "UNKNOWN", List.of());
+                false, false, "UNKNOWN", "UNKNOWN", "UNKNOWN", List.of(), "UNKNOWN");
     }
 
     private static String normalize(String value) {

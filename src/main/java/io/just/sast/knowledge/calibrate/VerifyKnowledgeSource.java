@@ -80,21 +80,37 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                     .toMillis(System.nanoTime() - verificationStarted));
             return;
         }
-        // Do not expand the target class path when the operator requested no dynamic work.
-        // For real verification, construct the loader lazily and share one immutable class
-        // cache across the bounded construction pass.
+        // Dynamic verification is a finite experiment.  Select a cheap, deterministic seed
+        // before opening the target classpath: the old implementation reflected every unique
+        // entry class even when the entry could never consume the finite child-process budget.
+        // Construction remains an evidence refinement, never a soundness gate, so deferred
+        // entries stay visible to static reporting and are not calibrated away.
+        List<Chain> candidates = bb.chains().stream()
+                .filter(c -> bb.calibrationOf(c.key()) == null)
+                .toList();
+        ParallelVerifier verifier = null;
         try {
-            this.payloadLoader = targetClassLoader(bb);
-            this.constructor = new PayloadConstructor(payloadLoader);
-        } catch (RuntimeException | LinkageError loaderFailure) {
-            bb.markIncomplete("VERIFY_CLASSPATH_EXPANSION");
+            verifier = new ParallelVerifier(bb.scanInputs().target(), bb.scanInputs().deps(),
+                    bb.scanInputs().jdkHome(), bb.scanInputs().targetMajorVersion(),
+                    bb.scanInputs().safeExec(), bb.scanInputs().safeReal(),
+                    bb.scanInputs().requireStrictIsolation(),
+                    (chain, detail, sinkReached) -> {
+                        if (sinkReached) {
+                            JustLogger.info("  ✓ SINK_BLOCKED: {}#{} → {}.{}  [{}]",
+                                    chain.entryClass().replace('/', '.'), chain.entryMethod(),
+                                    chain.sinkClass().replace('/', '.'), chain.sinkMethod(), detail);
+                        }
+                    });
+        } catch (RuntimeException | LinkageError verifierFailure) {
+            bb.markIncomplete("VERIFY_INITIALIZATION");
             bb.setVerificationStatus("UNTESTABLE");
             bb.setVerificationSummary(VerificationSummary.empty("UNTESTABLE", budget));
-            JustLogger.debug("构造器 classpath 初始化失败: {}", loaderFailure.getMessage());
+            JustLogger.debug("验证器初始化失败: {}", verifierFailure.getMessage());
             bb.recordPhaseMs("verify", java.util.concurrent.TimeUnit.NANOSECONDS
                     .toMillis(System.nanoTime() - verificationStarted));
             return;
         }
+        List<Chain> seedChains = verifier.selectChains(candidates, budget, Set.of());
         int constructible = 0;
         int rejected = 0;
         Set<String> constructibleKeys = new HashSet<>();
@@ -102,29 +118,48 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         java.util.Map<String, PayloadConstructor.ConstructionResult> constructionByEntry =
                 new java.util.HashMap<>();
         try {
-            for (Chain chain : bb.chains()) {
-                if (bb.calibrationOf(chain.key()) != null) continue;
+            if (!seedChains.isEmpty()) {
+                this.payloadLoader = targetClassLoader(bb);
+                this.constructor = new PayloadConstructor(payloadLoader);
+                for (Chain chain : seedChains) {
+                    String dotted = chain.entryClass().replace('/', '.');
+                    constructionByEntry.computeIfAbsent(dotted, constructor::tryConstruct);
+                }
+            }
+            // A result is keyed by entry class, so publish it to every equivalent candidate
+            // after the bounded pass.  This preserves accurate evidence for variants without
+            // paying the reflection cost for entries that were never eligible for verification.
+            for (Chain chain : candidates) {
                 String dotted = chain.entryClass().replace('/', '.');
-                // Construction depends only on the entry type, not on the selected sink or
-                // the static hop spelling. A scan can publish many variants for one entry;
-                // deduplicate that work before the finite dynamic budget is consumed.
-                PayloadConstructor.ConstructionResult result = constructionByEntry.computeIfAbsent(
-                        dotted, constructor::tryConstruct);
+                PayloadConstructor.ConstructionResult result = constructionByEntry.get(dotted);
+                if (result == null) {
+                    bb.chainNote(chain.key(), "verify:construction-deferred");
+                    continue;
+                }
                 switch (result.verdict()) {
                     case "CONSTRUCTIBLE" -> {
                         bb.chainNote(chain.key(), "verify:constructible");
                         constructibleKeys.add(chain.key());
                         constructible++;
                     }
-                    case "PARTIALLY_CONSTRUCTIBLE" -> bb.chainNote(chain.key(), "degrade:partial-construct");
+                    case "PARTIALLY_CONSTRUCTIBLE" ->
+                            bb.chainNote(chain.key(), "degrade:partial-construct");
                     case "SKIP" -> // 按原因类别聚合（detail 含类名，逐类输出会过长）
-                    skipReasons.merge(result.detail() != null
-                            ? result.detail().split(":")[0] : "skip", 1, Integer::sum);
+                            skipReasons.merge(result.detail() != null
+                                    ? result.detail().split(":")[0] : "skip", 1, Integer::sum);
                     default -> {
                         bb.calibrateChain(chain.key(), "not-constructible");
                         rejected++;
                     }
                 }
+            }
+            int distinctEntries = (int) candidates.stream().map(c -> c.entryClass().replace('/', '.'))
+                    .distinct().count();
+            int deferredEntries = Math.max(0, distinctEntries - constructionByEntry.size());
+            if (deferredEntries > 0) {
+                skipReasons.merge("budget-deferred", deferredEntries, Integer::sum);
+                JustLogger.debug("构造可行性延迟 {} 个入口类型（候选 {}，种子 {}）",
+                        deferredEntries, candidates.size(), seedChains.size());
             }
         } catch (RuntimeException | LinkageError constructionFailure) {
             // Construction is a per-chain capability check.  A malformed optional
@@ -139,7 +174,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         }
         // 不可检查类聚合报告（抽象/不在类路径——探针能力边界可见化）
         if (!skipReasons.isEmpty()) {
-            JustLogger.info("构造可行性：{} 类不可构造（{}）", skipReasons.values().stream().mapToInt(Integer::intValue).sum(),
+            JustLogger.info("构造可行性边界：{} 项（{}）", skipReasons.values().stream().mapToInt(Integer::intValue).sum(),
                     skipReasons.entrySet().stream().map(e -> e.getKey() + "×" + e.getValue())
                             .reduce((a, b) -> a + ", " + b).orElse(""));
         }
@@ -151,26 +186,10 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         int failed = 0;
         int untestable = 0;
         int timeout = 0;
-        ParallelVerifier verifier = null;
         java.util.Map<String, Integer> verificationDetails = new java.util.LinkedHashMap<>();
         List<Chain> selectedChains = List.of();
         List<ParallelVerifier.VerifyResult> verificationResults = List.of();
         try {
-                Path targetJar = bb.scanInputs().target();
-                verifier = new ParallelVerifier(targetJar, bb.scanInputs().deps(),
-                    bb.scanInputs().jdkHome(), bb.scanInputs().targetMajorVersion(),
-                    bb.scanInputs().safeExec(),
-                    bb.scanInputs().requireStrictIsolation(),
-                    (chain, detail, sinkReached) -> {
-                        if (sinkReached) {
-                            JustLogger.info("  ✓ SINK_BLOCKED: {}#{} → {}.{}  [{}]",
-                                    chain.entryClass().replace('/', '.'),
-                                    chain.entryMethod(),
-                                    chain.sinkClass().replace('/', '.'),
-                                    chain.sinkMethod(),
-                                    detail);
-                        }
-                    });
                 // entryKind=source 的完整链也进入隔离探针。探针使用统一的受限默认参数
                 // 适配器验证宿主是否真实执行；这不是攻击者 payload 生成。只有同一候选
                 // 到达 sink canary 边界才能得到 SINK_BLOCKED。
@@ -290,6 +309,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         String isolationLevel = verifier == null ? "UNKNOWN" : verifier.isolationLevel();
         List<String> isolationCapabilities = verifier == null
                 ? List.of() : new ArrayList<>(verifier.isolationCapabilities());
+        String attestationVersion = verifier == null ? "UNKNOWN" : verifier.attestationVersion();
         boolean sinkDistorted = false;
         boolean sandboxReady = false;
         String cleanup = "UNKNOWN";
@@ -326,7 +346,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         return new VerificationSummary(bb.verificationStatus(), budget, constructible, rejected,
                 selected.size(), statuses, detailCounts, items, backend, jdk, policyDigest,
                 sinkDistorted, sandboxReady, cleanup, artifactHash,
-                isolationLevel, isolationCapabilities);
+                isolationLevel, isolationCapabilities, attestationVersion);
     }
 
     /** 将子进程诊断压缩成稳定、有限长度的聚合键，避免日志被单条异常或类名刷屏。 */

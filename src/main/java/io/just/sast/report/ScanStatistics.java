@@ -73,4 +73,38 @@ public record ScanStatistics(
                 0, "UNKNOWN", List.of(), Map.of(), Map.of(), "UNKNOWN",
                 VerificationSummary.empty("UNKNOWN", 0), "UNKNOWN", "UNKNOWN");
     }
+
+    /** Read an optional numeric metric without exposing a mutable map to callers. */
+    public long metric(String name, long fallback) {
+        if (name == null) {
+            return fallback;
+        }
+        Long value = metrics.get(name);
+        return value == null ? fallback : value;
+    }
+
+    /** Sum a stable phase family; missing phase detail falls back to the total scan time. */
+    public long phaseMs(String prefix, long fallback) {
+        if (prefix == null || prefix.isBlank()) {
+            return fallback;
+        }
+        long total = 0L;
+        boolean found = false;
+        for (Map.Entry<String, Long> phase : phaseMs.entrySet()) {
+            if (phase.getKey() != null && (phase.getKey().equals(prefix)
+                    || phase.getKey().startsWith(prefix + "."))) {
+                total = saturatedAdd(total, Math.max(0L, phase.getValue() == null
+                        ? 0L : phase.getValue()));
+                found = true;
+            }
+        }
+        return found ? total : fallback;
+    }
+
+    private static long saturatedAdd(long left, long right) {
+        if (Long.MAX_VALUE - left < right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
+    }
 }

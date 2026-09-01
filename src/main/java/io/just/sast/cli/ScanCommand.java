@@ -47,6 +47,10 @@ public final class ScanCommand implements Callable<Integer> {
             description = "显式请求安全化 sink adapter；未覆盖的 sink 仍只在 canary 边界观察，绝不执行目标 sink 方法体")
     boolean safeExec;
 
+    @Option(names = "--safe-real-sink",
+            description = "在已认证 OS_STRICT runner 内执行 Just 固定参数的无害 adapter effect；不执行目标 sink body，必须同时使用 --require-os-isolation")
+    boolean safeRealSink;
+
     @Option(names = "--require-os-isolation",
             description = "动态验证必须使用生产级 OS_STRICT 后端；不可用时 fail closed（默认接受能力降级并报告）")
     boolean requireOsIsolation;
@@ -80,7 +84,8 @@ public final class ScanCommand implements Callable<Integer> {
             if (useCache) {
                 try {
                     preflight = ScanCache.preflight(target, deps, rules, jdkHome, fast,
-                            !noVerify, verifyBudget, safeExec, requireOsIsolation);
+                            !noVerify, verifyBudget, safeExec, safeRealSink,
+                            requireOsIsolation);
                     if (ScanCache.restore(cache, preflight.cacheKey(), output)) {
                         System.err.println("[just:info] 增量缓存命中（报告身份已校验）");
                         return ExitCode.OK.code();
@@ -91,7 +96,8 @@ public final class ScanCommand implements Callable<Integer> {
                 }
             }
             ScanPipeline.ScanResult result = ScanPipeline.run(target, deps, output, rules, stats,
-                    fast, jdkHome, !noVerify, verifyBudget, safeExec, requireOsIsolation,
+                    fast, jdkHome, !noVerify, verifyBudget, safeExec, safeRealSink,
+                    requireOsIsolation,
                     baseline, suppressions);
             if (useCache && preflight != null) {
                 try {

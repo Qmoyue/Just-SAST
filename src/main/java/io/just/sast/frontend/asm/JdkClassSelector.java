@@ -264,7 +264,8 @@ public final class JdkClassSelector {
         }
 
         List<ClassBytes> result = new ArrayList<>(selected.values());
-        result.sort(java.util.Comparator.comparing(ClassBytes::className));
+        result.sort(java.util.Comparator.comparing(ClassBytes::className)
+                .thenComparing(ClassBytes::origin));
         return new Selection(List.copyOf(result), availableClasses, selectedHeaders.size(),
                 initialSeeds, 0, selected.size());
     }

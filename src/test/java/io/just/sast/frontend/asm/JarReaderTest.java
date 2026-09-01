@@ -99,6 +99,58 @@ class JarReaderTest {
     }
 
     @Test
+    void multiReleaseJarSelectsHighestCompatibleVariant(@TempDir Path tmp) throws Exception {
+        Path jar = tmp.resolve("multi-release.jar");
+        Map<String, Function<String, byte[]>> root = new LinkedHashMap<>();
+        root.put("META-INF/MANIFEST.MF", ignored -> (
+                "Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n")
+                .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        root.put("com/app/Main.class", ignored -> markerClass("base"));
+        root.put("META-INF/versions/9/com/app/Main.class", ignored -> markerClass("9"));
+        root.put("META-INF/versions/17/com/app/Main.class", ignored -> markerClass("17"));
+        Files.write(jar, zip(root));
+
+        JarReader reader = new JarReader();
+        JarReader.ReadResult java8 = reader.readDetailed(jar, 8);
+        JarReader.ReadResult java11 = reader.readDetailed(jar, 11);
+        JarReader.ReadResult java17 = reader.readDetailed(jar, 17);
+
+        assertEquals("base", new String(java8.classes().get(0).bytes(),
+                java.nio.charset.StandardCharsets.US_ASCII).substring("fake-class:".length()));
+        assertEquals("9", new String(java11.classes().get(0).bytes(),
+                java.nio.charset.StandardCharsets.US_ASCII).substring("fake-class:".length()));
+        assertEquals("17", new String(java17.classes().get(0).bytes(),
+                java.nio.charset.StandardCharsets.US_ASCII).substring("fake-class:".length()));
+        assertEquals("com/app/Main", java17.classes().get(0).className());
+        assertTrue(java17.completenessReasons().isEmpty(),
+                "选择兼容版本不是完整性失败: " + java17.completenessReasons());
+    }
+
+    @Test
+    void nestedMultiReleaseJarIsExplicitlyMarkedWhenStreamingKeepsBaseView(@TempDir Path tmp)
+            throws Exception {
+        Map<String, Function<String, byte[]>> nestedEntries = new LinkedHashMap<>();
+        nestedEntries.put("META-INF/MANIFEST.MF", ignored -> (
+                "Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n")
+                .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        nestedEntries.put("com/app/Main.class", ignored -> markerClass("base"));
+        nestedEntries.put("META-INF/versions/17/com/app/Main.class",
+                ignored -> markerClass("17"));
+        byte[] nested = zip(nestedEntries);
+        Path jar = tmp.resolve("nested-multi-release.jar");
+        Files.write(jar, zip(Map.of("BOOT-INF/lib/dependency.jar", ignored -> nested)));
+
+        JarReader.ReadResult result = new JarReader().readDetailed(jar, 17);
+
+        assertEquals(1, result.classes().size());
+        assertEquals("base", new String(result.classes().get(0).bytes(),
+                java.nio.charset.StandardCharsets.US_ASCII).substring("fake-class:".length()));
+        assertTrue(result.completenessReasons().contains("MULTI_RELEASE_NESTED_UNSELECTED"),
+                "nested MR stream cannot silently claim that the target feature was selected: "
+                        + result.completenessReasons());
+    }
+
+    @Test
     void compressionRatioLimitIsObservable(@TempDir Path tmp) throws Exception {
         byte[] zeros = new byte[4 * 1024 * 1024];
         Path jar = tmp.resolve("ratio.jar");
