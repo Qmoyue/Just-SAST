@@ -276,8 +276,9 @@ public final class YamlRuleLoader {
                     throw new IOException("model 规则 " + id + " 的来源不能为空");
                 }
                 String source = s.toString();
-                if (!("this".equals(source) || source.matches("arg[0-9]+"))) {
-                    throw new IOException("model 规则 " + id + " 的来源必须是 this 或 argN");
+                if (!ModelSource.isValid(source)) {
+                    throw new IOException("model 规则 " + id
+                            + " 的来源必须是 this、argN 或 element(this/argN)");
                 }
                 sources.add(source);
             }

@@ -21,7 +21,7 @@ CSV / JSON / SARIF / HTML / Markdown
 - 支持普通 JAR、Spring Boot fat JAR、WAR、class 目录和外部依赖。
 - 覆盖 Java 原生序列化及常见替代反序列化框架，分析字段流、回调、反射、代理、lambda、继承和 sink 可达性。
 - 规则位于 `src/main/resources/rules/default-rules.yaml`；知识源通过 `KnowledgeSource`、Blackboard 和 ServiceLoader 扩展。
-- 动态验证在独立子 JVM 中执行真实前置触发链，在精确 sink 边界由 canary 阻断；不执行最终 sink、命令、网络、native 或可直接投递的 payload。
+- 动态验证在独立子 JVM 中执行真实前置触发链；默认在精确 sink 边界由 canary 阻断。显式使用 `--safe-real-sink --require-os-isolation` 时，只有具备完整类型签名和固定安全参数的 target API/body 才会真实调用；命令只固定为 Just 自有 JDK 的 `-version`，文件只写 scratch，网络只允许固定 loopback，JNI 只加载 Just 自有且摘要/架构匹配的 fixture。该模式证明可调用性与完整返回，不证明 RCE。
 
 ## 构建与快速使用
 
@@ -100,15 +100,17 @@ just-out/
 ```
 
 - `SINK_BLOCKED`：真实前置链抵达精确 sink 边界，canary 已阻断 sink 方法体。
+- `SINK_EXECUTED_SAFE`：精确 target API 或 application body 以固定安全参数正常返回，并带 `sink_distorted=true`；不是恶意参数可利用性证明。
+- `JNI_EXECUTED_SAFE`：Just 自有、固定摘要且匹配当前平台架构的 native fixture 完成 load 与 native callback；不是 target native 或 RCE 证明。
 - `CONCRETE_REACHED`：抵达安全观察点，但尚未观察到精确 sink 边界。
 - `PARTIAL`：只完成部分构造或触发，不能据此否定静态候选。
 - `UNTESTABLE`：缺类、JDK、权限或运行时能力导致无法验证。
 
 `payload.md/json` 是人和 agent 可读的安全构造计划与证据视图，不是可执行 exploit。JVM 权限门不等价于 OS 沙箱；处理不可信工件时仍应使用低权限账户、无网络环境及容器或虚拟机隔离。
 
-## Gleipner 摘要
+## 外部回归
 
-当前本地回归完成 30 个 block 的扫描与转换，其中 29 个完成 evaluator：原始块级计数为 `TP=219, FP=22`；报告转换器对连续重复方法节点归一化后为 `TP=186, FP=22`，按入口类去重为 `TP=126, FP=17`。Windows JNI block 受 evaluator 原生库加载路径限制，按环境不可用记录，不改变 Just 默认不加载 native 的安全边界。benchmark 语料、评测产物和临时结果均由 `.gitignore` 排除，不随仓库提交。
+外部 evaluator、CTF-like JAR 和其他外部语料只作为本地校准输入，不进入生产规则，也不修改 truth/WP。回归输出、题目名称、绝对路径和中间产物不随仓库发布；请以 `docs/architecture.md` 与 `docs/requirements.md` 中的协议和验收口径为准。
 
 ## 开发
 

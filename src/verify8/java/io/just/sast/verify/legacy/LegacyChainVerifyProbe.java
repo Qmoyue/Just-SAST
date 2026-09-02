@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.ObjectStreamClass;
@@ -23,14 +24,19 @@ import java.nio.file.StandardOpenOption;
 import java.nio.charset.StandardCharsets;
 import java.io.Serializable;
 import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 /** Java 8-compatible fork-per-chain verifier. */
 public final class LegacyChainVerifyProbe {
@@ -52,8 +58,12 @@ public final class LegacyChainVerifyProbe {
     /** Captured before target code loads; target classes cannot widen safe-exec properties. */
     private static String safeSinkMode = "BOUNDARY";
     private static String safeSinkDisposition = "CANARY_BOUNDARY";
+    private static String safeSinkKind = "UNSUPPORTED";
     private static String safeSinkPolicyDigest = "";
+    private static boolean executionGateReady;
+    private static String nativeFixtureDigest = "none";
     private static String safeScratchRoot = ".";
+    private static String safeNativeScratchRoot = "";
     /** Captured before target code loads; SAFE_REAL may start only this fixed executable. */
     private static Path safeJavaExecutable;
     /** One-time parent secret and probe-owned authenticated result file. */
@@ -144,8 +154,10 @@ public final class LegacyChainVerifyProbe {
         SourceTrigger sourceTrigger = parseSourceTrigger(args.length > 4 ? args[4] : "");
         safeSinkMode = safeProperty("just.verify.sink-mode", "BOUNDARY");
         safeSinkDisposition = safeProperty("just.verify.sink-disposition", "CANARY_BOUNDARY");
+        safeSinkKind = safeProperty("just.verify.real-kind", "UNSUPPORTED");
         safeSinkPolicyDigest = safeProperty("just.verify.sink-policy-digest", "");
-        safeScratchRoot = safeProperty("java.io.tmpdir", ".");
+        safeScratchRoot = boundedPathProperty("java.io.tmpdir");
+        safeNativeScratchRoot = boundedPathProperty("just.verify.native-scratch");
         safeJavaExecutable = locateSafeJavaExecutable();
         if ("SAFE_REAL".equals(safeSinkMode)
                 && !"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
@@ -169,6 +181,13 @@ public final class LegacyChainVerifyProbe {
                 System.exit(3);
                 return;
             }
+            executionGateReady = !"SAFE_REAL".equals(safeSinkMode)
+                    || io.just.sast.verify.boot.SinkExecutionGate.configured();
+            if (!executionGateReady) {
+                emit("UNTESTABLE: REAL_SINK_AGENT_NOT_READY");
+                System.exit(3);
+                return;
+            }
             if (!protocolBound()) {
                 emit("UNTESTABLE: PROTOCOL_BINDING_NOT_READY");
                 System.exit(3);
@@ -182,6 +201,13 @@ public final class LegacyChainVerifyProbe {
             // The gate keeps its token in bootstrap memory; do not leave the attestation in the
             // mutable system-properties map where target code could read or replace it.
             System.clearProperty("just.verify.canary-token");
+            if ("SAFE_REAL".equals(safeSinkMode)
+                    && "NATIVE_FIXTURE".equals(safeSinkKind)
+                    && !configureNativeFixtures()) {
+                emit("UNTESTABLE: SAFE_NATIVE_FIXTURE_CONFIGURATION_FAILED");
+                System.exit(3);
+                return;
+            }
             // Keep stack formatting and collection initialization outside the gadget call. Some
             // old runtimes initialize these classes lazily and can otherwise obscure the result.
             try {
@@ -253,7 +279,8 @@ public final class LegacyChainVerifyProbe {
 
             trigger(entryType, entryInstance, entryMethod, entryDescriptor, mode,
                     sourceTrigger, sourceTriggerInstance);
-            if (reportLatchedCanary(sinkClass, sinkMethod)) return;
+            if (reportRealSink(sinkClass, sinkMethod)
+                    || reportLatchedCanary(sinkClass, sinkMethod)) return;
             if ("SERIAL".equals(mode) || "PROXY".equals(mode)
                     || mode.startsWith("TRIGGER_")) {
                 emit("CONCRETE_REACHED: " + mode + ";canary="
@@ -264,7 +291,8 @@ public final class LegacyChainVerifyProbe {
             }
             System.exit(0);
         } catch (Throwable failure) {
-            if (reportLatchedCanary(sinkClass, sinkMethod)) return;
+            if (reportRealSink(sinkClass, sinkMethod)
+                    || reportLatchedCanary(sinkClass, sinkMethod)) return;
             String marker = markerSpec(failure);
             if (marker != null && sameSink(marker, sinkClass, sinkMethod, sinkDescriptor)
                     && entryReached(failure, entryClass, entryMethod)) {
@@ -300,6 +328,69 @@ public final class LegacyChainVerifyProbe {
             emit("PARTIAL_PATH: " + failure.getClass().getSimpleName() + cause
                     + (detail.length() == 0 ? "" : ": " + detail));
             System.exit(0);
+        }
+    }
+
+    /** Report exact target body/call events from REAL_SANITIZED, never the legacy canary latch. */
+    private static boolean reportRealSink(String sinkClass, String sinkMethod) {
+        if (!"SAFE_REAL".equals(safeSinkMode) || !executionGateReady) return false;
+        waitForRealEvidence();
+        boolean body = io.just.sast.verify.boot.SinkExecutionGate.bodyEntered();
+        boolean bodyReturned = io.just.sast.verify.boot.SinkExecutionGate.bodyReturned();
+        boolean call = io.just.sast.verify.boot.SinkExecutionGate.callObserved();
+        boolean applicationBody = "APPLICATION_BODY".equals(safeSinkKind);
+        if ((applicationBody && !bodyReturned) || (!applicationBody && !call)) {
+            if (body) {
+                emit("UNTESTABLE: REAL_SINK_BODY_DID_NOT_RETURN;body=1;body_returned=0");
+                return true;
+            }
+            if (io.just.sast.verify.boot.SinkExecutionGate.callAttempted()) {
+                emit("UNTESTABLE: REAL_SINK_CALL_DID_NOT_RETURN;attempted=1");
+                return true;
+            }
+            return false;
+        }
+        boolean nativeComplete = io.just.sast.verify.boot.SinkExecutionGate.nativeLoadSucceeded()
+                && io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved();
+        if ("NATIVE_FIXTURE".equals(safeSinkKind) && !nativeComplete) {
+            emit("UNTESTABLE: REAL_NATIVE_FIXTURE_INCOMPLETE;native_load="
+                    + (io.just.sast.verify.boot.SinkExecutionGate.nativeLoadSucceeded() ? "1" : "0")
+                    + ";native_call="
+                    + (io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved() ? "1" : "0"));
+            return true;
+        }
+        String status = nativeComplete ? "JNI_EXECUTED_SAFE" : "SINK_EXECUTED_SAFE";
+        String detail = status + ":body=" + (body ? "1" : "0")
+                + ";body_returned=" + (bodyReturned ? "1" : "0")
+                + ";call=" + (call ? "1" : "0")
+                + ";attempted=" + (io.just.sast.verify.boot.SinkExecutionGate.callAttempted() ? "1" : "0")
+                + ";native_load=" + (io.just.sast.verify.boot.SinkExecutionGate.nativeLoadSucceeded() ? "1" : "0")
+                + ";native_call=" + (io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved() ? "1" : "0")
+                + ";native_spec=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.nativeCallSpec())
+                + ";nested_blocked=" + (io.just.sast.verify.boot.SinkExecutionGate.nestedBlocked() ? "1" : "0")
+                + ";native_digest=" + safeLabel(nativeFixtureDigest)
+                + ";sanitizer=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.sanitizer());
+        emit(detail);
+        System.err.println("SINK_EXECUTED_SAFE: " + sinkClass + "." + sinkMethod
+                + " body=" + (body ? "1" : "0") + " call=" + (call ? "1" : "0")
+                + " native=" + (nativeComplete ? "1" : "0"));
+        return true;
+    }
+
+    private static void waitForRealEvidence() {
+        if (io.just.sast.verify.boot.SinkExecutionGate.bodyReturned()
+                || io.just.sast.verify.boot.SinkExecutionGate.callObserved()) return;
+        long deadline = System.nanoTime() + ("NATIVE_FIXTURE".equals(safeSinkKind)
+                ? 300000000L : 150000000L);
+        while (System.nanoTime() < deadline) {
+            try {
+                Thread.sleep(10L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (io.just.sast.verify.boot.SinkExecutionGate.bodyReturned()
+                    || io.just.sast.verify.boot.SinkExecutionGate.callObserved()) return;
         }
     }
 
@@ -349,6 +440,218 @@ public final class LegacyChainVerifyProbe {
         } catch (RuntimeException ignored) {
             return null;
         }
+    }
+
+    /**
+     * Extract only the fixed verifier-owned native fixture.  Target JAR native resources are
+     * executable code and are therefore never treated as safe input.  The fixture is checked
+     * against its release-time digest and executable format before the child can load it.
+     */
+    private static boolean configureNativeFixtures() {
+        try {
+            Path scratch = Paths.get(safeScratchRoot).toAbsolutePath().normalize();
+            if (!Files.isDirectory(scratch, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || Files.isSymbolicLink(scratch)) return false;
+            Path nativeRoot = safeNativeScratchRoot.length() == 0
+                    ? scratch.resolve("native").normalize()
+                    : Paths.get(safeNativeScratchRoot).toAbsolutePath().normalize();
+            if ((safeNativeScratchRoot.length() > 0 && nativeRoot.equals(scratch))
+                    || (safeNativeScratchRoot.length() > 0
+                    && io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(nativeRoot))
+                    || !Files.isDirectory(nativeRoot, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return false;
+            String resourceName = trustedNativeResource();
+            String expectedDigest = trustedNativeDigest(resourceName);
+            if (resourceName.length() == 0 || expectedDigest.length() == 0) return false;
+            Path output = nativeRoot.resolve(nativeFileName(resourceName))
+                    .normalize();
+            if (!output.startsWith(nativeRoot)
+                    || !Files.isRegularFile(output, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(output)) return false;
+            MessageDigest resourceDigest = MessageDigest.getInstance("SHA-256");
+            long resourceBytes = 0L;
+            InputStream input = LegacyChainVerifyProbe.class.getResourceAsStream(resourceName);
+            if (input == null) return false;
+            try {
+                byte[] buffer = new byte[32 * 1024];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    if (read == 0) continue;
+                    resourceBytes += read;
+                    if (resourceBytes > 16L * 1024L * 1024L) return false;
+                    resourceDigest.update(buffer, 0, read);
+                }
+            } finally {
+                input.close();
+            }
+            if (resourceBytes == 0L) return false;
+            if (!expectedDigest.equalsIgnoreCase(hex(resourceDigest.digest()))) return false;
+            MessageDigest outputDigest = MessageDigest.getInstance("SHA-256");
+            long outputBytes = 0L;
+            InputStream outputInput = Files.newInputStream(output);
+            try {
+                byte[] buffer = new byte[32 * 1024];
+                int read;
+                while ((read = outputInput.read(buffer)) >= 0) {
+                    if (read == 0) continue;
+                    outputBytes += read;
+                    if (outputBytes > 16L * 1024L * 1024L) return false;
+                    outputDigest.update(buffer, 0, read);
+                }
+            } finally {
+                outputInput.close();
+            }
+            String fileHex = hex(outputDigest.digest());
+            if (outputBytes == 0L || !expectedDigest.equalsIgnoreCase(fileHex)
+                    || !nativeCompatible(output)) {
+                return false;
+            }
+            String outputPath = output.toAbsolutePath().normalize().toString();
+            String fileName = nativeFileName(resourceName).toLowerCase(java.util.Locale.ROOT);
+            Map<String, String> mapping = new TreeMap<String, String>();
+            mapping.put(fileName, outputPath);
+            String stem = nativeResourceStem(fileName);
+            if (stem.length() > 0) mapping.put(stem, outputPath);
+            nativeFixtureDigest = fileHex;
+            io.just.sast.verify.boot.SinkExecutionGate.setNativeMap(encodeNativeMap(mapping));
+            return io.just.sast.verify.boot.SinkExecutionGate.configured();
+        } catch (IOException | NoSuchAlgorithmException | RuntimeException failure) {
+            return false;
+        }
+    }
+
+    private static String targetClassPath() {
+        String value = System.getProperty("just.verify.target-cp", "");
+        return value.length() == 0 ? System.getProperty("java.class.path", "") : value;
+    }
+
+    private static String trustedNativeResource() {
+        String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+        String platform = os.indexOf("win") >= 0 ? "windows" : os.indexOf("linux") >= 0 ? "linux"
+                : os.indexOf("mac") >= 0 || os.indexOf("darwin") >= 0 ? "macos" : "";
+        String cpu = arch.indexOf("amd64") >= 0 || arch.indexOf("x86_64") >= 0
+                || arch.indexOf("x64") >= 0 ? "x86-64" : arch.indexOf("aarch64") >= 0
+                || arch.indexOf("arm64") >= 0 ? "aarch64" : arch.matches("i[3-6]86")
+                || arch.equals("x86") ? "x86" : "";
+        String mapped = System.mapLibraryName("just-safe-jni");
+        return platform.length() == 0 || cpu.length() == 0 ? ""
+                : "/native/" + platform + "-" + cpu + "/" + mapped;
+    }
+
+    private static String trustedNativeDigest(String resourceName) {
+        return "/native/windows-x86-64/just-safe-jni.dll".equals(resourceName)
+                ? "9bec06088563f4f6d33d91bb04df4f05bf1c53fd38939b6c7600f4bf036c0506" : "";
+    }
+
+    private static String nativeFileName(String resourceName) {
+        int slash = resourceName.lastIndexOf('/');
+        return slash >= 0 ? resourceName.substring(slash + 1) : resourceName;
+    }
+
+    private static String nativeResourceStem(String key) {
+        if (key.endsWith(".dll")) return key.substring(0, key.length() - 4);
+        if (key.endsWith(".dylib")) return key.substring(0, key.length() - 6);
+        int so = key.indexOf(".so");
+        return so > 0 ? key.substring(0, so) : "";
+    }
+
+    private static String encodeNativeMap(Map<String, String> mapping) {
+        StringBuilder result = new StringBuilder("v1,");
+        for (Map.Entry<String, String> item : mapping.entrySet()) {
+            if (result.length() > 3) result.append(',');
+            result.append(hex(item.getKey().getBytes(StandardCharsets.UTF_8))).append('=')
+                    .append(hex(item.getValue().getBytes(StandardCharsets.UTF_8)));
+        }
+        return result.toString();
+    }
+
+    private static String hex(byte[] value) {
+        StringBuilder result = new StringBuilder(value.length * 2);
+        for (byte item : value) {
+            String digit = Integer.toHexString(item & 0xff);
+            if (digit.length() == 1) result.append('0');
+            result.append(digit);
+        }
+        return result.toString();
+    }
+
+    private static boolean nativeCompatible(Path path) {
+        try {
+            byte[] header = new byte[4096];
+            int length = 0;
+            InputStream input = Files.newInputStream(path, StandardOpenOption.READ);
+            try {
+                while (length < header.length) {
+                    int read = input.read(header, length, header.length - length);
+                    if (read < 0) break;
+                    if (read == 0) continue;
+                    length += read;
+                }
+            } finally {
+                input.close();
+            }
+            String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+            int arch = normalizedArch(System.getProperty("os.arch", "").toLowerCase(
+                    java.util.Locale.ROOT));
+            if (arch < 0 || length < 20) return false;
+            if (os.indexOf("win") >= 0) {
+                if (length < 64 || header[0] != 'M' || header[1] != 'Z') return false;
+                int pe = littleEndianInt(header, 0x3c);
+                return pe >= 0 && pe + 6 <= length && header[pe] == 'P' && header[pe + 1] == 'E'
+                        && header[pe + 2] == 0 && header[pe + 3] == 0
+                        && littleEndianShort(header, pe + 4) == peMachine(arch);
+            }
+            if (os.indexOf("linux") >= 0) {
+                if (header[0] != 0x7f || header[1] != 'E' || header[2] != 'L'
+                        || header[3] != 'F') return false;
+                return (header[4] & 0xff) == (arch == 2 ? 1 : 2)
+                        && littleEndianShort(header, 18) == elfMachine(arch);
+            }
+            if (os.indexOf("mac") >= 0 || os.indexOf("darwin") >= 0) {
+                int big = bigEndianInt(header, 0);
+                int little = littleEndianInt(header, 0);
+                boolean bigEndian = big == 0xfeedface || big == 0xfeedfacf;
+                boolean littleEndian = little == 0xfeedface || little == 0xfeedfacf;
+                if (!bigEndian && !littleEndian) return false;
+                return (bigEndian ? bigEndianInt(header, 4) : littleEndianInt(header, 4))
+                        == machoMachine(arch);
+            }
+            return false;
+        } catch (IOException | RuntimeException failure) {
+            return false;
+        }
+    }
+
+    private static int normalizedArch(String arch) {
+        if (arch.indexOf("amd64") >= 0 || arch.indexOf("x86_64") >= 0
+                || arch.indexOf("x64") >= 0) return 1;
+        if (arch.matches("i[3-6]86") || "x86".equals(arch)) return 2;
+        if (arch.indexOf("aarch64") >= 0 || arch.indexOf("arm64") >= 0) return 3;
+        return -1;
+    }
+
+    private static int peMachine(int arch) { return arch == 1 ? 0x8664 : arch == 2 ? 0x14c : 0xaa64; }
+    private static int elfMachine(int arch) { return arch == 1 ? 62 : arch == 2 ? 3 : 183; }
+    private static int machoMachine(int arch) { return arch == 1 ? 0x01000007 : arch == 2 ? 7 : 0x0100000c; }
+    private static int littleEndianInt(byte[] bytes, int offset) {
+        if (offset < 0 || offset + 4 > bytes.length) return -1;
+        return (bytes[offset] & 0xff) | ((bytes[offset + 1] & 0xff) << 8)
+                | ((bytes[offset + 2] & 0xff) << 16) | ((bytes[offset + 3] & 0xff) << 24);
+    }
+    private static int bigEndianInt(byte[] bytes, int offset) {
+        if (offset < 0 || offset + 4 > bytes.length) return -1;
+        return ((bytes[offset] & 0xff) << 24) | ((bytes[offset + 1] & 0xff) << 16)
+                | ((bytes[offset + 2] & 0xff) << 8) | (bytes[offset + 3] & 0xff);
+    }
+    private static int littleEndianShort(byte[] bytes, int offset) {
+        if (offset < 0 || offset + 2 > bytes.length) return -1;
+        return (bytes[offset] & 0xff) | ((bytes[offset + 1] & 0xff) << 8);
+    }
+
+    private static String safeLabel(String value) {
+        if (value == null) return "";
+        String clean = value.replace('\r', '_').replace('\n', '_').replace('|', '_');
+        return clean.substring(0, Math.min(clean.length(), 96));
     }
 
     private static void emit(String status) {
@@ -1493,8 +1796,12 @@ public final class LegacyChainVerifyProbe {
         if (!"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
             return true;
         }
-        if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
-                .contains("linux")) {
+        String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        if (os.contains("win")) {
+            return "WINDOWS_APPCONTAINER_STRICT".equals(safeProperty("just.verify.backend", ""))
+                    && io.just.sast.verify.boot.WindowsProcessAttestation.appContainerLow();
+        }
+        if (!os.contains("linux")) {
             return false;
         }
         try {

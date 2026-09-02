@@ -244,6 +244,11 @@ public final class ChainPrecision {
         if ("SAFE_EFFECT_DISTORTED".equals(runtime)) {
             reasons.add("SAFE_ADAPTER_DISTORTED");
         }
+        if ("REAL_SINK_SAFE".equals(runtime)) {
+            reasons.add("REAL_SINK_FIXED_ARGUMENTS");
+        } else if ("JNI_SAFE_FIXTURE".equals(runtime)) {
+            reasons.add("JNI_FIXED_FIXTURE");
+        }
         if ("OS_STRICT_ATTESTED".equals(isolation)) {
             reasons.add("STRICT_OS_ATTESTED");
         } else if (verification != null && verification.sandboxReady()) {
@@ -372,6 +377,8 @@ public final class ChainPrecision {
         if (result != null && result.status() != null && !result.status().isBlank()) {
             return switch (result.status()) {
                 case "SINK_BLOCKED" -> "SINK_BOUNDARY";
+                case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE";
+                case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE";
                 case "SAFE_EFFECT_OBSERVED", "SAFE_SINK_EXECUTED" -> "SAFE_EFFECT_DISTORTED";
                 case "CONCRETE_REACHED" -> "CONCRETE_PREFIX";
                 case "EXECUTED" -> "ENTRY_RETURN";
@@ -384,6 +391,8 @@ public final class ChainPrecision {
         }
         return switch (ConfidenceScorer.statusFromNotes(notes)) {
             case "SINK_BLOCKED" -> "SINK_BOUNDARY";
+            case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE";
+            case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE";
             case "SAFE_EFFECT_OBSERVED" -> "SAFE_EFFECT_DISTORTED";
             case "CONCRETE_REACHED" -> "CONCRETE_PREFIX";
             case "EXECUTED" -> "ENTRY_RETURN";
@@ -446,8 +455,9 @@ public final class ChainPrecision {
         };
         value += rankOf(construction, "CONSTRUCTIBLE", "DECLARED_PLAN", "PARTIAL",
                 "PLAN_PARTIAL", "UNKNOWN");
-        value += rankOf(runtime, "SINK_BOUNDARY", "SAFE_EFFECT_DISTORTED", "CONCRETE_PREFIX",
-                "ENTRY_RETURN", "NOT_SELECTED", "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE");
+        value += rankOf(runtime, "SINK_BOUNDARY", "REAL_SINK_SAFE", "JNI_SAFE_FIXTURE",
+                "SAFE_EFFECT_DISTORTED", "CONCRETE_PREFIX", "ENTRY_RETURN", "NOT_SELECTED",
+                "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE");
         value += rankOf(isolation, "OS_STRICT_ATTESTED", "OS_NAMESPACE_ATTESTED",
                 "OS_PARTIAL_ATTESTED", "NOT_RUN", "UNAVAILABLE");
         value += rankOf(completeness, "COMPLETE", "PARTIAL", "UNKNOWN");

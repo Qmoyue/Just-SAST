@@ -283,6 +283,78 @@ class ForwardOriginsTest {
     }
 
     @Test
+    void standardIteratorRelationKeepsElementSeparateFromContainer() {
+        MethodNode m = new MethodNode(8, "run", "(Ljava/util/Collection;)Ljava/lang/Object;",
+                null, null);
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        m.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Collection",
+                "iterator", "()Ljava/util/Iterator;", true));
+        m.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Iterator",
+                "next", "()Ljava/lang/Object;", true));
+        m.instructions.add(new InsnNode(Op.ARETURN.code()));
+
+        MethodInfo method = extract(m);
+        Map<String, Long> callIds = new HashMap<>();
+        callIds.put(ForwardOrigins.CfgKey.of(method) + "@1", 201L);
+        callIds.put(ForwardOrigins.CfgKey.of(method) + "@2", 202L);
+        ForwardOrigins.Result result = new ForwardOrigins(callIds).compute(method);
+
+        assertEquals(Set.of(new ValueOrigin.Param(0)),
+                result.containerElements().get(new ValueOrigin.CallResult(201L)),
+                "iterator() 只应记录其集合 receiver 作为 view 来源");
+        assertEquals(Set.of(new ValueOrigin.CallResult(201L)),
+                result.containerElements().get(new ValueOrigin.CallResult(202L)),
+                "next() 的元素来源必须保留 iterator 关系而不是伪造新的容器对象");
+    }
+
+    @Test
+    void collectionToArrayPreservesElementsForLaterArrayLoad() {
+        MethodNode m = new MethodNode(8, "run", "(Ljava/util/Collection;)Ljava/lang/Object;",
+                null, null);
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        m.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Collection",
+                "toArray", "()[Ljava/lang/Object;", true));
+        m.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        m.instructions.add(new InsnNode(Op.AALOAD.code()));
+        m.instructions.add(new InsnNode(Op.ARETURN.code()));
+
+        MethodInfo method = extract(m);
+        Map<String, Long> callIds = new HashMap<>();
+        callIds.put(ForwardOrigins.CfgKey.of(method) + "@1", 203L);
+        ForwardOrigins.Result result = new ForwardOrigins(callIds).compute(method);
+
+        assertEquals(Set.of(new ValueOrigin.Param(0)),
+                result.arrayElements().get(new ValueOrigin.CallResult(203L)),
+                "Collection.toArray() 的数组元素应继承 receiver 的有限来源");
+        assertEquals(Set.of(new ValueOrigin.Param(0)),
+                result.arrayElements().get(new ValueOrigin.Insn(3)),
+                "AALOAD 应继续解析 toArray 数组中的元素来源");
+    }
+
+    @Test
+    void collectionArrayRelationRemainsWritableForLaterArrayStore() {
+        MethodNode m = new MethodNode(8, "run", "(Ljava/util/Collection;Ljava/lang/Object;)Ljava/lang/Object;",
+                null, null);
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        m.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Collection",
+                "toArray", "()[Ljava/lang/Object;", true));
+        m.instructions.add(new InsnNode(Op.DUP.code()));
+        m.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        m.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        m.instructions.add(new InsnNode(Op.AASTORE.code()));
+        m.instructions.add(new InsnNode(Op.ARETURN.code()));
+
+        MethodInfo method = extract(m);
+        Map<String, Long> callIds = new HashMap<>();
+        callIds.put(ForwardOrigins.CfgKey.of(method) + "@1", 204L);
+        ForwardOrigins.Result result = new ForwardOrigins(callIds).compute(method);
+
+        assertEquals(Set.of(new ValueOrigin.Param(0), new ValueOrigin.Param(1)),
+                result.arrayElements().get(new ValueOrigin.CallResult(204L)),
+                "toArray 的既有元素来源必须能与后续 AASTORE 合并");
+    }
+
+    @Test
     void longArithmeticBitwiseAndConversionKeepJvmStackShape() {
         MethodNode m = new MethodNode(0, "run", "()V", null, null);
         m.instructions.add(new InsnNode(Op.LCONST_0.code()));

@@ -10,6 +10,7 @@ import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
+import io.just.sast.util.JustLogger;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -260,6 +261,7 @@ public final class ForwardOrigins {
     public record Result(Map<Integer, State> stateBefore,
                          Map<ValueOrigin, Set<ValueOrigin>> arrayElements,
                          Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements,
+                         Map<ValueOrigin, Set<ValueOrigin>> containerElements,
                          boolean incomplete,
                          Set<String> incompleteReasons) {
 
@@ -267,19 +269,28 @@ public final class ForwardOrigins {
             stateBefore = freezeStates(stateBefore);
             arrayElements = freezeArrayElements(arrayElements);
             indexedArrayElements = freezeIndexedArrayElements(indexedArrayElements);
-            incompleteReasons = incompleteReasons == null ? Set.of() : Set.copyOf(incompleteReasons);
+            containerElements = freezeArrayElements(containerElements);
+            incompleteReasons = freezeReasons(incompleteReasons);
             incomplete = incomplete || !incompleteReasons.isEmpty();
         }
 
         public Result(Map<Integer, State> stateBefore,
                       Map<ValueOrigin, Set<ValueOrigin>> arrayElements) {
-            this(stateBefore, arrayElements, Map.of(), false, Set.of());
+            this(stateBefore, arrayElements, Map.of(), Map.of(), false, Set.of());
         }
 
         public Result(Map<Integer, State> stateBefore,
                       Map<ValueOrigin, Set<ValueOrigin>> arrayElements,
                       Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements) {
-            this(stateBefore, arrayElements, indexedArrayElements, false, Set.of());
+            this(stateBefore, arrayElements, indexedArrayElements, Map.of(), false, Set.of());
+        }
+
+        public Result(Map<Integer, State> stateBefore,
+                      Map<ValueOrigin, Set<ValueOrigin>> arrayElements,
+                      Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements,
+                      boolean incomplete, Set<String> incompleteReasons) {
+            this(stateBefore, arrayElements, indexedArrayElements, Map.of(), incomplete,
+                    incompleteReasons);
         }
     }
 
@@ -326,11 +337,17 @@ public final class ForwardOrigins {
         if (values == null || values.isEmpty()) {
             return Map.of();
         }
-        Map<ValueOrigin, Set<ValueOrigin>> copy = new HashMap<>();
+        List<Map.Entry<ValueOrigin, Set<ValueOrigin>>> entries = new ArrayList<>();
         for (Map.Entry<ValueOrigin, Set<ValueOrigin>> entry : values.entrySet()) {
             if (entry.getKey() != null) {
-                copy.put(entry.getKey(), freezeOrigins(entry.getValue()));
+                entries.add(entry);
             }
+        }
+        entries.sort(Map.Entry.comparingByKey(
+                java.util.Comparator.comparing(ValueOriginOrder::key)));
+        Map<ValueOrigin, Set<ValueOrigin>> copy = new java.util.LinkedHashMap<>();
+        for (Map.Entry<ValueOrigin, Set<ValueOrigin>> entry : entries) {
+            copy.put(entry.getKey(), freezeOrigins(entry.getValue()));
         }
         return Collections.unmodifiableMap(copy);
     }
@@ -340,20 +357,47 @@ public final class ForwardOrigins {
         if (values == null || values.isEmpty()) {
             return Map.of();
         }
-        Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> copy = new HashMap<>();
+        List<Map.Entry<ValueOrigin, Map<Integer, Set<ValueOrigin>>>> entries = new ArrayList<>();
         for (Map.Entry<ValueOrigin, Map<Integer, Set<ValueOrigin>>> entry : values.entrySet()) {
-            if (entry.getKey() == null || entry.getValue() == null) {
-                continue;
+            if (entry.getKey() != null && entry.getValue() != null) {
+                entries.add(entry);
             }
-            Map<Integer, Set<ValueOrigin>> byIndex = new HashMap<>();
+        }
+        entries.sort(Map.Entry.comparingByKey(
+                java.util.Comparator.comparing(ValueOriginOrder::key)));
+        Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> copy = new java.util.LinkedHashMap<>();
+        for (Map.Entry<ValueOrigin, Map<Integer, Set<ValueOrigin>>> entry : entries) {
+            List<Map.Entry<Integer, Set<ValueOrigin>>> indexedEntries = new ArrayList<>();
             for (Map.Entry<Integer, Set<ValueOrigin>> indexed : entry.getValue().entrySet()) {
                 if (indexed.getKey() != null) {
-                    byIndex.put(indexed.getKey(), freezeOrigins(indexed.getValue()));
+                    indexedEntries.add(indexed);
                 }
+            }
+            indexedEntries.sort(Map.Entry.comparingByKey());
+            Map<Integer, Set<ValueOrigin>> byIndex = new java.util.LinkedHashMap<>();
+            for (Map.Entry<Integer, Set<ValueOrigin>> indexed : indexedEntries) {
+                byIndex.put(indexed.getKey(), freezeOrigins(indexed.getValue()));
             }
             copy.put(entry.getKey(), Collections.unmodifiableMap(byIndex));
         }
         return Collections.unmodifiableMap(copy);
+    }
+
+    private static Set<String> freezeReasons(Set<String> values) {
+        if (values == null || values.isEmpty()) {
+            return Set.of();
+        }
+        List<String> ordered = new ArrayList<>();
+        for (String value : values) {
+            if (value != null) {
+                ordered.add(value);
+            }
+        }
+        if (ordered.isEmpty()) {
+            return Set.of();
+        }
+        Collections.sort(ordered);
+        return Collections.unmodifiableSet(new LinkedHashSet<>(ordered));
     }
 
     /**
@@ -375,6 +419,8 @@ public final class ForwardOrigins {
      * alternatives an explicit completeness boundary instead of a silent false proof.
      */
     static final int MAX_ORIGIN_SET = 512;
+    /** A method can contain many calls, but only a bounded standard-container relation is retained. */
+    static final int MAX_CONTAINER_RELATIONS = 256;
     /** Hard work bound for one method; partial states remain useful but are explicitly marked. */
     static final int MAX_METHOD_WORK = 100_000;
 
@@ -503,7 +549,18 @@ public final class ForwardOrigins {
                 if (cause instanceof Error error) {
                     throw error;
                 }
-                return incompleteResult("ANALYSIS_FAILURE");
+                String type = cause == null ? "UNKNOWN" : cause.getClass().getSimpleName();
+                StackTraceElement[] trace = cause == null ? null : cause.getStackTrace();
+                String frame = trace == null || trace.length == 0 ? "unknown-frame"
+                        : trace[0].toString();
+                String stack = trace == null ? "unknown-stack"
+                        : Arrays.stream(trace).limit(8)
+                        .map(StackTraceElement::toString)
+                        .reduce((left, right) -> left + " <- " + right)
+                        .orElse("unknown-stack");
+                JustLogger.debug("forward origin analysis failed for {}: {} at {} [{}]", key,
+                        type, frame, stack);
+                return incompleteResult("ANALYSIS_FAILURE:" + type);
             } finally {
                 if (ownsTask) {
                     inFlight.remove(key, task);
@@ -648,7 +705,7 @@ public final class ForwardOrigins {
             markIncomplete(incompleteReasons, "CFG_BUILD_INVALID");
         }
         if (cfg == null) {
-            return new Result(Map.of(), Map.of(), Map.of(), true, incompleteReasons);
+        return new Result(Map.of(), Map.of(), Map.of(), Map.of(), true, incompleteReasons);
         }
         int maxLocals = maxLocals(method);
         List<Set<ValueOrigin>> initLocals = new ArrayList<>(maxLocals);
@@ -665,6 +722,7 @@ public final class ForwardOrigins {
         State[] before = new State[method.instructions().size()];
         Map<ValueOrigin, Set<ValueOrigin>> arrayElements = new HashMap<>();
         Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements = new HashMap<>();
+        Map<ValueOrigin, Set<ValueOrigin>> containerElements = new HashMap<>();
         Deque<Integer> worklist = new ArrayDeque<>();
         State entry = new State(new ArrayList<>(), initLocals);
         before[0] = entry;
@@ -686,7 +744,7 @@ public final class ForwardOrigins {
                 continue;
             }
             State out = transfer(method, methodKey, method.insnAt(offset), state, arrayElements,
-                    indexedArrayElements, incompleteReasons);
+                    indexedArrayElements, containerElements, incompleteReasons);
             if (state.originsTruncated() || out.originsTruncated()) {
                 markIncomplete(incompleteReasons, "ORIGIN_SET_CAP:" + MAX_ORIGIN_SET);
             }
@@ -718,6 +776,7 @@ public final class ForwardOrigins {
             }
         }
         return new Result(new DenseStateMap(before), arrayElements, indexedArrayElements,
+                containerElements,
                 !incompleteReasons.isEmpty(), incompleteReasons);
     }
 
@@ -763,6 +822,7 @@ public final class ForwardOrigins {
     private State transfer(MethodInfo method, String methodKey, InsnFact insn, State in,
                            Map<ValueOrigin, Set<ValueOrigin>> arrayElements,
                            Map<ValueOrigin, Map<Integer, Set<ValueOrigin>>> indexedArrayElements,
+                           Map<ValueOrigin, Set<ValueOrigin>> containerElements,
                            Set<String> incompleteReasons) {
         Op originalOp = insn.op();
         // These instructions have no abstract-state effect. Returning the immutable input
@@ -825,11 +885,16 @@ public final class ForwardOrigins {
                 int argc = callArgCount(insn, op);
                 MethodRef methodRef = op == Op.INVOKEDYNAMIC || insn.operands().isEmpty()
                         ? null : insn.methodRef();
+                Set<ValueOrigin> receiverOrigins = receiverOrigins(stack, argc, op);
                 if (op != Op.INVOKEDYNAMIC && isReflectiveArraySet(methodRef)) {
                     recordReflectiveArrayWrite(stack, indexedArrayElements, arrayElements);
                 }
                 Long callId = callIdLookup.find(methodKey, insn.offset());
                 ValueOrigin.CallResult result = new ValueOrigin.CallResult(callId == null ? -1 : callId);
+                recordContainerRelation(methodRef, result, receiverOrigins, containerElements,
+                        incompleteReasons);
+                recordCollectionArrayRelation(methodRef, result, receiverOrigins, arrayElements,
+                        incompleteReasons);
                 if (op != Op.INVOKEDYNAMIC && isReflectiveArrayGet(methodRef)) {
                     recordReflectiveArrayRead(stack, result, indexedArrayElements, arrayElements);
                 }
@@ -958,6 +1023,105 @@ public final class ForwardOrigins {
         }
         return new State(stack.toArray(new Slot[0]), locals.toArray(new Set[0]),
                 in.originsTruncated());
+    }
+
+    private static Set<ValueOrigin> receiverOrigins(List<Slot> stack, int argc, Op op) {
+        if (op == Op.INVOKESTATIC || op == Op.INVOKEDYNAMIC || argc <= 0
+                || stack == null || stack.size() < argc) {
+            return Set.of();
+        }
+        return stack.get(stack.size() - argc).origins();
+    }
+
+    /**
+     * Record only JVM-standard container/view relations.  This is not a taint rule: it is a
+     * bounded provenance fact consumed by explicit {@code element(this/argN)} models.  A
+     * missing receiver or call id is retained as an unknown boundary rather than widened to
+     * every object in the method.
+     */
+    private static void recordContainerRelation(MethodRef ref, ValueOrigin.CallResult result,
+                                                 Set<ValueOrigin> receivers,
+                                                 Map<ValueOrigin, Set<ValueOrigin>> relations,
+                                                 Set<String> incompleteReasons) {
+        if (ref == null || result.callNodeId() < 0 || receivers == null || receivers.isEmpty()
+                || !isContainerRelation(ref)) {
+            return;
+        }
+        if (!relations.containsKey(result) && relations.size() >= MAX_CONTAINER_RELATIONS) {
+            markIncomplete(incompleteReasons, "CONTAINER_RELATION_CAP:" + MAX_CONTAINER_RELATIONS);
+            return;
+        }
+        relations.put(result, boundedOriginSet(receivers));
+    }
+
+    private static Set<ValueOrigin> boundedOriginSet(Set<ValueOrigin> values) {
+        if (values == null || values.isEmpty() || values.size() <= MAX_ORIGIN_SET) {
+            return values == null ? Set.of() : values;
+        }
+        return truncatedUnion(values, Set.of());
+    }
+
+    private static boolean isContainerRelation(MethodRef ref) {
+        String owner = ref.owner();
+        String name = ref.name();
+        String descriptor = ref.descriptor();
+        if ("java/util/Map".equals(owner)) {
+            return ("entrySet".equals(name) && "()Ljava/util/Set;".equals(descriptor))
+                    || ("keySet".equals(name) && "()Ljava/util/Set;".equals(descriptor))
+                    || ("values".equals(name) && "()Ljava/util/Collection;".equals(descriptor));
+        }
+        if (("java/lang/Iterable".equals(owner) || "java/util/Collection".equals(owner))
+                && "iterator".equals(name)
+                && "()Ljava/util/Iterator;".equals(descriptor)) {
+            return true;
+        }
+        if (("java/util/Iterator".equals(owner) || "java/util/ListIterator".equals(owner))
+                && ("next".equals(name) || "previous".equals(name))
+                && "()Ljava/lang/Object;".equals(descriptor)) {
+            return true;
+        }
+        if ("java/util/List".equals(owner) && "get".equals(name)
+                && "(I)Ljava/lang/Object;".equals(descriptor)) {
+            return true;
+        }
+        if ("java/util/Map$Entry".equals(owner)
+                && ("getKey".equals(name) || "getValue".equals(name))
+                && "()Ljava/lang/Object;".equals(descriptor)) {
+            return true;
+        }
+        return "java/util/Enumeration".equals(owner) && "nextElement".equals(name)
+                && "()Ljava/lang/Object;".equals(descriptor);
+    }
+
+    /**
+     * A collection converted to an Object[] retains the collection's element provenance.  Keep
+     * this in the array relation rather than modelling the call as returning one arbitrary
+     * element: the JVM result is an array and only a later AALOAD may consume its members.
+     */
+    private static void recordCollectionArrayRelation(MethodRef ref,
+                                                       ValueOrigin.CallResult result,
+                                                       Set<ValueOrigin> receivers,
+                                                       Map<ValueOrigin, Set<ValueOrigin>> arrays,
+                                                       Set<String> incompleteReasons) {
+        if (ref == null || result == null || result.callNodeId() < 0 || receivers == null
+                || receivers.isEmpty() || !isCollectionToArray(ref)) {
+            return;
+        }
+        if (!arrays.containsKey(result) && arrays.size() >= MAX_CONTAINER_RELATIONS) {
+            markIncomplete(incompleteReasons, "CONTAINER_ARRAY_RELATION_CAP:"
+                    + MAX_CONTAINER_RELATIONS);
+            return;
+        }
+        // The per-method array map is still being populated by later AASTORE/reflective
+        // writes.  Do not install the immutable state-origin view directly: a later write to
+        // the same array provenance must be able to union into this bucket.
+        arrays.put(result, new LinkedHashSet<>(boundedOriginSet(receivers)));
+    }
+
+    private static boolean isCollectionToArray(MethodRef ref) {
+        return "java/util/Collection".equals(ref.owner()) && "toArray".equals(ref.name())
+                && ("()[Ljava/lang/Object;".equals(ref.descriptor())
+                || "([Ljava/lang/Object;)[Ljava/lang/Object;".equals(ref.descriptor()));
     }
 
     private static Integer constantIndex(Set<ValueOrigin> origins) {

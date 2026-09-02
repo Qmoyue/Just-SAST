@@ -189,9 +189,9 @@ public record RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magic
                 issues.add(issue("MODEL_SOURCES_MISSING", rule.id(), "action sources must not be empty"));
             } else {
                 for (String source : entry.getValue()) {
-                    if (source == null || !("this".equals(source) || source.matches("arg[0-9]+"))) {
+                    if (!ModelSource.isValid(source)) {
                         issues.add(issue("MODEL_SOURCE_INVALID", rule.id(),
-                                "source must be this or argN"));
+                                "source must be this, argN, or element(this/argN)"));
                     }
                 }
             }

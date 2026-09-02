@@ -1,6 +1,7 @@
 package io.just.sast.knowledge.backward;
 
 import io.just.sast.analysis.taint.ForwardOrigins;
+import io.just.sast.analysis.taint.ContainerElementSources;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.analysis.taint.ValueOrigin;
 import io.just.sast.analysis.taint.ValueOriginOrder;
@@ -13,6 +14,7 @@ import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.SinkOutcome;
 import io.just.sast.config.Rule;
+import io.just.sast.config.ModelSource;
 import io.just.sast.cpg.build.FieldWriterIndex;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
@@ -291,8 +293,10 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 SinkTask task = sinks.get(i);
                 int perSinkBudget = budgetAllocator.claim(i);
                 try {
-                    analyzeSink(task.callId(), task.mark(), perSinkBudget);
+                    int steps = analyzeSink(task.callId(), task.mark(), perSinkBudget);
+                    budgetAllocator.record(i, perSinkBudget, steps);
                 } catch (Throwable e) {
+                    budgetAllocator.record(i, perSinkBudget, 0);
                     JustLogger.error("反向污点 sink 分析失败（已隔离）: {}", e.toString());
                 }
             }
@@ -457,12 +461,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 || owner.startsWith("com/sun/"));
     }
 
-    private void analyzeSink(long callNodeId, SinkMark mark, int stepBudget) {
+    private int analyzeSink(long callNodeId, SinkMark mark, int stepBudget) {
         Node call = bb.graph().node(callNodeId);
         MethodInfo method = support.enclosingMethod(call);
         if (method == null) {
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "UNRESOLVED"));
-            return;
+            return 0;
         }
         if (!entryReaching.contains(OriginSupport.methodKey(method))
                 && !isLifecycleEntryHost(method)
@@ -472,26 +476,26 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             // 但仍需生成候选交给 calibration 的 no-trigger 门；否则“无触发调用”的
             // 触发器会在分析阶段被静默丢弃，报告无法解释该候选为何不成立。
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
-            return;
+            return 0;
         }
         ForwardOrigins.Result result = originsOf(method);
         ForwardOrigins.State state = result.stateBefore().get(call.prop("offset"));
         if (state == null) {
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_STATE"));
-            return;
+            return 0;
         }
         // catch 可达性守卫（U1/U4，可判定才剪）：sink 位于 CCE handler 且守卫区为"类型安全的 Class.cast"
         // ——cast 目标是实参静态声明类型的（严格）父类时 cast 必成功，handler 不可达
         if (support.catchProvablyUnreachable(method, (Integer) call.prop("offset"))) {
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
-            return;
+            return 0;
         }
         if (support.sinkPathProvablyUnreachable(method, (Integer) call.prop("offset"), result)) {
             // The normal taint transfer remains deliberately path-insensitive.  This exact
             // local feasibility pass only suppresses a sink when every entry-to-sink path
             // requires a proven-impossible branch/reflective continuation/cast.
             bb.recordOutcome(callNodeId, outcome(call, mark, 0, 0, 0, 0, "NO_PATH"));
-            return;
+            return 0;
         }
         int paramCount = Descriptor.paramCount(call.descriptor());
         int produced = 0;
@@ -548,6 +552,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             pendingSinkChains.put(callNodeId, completedChains);
         }
         bb.recordOutcome(callNodeId, outcome(call, mark, produced, trace.steps, trace.unresolved, trace.tooLong, verdict));
+        return trace.steps;
     }
 
     /** Publish worker-local findings in sink-id order so finite downstream phases see one input. */
@@ -592,24 +597,29 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
      * it, then distributes the remainder. Allocation is a pure function of the sorted sink
      * index, so worker scheduling cannot change the analysis depth or chain set.
      */
-    private static final class FairBudgetAllocator {
+    static final class FairBudgetAllocator {
         private final long totalBudget;
         private final int sinkCount;
         private final int maxPerSink;
         private final int minimumPerSink;
+        private final long usableBudget;
+        private final java.util.concurrent.atomic.AtomicLong consumed =
+                new java.util.concurrent.atomic.AtomicLong();
 
-        private FairBudgetAllocator(long totalBudget, int maxPerSink, int sinkCount) {
+        FairBudgetAllocator(long totalBudget, int maxPerSink, int sinkCount) {
             this.totalBudget = Math.max(0L, totalBudget);
             this.sinkCount = Math.max(0, sinkCount);
             this.maxPerSink = Math.max(1, maxPerSink);
             this.minimumPerSink = Math.min(2_048, this.maxPerSink);
+            this.usableBudget = Math.min(this.totalBudget,
+                    (long) this.maxPerSink * this.sinkCount);
         }
 
-        private int claim(int sinkIndex) {
+        int claim(int sinkIndex) {
             if (sinkCount == 0 || sinkIndex < 0 || sinkIndex >= sinkCount) {
                 return 0;
             }
-            long usable = Math.min(totalBudget, (long) maxPerSink * sinkCount);
+            long usable = usableBudget;
             long share;
             long guaranteed = (long) minimumPerSink * sinkCount;
             if (usable >= guaranteed) {
@@ -622,8 +632,15 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             return (int) Math.min(maxPerSink, share);
         }
 
-        private boolean exhausted() {
-            return sinkCount > 0 && totalBudget <= (long) maxPerSink * sinkCount;
+        void record(int sinkIndex, int allocation, int actualSteps) {
+            if (sinkIndex < 0 || sinkIndex >= sinkCount || allocation <= 0) {
+                return;
+            }
+            consumed.addAndGet(Math.min(allocation, Math.max(0, actualSteps)));
+        }
+
+        boolean exhausted() {
+            return usableBudget > 0 && consumed.get() >= usableBudget;
         }
     }
 
@@ -1843,7 +1860,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     call.owner(), call.name(), call.descriptor()).orElse(null);
             if (model == null || !model.actions().containsKey("this")
                     || !model.actions().getOrDefault("this", List.of()).stream()
-                    .anyMatch(source -> source != null && source.startsWith("arg"))) {
+                    .map(ModelSource::parse)
+                    .anyMatch(source -> source != null && source.argumentOrdinal() != null)) {
                 continue;
             }
             Set<ValueOrigin> receivers = support.argOriginAtOrdinal(call, -1, result);
@@ -1851,11 +1869,19 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 continue;
             }
             for (String source : model.actions().getOrDefault("this", List.of())) {
-                Integer ordinal = modelArgOrdinal(source);
+                ModelSource modelSource = ModelSource.parse(source);
+                Integer ordinal = modelSource == null ? null : modelSource.argumentOrdinal();
                 if (ordinal == null) {
                     continue;
                 }
                 Set<ValueOrigin> values = support.argOriginAtOrdinal(call, ordinal, result);
+                if (modelSource.element() && !values.isEmpty()) {
+                    Set<ValueOrigin> elements = new java.util.LinkedHashSet<>();
+                    for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
+                        elements.addAll(ContainerElementSources.resolve(value, result));
+                    }
+                    values = elements;
+                }
                 if (values.isEmpty()) {
                     continue;
                 }
@@ -2000,7 +2026,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
             ChainHop hop = new ChainHop(caller.owner(), caller.name(), call.owner(), call.name(),
                     HopKind.DIRECT_CALL, null, "model:" + model.id(), call.descriptor(),
-                    modelArgOrdinal(source));
+                    modelSourceOrdinal(source));
             int unresolvedBefore = trace.unresolved;
             trace.hops.add(hop);
             for (ValueOrigin origin : ValueOriginOrder.sorted(origins)) {
@@ -2018,26 +2044,30 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private Set<ValueOrigin> modelSourceOrigins(String source, Node call, MethodInfo caller,
                                                 ForwardOrigins.Result result,
                                                 ForwardOrigins.State state) {
-        if (source == null) {
+        ModelSource modelSource = ModelSource.parse(source);
+        if (modelSource == null) {
             return Set.of();
         }
-        if ("this".equals(source)) {
-            return isStaticLike(call.invokeKind()) ? Set.of() : receiverOrigins(call, state);
+        Set<ValueOrigin> origins;
+        if (modelSource.receiver()) {
+            origins = isStaticLike(call.invokeKind()) ? Set.of() : receiverOrigins(call, state);
+        } else {
+            Integer ordinal = modelSource.argumentOrdinal();
+            origins = ordinal == null ? Set.of() : support.argOriginAtOrdinal(call, ordinal, result);
         }
-        Integer ordinal = modelArgOrdinal(source);
-        return ordinal == null ? Set.of() : support.argOriginAtOrdinal(call, ordinal, result);
+        if (!modelSource.element() || origins.isEmpty()) {
+            return origins;
+        }
+        Set<ValueOrigin> elements = new java.util.LinkedHashSet<>();
+        for (ValueOrigin origin : ValueOriginOrder.sorted(origins)) {
+            elements.addAll(ContainerElementSources.resolve(origin, result));
+        }
+        return elements;
     }
 
-    private static Integer modelArgOrdinal(String source) {
-        if (source == null || !source.startsWith("arg") || source.length() <= 3) {
-            return null;
-        }
-        try {
-            int ordinal = Integer.parseInt(source.substring(3));
-            return ordinal < 0 ? null : ordinal;
-        } catch (NumberFormatException ignored) {
-            return null;
-        }
+    private static Integer modelSourceOrdinal(String source) {
+        ModelSource parsed = ModelSource.parse(source);
+        return parsed == null ? null : parsed.argumentOrdinal();
     }
 
     /**

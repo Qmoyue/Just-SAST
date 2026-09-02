@@ -2,6 +2,8 @@ package io.just.sast.analysis.taint;
 
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.config.RuleEngine;
+import io.just.sast.config.Match;
+import io.just.sast.config.Rule;
 import io.just.sast.config.RuleSet;
 import io.just.sast.cpg.build.BuiltCpg;
 import io.just.sast.cpg.build.CpgBuilder;
@@ -230,6 +232,43 @@ class OriginSupportFeasibilityTest {
         assertTrue(support.reflectiveSites().getOrDefault(allocation.id(), List.of())
                         .contains("fixture/Target"),
                 "Constructor.newInstance 也必须保留 Class.getConstructor 的精确类来源");
+    }
+
+    @Test
+    void frameworkReflectionIndexContainsOnlyMethodInvokeSites() {
+        MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "run", "()V",
+                null, null);
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/lang/reflect/Method", "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;", false));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/lang/reflect/Constructor", "newInstance", "([Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        String owner = "org/apache/commons/fixture/Host";
+        MethodInfo hostMethod = extract(owner, method);
+        ClassInfo host = new ClassInfo(owner, "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(hostMethod), List.of());
+        LoadResult load = new LoadResult(Map.of(owner, host), List.of(), 1, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        Rule.SourceRule source = new Rule.SourceRule("T-FRAMEWORK", "deserialize",
+                new Rule.CallMatcher(Match.of("org/apache/commons/fixture/Deserializer"),
+                        Match.of("read"), null), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(new RuleSet(List.of(), List.of(), List.of(source), List.of(), List.of()),
+                        hierarchy), false, cpg.index());
+
+        assertEquals(1, support.frameworkMethodInvokeSites().size(),
+                "framework reflection index must retain Method.invoke");
     }
 
     @Test

@@ -131,6 +131,44 @@ class SinkCanaryAgentTest {
     }
 
     @Test
+    void realTransformerInstrumentsNativeOwnerOutsideCallerClass() throws Exception {
+        Map<String, Set<String>> nativeIndex = Map.of(
+                "fixture/NativeOwnerFixture", Set.of("value#()I"));
+        var transformer = new SinkCanaryAgent.CanaryTransformer(
+                Map.of("java/lang/System", Set.of("loadLibrary#(Ljava/lang/String;)V")),
+                "test-token", true, "NATIVE_FIXTURE", "fixture/NativeCallerFixture",
+                "call", "()I", nativeIndex);
+        byte[] original;
+        try (var input = SinkCanaryAgentTest.class.getClassLoader()
+                .getResourceAsStream("fixture/NativeCallerFixture.class")) {
+            original = input.readAllBytes();
+        }
+        byte[] injected = transformer.transform(null, "fixture/NativeCallerFixture", null, null,
+                original);
+
+        assertNotNull(injected);
+        AtomicBoolean observed = new AtomicBoolean();
+        new ClassReader(injected).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                             String signature, String[] exceptions) {
+                return new MethodVisitor(Opcodes.ASM9) {
+                    @Override
+                    public void visitMethodInsn(int opcode, String owner, String method,
+                                                String desc, boolean isInterface) {
+                        if ("io/just/sast/verify/boot/SinkExecutionGate".equals(owner)
+                                && "nativeCall".equals(method)
+                                && "(Ljava/lang/String;Ljava/lang/String;)V".equals(desc)) {
+                            observed.set(true);
+                        }
+                    }
+                };
+            }
+        }, 0);
+        assertTrue(observed.get(), "native callback must be tied to indexed owner/signature");
+    }
+
+    @Test
     void gateThrowsMarkerOnlyWhenEntryFrameOnStack() {
         String selfClass = SinkCanaryAgentTest.class.getName();
         // 入口注册为本测试方法自身——hit() 的真实调用栈上必然存在该帧

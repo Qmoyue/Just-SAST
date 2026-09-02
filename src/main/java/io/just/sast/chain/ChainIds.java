@@ -19,27 +19,21 @@ public final class ChainIds {
     private ChainIds() {}
 
     public static String id(String key) {
-        try {
-            MessageDigest digest = SHA1.get();
-            digest.reset();
-            return HEX.formatHex(digest.digest(key.getBytes(StandardCharsets.UTF_8))).substring(0, 8);
-        } catch (RuntimeException e) {
-            return Integer.toHexString(key.hashCode());
-        }
+        MessageDigest digest = SHA1.get();
+        digest.reset();
+        return HEX.formatHex(digest.digest(text(key).getBytes(StandardCharsets.UTF_8)))
+                .substring(0, 8);
     }
 
     /** Full content digest for compact evidence tables that must remain collision-resistant. */
     public static String sha256(String key) {
-        try {
-            MessageDigest digest = SHA256.get();
-            digest.reset();
-            return HEX.formatHex(digest.digest((key == null ? "" : key)
-                    .getBytes(StandardCharsets.UTF_8)));
-        } catch (RuntimeException e) {
-            // SHA-256 is mandatory in every supported JDK; keep a deterministic fallback for
-            // unusual embedded runtimes rather than making report generation fail.
-            return Integer.toHexString((key == null ? "" : key).hashCode());
-        }
+        MessageDigest digest = SHA256.get();
+        digest.reset();
+        return HEX.formatHex(digest.digest(text(key).getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static String text(String value) {
+        return value == null ? "" : value;
     }
 
     private static MessageDigest newDigest(String algorithm) {

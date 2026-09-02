@@ -55,7 +55,9 @@ rules:
     severity: HIGH
     match:
       call: { owner: "java/lang/reflect/Method", name: "invoke" }
-    tainted: [{arg: 0}, {arg: 1}]
+    # Method/target itself is a capability: a deserialized Class/Method object can select a
+    # dangerous public method even when the reflected call has no attacker-controlled args.
+    tainted: [{receiver: true}, {arg: 0}, {arg: 1}]
     role: capability
 
   - id: JUST-SINK-REFLECTIVE-NEWINSTANCE
@@ -64,7 +66,9 @@ rules:
     severity: HIGH
     match:
       call: { owner: "java/lang/reflect/Constructor", name: "newInstance" }
-    tainted: [{arg: 0}]
+    # Constructor.newInstance may be exploitable with an empty Object[]; the selected
+    # Constructor object is the controlled value in that shape.
+    tainted: [{receiver: true}, {arg: 0}]
     role: capability
 
   - id: JUST-SINK-CLASSLOADER-DEFINECLASS
@@ -565,6 +569,81 @@ rules:
       call: { owner: "java/util/AbstractCollection", name: "toString" }
     actions: { return: [this] }
   # 污染集合的 toString 结果可控（触发 hashCode/toString gadget 的关键桥接）
+
+  # 标准容器的元素/视图关系。element(...) 与整体容器透传不同：它只沿正向
+  # origin 已记录的 entrySet/iterator/next 关系展开，不把任意 Map/Iterator 强行
+  # 当成元素，避免依赖闭包中的全局假链。
+  - id: MODEL-MAP-ENTRYSET-ELEMENTS
+    kind: model
+    match:
+      call: { owner: "java/util/Map", name: "entrySet", descriptor: "()Ljava/util/Set;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-MAP-KEYSET-ELEMENTS
+    kind: model
+    match:
+      call: { owner: "java/util/Map", name: "keySet", descriptor: "()Ljava/util/Set;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-MAP-VALUES-ELEMENTS
+    kind: model
+    match:
+      call: { owner: "java/util/Map", name: "values", descriptor: "()Ljava/util/Collection;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-COLLECTION-ITERATOR-ELEMENTS
+    kind: model
+    match:
+      call: { owner: "java/util/Collection", name: "iterator", descriptor: "()Ljava/util/Iterator;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-ITERABLE-ITERATOR-ELEMENTS
+    kind: model
+    match:
+      call: { owner: "java/lang/Iterable", name: "iterator", descriptor: "()Ljava/util/Iterator;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-ITERATOR-NEXT-ELEMENT
+    kind: model
+    match:
+      call: { owner: "java/util/Iterator", name: "next", descriptor: "()Ljava/lang/Object;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-LISTITERATOR-NEXT-ELEMENT
+    kind: model
+    match:
+      call: { owner: "java/util/ListIterator", name: "next", descriptor: "()Ljava/lang/Object;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-LISTITERATOR-PREVIOUS-ELEMENT
+    kind: model
+    match:
+      call: { owner: "java/util/ListIterator", name: "previous", descriptor: "()Ljava/lang/Object;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-LIST-GET-ELEMENT
+    kind: model
+    match:
+      call: { owner: "java/util/List", name: "get", descriptor: "(I)Ljava/lang/Object;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-MAP-ENTRY-KEY-ELEMENT
+    kind: model
+    match:
+      call: { owner: "java/util/Map$Entry", name: "getKey", descriptor: "()Ljava/lang/Object;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-MAP-ENTRY-VALUE-ELEMENT
+    kind: model
+    match:
+      call: { owner: "java/util/Map$Entry", name: "getValue", descriptor: "()Ljava/lang/Object;" }
+    actions: { return: [element(this)] }
+
+  - id: MODEL-ENUMERATION-NEXT-ELEMENT
+    kind: model
+    match:
+      call: { owner: "java/util/Enumeration", name: "nextElement", descriptor: "()Ljava/lang/Object;" }
+    actions: { return: [element(this)] }
 
   # Hutool 的通用转换入口把第二个参数转换成声明类型；这是二次反序列化
   # 管线中 byte[] 从 MapProxy 进入 BeanConverter 的必要数据摘要。规则只描述

@@ -63,7 +63,7 @@ public final class PerformanceCommand implements Callable<Integer> {
     @Option(names = "--safe-exec", description = "使用安全化 sink adapter")
     boolean safeExec;
 
-    @Option(names = "--safe-real-sink", description = "请求 strict runner 内的 adapter-owned safe effect")
+    @Option(names = "--safe-real-sink", description = "在 strict runner 内调用精确目标 sink/body，使用固定安全参数并禁止危险副作用")
     boolean safeRealSink;
 
     @Option(names = "--require-os-isolation", description = "动态验证必须使用 OS_STRICT")
@@ -239,7 +239,7 @@ public final class PerformanceCommand implements Callable<Integer> {
             long started = System.nanoTime();
             ScanStatistics statistics = scanOnce(output);
             samples.add(PerformanceHarness.sample(i + 1, elapsedMs(started), statistics,
-                    findingsDigest(output)));
+                    resultDigest(output)));
         }
         return PerformanceHarness.report(warmups, samples, limits());
     }
@@ -317,26 +317,26 @@ public final class PerformanceCommand implements Callable<Integer> {
         String completeness = string(json, "completeness", "UNKNOWN");
         PerformanceHarness.Sample sample = new PerformanceHarness.Sample(iteration, wall, staticMs,
                 dynamicMs, heapUsed, heapPeak, rss, chains, completeness,
-                findingsDigest(output));
+                resultDigest(output));
         return sample;
     }
 
-    private static String findingsDigest(Path output) throws IOException {
+    /**
+     * Digest the stable result projection used by the performance gate.  Metadata is excluded
+     * because it contains elapsed time and host observations; the findings plus the complete
+     * variant evidence are the user-visible static result and must agree across runs.
+     */
+    private static String resultDigest(Path output) throws IOException {
         Path findings = output.resolve("findings").resolve("findings.csv");
-        if (!Files.isRegularFile(findings, LinkOption.NOFOLLOW_LINKS)) {
-            throw new IOException("scan did not produce canonical findings");
+        Path chains = output.resolve("evidence").resolve("chains.csv");
+        if (!Files.isRegularFile(findings, LinkOption.NOFOLLOW_LINKS)
+                || !Files.isRegularFile(chains, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("scan did not produce canonical result files");
         }
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            try (InputStream input = Files.newInputStream(findings)) {
-                byte[] buffer = new byte[8192];
-                int read;
-                while ((read = input.read(buffer)) >= 0) {
-                    if (read > 0) {
-                        digest.update(buffer, 0, read);
-                    }
-                }
-            }
+            updateDigest(digest, "findings", findings);
+            updateDigest(digest, "chains", chains);
             StringBuilder hex = new StringBuilder(64);
             for (byte value : digest.digest()) {
                 hex.append(String.format(Locale.ROOT, "%02x", value));
@@ -344,6 +344,22 @@ public final class PerformanceCommand implements Callable<Integer> {
             return hex.toString();
         } catch (NoSuchAlgorithmException impossible) {
             throw new IOException("SHA-256 unavailable", impossible);
+        }
+    }
+
+    private static void updateDigest(MessageDigest digest, String name, Path file)
+            throws IOException {
+        byte[] label = name.getBytes(StandardCharsets.UTF_8);
+        digest.update((byte) label.length);
+        digest.update(label);
+        try (InputStream input = Files.newInputStream(file)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) >= 0) {
+                if (read > 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
         }
     }
 

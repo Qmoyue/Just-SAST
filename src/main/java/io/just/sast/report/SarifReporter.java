@@ -196,7 +196,7 @@ public final class SarifReporter {
             }
             return hex.toString();
         } catch (java.security.NoSuchAlgorithmException e) {
-            return Integer.toHexString(src.hashCode());
+            throw new IllegalStateException("required SHA-256 digest unavailable", e);
         }
     }
 

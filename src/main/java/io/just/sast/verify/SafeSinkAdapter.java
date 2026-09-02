@@ -17,15 +17,15 @@ import io.just.sast.util.ArchiveLimits;
 /**
  * Policy boundary for optional sink adapters.
  *
- * <p>This class deliberately does not invoke a target sink.  It classifies a sink, chooses a
- * safe observation strategy, and validates the only filesystem root an adapter may use.  The
- * default policy is {@link Mode#BOUNDARY}; the canary remains the only operation that enters
- * the target call boundary.  In the explicit {@link Mode#SAFE_EXEC} mode, {@link #observe}
- * performs only a fixed inert/mock operation owned by this class.  It never forwards target
- * arguments, invokes a target method, starts a process, opens a socket, loads code, or follows
- * a target-provided path.  {@link Mode#SAFE_REAL} is an explicit, strict-runner-only mode:
- * it performs a small adapter-owned operation with fixed arguments after the canary has
- * latched.  A positive safe-real result is an adapter effect, not RCE evidence.</p>
+ * <p>This class classifies sinks and owns the non-executing adapter policy.  The default policy
+ * is {@link Mode#BOUNDARY}; the canary remains the only operation that enters the target call
+ * boundary in that mode.  In the explicit {@link Mode#SAFE_EXEC} mode, {@link #observe} performs
+ * only a fixed inert/mock operation owned by this class.  It never forwards target arguments,
+ * invokes a target method, starts a process, opens a socket, loads code, or follows a
+ * target-provided path.  {@link Mode#SAFE_REAL} is only a preflight contract: its permitted
+ * decision is handed to the child bytecode agent, which invokes the exact target API/body with
+ * fixed typed arguments under the authenticated OS runner.  A positive safe-real result is
+ * callability/integrity evidence with {@code sink_distorted=true}; it is never RCE evidence.</p>
  */
 public final class SafeSinkAdapter {
 
@@ -60,7 +60,35 @@ public final class SafeSinkAdapter {
         REAL_SCRATCH_FILESYSTEM,
         REAL_LOOPBACK,
         REAL_IN_MEMORY,
+        /** The target method/call is allowed with a typed sanitizer, not an adapter effect. */
+        REAL_TARGET_SINK,
+        /** A real native fixture is loaded only from the child-owned scratch directory. */
+        REAL_NATIVE_FIXTURE,
         DENIED
+    }
+
+    /** Explicit real-call families understood by the bytecode agent. */
+    public enum RealSinkKind {
+        APPLICATION_BODY,
+        RUNTIME_EXEC,
+        PROCESS_BUILDER_START,
+        CLASS_FOR_NAME,
+        CLASS_NEW_INSTANCE,
+        METHOD_INVOKE,
+        CONSTRUCTOR_NEW_INSTANCE,
+        FILE_OUTPUT,
+        URL_LOOPBACK,
+        SOCKET_LOOPBACK,
+        NATIVE_FIXTURE,
+        UNSUPPORTED
+    }
+
+    /** Authorization result for the target-call path; it is not runtime evidence. */
+    public record RealPlan(RealSinkKind kind, boolean permitted, String reason) {
+        public RealPlan {
+            kind = kind == null ? RealSinkKind.UNSUPPORTED : kind;
+            reason = reason == null ? "" : reason;
+        }
     }
 
     /** Sink metadata is intentionally value-only so the policy cannot invoke target objects. */
@@ -117,7 +145,15 @@ public final class SafeSinkAdapter {
         /** True only when a safe adapter, not the target sink, owns the operation. */
         public boolean adapterSelected() {
             return permitted && disposition != Disposition.CANARY_BOUNDARY
-                    && disposition != Disposition.DENIED;
+                    && disposition != Disposition.DENIED
+                    && disposition != Disposition.REAL_TARGET_SINK
+                    && disposition != Disposition.REAL_NATIVE_FIXTURE;
+        }
+
+        /** True when the target API/body itself, rather than this adapter, will run. */
+        public boolean targetSinkSelected() {
+            return permitted && (disposition == Disposition.REAL_TARGET_SINK
+                    || disposition == Disposition.REAL_NATIVE_FIXTURE);
         }
     }
 
@@ -256,6 +292,17 @@ public final class SafeSinkAdapter {
             return new Decision(capability, Disposition.CANARY_BOUNDARY, true, true,
                     policy.digest(), "default-boundary");
         }
+        if (policy.mode() == Mode.SAFE_REAL) {
+            RealPlan real = realPlan(sink);
+            if (real.permitted()) {
+                Disposition disposition = real.kind() == RealSinkKind.NATIVE_FIXTURE
+                        ? Disposition.REAL_NATIVE_FIXTURE : Disposition.REAL_TARGET_SINK;
+                return new Decision(capability, disposition, true, true, policy.digest(),
+                        "real-sanitized:" + real.kind().name());
+            }
+            return new Decision(capability, Disposition.CANARY_BOUNDARY, true, true,
+                    policy.digest(), "safe-sanitizer-unavailable:" + real.reason());
+        }
         if (!policy.adapterCapabilities().contains(capability)) {
             // Unsupported families remain at the canary boundary; this is safer and more
             // useful than silently labeling a family as safe just because a policy exists.
@@ -264,6 +311,154 @@ public final class SafeSinkAdapter {
         }
         return new Decision(capability, dispositionOf(capability, policy.mode()), true, true,
                 policy.digest(), "safe-adapter-preflight");
+    }
+
+    /**
+     * Return only target calls for which the agent has a concrete, type-aware sanitizer.
+     * Unknown overloads and remote/code-generation families stay at the canary boundary.
+     */
+    public static RealPlan realPlan(Sink sink) {
+        if (sink == null || sink.owner().isEmpty() || sink.method().isEmpty()) {
+            return new RealPlan(RealSinkKind.UNSUPPORTED, false, "sink-metadata-missing");
+        }
+        String owner = sink.owner().replace('.', '/');
+        String method = sink.method();
+        String descriptor = sink.descriptor();
+        if (owner.equals("java/lang/Runtime") && method.equals("exec")
+                && commandDescriptor(descriptor)) {
+            return new RealPlan(RealSinkKind.RUNTIME_EXEC, true, "fixed-java-version-command");
+        }
+        if (owner.equals("java/lang/ProcessBuilder") && method.equals("start")
+                && "()Ljava/lang/Process;".equals(descriptor)) {
+            return new RealPlan(RealSinkKind.PROCESS_BUILDER_START, true,
+                    "receiver-command-replaced-before-start");
+        }
+        if (owner.equals("java/lang/Class") && method.equals("forName")
+                && classForNameDescriptor(descriptor)) {
+            return new RealPlan(RealSinkKind.CLASS_FOR_NAME, true, "fixed-java-class");
+        }
+        if (owner.equals("java/lang/Class") && method.equals("newInstance")
+                && "()Ljava/lang/Object;".equals(descriptor)) {
+            return new RealPlan(RealSinkKind.CLASS_NEW_INSTANCE, true, "fixed-string-class");
+        }
+        if (owner.equals("java/lang/reflect/Method") && method.equals("invoke")
+                && "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;".equals(descriptor)) {
+            return new RealPlan(RealSinkKind.METHOD_INVOKE, true, "fixed-noop-method");
+        }
+        if (owner.equals("java/lang/reflect/Constructor") && method.equals("newInstance")
+                && "([Ljava/lang/Object;)Ljava/lang/Object;".equals(descriptor)) {
+            return new RealPlan(RealSinkKind.CONSTRUCTOR_NEW_INSTANCE, true,
+                    "fixed-safe-constructor");
+        }
+        if ((owner.equals("java/nio/file/Files") && method.equals("newOutputStream")
+                && fileOutputDescriptor(descriptor))
+                || ((owner.equals("java/io/FileOutputStream")
+                || owner.equals("java/io/FileWriter")) && method.equals("<init>")
+                && fileConstructorDescriptor(descriptor))) {
+            return new RealPlan(RealSinkKind.FILE_OUTPUT, true, "scratch-path");
+        }
+        if (owner.equals("java/net/URL")
+                && (method.equals("openConnection") || method.equals("openStream"))
+                && ("()Ljava/net/URLConnection;".equals(descriptor)
+                || "()Ljava/io/InputStream;".equals(descriptor))) {
+            return new RealPlan(RealSinkKind.URL_LOOPBACK, true, "fixed-loopback-url");
+        }
+        if (owner.equals("java/net/Socket") && method.equals("connect")
+                && ("(Ljava/net/SocketAddress;)V".equals(descriptor)
+                || "(Ljava/net/SocketAddress;I)V".equals(descriptor))) {
+            return new RealPlan(RealSinkKind.SOCKET_LOOPBACK, true, "fixed-loopback-address");
+        }
+        if (owner.equals("java/lang/System") && (method.equals("load")
+                || method.equals("loadLibrary")) && stringOnlyDescriptor(descriptor)) {
+            return new RealPlan(RealSinkKind.NATIVE_FIXTURE, true,
+                    "unique-extracted-native-fixture");
+        }
+        if (applicationOwner(owner) && safeApplicationDescriptor(descriptor)) {
+            return new RealPlan(RealSinkKind.APPLICATION_BODY, true,
+                    "typed-string-arguments-and-nested-effect-gate");
+        }
+        return new RealPlan(RealSinkKind.UNSUPPORTED, false, "safe-sanitizer-unavailable");
+    }
+
+    private static boolean applicationOwner(String owner) {
+        return !(owner.startsWith("java/") || owner.startsWith("javax/")
+                || owner.startsWith("jdk/") || owner.startsWith("sun/")
+                || owner.startsWith("com/sun/") || owner.startsWith("io/just/sast/"));
+    }
+
+    private static boolean commandDescriptor(String descriptor) {
+        return "(Ljava/lang/String;)Ljava/lang/Process;".equals(descriptor)
+                || "([Ljava/lang/String;)Ljava/lang/Process;".equals(descriptor)
+                || "(Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/Process;".equals(descriptor)
+                || "([Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/Process;".equals(descriptor)
+                || "(Ljava/lang/String;[Ljava/lang/String;Ljava/io/File;)Ljava/lang/Process;".equals(descriptor)
+                || "([Ljava/lang/String;[Ljava/lang/String;Ljava/io/File;)Ljava/lang/Process;".equals(descriptor);
+    }
+
+    private static boolean classForNameDescriptor(String descriptor) {
+        return "(Ljava/lang/String;)Ljava/lang/Class;".equals(descriptor)
+                || "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;".equals(descriptor);
+    }
+
+    private static boolean stringOnlyDescriptor(String descriptor) {
+        return "(Ljava/lang/String;)V".equals(descriptor);
+    }
+
+    private static boolean fileOutputDescriptor(String descriptor) {
+        return "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/OutputStream;"
+                .equals(descriptor);
+    }
+
+    private static boolean fileConstructorDescriptor(String descriptor) {
+        return "(Ljava/lang/String;)V".equals(descriptor)
+                || "(Ljava/io/File;)V".equals(descriptor)
+                || "(Ljava/lang/String;Z)V".equals(descriptor)
+                || "(Ljava/io/File;Z)V".equals(descriptor);
+    }
+
+    private static boolean safeApplicationDescriptor(String descriptor) {
+        if (descriptor == null || descriptor.isEmpty() || !descriptor.startsWith("(")) {
+            return false;
+        }
+        int end = descriptor.indexOf(')');
+        if (end <= 0) {
+            return false;
+        }
+        String args = descriptor.substring(1, end);
+        for (int i = 0; i < args.length();) {
+            char type = args.charAt(i++);
+            if (type == 'L') {
+                int semicolon = args.indexOf(';', i);
+                if (semicolon < 0 || !"Ljava/lang/String;".equals(args.substring(i - 1,
+                        semicolon + 1))) {
+                    return false;
+                }
+                i = semicolon + 1;
+            } else if (type == '[') {
+                // The entry sanitizer currently replaces scalar String arguments only.  An
+                // array, even String[], can carry a second-order command or reflection value;
+                // fail closed until a typed array sanitizer exists for that exact sink family.
+                return false;
+            } else if ("ZBCSIJFD".indexOf(type) < 0) {
+                return false;
+            }
+        }
+        return end + 1 < descriptor.length() && validReturnDescriptor(descriptor, end + 1);
+    }
+
+    private static boolean validReturnDescriptor(String descriptor, int offset) {
+        char type = descriptor.charAt(offset);
+        if ("VZBCSIJFD".indexOf(type) >= 0) {
+            return offset + 1 == descriptor.length();
+        }
+        if (type == 'L') {
+            int semicolon = descriptor.indexOf(';', offset + 1);
+            return semicolon == descriptor.length() - 1 && semicolon > offset + 1;
+        }
+        if (type == '[') {
+            return false;
+        }
+        return false;
     }
 
     /** Apply a path-aware check without touching the target sink or the host filesystem. */
@@ -296,9 +491,14 @@ public final class SafeSinkAdapter {
      * target properties.
      */
     static AdapterResult observe(Policy policy, Sink sink, Path requestedPath,
-                                 Path fixedJavaExecutable) {
+                                  Path fixedJavaExecutable) {
         AdapterResult preflight = preflight(policy, sink, requestedPath);
         Decision decision = preflight.decision();
+        if (policy != null && policy.mode() == Mode.SAFE_REAL) {
+            // SAFE_REAL is owned by the child agent.  Running an adapter here would make a
+            // target call look real while leaving the target body untouched.
+            return new AdapterResult(decision, false, "REAL_TARGET_REQUIRES_CHILD_AGENT");
+        }
         if (!decision.adapterSelected()) {
             return preflight;
         }
@@ -590,7 +790,10 @@ public final class SafeSinkAdapter {
             }
             return result.toString();
         } catch (NoSuchAlgorithmException impossible) {
-            return "sha256-unavailable-" + Integer.toHexString(value.hashCode());
+            // SHA-256 is a required JDK primitive for policy/effect identity.  A hashCode
+            // fallback would make two distinct observations share an apparently stable
+            // identity and would undermine the high-confidence evidence contract.
+            throw new IllegalStateException("required SHA-256 digest unavailable", impossible);
         }
     }
 }

@@ -16,8 +16,9 @@ import java.util.List;
  * 框架对象绑定边界：ENTRY reason=framework-bean-input +2
  * 模式：每个命中的 gadget 模式 +2（notes 中 "pattern:" 前缀计数的实现侧约定）
  * 惩罚：unresolved × 2
- * 动态证据是分层的：SINK_BLOCKED +4；CONCRETE_REACHED +2；EXECUTED +1；
- * SAFE_EFFECT_OBSERVED +1（这是失真 adapter 的效果，不能与 canary 边界同级）。
+ * 动态证据是分层的：SINK_BLOCKED +4；真实安全参数下的目标 sink +3；
+ * CONCRETE_REACHED +2；EXECUTED/SAFE_EFFECT_OBSERVED +1。真实安全参数仍带失真标记，
+ * 证明可调用性而不是恶意参数可利用性。
  * 分桶：FEASIBLE 只保留静态可行或真实 canary 边界；安全 adapter、具体前缀和入口返回
  * 都显式标记为 DEGRADED(reason)，不可验证不会被当成负向证明。
  */
@@ -25,11 +26,12 @@ public final class ConfidenceScorer {
 
     /** 供排序器复用的动态证据层级；数值越小越强。 */
     public static final int DYNAMIC_SINK_BOUNDARY = 0;
-    public static final int DYNAMIC_CONCRETE_TRIGGER = 1;
-    public static final int DYNAMIC_SAFE_ADAPTER = 2;
-    public static final int DYNAMIC_ENTRY_RETURN = 3;
-    public static final int DYNAMIC_NEGATIVE_OR_UNTESTABLE = 4;
-    public static final int DYNAMIC_NOT_SELECTED = 5;
+    public static final int DYNAMIC_REAL_SAFE = 1;
+    public static final int DYNAMIC_CONCRETE_TRIGGER = 2;
+    public static final int DYNAMIC_SAFE_ADAPTER = 3;
+    public static final int DYNAMIC_ENTRY_RETURN = 4;
+    public static final int DYNAMIC_NEGATIVE_OR_UNTESTABLE = 5;
+    public static final int DYNAMIC_NOT_SELECTED = 6;
 
     /** 每命中一个 gadget 模式的证据加分（GadgetPattern 经链注释 "pattern:*" 声明）。 */
     public static final int PATTERN_BONUS = 2;
@@ -55,6 +57,12 @@ public final class ConfidenceScorer {
         if ("SINK_BLOCKED".equals(runtimeStatus)) {
             return hasNote(notes, "degrade:sink-canary-non-strict-os")
                     ? "DEGRADED(SINK_CANARY_NON_STRICT_OS)" : "FEASIBLE";
+        }
+        if ("SINK_EXECUTED_SAFE".equals(runtimeStatus)) {
+            return "DEGRADED(REAL_SINK_SAFE_ARGUMENTS)";
+        }
+        if ("JNI_EXECUTED_SAFE".equals(runtimeStatus)) {
+            return "DEGRADED(JNI_SAFE_FIXTURE)";
         }
         int r = rank(chain, notes);
         List<String> degradations = notes == null ? List.of() : notes.stream()
@@ -105,6 +113,7 @@ public final class ConfidenceScorer {
             // 动态验证证据：真实边界 > 具体触发前缀 > 段归因 > 安全 adapter > 入口返回。
             points += switch (statusFromNotes(notes)) {
                 case "SINK_BLOCKED" -> SINK_BLOCKED_BONUS;
+                case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> 3;
                 case "CONCRETE_REACHED" -> 2;
                 case "SAFE_EFFECT_OBSERVED", "EXECUTED" -> 1;
                 default -> 0;
@@ -121,6 +130,7 @@ public final class ConfidenceScorer {
         }
         return switch (value) {
             case "SINK_BLOCKED" -> DYNAMIC_SINK_BOUNDARY;
+            case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> DYNAMIC_REAL_SAFE;
             case "CONCRETE_REACHED" -> DYNAMIC_CONCRETE_TRIGGER;
             // SAFE_SINK_EXECUTED is a pre-2.0 compatibility label.  It described an
             // adapter-owned operation, never entry into the target sink body, so old reports
@@ -143,6 +153,12 @@ public final class ConfidenceScorer {
                 || "SAFE_SINK_EXECUTED".equals(status);
     }
 
+    /** Real target execution with fixed safe arguments is useful, but intentionally distorted. */
+    public static boolean isSafeRealStatus(String status) {
+        return "SINK_EXECUTED_SAFE".equals(status)
+                || "JNI_EXECUTED_SAFE".equals(status);
+    }
+
     /**
      * Normalize legacy chain notes into the same closed dynamic status used by reports and
      * ranking.  Notes are an extension compatibility input, so null and unknown values are
@@ -154,6 +170,12 @@ public final class ConfidenceScorer {
         }
         if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
             return "SINK_BLOCKED";
+        }
+        if (hasNote(notes, "verify:jni-executed-safe")) {
+            return "JNI_EXECUTED_SAFE";
+        }
+        if (hasNote(notes, "verify:sink-executed-safe")) {
+            return "SINK_EXECUTED_SAFE";
         }
         if (hasNote(notes, "verify:segment-confirmed")
                 || hasNote(notes, "verify:concrete-reached")) {
@@ -227,6 +249,8 @@ public final class ConfidenceScorer {
         int staticScore = Math.max(0, evidenceScore(chain, staticNotes) + unresolvedPenalty);
         String runtime = switch (statusFromNotes(stableNotes)) {
             case "SINK_BLOCKED" -> "SINK_CANARY_BOUNDARY";
+            case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE_ARGUMENTS";
+            case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE";
             case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER";
             case "SAFE_EFFECT_OBSERVED" -> "SAFE_EFFECT_DISTORTED";
             case "EXECUTED" -> "ENTRY_RETURN";
@@ -234,6 +258,7 @@ public final class ConfidenceScorer {
         };
         int runtimeScore = switch (runtime) {
             case "SINK_CANARY_BOUNDARY" -> SINK_BLOCKED_BONUS;
+            case "REAL_SINK_SAFE_ARGUMENTS", "JNI_SAFE_FIXTURE" -> 3;
             case "CONCRETE_TRIGGER" -> 2;
             case "SAFE_EFFECT_DISTORTED" -> 1;
             case "ENTRY_RETURN" -> 1;
@@ -306,6 +331,16 @@ public final class ConfidenceScorer {
                     sb.append(";pattern:").append(note.substring("pattern:".length()))
                             .append("+").append(PATTERN_BONUS);
                 }
+            }
+            switch (statusFromNotes(notes)) {
+                case "SINK_BLOCKED" -> sb.append(";dynamic:SINK_BLOCKED+")
+                        .append(SINK_BLOCKED_BONUS);
+                case "SINK_EXECUTED_SAFE" -> sb.append(";dynamic:SINK_EXECUTED_SAFE+3");
+                case "JNI_EXECUTED_SAFE" -> sb.append(";dynamic:JNI_EXECUTED_SAFE+3");
+                case "CONCRETE_REACHED" -> sb.append(";dynamic:CONCRETE_REACHED+2");
+                case "SAFE_EFFECT_OBSERVED", "EXECUTED" -> sb.append(";dynamic:")
+                        .append(statusFromNotes(notes)).append("+1");
+                default -> { }
             }
         }
         return sb.toString();

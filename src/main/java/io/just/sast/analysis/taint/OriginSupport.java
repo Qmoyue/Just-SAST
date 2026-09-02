@@ -864,7 +864,9 @@ public final class OriginSupport {
             // 框架包内的 Method.invoke 位点——框架反射供给调用者池
             // （包前缀源自 source 规则：框架以攻击者可控类名反射调用应用类方法的语义，
             //   只在框架真实出现在 classpath 时成立）
-            if (inFrameworkPackage(host.owner())) {
+            if (inFrameworkPackage(host.owner())
+                    && "java/lang/reflect/Method".equals(call.owner())
+                    && "invoke".equals(call.name())) {
                 frameworkMethodInvokeSites.add(call);
             }
             if (proxyReflectiveInvokeSite(call)) {
@@ -1409,6 +1411,7 @@ public final class OriginSupport {
     public List<Node> frameworkMethodInvokeSites() {
         return frameworkMethodInvokeSites;
     }
+
 
     /** Cached proxy-runtime Method.invoke sites used by the reverse reflective wildcard. */
     public List<Node> proxyMethodInvokeSites() {

@@ -94,6 +94,10 @@ public final class SandboxSecurityManager extends SecurityManager {
         roots.add(normalize(cwd));
         Path tmp = normalize(writableRoot);
         roots.add(tmp);
+        String nativeRoot = System.getProperty("just.verify.native-scratch", "");
+        if (nativeRoot != null && !nativeRoot.isBlank()) {
+            roots.add(normalize(Path.of(nativeRoot)));
+        }
         // 允许读取运行时本身，但不允许借此扩大到用户目录；JDK 模块通常不会触发 FilePermission，
         // 这里只覆盖类路径式运行时/兼容 JDK 的 rt.jar 读取。
         Path javaHome = normalize(Path.of(System.getProperty("java.home", ".")));
@@ -170,7 +174,6 @@ public final class SandboxSecurityManager extends SecurityManager {
         if (permission instanceof RuntimePermission runtime) {
             String name = runtime.getName();
             if (name.equals("setSecurityManager")
-                    || name.startsWith("loadLibrary")
                     || name.equals("createNativeThread")
                     || name.equals("shutdownHooks")
                     || name.equals("setIO")
@@ -180,6 +183,14 @@ public final class SandboxSecurityManager extends SecurityManager {
                     || name.equals("readFileDescriptor")
                     || name.equals("writeFileDescriptor")
                     || name.equals("queuePrintJob")) {
+                throw new SecurityException("runtime permission denied: " + name);
+            }
+            if (name.startsWith("loadLibrary")) {
+                String library = name.startsWith("loadLibrary.")
+                        ? name.substring("loadLibrary.".length()) : "";
+                if (io.just.sast.verify.boot.SinkExecutionGate.isApprovedNativePath(library)) {
+                    return;
+                }
                 throw new SecurityException("runtime permission denied: " + name);
             }
             if (name.startsWith("getenv.")) {
@@ -535,7 +546,8 @@ public final class SandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkExec(String cmd) {
-        if (safeRealExecutableAllowed(cmd)) {
+        if (safeRealExecutableAllowed(cmd)
+                || io.just.sast.verify.boot.SinkExecutionGate.isApprovedJavaCommand(cmd)) {
             return;
         }
         throw new SecurityException("exec denied: " + cmd);
@@ -543,12 +555,16 @@ public final class SandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkLink(String lib) {
+        if (io.just.sast.verify.boot.SinkExecutionGate.isApprovedNativePath(lib)) {
+            return;
+        }
         throw new SecurityException("native load denied: " + lib);
     }
 
     @Override
     public void checkConnect(String host, int port) {
-        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host)) {
+        if (io.just.sast.verify.boot.SinkExecutionGate.isApprovedLoopback(host, port)
+                || (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host))) {
             return;
         }
         throw new SecurityException("connect denied: " + host + ":" + port);

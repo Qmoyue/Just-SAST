@@ -115,7 +115,7 @@ final class LegacySafeSinkAdapter {
             }
             return result.toString();
         } catch (NoSuchAlgorithmException impossible) {
-            return "sha256-unavailable";
+            throw new IllegalStateException("required SHA-256 digest unavailable", impossible);
         }
     }
 
@@ -129,7 +129,7 @@ final class LegacySafeSinkAdapter {
             }
             return result.toString();
         } catch (NoSuchAlgorithmException impossible) {
-            return "sha256-unavailable";
+            throw new IllegalStateException("required SHA-256 digest unavailable", impossible);
         }
     }
 

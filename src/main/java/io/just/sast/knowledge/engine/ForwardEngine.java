@@ -1,6 +1,7 @@
 package io.just.sast.knowledge.engine;
 
 import io.just.sast.analysis.taint.ForwardOrigins;
+import io.just.sast.analysis.taint.ContainerElementSources;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.analysis.taint.ValueOrigin;
 import io.just.sast.analysis.taint.ValueOriginOrder;
@@ -9,6 +10,7 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.config.Rule;
+import io.just.sast.config.ModelSource;
 import io.just.sast.cpg.build.Cfg;
 import io.just.sast.cpg.build.CfgEdge;
 import io.just.sast.cpg.build.CfgLabel;
@@ -3398,47 +3400,21 @@ public final class ForwardEngine {
         return false;
     }
 
-    /** model 动作来源位置的污点路径：this（receiver）或 argN（第 N 实参）。 */
+    /** model 动作来源位置的污点路径：this、argN 或有限的 element(this/argN)。 */
     private List<ChainHop> modelSourcePath(String src, Node call, MethodInfo method, int depth,
                                            Explore ex) {
+        if (src == null || call == null || method == null) {
+            return null;
+        }
         ForwardOrigins.Result originResult = origins(method, ex);
         ForwardOrigins.State state = originResult.stateBefore().get((Integer) call.prop("offset"));
         if (state == null) {
             return null;
         }
-        boolean calleeStatic = isStaticLike(call.invokeKind());
-        if ("this".equals(src)) {
-            if (calleeStatic) {
-                return null;
-            }
-            int receiverDepth = state.stack().size() - 1 - Descriptor.paramCount(call.descriptor());
-            if (receiverDepth < 0 || receiverDepth >= state.stack().size()) {
-                return null;
-            }
-            for (ValueOrigin receiver : state.stack().get(receiverDepth).origins()) {
-                List<ChainHop> path = tainted(receiver, method, depth + 1, ex);
-                if (path != null) {
-                    return path;
-                }
-            }
-            return null;
-        }
-        if (src.startsWith("arg")) {
-            int ordinal = Integer.parseInt(src.substring(3));
-            List<Integer> argSlots = Descriptor.argSlots(call.descriptor(), calleeStatic);
-            int slot = 0;
-            for (int i = 0; i < argSlots.size(); i++) {
-                if (i == ordinal) {
-                    for (ValueOrigin origin : ValueOriginOrder.sorted(
-                            support.argOriginAt(call, method, slot, originResult))) {
-                        List<ChainHop> path = tainted(origin, method, depth + 1, ex);
-                        if (path != null) {
-                            return path;
-                        }
-                    }
-                    return null;
-                }
-            slot += argSlots.get(i);
+        for (ValueOrigin origin : modelSourceOrigins(src, call, method, originResult, state)) {
+            List<ChainHop> path = tainted(origin, method, depth + 1, ex);
+            if (path != null) {
+                return path;
             }
         }
         return null;
@@ -3455,36 +3431,55 @@ public final class ForwardEngine {
         if (state == null) {
             return List.of();
         }
-        boolean calleeStatic = isStaticLike(call.invokeKind());
         List<List<ChainHop>> result = new ArrayList<>();
-        if ("this".equals(src)) {
-            if (calleeStatic) {
+        for (ValueOrigin origin : modelSourceOrigins(src, call, method, originResult, state)) {
+            result.addAll(taintedCandidates(origin, method, depth + 1, ex));
+        }
+        return distinctBestPaths(result);
+    }
+
+    /** Resolve one declarative model source to a bounded set of forward origins. */
+    private List<ValueOrigin> modelSourceOrigins(String source, Node call, MethodInfo method,
+                                                 ForwardOrigins.Result result,
+                                                 ForwardOrigins.State state) {
+        ModelSource modelSource = ModelSource.parse(source);
+        if (modelSource == null) {
+            return List.of();
+        }
+        Set<ValueOrigin> origins = new LinkedHashSet<>();
+        if (modelSource.receiver()) {
+            if (isStaticLike(call.invokeKind())) {
                 return List.of();
             }
             int receiverDepth = state.stack().size() - 1 - Descriptor.paramCount(call.descriptor());
             if (receiverDepth < 0 || receiverDepth >= state.stack().size()) {
                 return List.of();
             }
-            for (ValueOrigin receiver : ValueOriginOrder.sorted(
-                    state.stack().get(receiverDepth).origins())) {
-                result.addAll(taintedCandidates(receiver, method, depth + 1, ex));
+            origins.addAll(state.stack().get(receiverDepth).origins());
+        } else {
+            Integer ordinal = modelSource.argumentOrdinal();
+            if (ordinal == null) {
+                return List.of();
             }
-        } else if (src.startsWith("arg")) {
-            int ordinal = Integer.parseInt(src.substring(3));
-            List<Integer> argSlots = Descriptor.argSlots(call.descriptor(), calleeStatic);
+            List<Integer> argSlots = Descriptor.argSlots(call.descriptor(),
+                    isStaticLike(call.invokeKind()));
             int slot = 0;
             for (int i = 0; i < argSlots.size(); i++) {
                 if (i == ordinal) {
-                    for (ValueOrigin origin : ValueOriginOrder.sorted(
-                            support.argOriginAt(call, method, slot, originResult))) {
-                        result.addAll(taintedCandidates(origin, method, depth + 1, ex));
-                    }
+                    origins.addAll(support.argOriginAt(call, method, slot, result));
                     break;
                 }
                 slot += argSlots.get(i);
             }
         }
-        return distinctBestPaths(result);
+        if (!modelSource.element()) {
+            return ValueOriginOrder.sorted(origins);
+        }
+        Set<ValueOrigin> elements = new LinkedHashSet<>();
+        for (ValueOrigin origin : ValueOriginOrder.sorted(origins)) {
+            elements.addAll(ContainerElementSources.resolve(origin, result));
+        }
+        return ValueOriginOrder.sorted(elements);
     }
 
     /** 字段读污点：程序字段事实；回退——反序列化对象（thisTainted 类）的全部实例字段可控。 */

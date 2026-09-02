@@ -164,6 +164,8 @@ public sealed interface Rule {
      * model 规则（tabby actions 模式）：声明式方法摘要——无字节码体的外部/JDK 方法的污点传播。
      * targets: 污点到达位置 → 来源位置集合。如 {return: [arg0]} 表示 arg0 的污点传播到返回值；
      * {this: [arg1]} 表示 arg1 的污点投毒整个接收者对象（容器投毒，Map.put 语义）。
+     * element(this)/element(argN) 表示从标准容器/视图中取出的元素来源；只有正向
+     * origin 摘要已经建立有限关系时才会展开，未知对象不会扩大为全局候选。
      */
     record ModelRule(String id, CallMatcher call, Map<String, List<String>> actions) implements Rule {}
 

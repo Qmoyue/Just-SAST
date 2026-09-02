@@ -70,6 +70,42 @@ class ParallelVerifierTest {
     }
 
     @Test
+    void realPositiveEvidenceRequiresACompletedTypedObservation() {
+        String expectedNativeDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assertTrue(ParallelVerifier.realEvidenceComplete(
+                "SINK_EXECUTED_SAFE:body=1;body_returned=1;call=0;attempted=0"
+                        + ";native_load=0;native_call=0;native_spec=;native_digest=none;sanitizer=INT_FIXED_ZERO",
+                "APPLICATION_BODY"));
+        assertFalse(ParallelVerifier.realEvidenceComplete(
+                "SINK_EXECUTED_SAFE:body=1;body_returned=0;call=1;attempted=1",
+                "APPLICATION_BODY"));
+        assertTrue(ParallelVerifier.realEvidenceComplete(
+                "SINK_EXECUTED_SAFE:body=0;body_returned=0;call=1;attempted=1"
+                        + ";native_load=0;native_call=0;native_spec=;native_digest=none;sanitizer=COMMAND_FIXED_JAVA_VERSION",
+                "RUNTIME_EXEC"));
+        assertTrue(ParallelVerifier.realEvidenceComplete(
+                "JNI_EXECUTED_SAFE:body=0;body_returned=0;call=1;attempted=1"
+                        + ";native_load=1;native_call=1;native_spec=fixture/NativeFixture#value#()I"
+                        + ";native_digest=" + expectedNativeDigest,
+                "NATIVE_FIXTURE"));
+        assertTrue(ParallelVerifier.realEvidenceComplete(
+                "JNI_EXECUTED_SAFE:body=0;body_returned=0;call=1;attempted=1"
+                        + ";native_load=1;native_call=1;native_spec=fixture/NativeFixture#value#()I"
+                        + ";native_digest=" + expectedNativeDigest,
+                "NATIVE_FIXTURE", expectedNativeDigest));
+        assertFalse(ParallelVerifier.realEvidenceComplete(
+                "JNI_EXECUTED_SAFE:body=0;body_returned=0;call=1;attempted=1"
+                        + ";native_load=1;native_call=1;native_spec=fixture/NativeFixture#value#()I"
+                        + ";native_digest=abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "NATIVE_FIXTURE", expectedNativeDigest));
+        assertFalse(ParallelVerifier.realEvidenceComplete(
+                "JNI_EXECUTED_SAFE:body=0;body_returned=0;call=1;attempted=1"
+                        + ";native_load=1;native_call=1;native_spec=fixture/NativeFixture#value#()I"
+                        + ";native_digest=none",
+                "NATIVE_FIXTURE"));
+    }
+
+    @Test
     void readinessMustPrecedeAuthenticatedTerminalEvidence() {
         String token = "attempt-token";
         ParallelVerifier.ProtocolEvidence valid = ParallelVerifier.protocolEvidence(
@@ -223,6 +259,32 @@ class ParallelVerifierTest {
         assertEquals("BOUNDARY", boundary.policyMode());
         assertEquals("SAFE_EXEC", safe.policyMode());
         assertNotEquals(boundary.policyDigest(), safe.policyDigest());
+    }
+
+    @Test
+    void hostCapabilityIsKnownBeforeAnyChildAttempt() {
+        ParallelVerifier verifier = new ParallelVerifier(Path.of("."), List.of(), null);
+
+        assertNotEquals("NOT_RUN", verifier.hostCapability());
+        assertEquals("NOT_RUN", verifier.capability());
+    }
+
+    @Test
+    void strictPreflightResultCarriesTheHostPolicyIdentity() {
+        ParallelVerifier verifier = new ParallelVerifier(Path.of("."), List.of(), null);
+        if ("OS_STRICT".equals(verifier.hostCapability())) {
+            return;
+        }
+        Chain chain = new Chain("rule", "category", "HIGH", "fixture/Entry", "readObject",
+                "METHOD", "fixture/Sink", "call", List.of(), 0);
+
+        ParallelVerifier.VerifyResult result = verifier.strictUnavailableResult(chain);
+
+        assertEquals("UNTESTABLE", result.status());
+        assertEquals(verifier.backendId(), result.backend());
+        assertEquals(verifier.policyDigest(), result.policyDigest());
+        assertEquals("SANDBOX_UNAVAILABLE", result.evidence());
+        assertEquals("NOT_STARTED", result.cleanup());
     }
 
     @Test

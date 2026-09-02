@@ -18,10 +18,13 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.stream.Stream;
+
+import io.just.sast.util.JustLogger;
 
 /**
  * Selects the strongest small OS boundary that is available on the current host.
@@ -55,9 +58,13 @@ public final class OsIsolation {
     private static final int MAX_CHILD_PROCESSES = 64;
     private static final long MAX_PROCESS_MEMORY = 768L * 1024L * 1024L;
     private static final long MAX_ROOT_DIGEST_BYTES = 8L * 1024L * 1024L * 1024L;
+    /** A capability probe is a bounded startup check, not a second verification job. */
+    private static final long APP_CONTAINER_PROBE_TIMEOUT_MS = 4_000L;
+    private static final long APP_CONTAINER_TERMINATION_GRACE_MS = 250L;
     private static final Set<String> STRICT_PRODUCTION_CAPABILITIES = Set.of(
             "runner_attestation", "process_tree", "resource_limits",
             "filesystem_policy", "network_policy");
+    private static volatile boolean nativeLibrariesPrewarming;
 
     private OsIsolation() {
     }
@@ -126,9 +133,59 @@ public final class OsIsolation {
     }
 
     public static Backend select() {
+        return select(null);
+    }
+
+    /**
+     * Warm only trusted Windows API bindings while the static pipeline is busy. This is an
+     * optional latency optimization; strict selection still performs the authoritative broker
+     * and token-attestation probe and never treats a completed warm-up as capability evidence.
+     */
+    public static void prewarmStrict() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        if (!os.contains("win")) {
+            return;
+        }
+        synchronized (OsIsolation.class) {
+            if (nativeLibrariesPrewarming) {
+                return;
+            }
+            nativeLibrariesPrewarming = true;
+            Thread prewarm = new Thread(() -> {
+                try {
+                    Native.load("kernel32", WindowsAppContainerLauncherProbe.class);
+                    Native.load("userenv", WindowsAppContainerLauncherProbe.class);
+                    Native.load("advapi32", WindowsAppContainerLauncherProbe.class);
+                } catch (Throwable ignored) {
+                    // The real selection path remains authoritative and will report the exact
+                    // failure. A failed optional warm-up must not change that result.
+                }
+            }, "just-os-native-prewarm");
+            prewarm.setDaemon(true);
+            prewarm.start();
+        }
+    }
+
+    /** Select the strongest backend that can actually launch the current probe artifact. */
+    public static Backend select(Path launcherJar) {
+        return select(launcherJar, true);
+    }
+
+    /**
+     * Select a backend for the requested evidence level. Ordinary canary/adapter verification
+     * needs process-tree and resource containment, but it does not need to spend time proving an
+     * AppContainer that it is not allowed to use. Strict requests (including SAFE_REAL) still
+     * perform the complete AppContainer capability probe before any target class is loaded.
+     */
+    public static Backend select(Path launcherJar, boolean requireStrict) {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
-            return WindowsJobBackend.create();
+            if (!requireStrict) {
+                return WindowsJobBackend.create();
+            }
+            Backend strict = WindowsAppContainerBackend.create(launcherJar);
+            if (strict.available()) return strict;
+            return WindowsJobBackend.create(";strict-unavailable=" + strict.reason());
         }
         if (os.contains("linux")) {
             Backend nsjail = NsjailBackend.create();
@@ -648,9 +705,14 @@ public final class OsIsolation {
         }
 
         static Backend create() {
+            return create("");
+        }
+
+        static Backend create(String context) {
             try {
                 return new WindowsJobBackend(
-                        Native.load("kernel32", WindowsApi.class), "kernel32 Job Object ready");
+                        Native.load("kernel32", WindowsApi.class),
+                        "kernel32 Job Object ready" + (context == null ? "" : context));
             } catch (Throwable failure) {
                 return unavailable("windows-job-object-unavailable:"
                         + failure.getClass().getSimpleName());
@@ -695,6 +757,10 @@ public final class OsIsolation {
 
         @Override
         public Session attach(Process process) throws IOException {
+            return attachJob(process, id());
+        }
+
+        private Session attachJob(Process process, String sessionId) throws IOException {
             if (process == null || !process.isAlive()) {
                 throw new IOException("child-exited-before-job-attachment");
             }
@@ -728,7 +794,7 @@ public final class OsIsolation {
                     api.CloseHandle(child);
                 }
                 success = true;
-                return new WindowsSession(api, job);
+                return new WindowsSession(api, job, sessionId);
             } finally {
                 if (!success) {
                     api.TerminateJobObject(job, 1);
@@ -742,18 +808,294 @@ public final class OsIsolation {
         }
     }
 
+    /**
+     * Windows AppContainer broker.  The broker is launched with the scanner JDK and waits for
+     * the parent ready marker; it then creates the target JVM with the AppContainer security
+     * capability attribute before any target bytecode can run.
+     */
+    private static final class WindowsAppContainerBackend implements Backend {
+        private static volatile Boolean appContainerProfileCapability;
+        private static volatile String appContainerCapabilityReason = "not-probed";
+        private final Path launcherJar;
+        private final Path launcherJava;
+        private final WindowsJobBackend jobs;
+
+        private WindowsAppContainerBackend(Path launcherJar, Path launcherJava,
+                                           WindowsJobBackend jobs) {
+            this.launcherJar = launcherJar;
+            this.launcherJava = launcherJava;
+            this.jobs = jobs;
+        }
+
+        static Backend create(Path launcherJar) {
+            if (launcherJar == null || !regularNonLink(launcherJar)) {
+                return unavailable("windows-appcontainer-launcher-jar-missing");
+            }
+            Path java = currentJavaExecutable();
+            if (java == null) {
+                return unavailable("windows-appcontainer-scanner-java-missing");
+            }
+            try {
+                // Loading these libraries is a capability probe only; no target process is
+                // started until the parent attaches the broker Job Object.
+                Native.load("kernel32", WindowsAppContainerLauncherProbe.class);
+                Native.load("userenv", WindowsAppContainerLauncherProbe.class);
+                Native.load("advapi32", WindowsAppContainerLauncherProbe.class);
+                Boolean capability = appContainerProfileCapability;
+                if (capability == null) {
+                    synchronized (WindowsAppContainerBackend.class) {
+                        capability = appContainerProfileCapability;
+                        if (capability == null) {
+                            ProbeResult probe = canCreateDisposableAppContainer(launcherJar, java);
+                            capability = probe.available();
+                            appContainerCapabilityReason = probe.reason();
+                            appContainerProfileCapability = capability;
+                        }
+                    }
+                }
+                if (!Boolean.TRUE.equals(capability)) {
+                    return unavailable("windows-appcontainer-"
+                            + appContainerCapabilityReason);
+                }
+                Backend job = WindowsJobBackend.create();
+                if (!job.available() || !(job instanceof WindowsJobBackend)) {
+                    return unavailable("windows-job-object-unavailable");
+                }
+                return new WindowsAppContainerBackend(launcherJar, java,
+                        (WindowsJobBackend) job);
+            } catch (Throwable failure) {
+                return unavailable("windows-appcontainer-api-unavailable:"
+                        + failure.getClass().getSimpleName());
+            }
+        }
+
+        @Override
+        public String id() {
+            return "WINDOWS_APPCONTAINER_STRICT";
+        }
+
+        @Override
+        public boolean available() {
+            return true;
+        }
+
+        @Override
+        public String reason() {
+            return "AppContainer pre-start token+ACL with Job Object broker";
+        }
+
+        @Override
+        public Level level() {
+            return Level.OS_STRICT;
+        }
+
+        @Override
+        public Set<String> capabilities() {
+            return Set.of("appcontainer", "low_integrity", "acl_default_deny",
+                    "no_network_capability", "restricted_handle_inheritance", "process_tree",
+                    "resource_limits", "filesystem_policy", "network_policy",
+                    "runner_attestation");
+        }
+
+        @Override
+        public String policyDigest() {
+            return digest("windows-appcontainer-v1|pre-start-token|low-integrity|acl-default-deny|"
+                    + "no-network-capability|handle-list|job-object|attestation="
+                    + attestationVersion());
+        }
+
+        @Override
+        public List<String> command(List<String> childCommand, Path scratchDirectory) {
+            String readyFile = optionValue(childCommand, "-Djust.verify.isolation-ready=");
+            String readyToken = optionValue(childCommand, "-Djust.verify.isolation-token=");
+            if (readyFile.isBlank() || readyToken.isBlank()) {
+                throw new IllegalArgumentException("windows-runner-ready-properties-missing");
+            }
+            List<String> wrapped = new ArrayList<>();
+            wrapped.add(launcherJava.toString());
+            wrapped.add("-Xmx96m");
+            wrapped.add("-XX:+UseSerialGC");
+            wrapped.add("-cp");
+            wrapped.add(launcherJar.toString());
+            wrapped.add(WindowsAppContainerLauncher.class.getName());
+            wrapped.add("--ready-file");
+            wrapped.add(readyFile);
+            wrapped.add("--ready-token");
+            wrapped.add(readyToken);
+            wrapped.add("--cwd");
+            wrapped.add(scratchDirectory.toAbsolutePath().normalize().toString());
+            wrapped.add("--");
+            wrapped.addAll(childCommand);
+            return List.copyOf(wrapped);
+        }
+
+        @Override
+        public Session attach(Process process) throws IOException {
+            return jobs.attachJob(process, id());
+        }
+
+        private static String optionValue(List<String> command, String prefix) {
+            if (command == null) return "";
+            for (String token : command) {
+                if (token != null && token.startsWith(prefix)) return token.substring(prefix.length());
+            }
+            return "";
+        }
+
+        /**
+         * Probe the capability the broker actually needs, rather than treating a loadable DLL
+         * as proof that AppContainer profiles can be provisioned for this user/session.  Some
+         * Windows images expose userenv.dll but reject CreateAppContainerProfile with
+         * ERROR_FILE_NOT_FOUND (for example when the profile service is unavailable).  A
+         * backend selected after that probe is allowed to advertise OS_STRICT; the weaker Job
+         * Object backend is deliberately returned by the caller otherwise.
+         */
+        private record ProbeResult(boolean available, String reason) {
+            private ProbeResult {
+                reason = reason == null || reason.isBlank() ? "unknown" : reason;
+            }
+        }
+
+        private static ProbeResult canCreateDisposableAppContainer(Path launcherJar,
+                                                                    Path launcherJava) {
+            // The probe itself owns a short-lived broker process. Running it synchronously keeps
+            // one lifecycle owner: on timeout runAppContainerProbe destroys the broker and
+            // removes its scratch tree before selection returns. A daemon thread here could keep
+            // provisioning an AppContainer after the parent had already reported it unavailable.
+            return runAppContainerProbe(launcherJar, launcherJava);
+        }
+
+        /**
+         * Profile creation alone is not a strict-runner proof.  It can succeed while the
+         * security-capability process attribute, token construction, or ACL broker path is
+         * unusable.  Launch the verifier-owned attestation helper through the same broker that
+         * will be used for target probes; no target artifact or native code enters this check.
+         */
+        private static ProbeResult runAppContainerProbe(Path launcherJar, Path launcherJava) {
+            Path root = null;
+            Process broker = null;
+            Session job = null;
+            try {
+                Path temp = Path.of(System.getProperty("java.io.tmpdir", "."))
+                        .toAbsolutePath().normalize();
+                if (!regularDirectory(temp)) {
+                    return new ProbeResult(false, "temp-directory-unavailable");
+                }
+                root = Files.createTempDirectory(temp, "just-appcontainer-probe-");
+                Path ready = root.resolve("ready");
+                String token = "probe-" + UUID.randomUUID().toString().replace("-", "");
+                List<String> command = List.of(
+                        launcherJava.toString(), "-Xmx64m", "-Xss512k", "-cp",
+                        launcherJar.toString(), WindowsAppContainerLauncher.class.getName(),
+                        "--ready-file", ready.toString(), "--ready-token", token,
+                        "--cwd", root.toString(), "--",
+                        launcherJava.toString(), "-Xmx64m", "-Xss512k", "-cp",
+                        launcherJar.toString(), WindowsAppContainerCapabilityProbe.class.getName());
+                broker = new ProcessBuilder(command)
+                        .directory(root.toFile())
+                        .redirectErrorStream(true)
+                        .start();
+                Backend backend = WindowsJobBackend.create();
+                if (!(backend instanceof WindowsJobBackend jobs) || !jobs.available()) {
+                    return new ProbeResult(false, "job-object-unavailable");
+                }
+                job = jobs.attach(broker);
+                Files.writeString(ready, token, StandardCharsets.US_ASCII,
+                        java.nio.file.StandardOpenOption.CREATE_NEW,
+                        java.nio.file.StandardOpenOption.WRITE);
+                if (!broker.waitFor(APP_CONTAINER_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    broker.destroyForcibly();
+                    broker.waitFor(APP_CONTAINER_TERMINATION_GRACE_MS, TimeUnit.MILLISECONDS);
+                    // The broker may still have a descendant holding stdout/stderr open after
+                    // the parent is killed. Reading the pipe here can therefore turn a bounded
+                    // capability probe into an unbounded wait; the timeout itself is sufficient
+                    // evidence for a fail-closed selection.
+                    JustLogger.debug("Windows AppContainer capability probe timed out");
+                    return new ProbeResult(false, "broker-timeout");
+                }
+                String output = readProbeOutput(broker);
+                int exit = broker.exitValue();
+                if (exit == 0) {
+                    return new ProbeResult(true, "ok");
+                }
+                JustLogger.debug("Windows AppContainer capability probe exit {}: {}", exit,
+                        output);
+                return new ProbeResult(false, "broker-exit-" + exit);
+            } catch (Throwable failure) {
+                JustLogger.debug("Windows AppContainer capability probe failed: {}",
+                        failure.toString());
+                return new ProbeResult(false, "probe-"
+                        + failure.getClass().getSimpleName());
+            } finally {
+                if (job != null) {
+                    job.close();
+                }
+                if (broker != null && broker.isAlive()) {
+                    broker.destroyForcibly();
+                }
+                deleteTree(root);
+            }
+        }
+
+        private static String readProbeOutput(Process process) {
+            if (process == null) {
+                return "";
+            }
+            try {
+                byte[] bytes = process.getInputStream().readNBytes(512);
+                String value = new String(bytes, StandardCharsets.UTF_8)
+                        .replace('\r', ' ').replace('\n', ' ').trim();
+                if (value.length() > 160) {
+                    return value.substring(0, 160);
+                }
+                return value.replaceAll("[^A-Za-z0-9_:.()= -]", "_");
+            } catch (IOException | RuntimeException ignored) {
+                return "output-unavailable";
+            }
+        }
+
+        private static boolean regularDirectory(Path path) {
+            return path != null && Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && !ArchiveLink.isLink(path);
+        }
+
+        private static void deleteTree(Path root) {
+            if (root == null || !regularDirectory(root)) {
+                return;
+            }
+            try (Stream<Path> paths = Files.walk(root)) {
+                paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                    try {
+                        Files.deleteIfExists(path);
+                    } catch (IOException ignored) {
+                        // Capability failure remains fail-closed; cleanup is best effort.
+                    }
+                });
+            } catch (IOException ignored) {
+                // Do not turn an unavailable strict backend into a usable one.
+            }
+        }
+
+    }
+
+    /** Empty marker interface used only to probe JNA's native library loader without reflection. */
+    private interface WindowsAppContainerLauncherProbe extends StdCallLibrary {
+    }
+
     private static final class WindowsSession implements Session {
         private final WindowsApi api;
         private Pointer job;
+        private final String sessionId;
 
-        private WindowsSession(WindowsApi api, Pointer job) {
+        private WindowsSession(WindowsApi api, Pointer job, String sessionId) {
             this.api = api;
             this.job = job;
+            this.sessionId = sessionId;
         }
 
         @Override
         public String backend() {
-            return "WINDOWS_JOB_OBJECT_JVM_POLICY";
+            return sessionId;
         }
 
         @Override
@@ -879,6 +1221,25 @@ public final class OsIsolation {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
+    private static Path currentJavaExecutable() {
+        try {
+            Path home = Path.of(System.getProperty("java.home", "."));
+            Path candidate = home.resolve("bin").resolve("java.exe").toAbsolutePath().normalize();
+            return regularNonLink(candidate) ? candidate : null;
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static boolean regularNonLink(Path path) {
+        try {
+            return path != null && Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && !ArchiveLink.isLink(path);
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
     private static String digest(String value) {
         try {
             byte[] bytes = MessageDigest.getInstance("SHA-256")
@@ -889,7 +1250,7 @@ public final class OsIsolation {
             }
             return out.toString();
         } catch (NoSuchAlgorithmException impossible) {
-            return "sha256-unavailable";
+            throw new IllegalStateException("required SHA-256 digest unavailable", impossible);
         }
     }
 

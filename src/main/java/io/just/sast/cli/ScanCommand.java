@@ -48,7 +48,7 @@ public final class ScanCommand implements Callable<Integer> {
     boolean safeExec;
 
     @Option(names = "--safe-real-sink",
-            description = "在已认证 OS_STRICT runner 内执行 Just 固定参数的无害 adapter effect；不执行目标 sink body，必须同时使用 --require-os-isolation")
+            description = "在已认证 OS_STRICT runner 内调用精确目标 sink/body；参数按签名替换为固定安全值，不执行危险命令/RCE，必须同时使用 --require-os-isolation")
     boolean safeRealSink;
 
     @Option(names = "--require-os-isolation",

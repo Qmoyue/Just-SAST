@@ -50,6 +50,23 @@ class YamlRuleLoaderTest {
     }
 
     @Test
+    void reflectiveSinksTreatSelectedCapabilityAsTainted() throws IOException {
+        RuleSet set = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+
+        Rule.SinkRule method = set.sinks().stream()
+                .filter(rule -> "JUST-SINK-REFLECTIVE-INVOKE".equals(rule.id()))
+                .findFirst().orElseThrow();
+        Rule.SinkRule constructor = set.sinks().stream()
+                .filter(rule -> "JUST-SINK-REFLECTIVE-NEWINSTANCE".equals(rule.id()))
+                .findFirst().orElseThrow();
+        assertTrue(method.tainted().contains(Rule.TaintedPos.Receiver.INSTANCE),
+                "Method.invoke must track a controlled Method object even with empty args");
+        assertTrue(constructor.tainted().contains(Rule.TaintedPos.Receiver.INSTANCE),
+                "Constructor.newInstance must track a controlled Constructor object");
+    }
+
+    @Test
     void secondaryDeserializeBridgesAreTypedSources() throws IOException {
         Path rules = Path.of("src/main/resources/rules/default-rules.yaml");
         RuleSet set = new YamlRuleLoader().load(Files.newInputStream(rules));
@@ -235,6 +252,33 @@ class YamlRuleLoaderTest {
         e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
                 new ByteArrayInputStream(badModel.getBytes(StandardCharsets.UTF_8))));
         assertTrue(e.getMessage().contains("argN"), e.getMessage());
+    }
+
+    @Test
+    void containerElementModelSourceIsExplicitAndValidated() throws Exception {
+        String yaml = """
+                rules:
+                  - id: ELEMENT
+                    kind: model
+                    match: {call: {owner: java/util/Iterator, name: next}}
+                    actions: {return: [element(this)]}
+                """;
+        RuleSet rules = new YamlRuleLoader().load(
+                new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)));
+        assertEquals(List.of("element(this)"),
+                rules.models().get(0).actions().get("return"));
+        assertTrue(rules.lint().isEmpty(), "合法的 element(this) 不应触发 model lint");
+
+        String bad = """
+                rules:
+                  - id: ELEMENT
+                    kind: model
+                    match: {call: {owner: java/util/Iterator, name: next}}
+                    actions: {return: [element(argX)]}
+                """;
+        IOException failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(bad.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(failure.getMessage().contains("element"), failure.getMessage());
     }
 
     @Test

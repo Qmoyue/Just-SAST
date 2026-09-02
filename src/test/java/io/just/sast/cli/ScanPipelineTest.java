@@ -388,9 +388,12 @@ class ScanPipelineTest {
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Trigger,readObject")
-                        && findings.contains("app/Trigger.readObject -> app/ExternalHandler.invoke")
+                        && findings.contains("app/Trigger.readObject")
+                        && findings.contains("app/ExternalHandler.invoke")
+                        && findings.contains("java/util/List.iterator")
                         && findings.contains("java/lang/Runtime,exec"),
-                "外部组装的可序列化 JDK Proxy 应闭合到 handler sink：\n" + findings);
+                "外部组装的可序列化 JDK Proxy 应闭合到 handler sink，并保留容器元素桥接证据：\n"
+                        + findings);
     }
 
     @Test
@@ -597,9 +600,12 @@ class ScanPipelineTest {
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Trigger,readObject")
-                        && findings.contains("app/Trigger.readObject -> app/ExternalHandler.invoke")
+                        && findings.contains("app/Trigger.readObject")
+                        && findings.contains("app/ExternalHandler.invoke")
+                        && findings.contains("java/util/List.iterator")
                         && findings.contains("cn/hutool/core/util/ObjectUtil,deserialize"),
-                "Hutool Convert 的 return←arg1 摘要应把外部 Proxy 输入带到二次反序列化 sink：\n" + findings);
+                "Hutool Convert 的 return←arg1 摘要应把外部 Proxy 输入带到二次反序列化 sink，"
+                        + "并保留容器元素桥接证据：\n" + findings);
     }
 
     @Test

@@ -75,6 +75,10 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
         roots.add(normalize(Paths.get(System.getProperty("user.dir", "."))));
         roots.add(normalize(writableRoot));
+        String nativeRoot = System.getProperty("just.verify.native-scratch", "");
+        if (nativeRoot != null && nativeRoot.length() > 0) {
+            roots.add(normalize(Paths.get(nativeRoot)));
+        }
         roots.add(normalize(Paths.get(System.getProperty("java.home", "."))));
         System.setSecurityManager(new LegacySandboxSecurityManager(writableRoot, roots));
     }
@@ -136,7 +140,7 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
         }
         if (permission instanceof RuntimePermission) {
             String name = permission.getName();
-            if ("setSecurityManager".equals(name) || name.startsWith("loadLibrary")
+            if ("setSecurityManager".equals(name)
                     || "createNativeThread".equals(name)
                     || "shutdownHooks".equals(name) || "setIO".equals(name)
                     || "manageProcess".equals(name) || "createClassLoader".equals(name)
@@ -154,6 +158,14 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
                 }
                 throw new SecurityException("runtime permission denied: " + name
                         + " [caller=" + firstNonPlatformFrameLocation() + "]");
+            }
+            if (name.startsWith("loadLibrary")) {
+                String library = name.startsWith("loadLibrary.")
+                        ? name.substring("loadLibrary.".length()) : "";
+                if (io.just.sast.verify.boot.SinkExecutionGate.isApprovedNativePath(library)) {
+                    return;
+                }
+                throw new SecurityException("runtime permission denied: " + name);
             }
             if (name.startsWith("getenv.")) {
                 if (Boolean.getBoolean("just.verify.sanitized-env")) {
@@ -453,7 +465,8 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkExec(String cmd) {
-        if (safeRealExecutableAllowed(cmd)) {
+        if (safeRealExecutableAllowed(cmd)
+                || io.just.sast.verify.boot.SinkExecutionGate.isApprovedJavaCommand(cmd)) {
             return;
         }
         throw new SecurityException("exec denied: " + cmd);
@@ -461,12 +474,16 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
 
     @Override
     public void checkLink(String lib) {
+        if (io.just.sast.verify.boot.SinkExecutionGate.isApprovedNativePath(lib)) {
+            return;
+        }
         throw new SecurityException("native load denied: " + lib);
     }
 
     @Override
     public void checkConnect(String host, int port) {
-        if (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host)) {
+        if (io.just.sast.verify.boot.SinkExecutionGate.isApprovedLoopback(host, port)
+                || (Boolean.TRUE.equals(SAFE_REAL_NETWORK.get()) && loopback(host))) {
             return;
         }
         throw new SecurityException("connect denied: " + host + ":" + port);

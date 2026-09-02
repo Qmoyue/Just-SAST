@@ -143,6 +143,10 @@ public final class ScanPipeline {
             throw new UsageException("--require-os-isolation 需要启用动态验证（不能与 --no-verify 同时使用）");
         }
 
+        if (requireStrictIsolation || safeReal) {
+            io.just.sast.verify.OsIsolation.prewarmStrict();
+        }
+
         // Hash immutable inputs once at the scan boundary. Besides making report identity
         // available to the cache layer before frontend parsing, reusing these values avoids a
         // second full read of a large target/dependency archive during report generation.

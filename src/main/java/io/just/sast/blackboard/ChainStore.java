@@ -26,6 +26,8 @@ final class ChainStore {
     private final Set<String> chainKeys = new HashSet<>();
     private final Map<String, String> semanticKeys = new HashMap<>();
     private final Map<String, Chain> chainsByKey = new HashMap<>();
+    /** Key-to-slot index keeps semantic replacement out of the O(number of chains) hot path. */
+    private final Map<String, Integer> chainIndexes = new HashMap<>();
     private final Map<String, String> calibrations = new HashMap<>();
     private final Map<String, List<String>> notes = new HashMap<>();
     private long revision;
@@ -46,8 +48,9 @@ final class ChainStore {
             if (chosen == existing) {
                 return new AddResult(false, false);
             }
-            int index = indexOf(existingKey);
-            if (index < 0) {
+            Integer index = chainIndexes.get(existingKey);
+            if (index == null || index < 0 || index >= chains.size()
+                    || !java.util.Objects.equals(chains.get(index).key(), existingKey)) {
                 return new AddResult(false, false);
             }
             chains.set(index, chosen);
@@ -55,6 +58,8 @@ final class ChainStore {
             chainKeys.add(chosen.key());
             chainsByKey.remove(existingKey);
             chainsByKey.put(chosen.key(), chosen);
+            chainIndexes.remove(existingKey);
+            chainIndexes.put(chosen.key(), index);
             semanticKeys.put(semanticKey, chosen.key());
             transferEvidence(existingKey, chosen.key());
             revision++;
@@ -66,6 +71,7 @@ final class ChainStore {
         }
         chains.add(chain);
         chainsByKey.put(chain.key(), chain);
+        chainIndexes.put(chain.key(), chains.size() - 1);
         semanticKeys.put(semanticKey, chain.key());
         revision++;
         sortedRevision = -1L;
@@ -84,6 +90,7 @@ final class ChainStore {
 
     synchronized void sortForPhase() {
         chains.sort(Comparator.comparing(Chain::key));
+        rebuildIndexes();
         sortedSnapshot = List.copyOf(chains);
         sortedRevision = revision;
     }
@@ -122,13 +129,11 @@ final class ChainStore {
         return chainNotes == null || chainNotes.isEmpty() ? List.of() : List.copyOf(chainNotes);
     }
 
-    private int indexOf(String key) {
+    private void rebuildIndexes() {
+        chainIndexes.clear();
         for (int index = 0; index < chains.size(); index++) {
-            if (java.util.Objects.equals(chains.get(index).key(), key)) {
-                return index;
-            }
+            chainIndexes.put(chains.get(index).key(), index);
         }
-        return -1;
     }
 
     private void mergeReasons(Chain chosen, Chain other) {

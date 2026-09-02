@@ -65,6 +65,10 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
         String trigger;
         if ("SINK_BLOCKED".equals(dynamic)) {
             trigger = "DYNAMIC_CANARY_BOUNDARY";
+        } else if ("SINK_EXECUTED_SAFE".equals(dynamic)) {
+            trigger = "DYNAMIC_REAL_SINK_SAFE_ARGUMENTS";
+        } else if ("JNI_EXECUTED_SAFE".equals(dynamic)) {
+            trigger = "DYNAMIC_JNI_SAFE_FIXTURE";
         } else if ("SAFE_EFFECT_OBSERVED".equals(dynamic)) {
             trigger = "DYNAMIC_SAFE_ADAPTER_BOUNDARY";
         } else if ("CONCRETE_REACHED".equals(dynamic)) {
@@ -85,6 +89,9 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
             sinkControl = "CAPABILITY_ONLY";
         } else if ("SINK_BLOCKED".equals(dynamic)) {
             sinkControl = "DYNAMIC_CANARY_REACHED";
+        } else if ("SINK_EXECUTED_SAFE".equals(dynamic)
+                || "JNI_EXECUTED_SAFE".equals(dynamic)) {
+            sinkControl = "DYNAMIC_TARGET_SAFE_ARGUMENTS";
         } else if ("SAFE_EFFECT_OBSERVED".equals(dynamic)) {
             sinkControl = "DYNAMIC_ADAPTER_ONLY";
         } else if (chain.sinkDescriptor() == null || chain.sinkDescriptor().isBlank()

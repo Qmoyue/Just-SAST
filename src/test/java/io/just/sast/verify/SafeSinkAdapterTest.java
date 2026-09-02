@@ -190,7 +190,7 @@ class SafeSinkAdapterTest {
     }
 
     @Test
-    void safeRealUsesOnlyAdapterOwnedEffects(@TempDir Path scratch) throws Exception {
+    void safeRealCannotObserveAnAdapterEffect(@TempDir Path scratch) throws Exception {
         SafeSinkAdapter.Policy policy = SafeSinkAdapter.safeRealExecution(scratch);
         Path javaHome = Path.of(System.getProperty("java.home"));
         String executableName = System.getProperty("os.name", "").toLowerCase()
@@ -198,23 +198,27 @@ class SafeSinkAdapterTest {
         Path java = javaHome.resolve("bin").resolve(executableName);
 
         SafeSinkAdapter.AdapterResult command = SafeSinkAdapter.observe(policy,
-                new SafeSinkAdapter.Sink("COMMAND_EXEC", "java/lang/Runtime", "exec", ""),
+                new SafeSinkAdapter.Sink("COMMAND_EXEC", "java/lang/Runtime", "exec",
+                        "(Ljava/lang/String;)Ljava/lang/Process;"),
                 null, java);
         SafeSinkAdapter.AdapterResult network = SafeSinkAdapter.observe(policy,
-                new SafeSinkAdapter.Sink("SSRF", "java/net/Socket", "connect", ""), null, java);
+                new SafeSinkAdapter.Sink("SSRF", "java/net/Socket", "connect",
+                        "(Ljava/net/SocketAddress;)V"), null, java);
         SafeSinkAdapter.AdapterResult file = SafeSinkAdapter.observe(policy,
-                new SafeSinkAdapter.Sink("FILE_WRITE", "java/nio/file/Files", "write", ""),
+                new SafeSinkAdapter.Sink("FILE_WRITE", "java/nio/file/Files", "newOutputStream",
+                        "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/OutputStream;"),
                 null, java);
 
-        assertTrue(command.effectObserved(), String.valueOf(command));
-        assertEquals(SafeSinkAdapter.Disposition.REAL_COMMAND,
+        assertFalse(command.effectObserved(), String.valueOf(command));
+        assertEquals(SafeSinkAdapter.Disposition.REAL_TARGET_SINK,
                 command.decision().disposition());
-        assertTrue(network.effectObserved());
-        assertEquals(SafeSinkAdapter.Disposition.REAL_LOOPBACK,
+        assertFalse(network.effectObserved());
+        assertEquals(SafeSinkAdapter.Disposition.REAL_TARGET_SINK,
                 network.decision().disposition());
-        assertTrue(file.effectObserved());
-        assertEquals("REAL_SCRATCH_FILE_WRITE", file.effect());
-        assertTrue(Files.isRegularFile(scratch.resolve("just-safe-effect.marker")));
+        assertFalse(file.effectObserved());
+        assertEquals(SafeSinkAdapter.Disposition.REAL_TARGET_SINK,
+                file.decision().disposition());
+        assertFalse(Files.exists(scratch.resolve("just-safe-effect.marker")));
         assertNotEquals(policy.digest(), SafeSinkAdapter.policyDigest(SafeSinkAdapter.Mode.SAFE_EXEC));
     }
 }

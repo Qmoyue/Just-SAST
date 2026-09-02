@@ -89,6 +89,7 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                 .filter(c -> bb.calibrationOf(c.key()) == null)
                 .toList();
         ParallelVerifier verifier = null;
+        long verifierInitStarted = System.nanoTime();
         try {
             verifier = new ParallelVerifier(bb.scanInputs().target(), bb.scanInputs().deps(),
                     bb.scanInputs().jdkHome(), bb.scanInputs().targetMajorVersion(),
@@ -96,11 +97,13 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                     bb.scanInputs().requireStrictIsolation(),
                     (chain, detail, sinkReached) -> {
                         if (sinkReached) {
-                            JustLogger.info("  ✓ SINK_BLOCKED: {}#{} → {}.{}  [{}]",
+                            JustLogger.info("  ✓ dynamic sink evidence: {}#{} → {}.{}  [{}]",
                                     chain.entryClass().replace('/', '.'), chain.entryMethod(),
                                     chain.sinkClass().replace('/', '.'), chain.sinkMethod(), detail);
                         }
                     });
+            bb.recordPhaseMs("verify.init", java.util.concurrent.TimeUnit.NANOSECONDS
+                    .toMillis(System.nanoTime() - verifierInitStarted));
         } catch (RuntimeException | LinkageError verifierFailure) {
             bb.markIncomplete("VERIFY_INITIALIZATION");
             bb.setVerificationStatus("UNTESTABLE");
@@ -108,6 +111,34 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
             JustLogger.debug("验证器初始化失败: {}", verifierFailure.getMessage());
             bb.recordPhaseMs("verify", java.util.concurrent.TimeUnit.NANOSECONDS
                     .toMillis(System.nanoTime() - verificationStarted));
+            return;
+        }
+        // A strict request is a capability gate, not a reason to load the target classpath.
+        // When the selected host backend is weaker, construction reflection cannot produce a
+        // usable dynamic fact and only adds latency (and potentially class initialization
+        // pressure) before the same UNTESTABLE result.  Select the bounded report candidates
+        // and publish the exact per-chain boundary immediately; a capable runner continues
+        // through the normal construction and child verification path below.
+        if (verifier.requireStrictIsolation() && !verifier.strictIsolationReady()) {
+            long selectionStarted = System.nanoTime();
+            List<Chain> selected = verifier.selectChains(candidates, budget, Set.of());
+            bb.recordPhaseMs("verify.select", java.util.concurrent.TimeUnit.NANOSECONDS
+                    .toMillis(System.nanoTime() - selectionStarted));
+            String detail = verifier.strictUnavailableDetail();
+            List<ParallelVerifier.VerifyResult> blocked = selected.stream()
+                    .map(verifier::strictUnavailableResult)
+                    .toList();
+            for (Chain chain : selected) {
+                bb.chainNote(chain.key(), "degrade:verify-untestable");
+            }
+            bb.setVerificationStatus(verifier.hostCapability());
+            java.util.Map<String, Integer> details = new java.util.LinkedHashMap<>();
+            details.put(detailKey(detail), blocked.size());
+            bb.setVerificationSummary(summary(bb, verifier, selected, blocked,
+                    0, 0, budget, details));
+            bb.recordPhaseMs("verify", java.util.concurrent.TimeUnit.NANOSECONDS
+                    .toMillis(System.nanoTime() - verificationStarted));
+            verifier.cleanup();
             return;
         }
         List<Chain> seedChains = verifier.selectChains(candidates, budget, Set.of());
@@ -180,6 +211,8 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
         }
 
         int confirmed = 0;
+        int realSinks = 0;
+        int jniSinks = 0;
         int safeEffects = 0;
         int executed = 0;
         int partial = 0;
@@ -218,6 +251,14 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
                                 bb.chainNote(chain.key(), "degrade:sink-canary-non-strict-os");
                             }
                             confirmed++;
+                        }
+                        case SINK_EXECUTED_SAFE -> {
+                            bb.chainNote(chain.key(), "verify:sink-executed-safe");
+                            realSinks++;
+                        }
+                        case JNI_EXECUTED_SAFE -> {
+                            bb.chainNote(chain.key(), "verify:jni-executed-safe");
+                            jniSinks++;
                         }
                         // Safe-exec still reaches the same canary boundary, but the observed
                         // effect belongs to Just's inert/mock adapter and must remain visibly
@@ -281,9 +322,11 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
             bb.setVerificationStatus(verifier.capability());
         }
 
-        JustLogger.info("动态验证：构造可行 {} / 不可构造 {} | 子进程 SINK_BLOCKED {} / SAFE_EFFECT_OBSERVED {} / "
+        JustLogger.info("动态验证：构造可行 {} / 不可构造 {} | 子进程 SINK_BLOCKED {} / "
+                        + "SINK_EXECUTED_SAFE {} / JNI_EXECUTED_SAFE {} / SAFE_EFFECT_OBSERVED {} / "
                         + "CONCRETE_REACHED/EXECUTED {} / PARTIAL {} / FAILED {} / TIMEOUT {} / UNTESTABLE {}",
-                constructible, rejected, confirmed, safeEffects, executed, partial, failed, timeout, untestable);
+                constructible, rejected, confirmed, realSinks, jniSinks, safeEffects,
+                executed, partial, failed, timeout, untestable);
         if (!verificationDetails.isEmpty()) {
             JustLogger.info("动态验证明细：{}", verificationDetails.entrySet().stream()
                     .map(entry -> entry.getKey() + "×" + entry.getValue())
