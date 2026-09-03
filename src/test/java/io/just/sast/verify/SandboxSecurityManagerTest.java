@@ -109,8 +109,22 @@ class SandboxSecurityManagerTest {
                 .contains("win") ? "java.exe" : "java";
         String javaExe = Path.of(System.getProperty("java.home"), "bin", javaName).toString();
         String classpath = System.getProperty("java.class.path");
-        Process process = new ProcessBuilder(javaExe, "-cp", classpath, "SandboxSecurityChild",
-                writable.toString(), outside.toString()).redirectErrorStream(true).start();
+        List<String> command = new java.util.ArrayList<>();
+        command.add(javaExe);
+        // JDK 18–23 keep the legacy manager only behind an explicit opt-in.  The production
+        // verifier already supplies this flag for its compatibility child; the standalone
+        // contract child must use the same launch contract or CI on JDK 21 tests a different
+        // process policy than the real verifier.
+        int feature = Runtime.version().feature();
+        if (feature >= 18 && feature < 24) {
+            command.add("-Djava.security.manager=allow");
+        }
+        command.add("-cp");
+        command.add(classpath);
+        command.add("SandboxSecurityChild");
+        command.add(writable.toString());
+        command.add(outside.toString());
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         assertTrue(process.waitFor(15, TimeUnit.SECONDS), "sandbox child must terminate");
         String output = new String(process.getInputStream().readAllBytes(),
                 java.nio.charset.StandardCharsets.UTF_8);
