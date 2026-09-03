@@ -25,11 +25,12 @@ import java.util.List;
 public final class ConfidenceScorer {
 
     /** 供排序器复用的动态证据层级；数值越小越强。 */
-    public static final int DYNAMIC_SINK_BOUNDARY = 0;
-    public static final int DYNAMIC_REAL_SAFE = 1;
-    public static final int DYNAMIC_CONCRETE_TRIGGER = 2;
-    public static final int DYNAMIC_SAFE_ADAPTER = 3;
-    public static final int DYNAMIC_ENTRY_RETURN = 4;
+    public static final int DYNAMIC_REAL_SAFE = 0;
+    public static final int DYNAMIC_PREFIX_CONFIRMED = 1;
+    public static final int DYNAMIC_SINK_BOUNDARY = 2;
+    public static final int DYNAMIC_CONCRETE_TRIGGER = 3;
+    public static final int DYNAMIC_SAFE_ADAPTER = 4;
+    public static final int DYNAMIC_ENTRY_RETURN = 5;
     public static final int DYNAMIC_NEGATIVE_OR_UNTESTABLE = 5;
     public static final int DYNAMIC_NOT_SELECTED = 6;
 
@@ -55,8 +56,10 @@ public final class ConfidenceScorer {
         // those limitations remain visible in the evidence vector and notes.
         String runtimeStatus = statusFromNotes(notes);
         if ("SINK_BLOCKED".equals(runtimeStatus)) {
-            return hasNote(notes, "degrade:sink-canary-non-strict-os")
-                    ? "DEGRADED(SINK_CANARY_NON_STRICT_OS)" : "FEASIBLE";
+            return "FEASIBLE";
+        }
+        if ("PRE_SINK_CONFIRMED".equals(runtimeStatus)) {
+            return "DEGRADED(PRE_SINK_HIGH_RISK)";
         }
         if ("SINK_EXECUTED_SAFE".equals(runtimeStatus)) {
             return "DEGRADED(REAL_SINK_SAFE_ARGUMENTS)";
@@ -113,7 +116,8 @@ public final class ConfidenceScorer {
             // 动态验证证据：真实边界 > 具体触发前缀 > 段归因 > 安全 adapter > 入口返回。
             points += switch (statusFromNotes(notes)) {
                 case "SINK_BLOCKED" -> SINK_BLOCKED_BONUS;
-                case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> 3;
+                case "PRE_SINK_CONFIRMED" -> SINK_BLOCKED_BONUS;
+                case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> 5;
                 case "CONCRETE_REACHED" -> 2;
                 case "SAFE_EFFECT_OBSERVED", "EXECUTED" -> 1;
                 default -> 0;
@@ -129,8 +133,9 @@ public final class ConfidenceScorer {
             value = statusFromNotes(notes);
         }
         return switch (value) {
-            case "SINK_BLOCKED" -> DYNAMIC_SINK_BOUNDARY;
             case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> DYNAMIC_REAL_SAFE;
+            case "PRE_SINK_CONFIRMED" -> DYNAMIC_PREFIX_CONFIRMED;
+            case "SINK_BLOCKED" -> DYNAMIC_SINK_BOUNDARY;
             case "CONCRETE_REACHED" -> DYNAMIC_CONCRETE_TRIGGER;
             // SAFE_SINK_EXECUTED is a pre-2.0 compatibility label.  It described an
             // adapter-owned operation, never entry into the target sink body, so old reports
@@ -170,6 +175,10 @@ public final class ConfidenceScorer {
         }
         if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
             return "SINK_BLOCKED";
+        }
+        if (hasNote(notes, "verify:pre-sink-confirmed")
+                || hasNote(notes, "verify:prefix-confirmed")) {
+            return "PRE_SINK_CONFIRMED";
         }
         if (hasNote(notes, "verify:jni-executed-safe")) {
             return "JNI_EXECUTED_SAFE";
@@ -249,6 +258,7 @@ public final class ConfidenceScorer {
         int staticScore = Math.max(0, evidenceScore(chain, staticNotes) + unresolvedPenalty);
         String runtime = switch (statusFromNotes(stableNotes)) {
             case "SINK_BLOCKED" -> "SINK_CANARY_BOUNDARY";
+            case "PRE_SINK_CONFIRMED" -> "PREFIX_CHAIN_CONFIRMED";
             case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE_ARGUMENTS";
             case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE";
             case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER";
@@ -258,7 +268,8 @@ public final class ConfidenceScorer {
         };
         int runtimeScore = switch (runtime) {
             case "SINK_CANARY_BOUNDARY" -> SINK_BLOCKED_BONUS;
-            case "REAL_SINK_SAFE_ARGUMENTS", "JNI_SAFE_FIXTURE" -> 3;
+            case "PREFIX_CHAIN_CONFIRMED" -> SINK_BLOCKED_BONUS;
+            case "REAL_SINK_SAFE_ARGUMENTS", "JNI_SAFE_FIXTURE" -> 5;
             case "CONCRETE_TRIGGER" -> 2;
             case "SAFE_EFFECT_DISTORTED" -> 1;
             case "ENTRY_RETURN" -> 1;
@@ -266,8 +277,7 @@ public final class ConfidenceScorer {
         };
         int isolationScore = !sandboxReady ? 0 : switch (isolationLevel == null
                 ? "" : isolationLevel) {
-            case "OS_STRICT" -> 2;
-            case "OS_NAMESPACE" -> 1;
+            case "PROCESS_RESOURCE" -> 1;
             default -> 0;
         };
         return new EvidenceVector(staticScore,

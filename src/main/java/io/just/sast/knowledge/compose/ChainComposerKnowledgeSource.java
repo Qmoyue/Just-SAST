@@ -256,7 +256,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 Chain merged = new Chain(back.ruleId(), back.category(), back.severity(),
                         hostClass, hostMethod, "source",
                         back.sinkClass(), back.sinkMethod(), hops, back.unresolvedHops(),
-                        back.sinkDescriptor(), back.sinkRole(), constructionPlanOf(back, null));
+                        back.sinkDescriptor(), back.sinkRole(), constructionPlanOf(back, null),
+                        back.sinkRisk());
                 if (bb.addChain(merged)) {
                     bb.chainNote(merged.key(), "pattern:src-container-trigger");
                     composed++;
@@ -615,7 +616,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 front.entryClass(), front.entryMethod(), front.entryKind(),
                 back.sinkClass(), back.sinkMethod(), hops,
                 front.unresolvedHops() + back.unresolvedHops(), back.sinkDescriptor(), back.sinkRole(),
-                constructionPlanOf(back, front));
+                constructionPlanOf(back, front), back.sinkRisk());
     }
 
     /** Preserve the declarative gadget plan while composing a source prefix with a fragment.

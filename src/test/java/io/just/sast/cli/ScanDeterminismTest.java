@@ -18,8 +18,8 @@ import java.util.zip.ZipOutputStream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * NFR8 确定性契约：同一输入两次扫描，findings/chains 输出逐字节一致。
- * 这是 diff 功能与回归基线的前提——精扫并行批的事实替换必须与处理顺序无关。
+ * NFR8 静态确定性契约：同一输入两次静态扫描，findings/chains 输出逐字节一致。
+ * 动态子 JVM 的协议/结果确定性由 OS runner 契约覆盖；这里不为静态顺序测试重复启动它们。
  */
 class ScanDeterminismTest {
 
@@ -102,8 +102,8 @@ class ScanDeterminismTest {
                 Map.of("app.Gadget", GADGET, "app.FieldGadget", FIELD_GADGET));
         Path out1 = tmp.resolve("out1");
         Path out2 = tmp.resolve("out2");
-        ScanPipeline.run(jar, null, out1, null, false, true, null, true, 20);
-        ScanPipeline.run(jar, null, out2, null, false, true, null, true, 20);
+        ScanPipeline.run(jar, null, out1, null, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out2, null, false, true, null, false, 0);
         for (String file : List.of("findings/findings.csv", "evidence/chains.csv",
                 "evidence/edges.csv", "evidence/calibrations.csv")) {
             assertEquals(Files.readString(out1.resolve(file)), Files.readString(out2.resolve(file)),

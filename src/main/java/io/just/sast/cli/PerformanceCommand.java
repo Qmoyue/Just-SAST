@@ -16,8 +16,10 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,6 +41,8 @@ public final class PerformanceCommand implements Callable<Integer> {
             "\\\"([^\\\"]+)\\\"\\s*:\\s*(-?\\d+)");
     private static final Pattern STRING = Pattern.compile(
             "\\\"([^\\\"]+)\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
+    private static final Pattern VERIFICATION_DURATION = Pattern.compile(
+            "\\\"duration_ms\\\"\\s*:\\s*(\\d+)");
 
     @Option(names = "--jar", required = true, paramLabel = "<jar|dir>",
             description = "目标 JAR 或 class 目录")
@@ -60,13 +64,13 @@ public final class PerformanceCommand implements Callable<Integer> {
     @Option(names = "--no-verify", description = "关闭动态验证，仅测静态扫描")
     boolean noVerify;
 
-    @Option(names = "--safe-exec", description = "使用安全化 sink adapter")
+    @Option(names = "--safe-exec", description = "显式使用仅 canary 的兼容 adapter；默认动态验证走 LIGHT_SAFE_CALL")
     boolean safeExec;
 
-    @Option(names = "--safe-real-sink", description = "在 strict runner 内调用精确目标 sink/body，使用固定安全参数并禁止危险副作用")
+    @Option(names = "--safe-real-sink", description = "显式声明 SAFE_REAL；默认动态验证已启用")
     boolean safeRealSink;
 
-    @Option(names = "--require-os-isolation", description = "动态验证必须使用 OS_STRICT")
+    @Option(names = "--require-os-isolation", description = "动态验证要求 Job Object；不可用时返回 UNTESTABLE")
     boolean requireOsIsolation;
 
     @Option(names = "--verify-budget", defaultValue = "20", paramLabel = "<N>",
@@ -88,6 +92,10 @@ public final class PerformanceCommand implements Callable<Integer> {
     @Option(names = "--work-dir", paramLabel = "<dir>",
             description = "临时报告目录的父目录；未指定时使用临时目录")
     Path workDir;
+
+    @Option(names = "--launcher-jar", paramLabel = "<jar>",
+            description = "cold 模式使用的发布 launcher JAR；未指定时使用当前 classpath")
+    Path launcherJar;
 
     @Option(names = "--report", paramLabel = "<file>",
             description = "写入性能 JSON；未指定时只输出到 stdout")
@@ -185,9 +193,14 @@ public final class PerformanceCommand implements Callable<Integer> {
         if (safeExec && safeRealSink) {
             throw new ScanPipeline.UsageException("--safe-exec 与 --safe-real-sink 不能同时使用");
         }
-        if (safeRealSink && !requireOsIsolation) {
-            throw new ScanPipeline.UsageException(
-                    "--safe-real-sink 必须同时使用 --require-os-isolation");
+        if (launcherJar != null) {
+            Path normalized = launcherJar.toAbsolutePath().normalize();
+            if (!Files.isRegularFile(normalized, LinkOption.NOFOLLOW_LINKS)
+                    || ArchiveLimits.isLinkOrReparsePoint(normalized)) {
+                throw new ScanPipeline.UsageException("--launcher-jar 不是普通非链接文件: "
+                        + normalized);
+            }
+            launcherJar = normalized;
         }
     }
 
@@ -245,8 +258,10 @@ public final class PerformanceCommand implements Callable<Integer> {
     }
 
     private ScanStatistics scanOnce(Path output) throws Exception {
+        boolean useSafeReal = !noVerify && (safeRealSink || !safeExec);
+        boolean useOsIsolation = requireOsIsolation;
         return ScanPipeline.run(target, deps, output, rules, false, fast, jdkHome,
-                !noVerify, verifyBudget, safeExec, safeRealSink, requireOsIsolation,
+                !noVerify, verifyBudget, safeExec, useSafeReal, useOsIsolation,
                 null, null).stats();
     }
 
@@ -267,9 +282,14 @@ public final class PerformanceCommand implements Callable<Integer> {
         Files.createDirectories(output);
         List<String> command = new ArrayList<>();
         command.add(javaExecutable());
-        command.add("-cp");
-        command.add(System.getProperty("java.class.path", ""));
-        command.add(JustMain.class.getName());
+        if (launcherJar != null) {
+            command.add("-jar");
+            command.add(launcherJar.toString());
+        } else {
+            command.add("-cp");
+            command.add(System.getProperty("java.class.path", ""));
+            command.add(JustMain.class.getName());
+        }
         command.add("scan");
         command.add("--jar");
         command.add(target.toAbsolutePath().normalize().toString());
@@ -312,12 +332,14 @@ public final class PerformanceCommand implements Callable<Integer> {
         long dynamicMs = objectNumber(json, "phase_ms", "verify", 0L);
         long heapUsed = number(json, "heap_used_mb", 0L);
         long heapPeak = number(json, "heap_peak_mb", heapUsed);
-        long rss = objectNumber(json, "metrics", "rss_peak_mb", -1L);
+        long rss = objectNumber(json, "metrics", "parent_rss_mb",
+                objectNumber(json, "metrics", "rss_peak_mb", -1L));
         int chains = (int) Math.max(0L, number(json, "chains_found", 0L));
         String completeness = string(json, "completeness", "UNKNOWN");
         PerformanceHarness.Sample sample = new PerformanceHarness.Sample(iteration, wall, staticMs,
                 dynamicMs, heapUsed, heapPeak, rss, chains, completeness,
-                resultDigest(output));
+                resultDigest(output), objectNumbers(json, "phase_ms"),
+                resourceNumbers(json, "metrics"), verificationDurations(json));
         return sample;
     }
 
@@ -433,6 +455,68 @@ public final class PerformanceCommand implements Callable<Integer> {
             return fallback;
         }
         return number(source.substring(bodyStart, bodyEnd + 1), key, fallback);
+    }
+
+    private static Map<String, Long> objectNumbers(String json, String object) {
+        String source = json == null ? "" : json;
+        String marker = "\"" + object + "\"";
+        int start = source.indexOf(marker);
+        if (start < 0) {
+            return Map.of();
+        }
+        int bodyStart = source.indexOf('{', start + marker.length());
+        int bodyEnd = bodyStart < 0 ? -1 : source.indexOf('}', bodyStart + 1);
+        if (bodyStart < 0 || bodyEnd < 0) {
+            return Map.of();
+        }
+        Matcher matcher = NUMBER.matcher(source.substring(bodyStart, bodyEnd + 1));
+        Map<String, Long> values = new LinkedHashMap<>();
+        while (matcher.find()) {
+            try {
+                values.put(matcher.group(1), Long.parseLong(matcher.group(2)));
+            } catch (NumberFormatException ignored) {
+                // A malformed optional phase is omitted; the top-level scan result remains valid.
+            }
+        }
+        return values.isEmpty() ? Map.of() : Map.copyOf(values);
+    }
+
+    private static Map<String, Long> resourceNumbers(String json, String object) {
+        Map<String, Long> all = objectNumbers(json, object);
+        Map<String, Long> result = new LinkedHashMap<>();
+        all.forEach((name, value) -> {
+            if (name.startsWith("parent_") || name.startsWith("child_")
+                    || name.startsWith("scratch_") || name.startsWith("uncollected_")
+                    || name.startsWith("cleanup_") || "rss_peak_mb".equals(name)) {
+                result.put(name, value);
+            }
+        });
+        return result.isEmpty() ? Map.of() : Map.copyOf(result);
+    }
+
+    private static List<Long> verificationDurations(String json) {
+        String source = json == null ? "" : json;
+        int marker = source.indexOf("\"dynamic_verification\"");
+        if (marker < 0) {
+            return List.of();
+        }
+        int results = source.indexOf("\"results\"", marker);
+        if (results < 0) {
+            return List.of();
+        }
+        // Scan to the end of the dynamic-verification object.  A JSON array descriptor such as
+        // [Ljava/lang/Object; may contain a closing bracket, so looking for the first ']' would
+        // silently drop later candidate samples.
+        Matcher matcher = VERIFICATION_DURATION.matcher(source.substring(results));
+        List<Long> values = new ArrayList<>();
+        while (matcher.find()) {
+            try {
+                values.add(Long.parseLong(matcher.group(1)));
+            } catch (NumberFormatException ignored) {
+                // Optional telemetry cannot invalidate an otherwise valid scan result.
+            }
+        }
+        return List.copyOf(values);
     }
 
     private static String string(String json, String key, String fallback) {

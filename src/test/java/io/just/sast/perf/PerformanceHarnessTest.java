@@ -30,6 +30,10 @@ class PerformanceHarnessTest {
         assertEquals(3, report.wall().samples());
         assertEquals(7L, report.samples().get(0).staticMs());
         assertEquals(3L, report.samples().get(0).dynamicMs());
+        assertEquals(7L, report.samples().get(0).phaseMs().get("frontend"));
+        assertEquals(3, report.phaseGates().get("verify").samples());
+        assertEquals(3L, report.phaseGates().get("verify").p50Ms());
+        assertEquals(3L, report.phaseGates().get("verify").p95Ms());
         assertTrue(report.chainCountStable());
         assertTrue(report.completenessStable());
         assertTrue(report.resultDigestStable());
@@ -65,6 +69,23 @@ class PerformanceHarnessTest {
 
         assertFalse(report.resultDigestStable());
         assertFalse(report.passed());
+    }
+
+    @Test
+    void candidateVerificationDurationsDriveDynamicGate() {
+        PerformanceHarness.Limits limits = new PerformanceHarness.Limits(
+                100L, 100L, 100L, 100L, 10L, 20L);
+        PerformanceHarness.Report report = PerformanceHarness.report(0, List.of(
+                new PerformanceHarness.Sample(1, 10L, 6L, 99L, 1L, 2L, -1L,
+                        1, "COMPLETE", "same", Map.of(), Map.of(), List.of(4L, 7L)),
+                new PerformanceHarness.Sample(2, 10L, 6L, 99L, 1L, 2L, -1L,
+                        1, "COMPLETE", "same", Map.of(), Map.of(), List.of(5L, 8L))), limits);
+
+        assertEquals(5L, report.dynamicPhase().p50Ms());
+        assertEquals(8L, report.dynamicPhase().p95Ms());
+        assertEquals(List.of(4L, 7L), report.samples().get(0).verificationCandidateMs());
+        assertEquals(4, report.phaseGates().get("verify.candidate").samples());
+        assertTrue(report.passed());
     }
 
     private static ScanStatistics statistics(int chains, String completeness,

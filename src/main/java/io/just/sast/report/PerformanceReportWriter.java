@@ -40,6 +40,19 @@ public final class PerformanceReportWriter {
         appendGate(out, report.staticPhase());
         out.append(",\n  \"dynamic\":");
         appendGate(out, report.dynamicPhase());
+        out.append(",\n  \"phase_gates\":{");
+        java.util.List<java.util.Map.Entry<String, PerformanceGate.Result>> phaseGates =
+                new java.util.ArrayList<>(report.phaseGates().entrySet());
+        phaseGates.sort(java.util.Map.Entry.comparingByKey());
+        for (int i = 0; i < phaseGates.size(); i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            java.util.Map.Entry<String, PerformanceGate.Result> entry = phaseGates.get(i);
+            out.append('\"').append(escape(entry.getKey())).append("\":");
+            appendGate(out, entry.getValue());
+        }
+        out.append('}');
         out.append(",\n  \"samples\":[\n");
         for (int i = 0; i < report.samples().size(); i++) {
             if (i > 0) {
@@ -56,7 +69,13 @@ public final class PerformanceReportWriter {
                     .append(",\"chains_found\":").append(sample.chainsFound())
                     .append(",\"completeness\":\"").append(escape(sample.completeness()))
                     .append("\",\"result_digest\":\"")
-                    .append(escape(sample.resultDigest())).append("\"}");
+                    .append(escape(sample.resultDigest())).append("\",\"phase_ms\":");
+            appendPhases(out, sample.phaseMs());
+            out.append(",\"resource_metrics\":");
+            appendMetrics(out, sample.resourceMetrics());
+            out.append(",\"verification_candidate_ms\":");
+            appendDurations(out, sample.verificationCandidateMs());
+            out.append('}');
         }
         out.append("\n  ]\n}\n");
         return out.toString();
@@ -92,6 +111,56 @@ public final class PerformanceReportWriter {
         } else {
             out.append(limit);
         }
+    }
+
+    private static void appendPhases(StringBuilder out, java.util.Map<String, Long> phases) {
+        out.append('{');
+        if (phases != null && !phases.isEmpty()) {
+            java.util.List<java.util.Map.Entry<String, Long>> entries =
+                    new java.util.ArrayList<>(phases.entrySet());
+            entries.sort(java.util.Map.Entry.comparingByKey());
+            for (int i = 0; i < entries.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                java.util.Map.Entry<String, Long> entry = entries.get(i);
+                out.append('"').append(escape(entry.getKey())).append("\":")
+                        .append(Math.max(0L, entry.getValue() == null ? 0L : entry.getValue()));
+            }
+        }
+        out.append('}');
+    }
+
+    private static void appendMetrics(StringBuilder out, java.util.Map<String, Long> metrics) {
+        out.append('{');
+        if (metrics != null && !metrics.isEmpty()) {
+            java.util.List<java.util.Map.Entry<String, Long>> entries =
+                    new java.util.ArrayList<>(metrics.entrySet());
+            entries.sort(java.util.Map.Entry.comparingByKey());
+            for (int i = 0; i < entries.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                java.util.Map.Entry<String, Long> entry = entries.get(i);
+                out.append('"').append(escape(entry.getKey())).append("\":")
+                        .append(entry.getValue() == null ? -1L : entry.getValue());
+            }
+        }
+        out.append('}');
+    }
+
+    private static void appendDurations(StringBuilder out, java.util.List<Long> durations) {
+        out.append('[');
+        if (durations != null) {
+            for (int i = 0; i < durations.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                Long duration = durations.get(i);
+                out.append(Math.max(0L, duration == null ? 0L : duration));
+            }
+        }
+        out.append(']');
     }
 
     private static String escape(String value) {

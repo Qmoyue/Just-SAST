@@ -12,8 +12,8 @@ class JdkRuntimePolicyTest {
         JdkRuntimePolicy policy = JdkRuntimePolicy.forFeature(8);
 
         assertTrue(policy.jvmPolicyAvailable());
-        assertFalse(policy.osStrictRequired());
-        assertTrue(policy.admissible(false));
+        assertFalse(policy.admissible(false));
+        assertTrue(policy.admissible(true));
     }
 
     @Test
@@ -21,7 +21,6 @@ class JdkRuntimePolicyTest {
         JdkRuntimePolicy policy = JdkRuntimePolicy.forFeature(24);
 
         assertFalse(policy.jvmPolicyAvailable());
-        assertTrue(policy.osStrictRequired());
         assertFalse(policy.admissible(false));
         assertTrue(policy.admissible(true));
     }

@@ -26,6 +26,7 @@ public final class SinkExecutionGate {
     private static final InheritableThreadLocal<Boolean> ENTRY_CONTEXT =
             new InheritableThreadLocal<Boolean>();
     private static volatile boolean configured;
+    private static volatile long configuredAtNanos;
     private static volatile String mode = "";
     private static volatile String executionToken = "";
     private static volatile String entryClass = "";
@@ -38,6 +39,10 @@ public final class SinkExecutionGate {
     private static volatile boolean nativeMapConfigured;
     private static volatile boolean bodyEntered;
     private static volatile boolean bodyReturned;
+    private static volatile boolean targetLoaded;
+    private static volatile boolean safeArgumentsAccepted;
+    private static volatile long classLoadMs;
+    private static volatile long terminalCallMs;
     private static volatile boolean callAttempted;
     private static volatile boolean callObserved;
     private static volatile boolean nestedBlocked;
@@ -45,10 +50,12 @@ public final class SinkExecutionGate {
     private static volatile boolean nativeLoadSucceeded;
     private static volatile boolean nativeCallObserved;
     private static volatile String nativeCallSpec = "";
-    private static volatile int realSinkCalls;
+    private static volatile int callAttempts;
     private static volatile String lastSanitizer = "";
     private static final ThreadLocal<Boolean> BODY_CONTEXT = new ThreadLocal<Boolean>();
+    private static final ThreadLocal<Long> BODY_STARTED = new ThreadLocal<Long>();
     private static final ThreadLocal<String> PENDING_CALL = new ThreadLocal<String>();
+    private static final ThreadLocal<Long> CALL_STARTED = new ThreadLocal<Long>();
     private static final ThreadLocal<Boolean> NATIVE_LOAD_CONTEXT = new ThreadLocal<Boolean>();
     private static final Method SAFE_NOOP = findNoop();
     private static final Constructor<SafeObject> SAFE_CONSTRUCTOR = findSafeConstructor();
@@ -80,6 +87,9 @@ public final class SinkExecutionGate {
         if (parsed.isEmpty()) return;
         mode = requestedMode;
         executionToken = token;
+        configuredAtNanos = System.nanoTime();
+        classLoadMs = 0L;
+        terminalCallMs = 0L;
         entryClass = requestedEntryClass.replace('/', '.');
         entryMethod = requestedEntryMethod;
         scratchRoot = bounded(requestedScratchRoot);
@@ -122,7 +132,13 @@ public final class SinkExecutionGate {
     public static boolean configured() { return configured && REAL_SANITIZED.equals(mode); }
 
     public static void entryStart(String token) {
-        if (sameToken(token) && entryStackFrame()) ENTRY_CONTEXT.set(Boolean.TRUE);
+        if (sameToken(token) && entryStackFrame()) {
+            ENTRY_CONTEXT.set(Boolean.TRUE);
+            if (!targetLoaded) {
+                targetLoaded = true;
+                classLoadMs = elapsedMs(configuredAtNanos);
+            }
+        }
     }
 
     public static void entryEnd(String token) {
@@ -133,31 +149,40 @@ public final class SinkExecutionGate {
         if (authorized(spec, token)) {
             bodyEntered = true;
             BODY_CONTEXT.set(Boolean.TRUE);
-            realSinkCalls++;
+            BODY_STARTED.set(System.nanoTime());
         }
+    }
+
+    /** Record that the transformer replaced the exact call/entry arguments with fixed values. */
+    public static void argumentsAccepted(String spec, String token) {
+        if (authorized(spec, token)) safeArgumentsAccepted = true;
     }
 
     public static void bodyExit(String spec, String token) {
         if (authorized(spec, token) && Boolean.TRUE.equals(BODY_CONTEXT.get())) {
             bodyReturned = true;
             BODY_CONTEXT.remove();
+            terminalCallMs = elapsedMs(BODY_STARTED.get());
+            BODY_STARTED.remove();
         }
     }
 
     public static void beforeCall(String spec, String token) {
-        if (authorized(spec, token) && realSinkCalls < 8 && PENDING_CALL.get() == null) {
+        if (authorized(spec, token) && callAttempts < 8 && PENDING_CALL.get() == null) {
             callAttempted = true;
             PENDING_CALL.set(spec);
-            realSinkCalls++;
+            callAttempts++;
+            CALL_STARTED.set(System.nanoTime());
         }
     }
 
     /** Record a target API only after the invocation returned normally. */
     public static void afterCall(String spec, String token) {
-        if (authorized(spec, token) && realSinkCalls < 8 && spec.equals(PENDING_CALL.get())) {
+        if (authorized(spec, token) && spec.equals(PENDING_CALL.get())) {
             callObserved = true;
             PENDING_CALL.remove();
-            realSinkCalls++;
+            terminalCallMs = elapsedMs(CALL_STARTED.get());
+            CALL_STARTED.remove();
         }
     }
 
@@ -168,6 +193,7 @@ public final class SinkExecutionGate {
     public static void nativeCall(String spec, String token) {
         if (sameToken(token) && trustedEntryFrame() && nativeLoadSucceeded) {
             ENTRY_CONTEXT.set(Boolean.TRUE);
+            targetLoaded = true;
             nativeCallSpec = safeLabel(spec);
             nativeCallObserved = true;
         }
@@ -182,6 +208,10 @@ public final class SinkExecutionGate {
 
     public static boolean bodyEntered() { return bodyEntered; }
     public static boolean bodyReturned() { return bodyReturned; }
+    public static boolean targetLoaded() { return targetLoaded; }
+    public static boolean safeArgumentsAccepted() { return safeArgumentsAccepted; }
+    public static long classLoadMs() { return classLoadMs; }
+    public static long terminalCallMs() { return terminalCallMs; }
     public static boolean callObserved() { return callObserved; }
     public static boolean callAttempted() { return callAttempted; }
     public static boolean nestedBlocked() { return nestedBlocked; }
@@ -482,4 +512,9 @@ public final class SinkExecutionGate {
     }
     private static Method findNoop() { try { return SinkExecutionGate.class.getDeclaredMethod("noop"); } catch (Exception e) { return null; } }
     private static Constructor<SafeObject> findSafeConstructor() { try { return SafeObject.class.getDeclaredConstructor(); } catch (Exception e) { return null; } }
+
+    private static long elapsedMs(Long started) {
+        if (started == null || started.longValue() <= 0L) return 0L;
+        return Math.max(0L, (System.nanoTime() - started.longValue()) / 1000000L);
+    }
 }

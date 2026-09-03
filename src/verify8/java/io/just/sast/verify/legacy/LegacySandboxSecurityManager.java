@@ -584,7 +584,7 @@ public final class LegacySandboxSecurityManager extends SecurityManager {
             // On managed Windows hosts a real-path query can be denied for a freshly
             // materialized classpath tree.  Reads may use a lexical fallback only below an
             // explicit root; every component is still checked for a symbolic link. Writes
-            // and executes remain strict real-path checks.
+            // and executes remain real-path checks.
             if (lexicallySafeRead(path, readableRoots.get(i))) {
                 return true;
             }

@@ -20,6 +20,12 @@ public final class JustMain implements Runnable {
     }
 
     public static void main(String[] args) {
+        if (Runtime.version().feature() != 17) {
+            System.err.println("[just:error] Just 主进程必须使用 JDK 17（当前 "
+                    + Runtime.version().feature() + ")");
+            System.exit(78);
+            return;
+        }
         int code = new CommandLine(new JustMain()).execute(args);
         System.exit(code);
     }

@@ -249,10 +249,10 @@ public final class ChainPrecision {
         } else if ("JNI_SAFE_FIXTURE".equals(runtime)) {
             reasons.add("JNI_FIXED_FIXTURE");
         }
-        if ("OS_STRICT_ATTESTED".equals(isolation)) {
-            reasons.add("STRICT_OS_ATTESTED");
+        if ("JOB_OBJECT_ATTESTED".equals(isolation)) {
+            reasons.add("JOB_OBJECT_ATTESTED");
         } else if (verification != null && verification.sandboxReady()) {
-            reasons.add("SANDBOX_NOT_STRICTLY_ATTESTED");
+            reasons.add("SANDBOX_NOT_JOB_OBJECT_ATTESTED");
         }
         int rank = rank(controllability, dispatch, field, reflection, construction,
                 runtime, isolation, completeness);
@@ -269,21 +269,23 @@ public final class ChainPrecision {
      *
      * <p>This is kept separate from {@link ConfidenceScorer#score(Chain, List)}.  The latter
      * is a legacy/static confidence bucket used by integrations and must continue to describe
-     * useful static candidates even when the host cannot provide a strict runner.  This method
-     * is the release-grade gate: an exact authenticated canary boundary, a ready strict OS
-     * backend, a fully accounted chain, and no adapter or analysis degradation.</p>
+     * useful static candidates even when the host cannot provide the Windows process boundary.
+     * This method is the release-grade gate: an authenticated safe terminal return, a ready
+     * Job Object backend, a fully accounted chain, and no adapter or analysis degradation.</p>
      */
     public static boolean isHighConfidence(Chain chain, List<String> notes,
                                            VerificationSummary.ChainResult verification) {
         if (chain == null || verification == null
-                || !ConfidenceScorer.isSinkBoundaryStatus(verification.status())
-                || verification.sinkDistorted() || !verification.sandboxReady()
+                || !"SINK_EXECUTED_SAFE".equals(verification.status())
+                || verification.sinkDistorted() || !verification.terminalExecuted()
+                || !"TERMINAL_EXECUTED_SAFE".equals(verification.verificationScope())
+                || !verification.sandboxReady()
                 || chain.unresolvedHops() != 0) {
             return false;
         }
         Assessment assessment = assess(chain, notes, verification);
-        if (!"SINK_BOUNDARY".equals(assessment.runtime())
-                || !"OS_STRICT_ATTESTED".equals(assessment.isolation())
+        if (!"REAL_SINK_SAFE".equals(assessment.runtime())
+                || !"JOB_OBJECT_ATTESTED".equals(assessment.isolation())
                 || !"COMPLETE".equals(assessment.completeness())
                 || !"CONSTRUCTIBLE".equals(assessment.construction())) {
             return false;
@@ -307,7 +309,7 @@ public final class ChainPrecision {
         return toJson(assessment, escape, false);
     }
 
-    /** JSON projection with the strict high-confidence gate kept explicit at the call site. */
+    /** JSON projection with the high-confidence gate kept explicit at the call site. */
     public static String toJson(Assessment assessment, Function<String, String> escape,
                                 boolean highConfidence) {
         Assessment value = assessment == null
@@ -377,6 +379,7 @@ public final class ChainPrecision {
         if (result != null && result.status() != null && !result.status().isBlank()) {
             return switch (result.status()) {
                 case "SINK_BLOCKED" -> "SINK_BOUNDARY";
+                case "PRE_SINK_CONFIRMED" -> "PREFIX_CONFIRMED_HIGH_RISK";
                 case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE";
                 case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE";
                 case "SAFE_EFFECT_OBSERVED", "SAFE_SINK_EXECUTED" -> "SAFE_EFFECT_DISTORTED";
@@ -409,13 +412,10 @@ public final class ChainPrecision {
             return "UNAVAILABLE";
         }
         String backend = result.backend() == null ? "" : result.backend().toUpperCase();
-        if (backend.contains("STRICT") || backend.contains("NSJAIL")) {
-            return "OS_STRICT_ATTESTED";
+        if ("WINDOWS_JOB_OBJECT_JVM_POLICY".equals(backend)) {
+            return "JOB_OBJECT_ATTESTED";
         }
-        if (backend.contains("NAMESPACE") || backend.contains("BUBBLE")) {
-            return "OS_NAMESPACE_ATTESTED";
-        }
-        return "OS_PARTIAL_ATTESTED";
+        return "PROCESS_RESOURCE_UNATTESTED";
     }
 
     private static String completeness(Chain chain, List<String> notes, boolean unknown) {
@@ -455,11 +455,12 @@ public final class ChainPrecision {
         };
         value += rankOf(construction, "CONSTRUCTIBLE", "DECLARED_PLAN", "PARTIAL",
                 "PLAN_PARTIAL", "UNKNOWN");
-        value += rankOf(runtime, "SINK_BOUNDARY", "REAL_SINK_SAFE", "JNI_SAFE_FIXTURE",
+        value += rankOf(runtime, "REAL_SINK_SAFE", "PREFIX_CONFIRMED_HIGH_RISK", "SINK_BOUNDARY",
+                "JNI_SAFE_FIXTURE",
                 "SAFE_EFFECT_DISTORTED", "CONCRETE_PREFIX", "ENTRY_RETURN", "NOT_SELECTED",
                 "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE");
-        value += rankOf(isolation, "OS_STRICT_ATTESTED", "OS_NAMESPACE_ATTESTED",
-                "OS_PARTIAL_ATTESTED", "NOT_RUN", "UNAVAILABLE");
+        value += rankOf(isolation, "JOB_OBJECT_ATTESTED", "PROCESS_RESOURCE_UNATTESTED",
+                "NOT_RUN", "UNAVAILABLE");
         value += rankOf(completeness, "COMPLETE", "PARTIAL", "UNKNOWN");
         return value;
     }

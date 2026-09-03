@@ -262,6 +262,9 @@ public final class ForwardEngine {
     private static final int MAX_ENGINE_ORIGIN_CACHE_ENTRIES = 32_768;
     private final IdentityHashMap<MethodInfo, ForwardOrigins.Result> originResultCache =
             new IdentityHashMap<>();
+    /** Hit marker for the bounded scan-local cache; admission order stays allocation-light. */
+    private final Set<MethodInfo> originCacheSecondChance =
+            java.util.Collections.newSetFromMap(new IdentityHashMap<>());
     private final Deque<MethodInfo> originResultOrder = new ArrayDeque<>();
     private long originRequests;
     private long originCacheHits;
@@ -407,6 +410,7 @@ public final class ForwardEngine {
             ForwardOrigins.Result result = originResultCache.get(method);
             if (result != null) {
                 originCacheHits++;
+                originCacheSecondChance.add(method);
             } else {
                 result = support.origins().compute(method);
                 rememberOriginResult(method, result);
@@ -421,6 +425,7 @@ public final class ForwardEngine {
         ForwardOrigins.Result result = originResultCache.get(method);
         if (result != null) {
             originCacheHits++;
+            originCacheSecondChance.add(method);
         } else {
             result = support.origins().compute(method);
             rememberOriginResult(method, result);
@@ -439,6 +444,11 @@ public final class ForwardEngine {
         while (originResultCache.size() >= MAX_ENGINE_ORIGIN_CACHE_ENTRIES
                 && !originResultOrder.isEmpty()) {
             MethodInfo evicted = originResultOrder.removeFirst();
+            if (originCacheSecondChance.remove(evicted)
+                    && originResultCache.containsKey(evicted)) {
+                originResultOrder.addLast(evicted);
+                continue;
+            }
             originResultCache.remove(evicted);
         }
         originResultCache.put(method, result);
@@ -1709,7 +1719,8 @@ public final class ForwardEngine {
                     Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
                             entry.fromOwner(), entry.fromName(),
                             entry.reason() == null ? "?" : entry.reason(),
-                            call.owner(), call.name(), hops, 0, call.descriptor(), rule.role().name());
+                            call.owner(), call.name(), hops, 0, call.descriptor(), rule.role().name(),
+                            null, rule.sinkRisk());
                     bb.addChain(chain);
                 }
             }
@@ -5564,7 +5575,7 @@ public final class ForwardEngine {
                     entry.fromOwner(), entry.fromName(),
                     entry.reason() == null ? "?" : entry.reason(),
                     target.owner(), target.name(), hops, unresolvedTarget ? 1 : 0,
-                    target.descriptor(), rule.role().name()));
+                    target.descriptor(), rule.role().name(), null, rule.sinkRisk()));
         }
     }
 

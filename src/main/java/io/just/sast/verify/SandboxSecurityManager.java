@@ -98,6 +98,14 @@ public final class SandboxSecurityManager extends SecurityManager {
         if (nativeRoot != null && !nativeRoot.isBlank()) {
             roots.add(normalize(Path.of(nativeRoot)));
         }
+        // SAFE_REAL may need to copy the verifier-owned native fixture from the probe JAR after
+        // the manager is installed.  This is trusted verifier code, not an input classpath; the
+        // exact probe file is readable while its parent directory and all unrelated files remain
+        // outside the target read boundary.
+        String probeJar = System.getProperty("just.verify.probe-jar", "");
+        if (probeJar != null && !probeJar.isBlank()) {
+            roots.add(normalize(Path.of(probeJar)));
+        }
         // 允许读取运行时本身，但不允许借此扩大到用户目录；JDK 模块通常不会触发 FilePermission，
         // 这里只覆盖类路径式运行时/兼容 JDK 的 rt.jar 读取。
         Path javaHome = normalize(Path.of(System.getProperty("java.home", ".")));
@@ -165,7 +173,8 @@ public final class SandboxSecurityManager extends SecurityManager {
                     && !(permission instanceof ReflectPermission
                     && (trustedLambdaBootstrapCaller()
                     || trustedSerializerRuntimeCaller()
-                    || trustedDataBindingCaller()))) {
+                    || trustedDataBindingCaller()
+                    || trustedProcessBootstrapCaller(permission.getName())))) {
                 throw new SecurityException("reflective/serialization privilege denied: "
                         + permission.getName());
             }
@@ -183,6 +192,13 @@ public final class SandboxSecurityManager extends SecurityManager {
                     || name.equals("readFileDescriptor")
                     || name.equals("writeFileDescriptor")
                     || name.equals("queuePrintJob")) {
+                if ((name.equals("readFileDescriptor") || name.equals("writeFileDescriptor"))
+                        && io.just.sast.verify.boot.SinkExecutionGate.safeProcessBuilderCallActive()) {
+                    // ProcessBuilder.start() may create and initialize its pipe descriptors
+                    // before returning on JDK 21. This is the same fixed-command call window;
+                    // target code has no access to the flag after the exact start returns.
+                    return;
+                }
                 throw new SecurityException("runtime permission denied: " + name);
             }
             if (name.startsWith("loadLibrary")) {
@@ -211,7 +227,8 @@ public final class SandboxSecurityManager extends SecurityManager {
                 if (!trustedProbeCaller() && !trustedSourceAdapterCaller()
                         && !trustedLambdaBootstrapCaller()
                         && !trustedSerializerRuntimeCaller()
-                        && !trustedDataBindingCaller()) {
+                        && !trustedDataBindingCaller()
+                        && !io.just.sast.verify.boot.SinkExecutionGate.safeProcessBuilderCallActive()) {
                     throw new SecurityException("runtime permission denied: " + name);
                 }
                 return;
@@ -486,6 +503,22 @@ public final class SandboxSecurityManager extends SecurityManager {
     }
 
     /**
+     * JDK 21 initializes ProcessImpl through a narrow reflective bootstrap on the first
+     * ProcessBuilder.start call. Permit only the agent-injected fixed-command call; target
+     * reflection and all other permission types remain denied.
+     */
+    private boolean trustedProcessBootstrapCaller(String permissionName) {
+        if (!"suppressAccessChecks".equals(permissionName)
+                || !io.just.sast.verify.boot.SinkExecutionGate.safeProcessBuilderCallActive()) {
+            return false;
+        }
+        // The implementation frames changed between JDK 17 and JDK 21. The gate's
+        // agent-owned one-call state is the stable boundary; target code cannot create this
+        // state without the private attempt token and the injected fixed receiver rewrite.
+        return true;
+    }
+
+    /**
      * Java 8--11's privileged property helper requests the broad read/write permission used by
      * {@code System.getProperties()}, even when the caller only reads a cached runtime value.
      * Keep that compatibility window tied to an active probe-owned serialization operation and
@@ -692,7 +725,7 @@ public final class SandboxSecurityManager extends SecurityManager {
             }
             // Some managed Windows hosts deny GetFinalPathNameByHandle for a freshly
             // materialized temp tree even though the tree is the explicit classpath root.
-            // A strict real-path check would then turn every nested WAR/JAR class into a
+            // A real-path check would then turn every nested WAR/JAR class into a
             // misleading ClassNotFoundException.  Fall back only for reads, only below an
             // explicitly supplied root, and reject symbolic-link components when the host
             // exposes them.  Writes and executes remain real-path-only.

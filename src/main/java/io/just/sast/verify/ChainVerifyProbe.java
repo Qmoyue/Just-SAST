@@ -78,6 +78,7 @@ public final class ChainVerifyProbe {
     /** Agent-owned attestation for the separate real-sink event gate. */
     private static boolean executionGateReady;
     private static String nativeFixtureDigest = "none";
+    private static String nativeFixtureFailure = "unknown";
     private static String safeScratchRoot = ".";
     private static String safeNativeScratchRoot = "";
     /** Captured before target code loads; SAFE_REAL may start only this fixed executable. */
@@ -88,8 +89,6 @@ public final class ChainVerifyProbe {
     private static String resultChannelSecret = "";
     private static OutputStream resultChannel;
     private static boolean resultChannelBroken;
-    /** Whether the child installed the kernel filesystem policy requested by its runner. */
-    private static boolean landlockReady = true;
     /** Set only when the declarative graph used the probe-owned reflective proxy adapter. */
     private static boolean graphAdapterUsed;
     /**
@@ -137,18 +136,16 @@ public final class ChainVerifyProbe {
             System.exit(3);
             return;
         }
-        if (!strictOsAttestation()) {
+        // The parent writes this marker only after it has configured and attached the Job Object
+        // to this exact PID. The child must not reload kernel32/JNA here: that duplicate native
+        // probe adds startup latency and can block in environments where the fat probe JAR is
+        // being extracted. Parent attach plus the authenticated ready handshake is the boundary
+        // evidence; the child only carries the already-established label into the frame.
+        String windowsJob = "1";
+        if (!osAttestation(windowsJob)) {
             emit("SANDBOX_UNAVAILABLE: OS_ATTESTATION_FAILED");
             System.exit(3);
             return;
-        }
-        if (Boolean.parseBoolean(safeProperty("just.verify.landlock-required", "false"))) {
-            landlockReady = installLandlock();
-            if (!landlockReady) {
-                emit("SANDBOX_UNAVAILABLE: LANDLOCK_ATTESTATION_FAILED");
-                System.exit(3);
-                return;
-            }
         }
         // 解析链跳
         List<String[]> fieldLinks = parseFieldLinks(args.length > 1 ? args[1] : "");
@@ -191,19 +188,18 @@ public final class ChainVerifyProbe {
         safeScratchRoot = boundedPathProperty("java.io.tmpdir");
         safeNativeScratchRoot = boundedPathProperty("just.verify.native-scratch");
         safeJavaExecutable = locateSafeJavaExecutable();
+        String isolationLevel = safeProperty("just.verify.isolation-level", "NONE");
         if ("SAFE_REAL".equals(safeSinkMode)
-                && !"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
-            emit("SANDBOX_UNAVAILABLE: SAFE_REAL_REQUIRES_OS_STRICT");
+                && !"PROCESS_RESOURCE".equals(isolationLevel)) {
+            emit("SANDBOX_UNAVAILABLE: SAFE_REAL_REQUIRES_RUNNER");
             System.exit(3);
             return;
         }
 
         try {
             installApplicationLoader();
-            // JDK 24+ has no supported Security Manager boundary.  The parent has already
-            // authenticated OS_STRICT before releasing this child; continue without the JVM
-            // policy and keep all adapter effects fixed/owned by this probe.  On older JDKs the
-            // deny-by-default manager remains a useful defense-in-depth layer.
+            // The Job Object is the process boundary. On older JDKs the deny-by-default manager
+            // remains optional defense in depth, but it never upgrades the OS evidence.
             if (Runtime.version().feature() < 24) {
                 try {
                     SandboxSecurityManager.install(java.nio.file.Path.of(
@@ -236,9 +232,7 @@ public final class ChainVerifyProbe {
                 return;
             }
             emit("SANDBOX_READY: " + safeProperty("just.verify.backend", "unknown")
-                    + "|landlock=" + (Boolean.parseBoolean(
-                    safeProperty("just.verify.landlock-required", "false"))
-                    ? (landlockReady ? "1" : "0") : "na")
+                    + "|job=" + windowsJob
                     + "|attestation=" + safeAttestationVersion);
             // The gate keeps its token in bootstrap memory; do not leave the attestation in the
             // mutable system-properties map where target code could read or replace it.
@@ -246,7 +240,8 @@ public final class ChainVerifyProbe {
             if ("SAFE_REAL".equals(safeSinkMode)
                     && "NATIVE_FIXTURE".equals(safeSinkKind)
                     && !configureNativeFixtures()) {
-                emit("UNTESTABLE: SAFE_NATIVE_FIXTURE_CONFIGURATION_FAILED");
+                emit("UNTESTABLE: SAFE_NATIVE_FIXTURE_CONFIGURATION_FAILED:"
+                        + nativeFixtureFailure);
                 System.exit(3);
                 return;
             }
@@ -738,7 +733,8 @@ public final class ChainVerifyProbe {
             String marker = markerSpec(t);
             if (marker != null && sameSink(marker, sinkClassDotted, sinkMethod, sinkDescriptor)
                     && entryReached(t, entryClass, entryMethod)) {
-                emit("SINK_BLOCKED: " + sinkClassDotted);
+                emit("SINK_BLOCKED: " + sinkClassDotted + ";prefix_stop_ms="
+                        + io.just.sast.verify.boot.SinkCanaryGate.prefixStopMs());
                 System.err.println("SINK_REACHED: " + sinkClassDotted + "." + sinkMethod
                         + " (canary)");
                 System.exit(1);
@@ -1637,17 +1633,38 @@ public final class ChainVerifyProbe {
         boolean body = io.just.sast.verify.boot.SinkExecutionGate.bodyEntered();
         boolean bodyReturned = io.just.sast.verify.boot.SinkExecutionGate.bodyReturned();
         boolean call = io.just.sast.verify.boot.SinkExecutionGate.callObserved();
+        boolean loaded = io.just.sast.verify.boot.SinkExecutionGate.targetLoaded();
+        boolean arguments = io.just.sast.verify.boot.SinkExecutionGate.safeArgumentsAccepted();
         boolean applicationBody = "APPLICATION_BODY".equals(safeSinkKind);
         if ((applicationBody && !bodyReturned) || (!applicationBody && !call)) {
             if (body) {
-                emit(token, "UNTESTABLE: REAL_SINK_BODY_DID_NOT_RETURN;body=1;body_returned=0");
+                emit(token, "UNTESTABLE: REAL_SINK_BODY_DID_NOT_RETURN;body=1;body_returned=0"
+                        + ";class_load_ms=" + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs()
+                        + ";real_call_ms=" + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs());
                 return true;
             }
             if (io.just.sast.verify.boot.SinkExecutionGate.callAttempted()) {
-                emit(token, "UNTESTABLE: REAL_SINK_CALL_DID_NOT_RETURN;attempted=1");
+                emit(token, "UNTESTABLE: REAL_SINK_CALL_DID_NOT_RETURN;attempted=1"
+                        + ";class_load_ms=" + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs()
+                        + ";real_call_ms=" + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs()
+                        + ";sanitizer=" + safeLabel(
+                        io.just.sast.verify.boot.SinkExecutionGate.sanitizer())
+                        + ";process_window=" + (io.just.sast.verify.boot.SinkExecutionGate
+                        .safeProcessBuilderCallActive() ? "1" : "0"));
                 return true;
             }
             return false;
+        }
+        if (!loaded || !arguments) {
+            emit(token, "UNTESTABLE: REAL_SINK_EVIDENCE_INCOMPLETE;loaded="
+                    + (loaded ? "1" : "0") + ";arguments="
+                    + (arguments ? "1" : "0") + ";body="
+                    + (body ? "1" : "0") + ";body_returned="
+                    + (bodyReturned ? "1" : "0") + ";call="
+                    + (call ? "1" : "0") + ";class_load_ms="
+                    + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs() + ";real_call_ms="
+                    + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs());
+            return true;
         }
         boolean nativeComplete = io.just.sast.verify.boot.SinkExecutionGate.nativeLoadSucceeded()
                 && io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved();
@@ -1663,12 +1680,16 @@ public final class ChainVerifyProbe {
                 + ";body_returned=" + (bodyReturned ? "1" : "0")
                 + ";call=" + (call ? "1" : "0")
                 + ";attempted=" + (io.just.sast.verify.boot.SinkExecutionGate.callAttempted() ? "1" : "0")
+                + ";loaded=" + (loaded ? "1" : "0")
+                + ";arguments=" + (arguments ? "1" : "0")
                 + ";native_load=" + (io.just.sast.verify.boot.SinkExecutionGate.nativeLoadSucceeded() ? "1" : "0")
-                + ";native_call=" + (io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved() ? "1" : "0")
-                + ";native_spec=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.nativeCallSpec())
-                + ";nested_blocked=" + (io.just.sast.verify.boot.SinkExecutionGate.nestedBlocked() ? "1" : "0")
-                + ";native_digest=" + safeLabel(nativeFixtureDigest)
-                + ";sanitizer=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.sanitizer());
+                 + ";native_call=" + (io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved() ? "1" : "0")
+                 + ";native_spec=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.nativeCallSpec())
+                 + ";nested_blocked=" + (io.just.sast.verify.boot.SinkExecutionGate.nestedBlocked() ? "1" : "0")
+                 + ";native_digest=" + safeLabel(nativeFixtureDigest)
+                 + ";sanitizer=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.sanitizer())
+                 + ";class_load_ms=" + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs()
+                 + ";real_call_ms=" + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs();
         emit(token, detail);
         System.err.println("SINK_EXECUTED_SAFE: " + sinkClass + "." + sinkMethod
                 + " body=" + (body ? "1" : "0") + " call=" + (call ? "1" : "0")
@@ -1719,14 +1740,16 @@ public final class ChainVerifyProbe {
                 && safeSinkDisposition.equals(safeEffect.decision().disposition().name())) {
             emit(token, "SAFE_EFFECT_OBSERVED:" + safeSinkDisposition
                     + ";mode=" + safeSinkMode
-                    + ";effect=" + safeEffect.effect()
-                    + ";effect_digest=" + SafeSinkAdapter.effectDigest(safeEffect.effect())
+                     + ";effect=" + safeEffect.effect()
+                     + ";effect_digest=" + SafeSinkAdapter.effectDigest(safeEffect.effect())
                     + adapterSuffix());
             System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
                     + " (canary-latched; safe effect observed; target body not entered)");
             return true;
         }
-        emit(token, "SINK_BLOCKED: " + sinkClass + adapterSuffix());
+        emit(token, "SINK_BLOCKED: " + sinkClass + adapterSuffix()
+                + ";prefix_stop_ms="
+                + io.just.sast.verify.boot.SinkCanaryGate.prefixStopMs());
         System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod + " (canary-latched)");
         return true;
     }
@@ -2398,134 +2421,18 @@ public final class ChainVerifyProbe {
         return false;
     }
 
-    /**
-     * Verify the strict Linux claims from inside the child before any target class is loaded.
-     * Namespace presence alone is not enough: the attestation also requires the configured
-     * nobody uid, no_new_privs, seccomp filter mode and the cgroup-v2 controllers requested by
-     * the launcher. Other capability levels intentionally remain usable without this Linux-only
-     * probe and are reported as their weaker, explicit level.
-     */
-    private static boolean strictOsAttestation() {
-        if (!"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
-            return true;
-        }
+    /** Verify the only supported Windows runner before any target class is loaded. */
+    private static boolean osAttestation(String windowsJob) {
         String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
-        if (os.contains("win")) {
-            return "WINDOWS_APPCONTAINER_STRICT".equals(
-                    safeProperty("just.verify.backend", ""))
-                    && io.just.sast.verify.boot.WindowsProcessAttestation.appContainerLow();
-        }
-        if (!os.contains("linux")) {
+        String backend = safeProperty("just.verify.backend", "");
+        if (!os.contains("win") || !"WINDOWS_JOB_OBJECT_JVM_POLICY".equals(backend)) {
             return false;
         }
-        try {
-            for (String namespace : List.of("user", "mnt", "pid", "net", "ipc", "uts")) {
-                if (!Files.exists(Path.of("/proc/self/ns", namespace))) {
-                    return false;
-                }
-            }
-            String status = Files.readString(Path.of("/proc/self/status"));
-            if (!status.matches("(?s).*\\nUid:\\s+65534(?:\\s|$).*")) {
-                return false;
-            }
-            if (!status.matches("(?s).*\\nNoNewPrivs:\\s+1(?:\\s|$).*")) {
-                return false;
-            }
-            if (!status.matches("(?s).*\\nSeccomp:\\s+[12](?:\\s|$).*")) {
-                return false;
-            }
-            String controllers = Files.readString(Path.of("/sys/fs/cgroup/cgroup.controllers"));
-            if (!List.of("cpu", "memory", "pids").stream().allMatch(controllers::contains)) {
-                return false;
-            }
-            if (!cgroupLimitsAttested()) {
-                return false;
-            }
-            if ("true".equalsIgnoreCase(safeProperty("just.verify.loopback", "false"))) {
-                return java.net.NetworkInterface.getByInetAddress(
-                        java.net.InetAddress.getLoopbackAddress()) != null;
-            }
-            return true;
-        } catch (IOException | RuntimeException ignored) {
+        if (!"PROCESS_RESOURCE".equals(
+                safeProperty("just.verify.isolation-level", "NONE"))) {
             return false;
         }
-    }
-
-    /**
-     * Verify effective cgroup-v2 placement and finite limits, rather than trusting the host
-     * controller list alone.  A strict launcher that only exposes the controller files but
-     * leaves this process in an unlimited parent cgroup is not a resource boundary.
-     */
-    private static boolean cgroupLimitsAttested() {
-        try {
-            Path mount = Path.of("/sys/fs/cgroup");
-            Path cgroupFile = Path.of("/proc/self/cgroup");
-            if (!Files.isDirectory(mount) || !Files.isRegularFile(cgroupFile)) {
-                return false;
-            }
-            String relative = "";
-            for (String line : Files.readString(cgroupFile).split("\\R")) {
-                if (line.startsWith("0::")) {
-                    relative = line.substring(3).trim();
-                    break;
-                }
-            }
-            if (relative.isBlank()) {
-                return false;
-            }
-            Path group = mount.resolve(relative.startsWith("/")
-                    ? relative.substring(1) : relative).normalize();
-            if (!group.startsWith(mount) || !Files.isDirectory(group)) {
-                return false;
-            }
-            String pid = Long.toString(ProcessHandle.current().pid());
-            if (!Files.readString(group.resolve("cgroup.procs")).lines()
-                    .map(String::strip).anyMatch(pid::equals)) {
-                return false;
-            }
-            long memory = finiteCgroupValue(Files.readString(group.resolve("memory.max")));
-            long pids = finiteCgroupValue(Files.readString(group.resolve("pids.max")));
-            String[] cpu = Files.readString(group.resolve("cpu.max")).strip().split("\\s+");
-            long quota = cpu.length > 0 && !"max".equals(cpu[0])
-                    ? finiteCgroupValue(cpu[0]) : -1L;
-            return memory > 0L && pids > 0L && quota > 0L;
-        } catch (IOException | RuntimeException ignored) {
-            return false;
-        }
-    }
-
-    private static long finiteCgroupValue(String value) {
-        if (value == null || value.isBlank() || "max".equals(value.strip())) {
-            return -1L;
-        }
-        try {
-            long parsed = Long.parseLong(value.strip());
-            return parsed > 0L ? parsed : -1L;
-        } catch (NumberFormatException ignored) {
-            return -1L;
-        }
-    }
-
-    /** Install the child-side Landlock filesystem policy before loading target classes. */
-    private static boolean installLandlock() {
-        try {
-            List<Path> writable = new ArrayList<>();
-            Path temp = Path.of(System.getProperty("java.io.tmpdir", "."))
-                    .toAbsolutePath().normalize();
-            if (Files.isDirectory(temp)) {
-                writable.add(temp);
-            }
-            String resultFile = boundedPathProperty("just.verify.result-file");
-            if (!resultFile.isBlank()) {
-                Path parent = Path.of(resultFile).toAbsolutePath().normalize().getParent();
-                if (parent != null && Files.isDirectory(parent) && !writable.contains(parent)) {
-                    writable.add(parent);
-                }
-            }
-            return LinuxLandlock.install(writable);
-        } catch (RuntimeException failure) {
-            return false;
-        }
+        return "1".equals(windowsJob);
     }
 
     private static String safeProperty(String key, String fallback) {
@@ -2568,7 +2475,7 @@ public final class ChainVerifyProbe {
             Path scratch = Path.of(safeScratchRoot).toAbsolutePath().normalize();
             if (!Files.isDirectory(scratch, LinkOption.NOFOLLOW_LINKS)
                     || io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(scratch)) {
-                return false;
+                return nativeFixtureFailure("scratch-root-invalid");
             }
             Path nativeRoot = safeNativeScratchRoot.isBlank()
                     ? scratch.resolve("native").normalize()
@@ -2577,12 +2484,12 @@ public final class ChainVerifyProbe {
                     || (!safeNativeScratchRoot.isBlank()
                     && io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(nativeRoot))
                     || !Files.isDirectory(nativeRoot, LinkOption.NOFOLLOW_LINKS)) {
-                return false;
+                return nativeFixtureFailure("native-root-invalid");
             }
             String resourceName = trustedNativeResource();
             String expectedDigest = trustedNativeDigest(resourceName);
             if (resourceName.isEmpty() || expectedDigest.isEmpty()) {
-                return false;
+                return nativeFixtureFailure("fixture-not-supported");
             }
             // Keep the platform-mapped filename: System.loadLibrary resolves a basename through
             // java.library.path and must reach this exact verifier-owned file. The directory is
@@ -2592,28 +2499,30 @@ public final class ChainVerifyProbe {
             if (!output.startsWith(nativeRoot)
                     || !Files.isRegularFile(output, LinkOption.NOFOLLOW_LINKS)
                     || io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(output)) {
-                return false;
+                return nativeFixtureFailure("fixture-file-invalid");
             }
             MessageDigest resourceDigest = MessageDigest.getInstance("SHA-256");
             long resourceBytes = 0L;
             try (InputStream input = ChainVerifyProbe.class.getResourceAsStream(resourceName)) {
                 if (input == null) {
-                    return false;
+                    return nativeFixtureFailure("fixture-resource-missing");
                 }
                 byte[] buffer = new byte[32 * 1024];
                 int read;
                 while ((read = input.read(buffer)) >= 0) {
                     if (read == 0) continue;
                     resourceBytes += read;
-                    if (resourceBytes > 16L * 1024L * 1024L) return false;
+                    if (resourceBytes > 16L * 1024L * 1024L) {
+                        return nativeFixtureFailure("fixture-resource-too-large");
+                    }
                     resourceDigest.update(buffer, 0, read);
                 }
             }
             if (resourceBytes == 0L) {
-                return false;
+                return nativeFixtureFailure("fixture-resource-empty");
             }
             if (!expectedDigest.equalsIgnoreCase(hex(resourceDigest.digest()))) {
-                return false;
+                return nativeFixtureFailure("fixture-resource-digest-mismatch");
             }
             MessageDigest outputDigest = MessageDigest.getInstance("SHA-256");
             long outputBytes = 0L;
@@ -2622,14 +2531,16 @@ public final class ChainVerifyProbe {
                 for (int read; (read = input.read(buffer)) >= 0; ) {
                     if (read == 0) continue;
                     outputBytes += read;
-                    if (outputBytes > 16L * 1024L * 1024L) return false;
+                    if (outputBytes > 16L * 1024L * 1024L) {
+                        return nativeFixtureFailure("fixture-file-too-large");
+                    }
                     outputDigest.update(buffer, 0, read);
                 }
             }
             String fileHex = hex(outputDigest.digest());
             if (outputBytes == 0L || !expectedDigest.equalsIgnoreCase(fileHex)
                     || !nativeCompatible(output)) {
-                return false;
+                return nativeFixtureFailure("fixture-file-incompatible");
             }
             String absolute = output.toAbsolutePath().normalize().toString();
             String fileName = nativeFileName(resourceName).toLowerCase(java.util.Locale.ROOT);
@@ -2639,10 +2550,16 @@ public final class ChainVerifyProbe {
             if (!stem.isEmpty()) mapping.put(stem, absolute);
             nativeFixtureDigest = fileHex;
             io.just.sast.verify.boot.SinkExecutionGate.setNativeMap(encodeNativeMap(mapping));
-            return io.just.sast.verify.boot.SinkExecutionGate.configured();
+            return io.just.sast.verify.boot.SinkExecutionGate.configured()
+                    || nativeFixtureFailure("execution-gate-not-configured");
         } catch (IOException | NoSuchAlgorithmException | RuntimeException failure) {
-            return false;
+            return nativeFixtureFailure("fixture-setup-" + failure.getClass().getSimpleName());
         }
+    }
+
+    private static boolean nativeFixtureFailure(String reason) {
+        nativeFixtureFailure = reason == null || reason.isBlank() ? "unknown" : reason;
+        return false;
     }
 
     private static String trustedNativeResource() {

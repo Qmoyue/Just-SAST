@@ -112,6 +112,7 @@ public final class SarifReporter {
                     + ",\"entry_descriptor\":\"" + escape(entryDescriptor(chain)) + "\""
                     + ",\"sink_descriptor\":\"" + escape(sinkDescriptor(chain)) + "\""
                     + ",\"sink_role\":\"" + escape(chain.sinkRole()) + "\""
+                    + ",\"sink_risk\":\"" + escape(chain.sinkRisk().name()) + "\""
                     + ",\"unresolved_hops\":" + chain.unresolvedHops()
                     + ",\"chain_length\":" + chain.hops().size()
                     + ",\"verification_status\":\"" + escape(confidence) + "\""
@@ -127,7 +128,23 @@ public final class SarifReporter {
                     + (verificationResult != null && verificationResult.sinkDistorted())
                     + ",\"sandbox_ready\":"
                     + (verificationResult != null && verificationResult.sandboxReady())
-                    + ",\"precision\":"
+                    + ",\"requested_mode\":\""
+                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.requestedMode())
+                    + "\",\"effective_mode\":\""
+                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.effectiveMode())
+                    + "\",\"fallback\":\""
+                    + escape(verificationResult == null ? "none" : verificationResult.fallback())
+                    + "\",\"verification_scope\":\""
+                    + escape(verificationResult == null ? "NONE" : verificationResult.verificationScope())
+                    + "\",\"verification_group\":\""
+                    + escape(ReportEvidence.verificationGroup(verificationResult))
+                    + "\",\"terminal_executed\":"
+                    + (verificationResult != null && verificationResult.terminalExecuted())
+                    + ",\"stop_reason\":\""
+                    + escape(verificationResult == null ? "NOT_SELECTED" : verificationResult.stopReason())
+                    + "\",\"last_confirmed_stage\":\""
+                    + escape(verificationResult == null ? "NONE" : verificationResult.lastConfirmedStage())
+                    + "\",\"precision\":"
                     + ChainPrecision.toJson(precision, SarifReporter::escape)
                     + ",\"construction\":"
                     + ReportEvidence.constructionJson(chain, chainNotes, verificationResult);

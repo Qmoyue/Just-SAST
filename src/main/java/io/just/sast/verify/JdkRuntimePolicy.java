@@ -1,12 +1,11 @@
 package io.just.sast.verify;
 
 /**
- * Runtime capability decision shared by the verifier launcher and its JDK matrix tests.
- * Security Manager availability is a compatibility detail; OS_STRICT is the only admissible
- * isolation boundary for JDKs that no longer provide that detail.
+ * Runtime gate for the target child. The target JDK selected by {@code --jdk-home} may differ
+ * from Just's JDK17 process, but every child must still run behind the authenticated Job Object.
+ * Security Manager availability is only compatibility detail and never an isolation boundary.
  */
-public record JdkRuntimePolicy(int feature, boolean jvmPolicyAvailable,
-                               boolean osStrictRequired, String reason) {
+public record JdkRuntimePolicy(int feature, boolean jvmPolicyAvailable, String reason) {
 
     public JdkRuntimePolicy {
         feature = Math.max(0, feature);
@@ -15,18 +14,17 @@ public record JdkRuntimePolicy(int feature, boolean jvmPolicyAvailable,
 
     public static JdkRuntimePolicy forFeature(int feature) {
         int normalized = Math.max(0, feature);
-        if (normalized >= 24) {
-            return new JdkRuntimePolicy(normalized, false, true,
-                    "security-manager-removed-os-strict-required");
-        }
         if (normalized >= 8) {
-            return new JdkRuntimePolicy(normalized, true, false,
-                    "jvm-policy-defense-in-depth");
+            return new JdkRuntimePolicy(normalized, normalized < 24,
+                    normalized < 24
+                            ? "jvm-policy-defense-in-depth"
+                            : "security-manager-unavailable-job-object-required");
         }
-        return new JdkRuntimePolicy(normalized, false, true, "jdk-too-old");
+        return new JdkRuntimePolicy(normalized, false, "jdk-too-old");
     }
 
-    public boolean admissible(boolean strictOsReady) {
-        return jvmPolicyAvailable || (osStrictRequired && strictOsReady);
+    /** A target child is admissible only when the parent has configured the Job Object. */
+    public boolean admissible(boolean jobObjectReady) {
+        return feature >= 8 && jobObjectReady;
     }
 }

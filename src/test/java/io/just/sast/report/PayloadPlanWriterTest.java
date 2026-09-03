@@ -44,7 +44,8 @@ class PayloadPlanWriterTest {
         String readableJson = Files.readString(temp.resolve("payload.json"));
         String readableMarkdown = Files.readString(temp.resolve("payload.md"));
         assertTrue(readableJson.contains("\"steps\"")
-                && readableJson.contains("\"execution\":\"NOT_EXECUTED_BY_INERT_PLAN\"")
+                && readableJson.contains("\"execution\":\"RECORDED_BY_BOUNDED_CHILD_JVM\"")
+                && readableJson.contains("\"verification_group\":\"unverified\"")
                 && readableJson.contains("\"observed_boundary\":\"NOT_PROVEN\"")
                 && !readableJson.contains("BLOCK_BEFORE_SINK_BODY"));
         assertTrue(readableMarkdown.contains("### Steps")
@@ -69,7 +70,8 @@ class PayloadPlanWriterTest {
         String readableMarkdown = Files.readString(temp.resolve("payload.md"));
         assertTrue(readableJson.contains("\"status\":\"SINK_BLOCKED\"")
                         && readableJson.contains("\"observed_boundary\":\"SINK_BLOCKED_BEFORE_BODY\"")
-                        && readableJson.contains("\"execution\":\"NOT_EXECUTED_BY_INERT_PLAN\""),
+                        && readableJson.contains("\"execution\":\"RECORDED_BY_BOUNDED_CHILD_JVM\"")
+                        && readableJson.contains("\"verification_group\":\"boundary_only\""),
                 "canary 边界必须与最终 payload 执行严格分离：\n" + readableJson);
         assertTrue(readableMarkdown.contains("SINK BLOCKED BEFORE BODY")
                         && readableMarkdown.contains("real prefix reached the canary")
@@ -93,7 +95,8 @@ class PayloadPlanWriterTest {
         String readableJson = Files.readString(temp.resolve("payload.json"));
         String readableMarkdown = Files.readString(temp.resolve("payload.md"));
         assertTrue(readableJson.contains("SAFE_EFFECT_OBSERVED_WITH_DISTORTION")
-                        && readableJson.contains("NOT_EXECUTED_BY_INERT_PLAN")
+                        && readableJson.contains("RECORDED_BY_BOUNDED_CHILD_JVM")
+                        && readableJson.contains("\"verification_group\":\"unverified\"")
                         && !readableJson.contains("SAFE_SINK_EXECUTED"),
                 "safe effect 必须保留失真且不能升级为真实 sink 执行：\n" + readableJson);
         assertTrue(readableMarkdown.contains("SAFE EFFECT OBSERVED; REAL SINK NOT ENTERED")

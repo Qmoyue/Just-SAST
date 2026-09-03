@@ -1680,24 +1680,9 @@ public final class OriginSupport {
         if (downstream != null) {
             return downstream;
         }
-        Map<String, List<String>> fieldsWrittenBy = new HashMap<>();
         Map<String, List<String>> fieldReaders = new HashMap<>();
-        for (Node m : graph.nodesOfType(NodeType.METHOD)) {
-            MethodInfo info = methodOf(m.strProp("owner"), m.strProp("name"), m.strProp("desc"));
-            if (info == null) {
-                continue;
-            }
-            String key = methodKeyOf(m.strProp("owner"), m.strProp("name"), m.strProp("desc"));
-            for (io.just.sast.model.InsnFact insn : info.instructions()) {
-                if (insn.op().isFieldRead()) {
-                    String fieldKey = fieldKey(insn);
-                    fieldReaders.computeIfAbsent(fieldKey, k -> new ArrayList<>(1)).add(key);
-                } else if (insn.op().isFieldWrite()) {
-                    String fieldKey = fieldKey(insn);
-                    fieldsWrittenBy.computeIfAbsent(key, k -> new ArrayList<>(1)).add(fieldKey);
-                }
-            }
-        }
+        Map<String, List<String>> fieldsWrittenBy = new HashMap<>();
+        boolean[] readersIndexed = {false};
         downstream = new HashSet<>();
         Map<String, Integer> depths = new HashMap<>();
         Deque<Node> work = new ArrayDeque<>();
@@ -2135,7 +2120,24 @@ public final class OriginSupport {
                     }
                 }
             }
+            MethodInfo currentMethod = methodOf(m.strProp("owner"), m.strProp("name"),
+                    m.strProp("desc"));
             List<String> written = fieldsWrittenBy.get(key);
+            if (written == null && currentMethod != null) {
+                List<String> currentWrites = new ArrayList<>(2);
+                for (InsnFact instruction : currentMethod.instructions()) {
+                    if (instruction.op().isFieldWrite()) {
+                        currentWrites.add(fieldKey(instruction));
+                    }
+                }
+                currentWrites.sort(String::compareTo);
+                written = List.copyOf(currentWrites);
+                fieldsWrittenBy.put(key, written);
+            }
+            if (written != null && !written.isEmpty() && !readersIndexed[0]) {
+                indexEntryFieldReaders(graph, fieldReaders);
+                readersIndexed[0] = true;
+            }
             if (written != null) {
                 for (String fieldKey : written) {
                     for (String reader : fieldReaders.getOrDefault(fieldKey, List.of())) {
@@ -2160,6 +2162,28 @@ public final class OriginSupport {
         return downstream;
     }
 
+    /** Activate the global field-reader index only when an entry-relevant method writes a field. */
+    private void indexEntryFieldReaders(Graph graph, Map<String, List<String>> fieldReaders) {
+        for (Node methodNode : graph.nodesOfType(NodeType.METHOD)) {
+            MethodInfo method = methodOf(methodNode.strProp("owner"),
+                    methodNode.strProp("name"), methodNode.strProp("desc"));
+            if (method == null) {
+                continue;
+            }
+            String methodKey = methodKeyOf(methodNode.strProp("owner"),
+                    methodNode.strProp("name"), methodNode.strProp("desc"));
+            for (InsnFact instruction : method.instructions()) {
+                if (instruction.op().isFieldRead()) {
+                    fieldReaders.computeIfAbsent(fieldKey(instruction),
+                            ignored -> new ArrayList<>(1)).add(methodKey);
+                }
+            }
+        }
+        for (List<String> readers : fieldReaders.values()) {
+            readers.sort(String::compareTo);
+        }
+    }
+
     /**
      * Methods that can reach a configured sink through ordinary call edges.  A
      * typed Method collection can select any compatible getter, but only a
@@ -2173,24 +2197,14 @@ public final class OriginSupport {
         Map<String, List<String>> writersByField = new HashMap<>();
         Map<String, Integer> distances = new HashMap<>();
         Deque<String> work = new ArrayDeque<>();
-        for (Node methodNode : graph.nodesOfType(NodeType.METHOD)) {
-            String methodKey = methodKeyOf(methodNode.strProp("owner"),
-                    methodNode.strProp("name"), methodNode.strProp("desc"));
-            MethodInfo method = methodOf(methodNode.strProp("owner"), methodNode.strProp("name"),
-                    methodNode.strProp("desc"));
-            if (method == null) {
-                continue;
-            }
-            for (InsnFact instruction : method.instructions()) {
-                if (instruction.op().isFieldRead()) {
-                    fieldsReadByMethod.computeIfAbsent(methodKey, ignored -> new ArrayList<>(1))
-                            .add(fieldKey(instruction));
-                } else if (instruction.op().isFieldWrite()) {
-                    writersByField.computeIfAbsent(fieldKey(instruction), ignored -> new ArrayList<>(1))
-                            .add(methodKey);
-                }
-            }
-        }
+        /*
+         * Do not build field indexes for the whole artifact up front.  A direct-call sink has
+         * no field reverse edge, and dependency-heavy jars commonly contain many methods with
+         * no relation to any configured sink.  The first field read encountered in the reverse
+         * BFS activates the exact writer index; this is a scheduler optimization only and
+         * produces the same field edges as the eager implementation.
+         */
+        boolean[] writersIndexed = {false};
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             String callerKey = methodKeyOf(call.strProp("methodOwner"),
                     call.strProp("methodName"), call.strProp("methodDesc"));
@@ -2225,7 +2239,23 @@ public final class OriginSupport {
             // those field writers in the reverse relevance slice, then continue through their
             // callers.  This is a bounded semantic edge, not a whole-program field alias
             // analysis; exact object/field feasibility remains the responsibility of taint.
-            for (String field : fieldsReadByMethod.getOrDefault(callee, List.of())) {
+            MethodInfo calleeMethod = methodInfoOfKey(graph, callee);
+            if (calleeMethod != null && !fieldsReadByMethod.containsKey(callee)) {
+                List<String> fields = new ArrayList<>(2);
+                for (InsnFact instruction : calleeMethod.instructions()) {
+                    if (instruction.op().isFieldRead()) {
+                        fields.add(fieldKey(instruction));
+                    }
+                }
+                fields.sort(String::compareTo);
+                fieldsReadByMethod.put(callee, List.copyOf(fields));
+            }
+            List<String> readFields = fieldsReadByMethod.getOrDefault(callee, List.of());
+            if (!readFields.isEmpty() && !writersIndexed[0]) {
+                indexSinkDistanceFieldWriters(graph, writersByField);
+                writersIndexed[0] = true;
+            }
+            for (String field : readFields) {
                 for (String writer : writersByField.getOrDefault(field, List.of())) {
                     if (distances.size() >= SINK_REACHABILITY_CAP) {
                         markIncomplete("SINK_REACHABILITY_CAP:" + SINK_REACHABILITY_CAP);
@@ -2239,6 +2269,35 @@ public final class OriginSupport {
             }
         }
         return distances;
+    }
+
+    private void indexSinkDistanceFieldWriters(Graph graph,
+                                               Map<String, List<String>> writersByField) {
+        for (Node methodNode : graph.nodesOfType(NodeType.METHOD)) {
+            String methodKey = methodKeyOf(methodNode.strProp("owner"),
+                    methodNode.strProp("name"), methodNode.strProp("desc"));
+            MethodInfo method = methodOf(methodNode.strProp("owner"), methodNode.strProp("name"),
+                    methodNode.strProp("desc"));
+            if (method == null) {
+                continue;
+            }
+            for (InsnFact instruction : method.instructions()) {
+                if (instruction.op().isFieldWrite()) {
+                    writersByField.computeIfAbsent(fieldKey(instruction),
+                            ignored -> new ArrayList<>(1)).add(methodKey);
+                }
+            }
+        }
+        for (List<String> writers : writersByField.values()) {
+            writers.sort(String::compareTo);
+        }
+    }
+
+    private MethodInfo methodInfoOfKey(Graph graph, String methodKey) {
+        Node methodNode = methodNodeOf(graph, methodKey);
+        return methodNode == null ? null
+                : methodOf(methodNode.strProp("owner"), methodNode.strProp("name"),
+                methodNode.strProp("desc"));
     }
 
 

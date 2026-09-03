@@ -183,8 +183,9 @@ public final class SafeSinkAdapter {
     }
 
     /**
-     * Create the explicit adapter-owned effect policy. The parent verifier must additionally
-     * require an authenticated {@code OS_STRICT} backend before this policy can reach a child.
+     * Create the explicit real-call policy. The parent verifier must additionally require an
+     * authenticated Job Object before this policy can reach a child. The child still receives
+     * fixed arguments and the authenticated runner proof.
      */
     public static Policy safeRealExecution(Path scratchRoot) {
         Path root = requireScratchRoot(scratchRoot);
@@ -333,23 +334,10 @@ public final class SafeSinkAdapter {
             return new RealPlan(RealSinkKind.PROCESS_BUILDER_START, true,
                     "receiver-command-replaced-before-start");
         }
-        if (owner.equals("java/lang/Class") && method.equals("forName")
-                && classForNameDescriptor(descriptor)) {
-            return new RealPlan(RealSinkKind.CLASS_FOR_NAME, true, "fixed-java-class");
-        }
-        if (owner.equals("java/lang/Class") && method.equals("newInstance")
-                && "()Ljava/lang/Object;".equals(descriptor)) {
-            return new RealPlan(RealSinkKind.CLASS_NEW_INSTANCE, true, "fixed-string-class");
-        }
-        if (owner.equals("java/lang/reflect/Method") && method.equals("invoke")
-                && "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;".equals(descriptor)) {
-            return new RealPlan(RealSinkKind.METHOD_INVOKE, true, "fixed-noop-method");
-        }
-        if (owner.equals("java/lang/reflect/Constructor") && method.equals("newInstance")
-                && "([Ljava/lang/Object;)Ljava/lang/Object;".equals(descriptor)) {
-            return new RealPlan(RealSinkKind.CONSTRUCTOR_NEW_INSTANCE, true,
-                    "fixed-safe-constructor");
-        }
+        // Class loading, reflection and initialization are terminal code-loading capabilities.
+        // A fixed name does not prove that the target class is harmless, so these sinks are
+        // deliberately prefix-only. Their enum values remain for wire compatibility with old
+        // probe artifacts, but no target chain can obtain a permitted real plan.
         if ((owner.equals("java/nio/file/Files") && method.equals("newOutputStream")
                 && fileOutputDescriptor(descriptor))
                 || ((owner.equals("java/io/FileOutputStream")
@@ -357,22 +345,9 @@ public final class SafeSinkAdapter {
                 && fileConstructorDescriptor(descriptor))) {
             return new RealPlan(RealSinkKind.FILE_OUTPUT, true, "scratch-path");
         }
-        if (owner.equals("java/net/URL")
-                && (method.equals("openConnection") || method.equals("openStream"))
-                && ("()Ljava/net/URLConnection;".equals(descriptor)
-                || "()Ljava/io/InputStream;".equals(descriptor))) {
-            return new RealPlan(RealSinkKind.URL_LOOPBACK, true, "fixed-loopback-url");
-        }
-        if (owner.equals("java/net/Socket") && method.equals("connect")
-                && ("(Ljava/net/SocketAddress;)V".equals(descriptor)
-                || "(Ljava/net/SocketAddress;I)V".equals(descriptor))) {
-            return new RealPlan(RealSinkKind.SOCKET_LOOPBACK, true, "fixed-loopback-address");
-        }
-        if (owner.equals("java/lang/System") && (method.equals("load")
-                || method.equals("loadLibrary")) && stringOnlyDescriptor(descriptor)) {
-            return new RealPlan(RealSinkKind.NATIVE_FIXTURE, true,
-                    "unique-extracted-native-fixture");
-        }
+        // URL/socket, native loading and remote lookup remain high-risk even when the proposed
+        // value is loopback or a Just-owned fixture: Job Object does not enforce network or code
+        // loading policy, and a successful fixture load must not stand in for a target JNI call.
         if (applicationOwner(owner) && safeApplicationDescriptor(descriptor)) {
             return new RealPlan(RealSinkKind.APPLICATION_BODY, true,
                     "typed-string-arguments-and-nested-effect-gate");
@@ -570,7 +545,7 @@ public final class SafeSinkAdapter {
     /**
      * Start only the verifier's own Java executable with a fixed {@code -version} argument.
      * This is a real process effect, but it is not the target command and carries no target
-     * argument. The strict OS runner is the outer boundary; the Java permission gate is only
+     * argument. The Job Object runner is the outer process boundary; the Java permission gate is only
      * a second line of defense on runtimes that still support it.
      */
     private static AdapterResult observeRealCommand(Decision decision, Path executable)

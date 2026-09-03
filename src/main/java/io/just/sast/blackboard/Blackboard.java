@@ -30,7 +30,7 @@ public final class Blackboard {
     public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                              int verifyBudget, Path jdkHome, int targetMajorVersion,
                              boolean safeExec, boolean safeReal,
-                             boolean requireStrictIsolation) {
+                             boolean requireOsIsolation) {
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget) {
             this(target, deps, fast, verify, verifyBudget, null, 0, false, false, false);
@@ -57,9 +57,9 @@ public final class Blackboard {
         /** Compatibility constructor retained for callers before SAFE_REAL was added. */
         public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
                           int verifyBudget, Path jdkHome, int targetMajorVersion,
-                          boolean safeExec, boolean requireStrictIsolation) {
+                          boolean safeExec, boolean requireOsIsolation) {
             this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
-                    safeExec, false, requireStrictIsolation);
+                    safeExec, false, requireOsIsolation);
         }
 
         public static ScanInputs fastDefault(Path target) {
@@ -99,6 +99,8 @@ public final class Blackboard {
     private volatile String verificationStatus = "NOT_RUN";
     /** 动态验证正式产物；报告层不得从 stderr 重新推断验证结果。 */
     private volatile VerificationSummary verificationSummary = VerificationSummary.empty("NOT_RUN", 0);
+    /** Runner resource observations published by the calibration source for report metrics. */
+    private volatile Map<String, Long> verificationResourceMetrics = Map.of();
     private final Deque<Event> queue = new ArrayDeque<>();
 
     public Blackboard(Graph graph, ClassHierarchy hierarchy, FieldWriterIndex fieldWriters,
@@ -254,6 +256,24 @@ public final class Blackboard {
 
     public VerificationSummary verificationSummary() {
         return verificationSummary;
+    }
+
+    public void setVerificationResourceMetrics(Map<String, Long> metrics) {
+        if (metrics == null || metrics.isEmpty()) {
+            verificationResourceMetrics = Map.of();
+            return;
+        }
+        Map<String, Long> sorted = new java.util.TreeMap<>();
+        metrics.forEach((name, value) -> {
+            if (name != null && !name.isBlank() && value != null && value >= 0L) {
+                sorted.put(name, value);
+            }
+        });
+        verificationResourceMetrics = java.util.Collections.unmodifiableMap(sorted);
+    }
+
+    public Map<String, Long> verificationResourceMetrics() {
+        return verificationResourceMetrics;
     }
 
     /** 链级注释（gadget 模式标注等），附着到具体链 key。 */

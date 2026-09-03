@@ -3,8 +3,12 @@ package io.just.sast.perf;
 import io.just.sast.report.ScanStatistics;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.Callable;
 
 /**
@@ -35,13 +39,32 @@ public final class PerformanceHarness {
     /** One measured invocation; values are normalized so a malformed producer cannot poison a report. */
     public record Sample(int iteration, long wallMs, long staticMs, long dynamicMs,
                          long heapUsedMb, long heapPeakMb, long rssPeakMb,
-                         int chainsFound, String completeness, String resultDigest) {
+                         int chainsFound, String completeness, String resultDigest,
+                         Map<String, Long> phaseMs, Map<String, Long> resourceMetrics,
+                         List<Long> verificationCandidateMs) {
         /** Compatibility constructor for callers that do not provide canonical output bytes. */
         public Sample(int iteration, long wallMs, long staticMs, long dynamicMs,
                       long heapUsedMb, long heapPeakMb, long rssPeakMb,
                       int chainsFound, String completeness) {
             this(iteration, wallMs, staticMs, dynamicMs, heapUsedMb, heapPeakMb, rssPeakMb,
-                    chainsFound, completeness, "UNKNOWN");
+                    chainsFound, completeness, "UNKNOWN", Map.of(), Map.of(), List.of());
+        }
+
+        /** Compatibility constructor for callers that already provide a result digest. */
+        public Sample(int iteration, long wallMs, long staticMs, long dynamicMs,
+                      long heapUsedMb, long heapPeakMb, long rssPeakMb,
+                      int chainsFound, String completeness, String resultDigest) {
+            this(iteration, wallMs, staticMs, dynamicMs, heapUsedMb, heapPeakMb, rssPeakMb,
+                    chainsFound, completeness, resultDigest, Map.of(), Map.of(), List.of());
+        }
+
+        /** Compatibility constructor for callers that already provide phase telemetry. */
+        public Sample(int iteration, long wallMs, long staticMs, long dynamicMs,
+                      long heapUsedMb, long heapPeakMb, long rssPeakMb,
+                      int chainsFound, String completeness, String resultDigest,
+                      Map<String, Long> phaseMs) {
+            this(iteration, wallMs, staticMs, dynamicMs, heapUsedMb, heapPeakMb, rssPeakMb,
+                    chainsFound, completeness, resultDigest, phaseMs, Map.of(), List.of());
         }
 
         public Sample {
@@ -57,6 +80,33 @@ public final class PerformanceHarness {
                     ? "UNKNOWN" : completeness;
             resultDigest = resultDigest == null || resultDigest.isBlank()
                     ? "UNKNOWN" : resultDigest;
+            Map<String, Long> normalizedPhases = new TreeMap<>();
+            if (phaseMs != null) {
+                phaseMs.forEach((key, value) -> {
+                    if (key != null && !key.isBlank()) {
+                        normalizedPhases.put(key, Math.max(0L, value == null ? 0L : value));
+                    }
+                });
+            }
+            phaseMs = Collections.unmodifiableMap(normalizedPhases);
+            Map<String, Long> normalizedResources = new TreeMap<>();
+            if (resourceMetrics != null) {
+                resourceMetrics.forEach((key, value) -> {
+                    if (key != null && !key.isBlank() && value != null) {
+                        normalizedResources.put(key, value);
+                    }
+                });
+            }
+            resourceMetrics = Collections.unmodifiableMap(normalizedResources);
+            List<Long> normalizedVerification = new ArrayList<>();
+            if (verificationCandidateMs != null) {
+                for (Long duration : verificationCandidateMs) {
+                    if (duration != null) {
+                        normalizedVerification.add(Math.max(0L, duration));
+                    }
+                }
+            }
+            verificationCandidateMs = List.copyOf(normalizedVerification);
         }
     }
 
@@ -66,12 +116,33 @@ public final class PerformanceHarness {
                          PerformanceGate.Result staticPhase,
                          PerformanceGate.Result dynamicPhase,
                          long peakHeapMb, long peakRssMb,
-                         boolean chainCountStable, boolean completenessStable) {
+                         boolean chainCountStable, boolean completenessStable,
+                         Map<String, PerformanceGate.Result> phaseGates) {
+        /** Compatibility constructor for consumers written before per-phase percentiles. */
+        public Report(int warmups, List<Sample> samples,
+                      PerformanceGate.Result wall,
+                      PerformanceGate.Result staticPhase,
+                      PerformanceGate.Result dynamicPhase,
+                      long peakHeapMb, long peakRssMb,
+                      boolean chainCountStable, boolean completenessStable) {
+            this(warmups, samples, wall, staticPhase, dynamicPhase, peakHeapMb, peakRssMb,
+                    chainCountStable, completenessStable, Map.of());
+        }
+
         public Report {
             warmups = Math.max(0, warmups);
             samples = samples == null ? List.of() : List.copyOf(samples);
             peakHeapMb = Math.max(0L, peakHeapMb);
             peakRssMb = peakRssMb < 0L ? -1L : peakRssMb;
+            Map<String, PerformanceGate.Result> sorted = new TreeMap<>();
+            if (phaseGates != null) {
+                phaseGates.forEach((name, gate) -> {
+                    if (name != null && !name.isBlank() && gate != null) {
+                        sorted.put(name, gate);
+                    }
+                });
+            }
+            phaseGates = Collections.unmodifiableMap(sorted);
         }
 
         public boolean passed() {
@@ -133,7 +204,9 @@ public final class PerformanceHarness {
         List<Sample> stable = samples == null ? List.of() : List.copyOf(samples);
         List<Long> wall = values(stable, Dimension.WALL);
         List<Long> staticPhase = values(stable, Dimension.STATIC);
-        List<Long> dynamic = values(stable, Dimension.DYNAMIC);
+        List<Long> dynamicCandidates = verificationCandidateValues(stable);
+        List<Long> dynamic = dynamicCandidates.isEmpty()
+                ? values(stable, Dimension.DYNAMIC) : dynamicCandidates;
         PerformanceGate.Result wallGate = PerformanceGate.evaluate(wall,
                 limits.wallP50Ms(), limits.wallP95Ms());
         PerformanceGate.Result staticGate = PerformanceGate.evaluate(staticPhase,
@@ -141,7 +214,37 @@ public final class PerformanceHarness {
         PerformanceGate.Result dynamicGate = PerformanceGate.evaluate(dynamic,
                 limits.dynamicP50Ms(), limits.dynamicP95Ms());
         return new Report(Math.max(0, warmups), stable, wallGate, staticGate, dynamicGate,
-                maxHeap(stable), maxRss(stable), stableInt(stable, true), stableCompleteness(stable));
+                maxHeap(stable), maxRss(stable), stableInt(stable, true), stableCompleteness(stable),
+                phaseGates(stable, dynamicCandidates));
+    }
+
+    /**
+     * Compute percentiles for every phase that was actually published by at least one sample.
+     * Missing telemetry is not converted to zero: a phase with no observation has no gate result,
+     * while a phase observed in only part of a run retains its smaller explicit sample count.
+     */
+    private static Map<String, PerformanceGate.Result> phaseGates(List<Sample> samples,
+                                                                   List<Long> candidates) {
+        TreeSet<String> names = new TreeSet<>();
+        for (Sample sample : samples) {
+            names.addAll(sample.phaseMs().keySet());
+        }
+        Map<String, PerformanceGate.Result> result = new TreeMap<>();
+        for (String name : names) {
+            List<Long> values = new ArrayList<>();
+            for (Sample sample : samples) {
+                Long value = sample.phaseMs().get(name);
+                if (value != null) {
+                    values.add(Math.max(0L, value));
+                }
+            }
+            result.put(name, PerformanceGate.evaluate(values, Long.MAX_VALUE, Long.MAX_VALUE));
+        }
+        if (candidates != null && !candidates.isEmpty()) {
+            result.put("verify.candidate", PerformanceGate.evaluate(candidates,
+                    Long.MAX_VALUE, Long.MAX_VALUE));
+        }
+        return result;
     }
 
     private static Sample sample(int iteration, long wallMs, ScanStatistics statistics) {
@@ -151,16 +254,75 @@ public final class PerformanceHarness {
     /** Build a sample while allowing an external runner to attach canonical output identity. */
     public static Sample sample(int iteration, long wallMs, ScanStatistics statistics,
                                 String resultDigest) {
+        return sample(iteration, wallMs, statistics, resultDigest, statistics.phaseMs(),
+                resourceMetrics(statistics));
+    }
+
+    /** Build a sample with the phase telemetry published by the scan pipeline. */
+    public static Sample sample(int iteration, long wallMs, ScanStatistics statistics,
+                                String resultDigest, Map<String, Long> phaseMs) {
+        return sample(iteration, wallMs, statistics, resultDigest, phaseMs,
+                resourceMetrics(statistics));
+    }
+
+    /** Build a sample with phase and runner resource telemetry. */
+    public static Sample sample(int iteration, long wallMs, ScanStatistics statistics,
+                                String resultDigest, Map<String, Long> phaseMs,
+                                Map<String, Long> resourceMetrics) {
+        return sample(iteration, wallMs, statistics, resultDigest, phaseMs, resourceMetrics,
+                verificationCandidateMs(statistics));
+    }
+
+    /** Build a sample with phase, runner and per-candidate verification telemetry. */
+    public static Sample sample(int iteration, long wallMs, ScanStatistics statistics,
+                                String resultDigest, Map<String, Long> phaseMs,
+                                Map<String, Long> resourceMetrics,
+                                List<Long> verificationCandidateMs) {
         Objects.requireNonNull(statistics, "statistics");
         long staticMs = statistics.phaseMs("static", -1L);
         if (staticMs < 0L) {
             staticMs = staticPhaseMs(statistics);
         }
         long dynamicMs = statistics.phaseMs("verify", 0L);
-        long rssPeak = statistics.metric("rss_peak_mb", -1L);
+        long rssPeak = statistics.metric("parent_rss_mb",
+                statistics.metric("rss_peak_mb", -1L));
         return new Sample(iteration, wallMs, staticMs, dynamicMs,
                 statistics.heapUsedMb(), statistics.heapPeakMb(), rssPeak,
-                statistics.chainsFound(), statistics.completeness(), resultDigest);
+                statistics.chainsFound(), statistics.completeness(), resultDigest, phaseMs,
+                resourceMetrics, verificationCandidateMs);
+    }
+
+    private static List<Long> verificationCandidateMs(ScanStatistics statistics) {
+        if (statistics == null || statistics.dynamicVerification() == null) {
+            return List.of();
+        }
+        List<Long> result = new ArrayList<>();
+        statistics.dynamicVerification().results().forEach(item -> {
+            if (item != null) {
+                result.add(Math.max(0L, item.durationMs()));
+            }
+        });
+        return List.copyOf(result);
+    }
+
+    private static List<Long> verificationCandidateValues(List<Sample> samples) {
+        List<Long> values = new ArrayList<>();
+        for (Sample sample : samples) {
+            values.addAll(sample.verificationCandidateMs());
+        }
+        return values;
+    }
+
+    private static Map<String, Long> resourceMetrics(ScanStatistics statistics) {
+        Map<String, Long> result = new TreeMap<>();
+        statistics.metrics().forEach((name, value) -> {
+            if (name != null && (name.startsWith("parent_") || name.startsWith("child_")
+                    || name.startsWith("scratch_") || name.startsWith("uncollected_")
+                    || name.startsWith("cleanup_") || "rss_peak_mb".equals(name))) {
+                result.put(name, value);
+            }
+        });
+        return result;
     }
 
     private static long staticPhaseMs(ScanStatistics statistics) {

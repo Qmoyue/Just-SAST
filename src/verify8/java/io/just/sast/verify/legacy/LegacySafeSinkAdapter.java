@@ -18,7 +18,8 @@ import java.security.NoSuchAlgorithmException;
  *
  * <p>This class is deliberately dependency-free because the legacy verifier JAR is launched
  * on the target runtime.  SAFE_EXEC performs fixed mock observations. SAFE_REAL performs only
- * adapter-owned fixed effects after a canary and is accepted by the parent only with strict OS
+ * adapter-owned fixed effects after a canary and is accepted by the parent only with an
+ * authenticated process boundary
  * isolation; it never forwards target sink arguments.</p>
  */
 final class LegacySafeSinkAdapter {

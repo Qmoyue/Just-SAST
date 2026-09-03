@@ -242,7 +242,7 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
         return new Chain(rule.id(), rule.category(), rule.severity(),
                 entryMethod.owner(), entryMethod.name(), bridge,
                 sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"),
-                rule.role().name());
+                rule.role().name(), null, rule.sinkRisk());
     }
 
     private static String packagePrefix(String internalName, int segments) {

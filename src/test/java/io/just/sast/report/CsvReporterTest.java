@@ -40,6 +40,7 @@ class CsvReporterTest {
         assertTrue(findings.startsWith("\uFEFFchain_id,rule_id"), "BOM + 表头契约");
         assertTrue(findings.contains("construction_status,construction_type,construction_fields")
                 && findings.contains("verification_status,sink_distorted,sandbox_ready"));
+        assertTrue(findings.contains("verification_scope,verification_group,sink_risk"));
         assertTrue(findings.contains("app/Gadget,readObject"), "保留链在 findings");
         assertFalse(findings.contains("app/Gadget,equals"), "被拒链不进 findings");
         assertTrue(findings.contains("CC6"), "patterns 列含模式名");
@@ -75,6 +76,7 @@ class CsvReporterTest {
         String findings = Files.readString(tmp.resolve("findings.csv"));
         assertTrue(findings.contains("status=SINK_BLOCKED"));
         assertTrue(findings.contains("backend=WINDOWS_JOB_OBJECT"));
+        assertTrue(findings.contains("verification_group=boundary_only"));
         assertFalse(findings.contains("status=OLD-NOTE"));
     }
 

@@ -1,6 +1,7 @@
 package io.just.sast.config;
 
 import io.just.sast.blackboard.ObjectGraphPlan;
+import io.just.sast.blackboard.SinkRisk;
 
 import java.util.List;
 import java.util.Map;
@@ -72,7 +73,7 @@ public sealed interface Rule {
 
     /** sink 规则：调用匹配 + 需要污点的位置。 */
     record SinkRule(String id, String category, String severity, CallMatcher call,
-                    List<TaintedPos> tainted, SinkRole role) implements Rule {
+                    List<TaintedPos> tainted, SinkRole role, SinkRisk sinkRisk) implements Rule {
         public SinkRule {
             if (id == null || id.isBlank()) {
                 throw new IllegalArgumentException("sink id must not be blank");
@@ -82,12 +83,20 @@ public sealed interface Rule {
             }
             tainted = tainted == null ? List.of() : List.copyOf(tainted);
             role = role == null ? SinkRole.TERMINAL : role;
+            sinkRisk = SinkRisk.resolve(sinkRisk, category, call.ownerType(),
+                    call.name().pattern());
         }
 
         /** Compatibility constructor for extensions written before sink roles. */
         public SinkRule(String id, String category, String severity, CallMatcher call,
                         List<TaintedPos> tainted) {
-            this(id, category, severity, call, tainted, SinkRole.TERMINAL);
+            this(id, category, severity, call, tainted, SinkRole.TERMINAL, null);
+        }
+
+        /** Compatibility constructor retained for rule extensions that already provide a role. */
+        public SinkRule(String id, String category, String severity, CallMatcher call,
+                        List<TaintedPos> tainted, SinkRole role) {
+            this(id, category, severity, call, tainted, role, null);
         }
 
         public boolean terminal() {

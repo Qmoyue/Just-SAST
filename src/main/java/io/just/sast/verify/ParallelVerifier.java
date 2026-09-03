@@ -30,6 +30,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import org.objectweb.asm.ClassReader;
@@ -47,7 +50,7 @@ public final class ParallelVerifier {
 
     /** Closed verifier lifecycle; the serialized string remains for report compatibility. */
     public enum VerifyStatus {
-        SINK_BLOCKED, SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE, SAFE_EFFECT_OBSERVED,
+        SINK_BLOCKED, PRE_SINK_CONFIRMED, SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE, SAFE_EFFECT_OBSERVED,
         CONCRETE_REACHED, EXECUTED, PARTIAL, FAILED, TIMEOUT, UNTESTABLE, UNKNOWN;
 
         static VerifyStatus from(String value) {
@@ -66,7 +69,10 @@ public final class ParallelVerifier {
                                int attempt, long durationMs, String evidence,
                                String backend, String jdk, String policyDigest,
                                boolean sinkDistorted, boolean sandboxReady,
-                               String cleanup) {
+                               String cleanup, String requestedMode, String effectiveMode,
+                               String fallback, String verificationScope, String sinkRisk,
+                               boolean terminalExecuted, String stopReason,
+                               String lastConfirmedStage) {
         public VerifyResult(String chainKey, String status, String detail) {
             this(chainKey, status, detail, 1, 0L, defaultEvidence(status, detail));
         }
@@ -82,6 +88,21 @@ public final class ParallelVerifier {
                     "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false, "UNKNOWN");
         }
 
+        /** Compatibility constructor for the pre-schema runtime metadata shape. */
+        public VerifyResult(String chainKey, String status, String detail,
+                            int attempt, long durationMs, String evidence,
+                            String backend, String jdk, String policyDigest,
+                            boolean sinkDistorted, boolean sandboxReady,
+                            String cleanup) {
+            this(chainKey, status, detail, attempt, durationMs, evidence, backend, jdk,
+                    policyDigest, sinkDistorted, sandboxReady, cleanup,
+                    field(detail, "requested_mode", "UNKNOWN"),
+                    field(detail, "effective_mode", "UNKNOWN"),
+                    field(detail, "fallback", "none"), defaultScope(status), "UNKNOWN",
+                    defaultTerminalExecuted(status), defaultStopReason(status, detail),
+                    defaultLastStage(status));
+        }
+
         public VerifyResult {
             chainKey = chainKey == null ? "" : chainKey;
             status = status == null ? "UNKNOWN" : status;
@@ -94,6 +115,13 @@ public final class ParallelVerifier {
             jdk = normalize(jdk);
             policyDigest = normalize(policyDigest);
             cleanup = normalize(cleanup);
+            requestedMode = normalize(requestedMode);
+            effectiveMode = normalize(effectiveMode);
+            fallback = normalize(fallback);
+            verificationScope = normalize(verificationScope);
+            sinkRisk = normalize(sinkRisk);
+            stopReason = normalize(stopReason);
+            lastConfirmedStage = normalize(lastConfirmedStage);
         }
 
         private static String normalize(String value) {
@@ -107,6 +135,7 @@ public final class ParallelVerifier {
         private static String defaultEvidence(String status, String detail) {
             return switch (VerifyStatus.from(status)) {
                 case SINK_BLOCKED -> "SINK_CANARY_BOUNDARY";
+                case PRE_SINK_CONFIRMED -> "PREFIX_CHAIN_CONFIRMED";
                 case SINK_EXECUTED_SAFE -> "REAL_SINK_BODY_SAFE_ARGUMENTS";
                 case JNI_EXECUTED_SAFE -> "JNI_LOAD_CALLBACK_SAFE_FIXTURE";
                 case SAFE_EFFECT_OBSERVED -> "SAFE_EFFECT_OBSERVED";
@@ -126,6 +155,60 @@ public final class ParallelVerifier {
                 default -> "UNKNOWN";
             };
         }
+
+        private static String field(String detail, String name, String fallback) {
+            if (detail == null) {
+                return fallback;
+            }
+            String marker = name + "=";
+            int start = detail.indexOf(marker);
+            if (start < 0) {
+                return fallback;
+            }
+            start += marker.length();
+            int end = detail.indexOf(';', start);
+            String value = end < 0 ? detail.substring(start) : detail.substring(start, end);
+            return value.isBlank() ? fallback : value;
+        }
+
+        private static String defaultScope(String status) {
+            return switch (VerifyStatus.from(status)) {
+                case SINK_BLOCKED -> "BOUNDARY_ONLY";
+                case PRE_SINK_CONFIRMED -> "PREFIX_ONLY";
+                case SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE -> "TERMINAL_EXECUTED_SAFE";
+                default -> "NONE";
+            };
+        }
+
+        private static boolean defaultTerminalExecuted(String status) {
+            VerifyStatus code = VerifyStatus.from(status);
+            return code == VerifyStatus.SINK_EXECUTED_SAFE || code == VerifyStatus.JNI_EXECUTED_SAFE;
+        }
+
+        private static String defaultStopReason(String status, String detail) {
+            return switch (VerifyStatus.from(status)) {
+                case SINK_BLOCKED -> "SINK_BOUNDARY_CANARY";
+                case PRE_SINK_CONFIRMED -> "HIGH_RISK_SINK";
+                case SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE -> "SAFE_TERMINAL_RETURNED";
+                case SAFE_EFFECT_OBSERVED -> "ADAPTER_EFFECT_ONLY";
+                case TIMEOUT -> "PROCESS_TIMEOUT";
+                case UNTESTABLE -> detail != null && detail.startsWith("SANDBOX_UNAVAILABLE")
+                        ? "SANDBOX_UNAVAILABLE" : "UNTESTABLE";
+                default -> "NONE";
+            };
+        }
+
+        private static String defaultLastStage(String status) {
+            return switch (VerifyStatus.from(status)) {
+                case SINK_BLOCKED -> "SINK_BOUNDARY";
+                case PRE_SINK_CONFIRMED -> "PRE_SINK";
+                case SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE -> "SINK_RETURNED";
+                case SAFE_EFFECT_OBSERVED -> "ADAPTER_EFFECT";
+                case CONCRETE_REACHED -> "CONCRETE_TRIGGER";
+                case EXECUTED -> "ENTRY_RETURNED";
+                default -> "NONE";
+            };
+        }
     }
 
     public interface ConfirmCallback {
@@ -143,7 +226,8 @@ public final class ParallelVerifier {
     private final String policyDigest;
     /** Fixed-size child protocol binding; the report keeps the readable composite policy. */
     private final String policyBindingDigest;
-    private final boolean requireStrictIsolation;
+    /** Kept as an explicit policy bit for CLI/cache identity; Job Object is always the default. */
+    private final boolean requireOsIsolation;
 
     private final Path targetJar;
     private final List<Path> deps;
@@ -151,7 +235,7 @@ public final class ParallelVerifier {
     private final Path targetJdkHome;
     private final int targetMajorVersion;
     private final ConfirmCallback callback;
-    /** The parent must own a real OS boundary before releasing an untrusted child. */
+    /** The selected first-tier OS boundary; SAFE_REAL normally starts at the light tier. */
     private final OsIsolation.Backend isolationBackend;
     /** 共享的有界 fat JAR/WAR classpath 展开；所有链复用同一只读结果。 */
     private volatile NestedClasspath expandedClasspath;
@@ -169,6 +253,8 @@ public final class ParallelVerifier {
     private volatile RuntimeSelection selectedRuntime;
     /** Candidate-local native indexes are small and reusable; failures are never cached. */
     private final Map<String, String> nativeIndexCache = new java.util.LinkedHashMap<>();
+    /** One owner for dynamic phase/resource observations; it is not part of the scan state. */
+    private final VerificationTelemetry telemetry = new VerificationTelemetry();
 
     /** Launcher-owned identities carried by the authenticated probe protocol. */
     static record ProtocolIdentity(String token, String runId, String chainFingerprint,
@@ -199,16 +285,16 @@ public final class ParallelVerifier {
 
     public ParallelVerifier(Path targetJar, List<Path> deps, Path targetJdkHome,
                             int targetMajorVersion, boolean safeExec,
-                            boolean requireStrictIsolation,
+                            boolean requireOsIsolation,
                             ConfirmCallback callback) {
         this(targetJar, deps, targetJdkHome, targetMajorVersion, safeExec, false,
-                requireStrictIsolation, callback);
+                requireOsIsolation, callback);
     }
 
     /** Explicit adapter mode; SAFE_REAL is intentionally separate from historical SAFE_EXEC. */
     public ParallelVerifier(Path targetJar, List<Path> deps, Path targetJdkHome,
                             int targetMajorVersion, boolean safeExec, boolean safeReal,
-                            boolean requireStrictIsolation,
+                            boolean requireOsIsolation,
                             ConfirmCallback callback) {
         this.targetJar = targetJar.toAbsolutePath().normalize();
         this.deps = deps != null ? deps : List.of();
@@ -219,22 +305,185 @@ public final class ParallelVerifier {
         this.ownJar = locateOwnJar();
         this.sinkMode = safeReal ? SafeSinkAdapter.Mode.SAFE_REAL
                 : safeExec ? SafeSinkAdapter.Mode.SAFE_EXEC : SafeSinkAdapter.Mode.BOUNDARY;
-        this.isolationBackend = OsIsolation.select(this.ownJar,
-                requireStrictIsolation || safeReal);
-        // SAFE_REAL is never meaningful without the strict OS contract. Keep that invariant in
-        // the verifier itself so direct extension callers cannot create a contradictory mode.
-        this.requireStrictIsolation = requireStrictIsolation || safeReal;
+        // The default and only real-call tier is the cheap process/resource boundary. The
+        // explicit CLI bit is retained for policy/cache identity and does not select another
+        // runner.
+        this.requireOsIsolation = requireOsIsolation;
+        this.isolationBackend = OsIsolation.select(this.ownJar);
         this.policyDigest = SafeSinkAdapter.policyDigest(this.sinkMode)
                 + ";os=" + isolationBackend.policyDigest()
                 + ";attestation=" + isolationBackend.attestationVersion()
                 + ";loopback=" + (this.sinkMode == SafeSinkAdapter.Mode.SAFE_REAL)
-                + ";strict=" + this.requireStrictIsolation;
+                + ";require_os=" + this.requireOsIsolation;
         this.policyBindingDigest = policyDigestOf(this.policyDigest);
     }
 
     private record RuntimeSelection(Path javaHome, Path probeJar, int feature, String reason) {
         boolean available() {
             return javaHome != null && probeJar != null;
+        }
+    }
+
+    /** Per-child phase observations; values are published only after the child is closed. */
+    private static final class AttemptTiming {
+        private final Map<String, Long> values = new HashMap<>();
+
+        void add(String name, long durationNanos) {
+            if (name == null || name.isBlank()) {
+                return;
+            }
+            long millis = Math.max(0L, durationNanos) / 1_000_000L;
+            values.merge(name, millis, ParallelVerifier::saturatedAdd);
+        }
+
+        void addMillis(String name, long millis) {
+            if (name == null || name.isBlank()) {
+                return;
+            }
+            values.merge(name, Math.max(0L, millis), ParallelVerifier::saturatedAdd);
+        }
+    }
+
+    /**
+     * Owns the verifier's optional telemetry without leaking counters into the execution state.
+     * The hot path still uses the same concurrent adders and one thread-local attempt object;
+     * this type only makes their lifetime and aggregation rules explicit.
+     */
+    private static final class VerificationTelemetry {
+        private final Map<String, LongAdder> phaseTotals = new ConcurrentHashMap<>();
+        private final Map<String, LongAdder> resourceTotals = new ConcurrentHashMap<>();
+        private final Map<String, AtomicLong> resourceMaxima = new ConcurrentHashMap<>();
+        private final LongAdder cleanupSuccesses = new LongAdder();
+        private final LongAdder cleanupFailures = new LongAdder();
+        private final ThreadLocal<AttemptTiming> currentAttempt = new ThreadLocal<>();
+
+        AttemptTiming beginAttempt() {
+            AttemptTiming timing = new AttemptTiming();
+            currentAttempt.set(timing);
+            return timing;
+        }
+
+        void endAttempt() {
+            currentAttempt.remove();
+        }
+
+        void publishAttempt(AttemptTiming timing) {
+            if (timing == null) {
+                return;
+            }
+            for (Map.Entry<String, Long> entry : timing.values.entrySet()) {
+                phaseTotals.computeIfAbsent(entry.getKey(), ignored -> new LongAdder())
+                        .add(Math.max(0L, entry.getValue()));
+            }
+        }
+
+        void recordAttemptPhase(String name, long started) {
+            AttemptTiming timing = currentAttempt.get();
+            if (timing != null) {
+                timing.add(name, System.nanoTime() - started);
+            }
+        }
+
+        void recordGlobalPhase(String name, long durationNanos) {
+            if (name != null && !name.isBlank()) {
+                phaseTotals.computeIfAbsent(name, ignored -> new LongAdder())
+                        .add(Math.max(0L, durationNanos) / 1_000_000L);
+            }
+        }
+
+        Map<String, Long> phases() {
+            Map<String, Long> result = new TreeMap<>();
+            phaseTotals.forEach((name, value) -> result.put(name, Math.max(0L, value.sum())));
+            return Collections.unmodifiableMap(result);
+        }
+
+        void addResourceTotal(String name, long value) {
+            if (name != null && !name.isBlank() && value >= 0L) {
+                resourceTotals.computeIfAbsent(name, ignored -> new LongAdder()).add(value);
+            }
+        }
+
+        void addResourceMax(String name, long value) {
+            if (name != null && !name.isBlank() && value >= 0L) {
+                resourceMaxima.computeIfAbsent(name, ignored -> new AtomicLong())
+                        .accumulateAndGet(value, Math::max);
+            }
+        }
+
+        void recordCleanup(boolean cleaned) {
+            if (cleaned) {
+                cleanupSuccesses.increment();
+            } else {
+                cleanupFailures.increment();
+            }
+        }
+
+        Map<String, Long> resources() {
+            Map<String, Long> result = new TreeMap<>();
+            resourceTotals.forEach((name, value) -> result.put(name, Math.max(0L, value.sum())));
+            resourceMaxima.forEach((name, value) -> result.put(name, Math.max(0L, value.get())));
+            long success = cleanupSuccesses.sum();
+            long failure = cleanupFailures.sum();
+            long attempts = saturatedAdd(success, failure);
+            result.put("cleanup_successes", success);
+            result.put("cleanup_failures", failure);
+            result.put("cleanup_rate_milli", attempts == 0L
+                    ? 1000L : Math.min(1000L, (success * 1000L) / attempts));
+            return Collections.unmodifiableMap(result);
+        }
+    }
+
+    /**
+     * Low-frequency process-tree sampler used only while a child attempt is alive.  Job Object
+     * accounting exposes total/active processes but not a peak process count; this sampler fills
+     * that one reporting gap without adding a resident service or another process.
+     */
+    private static final class ProcessTreeMonitor implements AutoCloseable {
+        private static final long SAMPLE_MILLIS = 100L;
+        private final ProcessHandle root;
+        private final AtomicLong peak = new AtomicLong(1L);
+        private volatile boolean running = true;
+        private final Thread sampler;
+
+        private ProcessTreeMonitor(Process process) {
+            this.root = process.toHandle();
+            sample();
+            sampler = new Thread(() -> {
+                while (running) {
+                    sample();
+                    try {
+                        Thread.sleep(SAMPLE_MILLIS);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }, "just-verify-resource");
+            sampler.setDaemon(true);
+            sampler.start();
+        }
+
+        private void sample() {
+            long count = liveProcessCount(root);
+            if (count >= 0L) {
+                peak.accumulateAndGet(count, Math::max);
+            }
+        }
+
+        private long peak() {
+            return peak.get();
+        }
+
+        @Override
+        public void close() {
+            running = false;
+            sampler.interrupt();
+            try {
+                sampler.join(250L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            sample();
         }
     }
 
@@ -734,6 +983,28 @@ public final class ParallelVerifier {
         return capability;
     }
 
+    /** Aggregated per-attempt timing work for the opt-in performance report. */
+    public Map<String, Long> phaseTimings() {
+        return telemetry.phases();
+    }
+
+    /**
+     * Aggregated runner resource observations.  Peak values use a maximum across attempts;
+     * child CPU and scratch bytes are additive.  Missing platform observations are omitted
+     * instead of being reported as zero.
+     */
+    public Map<String, Long> resourceMetrics() {
+        return telemetry.resources();
+    }
+
+    private void recordResourceTotal(String name, long value) {
+        telemetry.addResourceTotal(name, value);
+    }
+
+    private void recordResourceMax(String name, long value) {
+        telemetry.addResourceMax(name, value);
+    }
+
     /** Capability represented by the selected host backend before a child attempt runs. */
     public String hostCapability() {
         return capabilityForReadyBackend();
@@ -753,14 +1024,15 @@ public final class ParallelVerifier {
     }
 
     public String policyMode() {
-        return sinkMode.name();
+        return sinkMode == SafeSinkAdapter.Mode.SAFE_REAL
+                ? "LIGHT_SAFE_CALL" : sinkMode.name();
     }
 
     public String isolationLevel() {
         return isolationBackend.level().name();
     }
 
-    /** Version of the child-side isolation proof carried by every ready event. */
+    /** Version of the parent-attached runner proof carried by every ready event. */
     public String attestationVersion() {
         return isolationBackend.attestationVersion();
     }
@@ -770,36 +1042,34 @@ public final class ParallelVerifier {
         return java.util.Collections.unmodifiableSet(sorted);
     }
 
-    public boolean requireStrictIsolation() {
-        return requireStrictIsolation;
+    public boolean requireOsIsolation() {
+        return requireOsIsolation;
     }
 
-    /** True only when the selected backend has passed the complete strict production contract. */
-    public boolean strictIsolationReady() {
-        return strictOsBackendAvailable();
+    /** True only when the selected Job Object backend has passed its production contract. */
+    public boolean osIsolationReady() {
+        return isolationBackend.available() && isolationBackend.productionReady();
     }
 
-    /** Stable per-chain detail used when a strict request is rejected before child launch. */
-    public String strictUnavailableDetail() {
-        return "SANDBOX_UNAVAILABLE:STRICT_OS_REQUIRED:"
+    /** Stable per-chain detail used when the Job Object backend is unavailable. */
+    public String isolationUnavailableDetail() {
+        return "SANDBOX_UNAVAILABLE:JOB_OBJECT_REQUIRED:"
                 + isolationBackend.level().name() + isolationReason(isolationBackend);
     }
 
     /**
-     * Build the report-only result used when strict verification is rejected before a child
+     * Build the report-only result used when process-boundary verification is rejected before a child
      * JVM is started.  Keeping the host policy metadata here prevents the preflight path from
      * silently manufacturing per-chain UNKNOWN backend/effect fields.
      */
-    public VerifyResult strictUnavailableResult(Chain chain) {
-        return new VerifyResult(chain.key(), "UNTESTABLE", strictUnavailableDetail(), 1, 0L,
+    public VerifyResult isolationUnavailableResult(Chain chain) {
+        return new VerifyResult(chain.key(), "UNTESTABLE", isolationUnavailableDetail(), 1, 0L,
                 "SANDBOX_UNAVAILABLE", backendId(), runtimeLabel(selectRuntime()), policyDigest(),
                 false, false, "NOT_STARTED");
     }
 
     private String capabilityForReadyBackend() {
         return switch (isolationBackend.level()) {
-            case OS_STRICT -> "OS_STRICT";
-            case OS_NAMESPACE -> "OS_NAMESPACE";
             case PROCESS_RESOURCE -> "PROCESS_RESOURCE";
             case NONE -> "OS_ISOLATION_UNAVAILABLE";
         };
@@ -829,6 +1099,9 @@ public final class ParallelVerifier {
                 sandboxUnavailable = true;
             }
             if (detail.contains("no-compatible-jdk")
+                    || detail.contains("target-jdk-executable-missing")
+                    || detail.contains("target-jdk-feature-unknown")
+                    || detail.contains("target-jdk-too-old")
                     || detail.contains("runtime-jdk-too-old")
                     || detail.contains("verifier-artifact-missing")
                     || detail.contains("CANARY_ARTIFACT_MISSING")) {
@@ -867,8 +1140,12 @@ public final class ParallelVerifier {
         List<VerifyResult> results = new ArrayList<>(Collections.nCopies(chains.size(), null));
         for (int i = 0; i < chains.size(); i++) {
             final int index = i;
+            final long queuedAt = System.nanoTime();
             Future<IndexedResult> future = completion.submit(
-                    () -> new IndexedResult(index, verifyOne(chains.get(index), attempt)));
+                    () -> {
+                        recordGlobalPhase("queue", System.nanoTime() - queuedAt);
+                        return new IndexedResult(index, verifyOne(chains.get(index), attempt));
+                    });
             pending.put(future, index);
         }
         // The process-level timeout belongs to each child, but the collector has one batch
@@ -877,7 +1154,7 @@ public final class ParallelVerifier {
         // A single monotonic deadline bounds the whole batch while preserving the input-indexed
         // result order and the explicit opt-in retry policy.
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(
-                batchTimeoutSeconds(chains.size(), workers));
+                batchTimeoutSecondsForRun(chains.size(), workers));
         while (!pending.isEmpty()) {
             Future<IndexedResult> future;
             try {
@@ -913,7 +1190,7 @@ public final class ParallelVerifier {
             Chain chain = chains.get(index);
             results.set(index, enrich(new VerifyResult(chain.key(), "UNTESTABLE",
                     "verification-future-timeout", attempt,
-                    (long) batchTimeoutSeconds(chains.size(), workers) * 1000)));
+                    (long) batchTimeoutSecondsForRun(chains.size(), workers) * 1000)));
         }
         return results;
     }
@@ -929,14 +1206,30 @@ public final class ParallelVerifier {
      * candidate one bounded wave and adds one grace period for collector cleanup.</p>
      */
     static int batchTimeoutSeconds(int chainCount, int workers) {
+        return batchTimeoutSeconds(chainCount, workers, 1);
+    }
+
+    /**
+     * Collector budget for a run whose worker can execute a bounded two-step policy. A light
+     * SAFE_REAL attempt may consume one child timeout, then the boundary attempt gets its own
+     * timeout. The legacy overload intentionally keeps its one-attempt contract for callers
+     * that only run a single verification mode.
+     */
+    static int batchTimeoutSeconds(int chainCount, int workers, int maxTierAttempts) {
         int tasks = Math.max(0, chainCount);
         if (tasks == 0) {
             return 0;
         }
         int parallelism = Math.max(1, workers);
         int waves = (tasks + parallelism - 1) / parallelism;
-        long seconds = (long) TIMEOUT_SECONDS * waves + FUTURE_GRACE_SECONDS;
+        int attempts = Math.max(1, maxTierAttempts);
+        long seconds = (long) TIMEOUT_SECONDS * waves * attempts + FUTURE_GRACE_SECONDS;
         return seconds > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) seconds;
+    }
+
+    private int batchTimeoutSecondsForRun(int chainCount, int workers) {
+        int maxTierAttempts = sinkMode == SafeSinkAdapter.Mode.SAFE_REAL ? 2 : 1;
+        return batchTimeoutSeconds(chainCount, workers, maxTierAttempts);
     }
 
     /** 入口类型 → 探针模式（触发忠实：hashCode 经 HashMap.put、compareTo 经两元素 TreeSet、
@@ -960,21 +1253,65 @@ public final class ParallelVerifier {
 
     private VerifyResult verifyOne(Chain chain, int attempt) {
         long started = System.nanoTime();
-        VerifyResult result = verifyOneInternal(chain);
-        if (result == null) {
-            result = new VerifyResult(chain.key(), "UNKNOWN", "verifier-returned-null");
+        AttemptTiming timing = telemetry.beginAttempt();
+        try {
+            VerifyResult result = verifyOneInternal(chain);
+            if (result == null) {
+                result = new VerifyResult(chain.key(), "UNKNOWN", "verifier-returned-null");
+            }
+            VerifyResult timed = copyResult(result, result.detail(), attempt,
+                    Math.max(result.durationMs(),
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)));
+            recordDetailTimings(timing, timed.detail());
+            telemetry.publishAttempt(timing);
+            return enrich(timed, chain);
+        } finally {
+            telemetry.endAttempt();
         }
-        VerifyResult timed = new VerifyResult(result.chainKey(), result.status(), result.detail(),
-                attempt,
-                Math.max(result.durationMs(),
-                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)),
-                result.evidence(), result.backend(), result.jdk(), result.policyDigest(),
-                result.sinkDistorted(), result.sandboxReady(), result.cleanup());
-        return enrich(timed);
+    }
+
+    private void recordDetailTimings(AttemptTiming timing, String detail) {
+        if (timing == null || detail == null || detail.isBlank()) {
+            return;
+        }
+        for (String phase : List.of("class_load_ms", "real_call_ms", "prefix_stop_ms")) {
+            long value = detailField(detail, phase);
+            if (value >= 0L) {
+                timing.addMillis(phase.substring(0, phase.length() - 3), value);
+            }
+        }
+    }
+
+    private static long detailField(String detail, String field) {
+        String marker = ";" + field + "=";
+        int start = detail.indexOf(marker);
+        if (start < 0) {
+            return -1L;
+        }
+        start += marker.length();
+        int end = detail.indexOf(';', start);
+        String value = end < 0 ? detail.substring(start) : detail.substring(start, end);
+        try {
+            return Math.max(0L, Long.parseLong(value));
+        } catch (NumberFormatException ignored) {
+            return -1L;
+        }
+    }
+
+    private void recordAttemptPhase(String name, long started) {
+        telemetry.recordAttemptPhase(name, started);
+    }
+
+    private void recordGlobalPhase(String name, long durationNanos) {
+        telemetry.recordGlobalPhase(name, durationNanos);
     }
 
     /** Add the immutable per-attempt policy context before a result reaches the blackboard. */
     private VerifyResult enrich(VerifyResult result) {
+        return enrich(result, null);
+    }
+
+    private VerifyResult enrich(VerifyResult result, Chain chain) {
         RuntimeSelection runtime = selectRuntime();
         // Readiness is authenticated by the child protocol, not inferred from a non-error
         // status. In particular FAILED/TIMEOUT must not advertise that the Java policy was
@@ -982,23 +1319,176 @@ public final class ParallelVerifier {
         boolean ready = result != null && result.sandboxReady();
         boolean distorted = ready && result.sinkDistorted();
         String detail = result == null ? "unknown-result" : sanitizeDetail(result.detail());
+        String resultBackend = result == null ? "UNKNOWN" : result.backend();
+        if (resultBackend == null || resultBackend.isBlank() || "UNKNOWN".equals(resultBackend)) {
+            resultBackend = backendId();
+        }
+        String resultPolicy = result == null ? "UNKNOWN" : result.policyDigest();
+        if (resultPolicy == null || resultPolicy.isBlank() || "UNKNOWN".equals(resultPolicy)) {
+            resultPolicy = policyDigest();
+        }
         return new VerifyResult(result == null ? "" : result.chainKey(),
                 result == null ? "UNKNOWN" : result.status(),
                 detail,
                 result == null ? 1 : result.attempt(),
                 result == null ? 0L : result.durationMs(),
                 result == null ? "UNKNOWN" : result.evidence(),
-                backendId(), runtimeLabel(runtime), policyDigest(), distorted, ready,
-                result == null ? "UNKNOWN" : result.cleanup());
+                resultBackend, runtimeLabel(runtime), resultPolicy, distorted, ready,
+                result == null ? "UNKNOWN" : result.cleanup(),
+                result == null ? "UNKNOWN" : result.requestedMode(),
+                result == null ? "UNKNOWN" : result.effectiveMode(),
+                result == null ? "none" : result.fallback(),
+                result == null ? "NONE" : result.verificationScope(),
+                chain == null || chain.sinkRisk() == null
+                        ? result == null ? "UNKNOWN" : result.sinkRisk()
+                        : chain.sinkRisk().name(),
+                result != null && result.terminalExecuted(),
+                result == null ? "UNKNOWN" : result.stopReason(),
+                result == null ? "UNKNOWN" : result.lastConfirmedStage());
     }
 
     /** Result carrying the child-authenticated boundary state into the parent enrichment step. */
     private VerifyResult authenticatedResult(Chain chain, String status, String detail,
                                              String evidence, boolean sinkDistorted,
                                              boolean sandboxReady) {
+        return authenticatedResult(chain, status, detail, evidence, sinkDistorted,
+                sandboxReady, isolationBackend, policyDigest());
+    }
+
+    private VerifyResult authenticatedResult(Chain chain, String status, String detail,
+                                             String evidence, boolean sinkDistorted,
+                                             boolean sandboxReady, OsIsolation.Backend backend,
+                                             String attemptPolicyDigest) {
         return new VerifyResult(chain.key(), status, detail, 1, 0L, evidence,
-                isolationBackend.id(), "UNKNOWN", policyDigest(), sinkDistorted,
-                sandboxReady, "CLEANUP_BEST_EFFORT");
+                backend == null ? "UNKNOWN" : backend.id(), "UNKNOWN",
+                attemptPolicyDigest == null ? "UNKNOWN" : attemptPolicyDigest,
+                sinkDistorted, sandboxReady, "CLEANUP_BEST_EFFORT");
+    }
+
+    private static String tierName(OsIsolation.Backend backend) {
+        return backend != null && backend.available() ? "LIGHT_SAFE_CALL" : "UNAVAILABLE";
+    }
+
+    private static VerifyResult decorate(VerifyResult result, String requestedTier,
+                                         String effectiveTier, String fallbackReason) {
+        if (result == null) {
+            return null;
+        }
+        String detail = result.detail() == null ? "" : result.detail();
+        if (detail.startsWith("requested_mode=")) {
+            return result;
+        }
+        String requested = requestedTier == null || requestedTier.isBlank()
+                ? "UNKNOWN" : requestedTier;
+        String effective = effectiveTier == null || effectiveTier.isBlank()
+                ? "UNKNOWN" : effectiveTier;
+        String fallback = fallbackReason == null || fallbackReason.isBlank()
+                ? "none" : sanitizeTierReason(fallbackReason);
+        String decoratedDetail = "requested_mode=" + requested
+                + ";effective_mode=" + effective
+                + ";fallback=" + fallback + ";" + detail;
+        return copyResult(result, decoratedDetail, result.attempt(), result.durationMs(),
+                requested, effective, fallback);
+    }
+
+    private static VerifyResult copyResult(VerifyResult result, String detail,
+                                           int attempt, long durationMs) {
+        return copyResult(result, detail, attempt, durationMs,
+                result.requestedMode(), result.effectiveMode(), result.fallback());
+    }
+
+    private static VerifyResult copyResult(VerifyResult result, String detail,
+                                           int attempt, long durationMs,
+                                           String requestedMode, String effectiveMode,
+                                           String fallback) {
+        return new VerifyResult(result.chainKey(), result.status(), detail, attempt, durationMs,
+                result.evidence(), result.backend(), result.jdk(), result.policyDigest(),
+                result.sinkDistorted(), result.sandboxReady(), result.cleanup(),
+                requestedMode, effectiveMode, fallback, result.verificationScope(),
+                result.sinkRisk(), result.terminalExecuted(), result.stopReason(),
+                result.lastConfirmedStage());
+    }
+
+    static boolean infrastructureFailure(VerifyResult result) {
+        if (result == null) {
+            return true;
+        }
+        if (result.statusCode() == VerifyStatus.TIMEOUT) {
+            return true;
+        }
+        if (result.statusCode() != VerifyStatus.UNTESTABLE) {
+            return false;
+        }
+        String detail = rawDetail(result.detail());
+        return detail.startsWith("SANDBOX_UNAVAILABLE")
+                || detail.startsWith("PROTOCOL_AUTHENTICATION_FAILED")
+                || detail.startsWith("PROBE_OUTPUT_LIMIT")
+                || detail.startsWith("PROCESS_OOM")
+                || detail.startsWith("verification-future-timeout")
+                || detail.startsWith("target-timeout")
+                || detail.startsWith("SAFE_NATIVE_FIXTURE_UNAVAILABLE")
+                || detail.startsWith("SAFE_NATIVE_FIXTURE_ROOT_UNAVAILABLE")
+                || detail.startsWith("CANARY_ARTIFACT_MISSING")
+                || detail.startsWith("UNTESTABLE: CANARY_AGENT_NOT_READY")
+                || detail.startsWith("UNTESTABLE: REAL_SINK_AGENT_NOT_READY")
+                || detail.startsWith("UNTESTABLE: PROTOCOL_BINDING_NOT_READY")
+                || detail.startsWith("UNTESTABLE: REAL_SINK_EVIDENCE_INCOMPLETE")
+                || detail.startsWith("UNTESTABLE: SAFE_NATIVE_FIXTURE_CONFIGURATION_FAILED");
+    }
+
+    static boolean boundaryOnlyFailure(VerifyResult result) {
+        return result != null
+                && rawDetail(result.detail()).startsWith("SAFE_SANITIZER_UNAVAILABLE");
+    }
+
+    static String stableFailure(VerifyResult result) {
+        if (result == null || result.detail() == null || result.detail().isBlank()) {
+            return "unknown";
+        }
+        if (result.statusCode() == VerifyStatus.TIMEOUT) {
+            return "PROCESS_TIMEOUT";
+        }
+        String detail = rawDetail(result.detail());
+        if (detail.startsWith("UNTESTABLE: REAL_SINK_EVIDENCE_INCOMPLETE")) {
+            return sanitizeTierReason("UNTESTABLE:REAL_SINK_EVIDENCE_INCOMPLETE_loaded="
+                    + fieldValue(detail, "loaded") + "_arguments="
+                    + fieldValue(detail, "arguments"));
+        }
+        int semicolon = detail.indexOf(';');
+        if (semicolon >= 0) {
+            detail = detail.substring(0, semicolon);
+        }
+        return sanitizeTierReason(detail);
+    }
+
+    private static String fieldValue(String detail, String field) {
+        String marker = ";" + field + "=";
+        int start = detail.indexOf(marker);
+        if (start < 0) {
+            return "unknown";
+        }
+        start += marker.length();
+        int end = detail.indexOf(';', start);
+        return end < 0 ? detail.substring(start) : detail.substring(start, end);
+    }
+
+    /** Remove the report-only tier prefix without confusing its fallback value for the cause. */
+    static String rawDetail(String detail) {
+        if (detail == null || !detail.startsWith("requested_mode=")) {
+            return detail == null ? "" : detail;
+        }
+        int first = detail.indexOf(';');
+        int second = first < 0 ? -1 : detail.indexOf(';', first + 1);
+        int third = second < 0 ? -1 : detail.indexOf(';', second + 1);
+        return third < 0 ? detail : detail.substring(third + 1);
+    }
+
+    private static String sanitizeTierReason(String value) {
+        if (value == null || value.isBlank()) {
+            return "unknown";
+        }
+        String sanitized = value.replaceAll("[^A-Za-z0-9_.=:-]", "_");
+        return sanitized.length() > 160 ? sanitized.substring(0, 160) : sanitized;
     }
 
     private static String runtimeLabel(RuntimeSelection runtime) {
@@ -1010,37 +1500,103 @@ public final class ParallelVerifier {
         return "feature=" + runtime.feature() + ";selection=" + runtime.reason();
     }
 
+    /**
+     * Execute the two-step lightweight policy. A safe real call is attempted once; only an
+     * infrastructure/sanitizer failure may fall back to the exact boundary canary. There is no
+     * stronger hidden runner and a semantic negative is never retried with a different shape.
+     */
     private VerifyResult verifyOneInternal(Chain chain) {
+        if (sinkMode != SafeSinkAdapter.Mode.SAFE_REAL) {
+            return decorate(verifyOneInternal(chain, isolationBackend, sinkMode, sinkMode.name(),
+                    sinkMode.name(), "none"), sinkMode.name(), sinkMode.name(), "none");
+        }
+
+        String requested = "LIGHT_SAFE_CALL";
+        OsIsolation.Backend first = isolationBackend;
+        if (chain.sinkRisk() == io.just.sast.blackboard.SinkRisk.HIGH_RISK_TERMINAL) {
+            // The exact sink boundary is still instrumented, but the target terminal method is
+            // never entered. This gives high-risk chains a real prefix experiment without
+            // pretending that a class load, native load, lookup or evaluator was executed.
+            VerifyResult prefix = verifyOneInternal(chain, first, SafeSinkAdapter.Mode.BOUNDARY,
+                    requested, "PREFIX_ONLY", "none");
+            return prefixOnlyResult(prefix, chain);
+        }
+        VerifyResult result = verifyOneInternal(chain, first, SafeSinkAdapter.Mode.SAFE_REAL,
+                requested, tierName(first), "none");
+        if (!infrastructureFailure(result)) {
+            if (boundaryOnlyFailure(result)) {
+                String fallbackReason = stableFailure(result);
+                VerifyResult boundary = verifyOneInternal(chain, first,
+                        SafeSinkAdapter.Mode.BOUNDARY, requested, "BOUNDARY",
+                        fallbackReason);
+                return boundary == null
+                        ? decorate(result, requested, "BOUNDARY", fallbackReason)
+                        : decorate(boundary, requested, "BOUNDARY", fallbackReason);
+            }
+            return decorate(result, requested, tierName(first), "none");
+        }
+
+        String fallbackReason = stableFailure(result);
+        // The only fallback is the same Job Object-backed boundary canary. If the runner itself
+        // is unavailable, this second call remains UNTESTABLE and cannot start an uncontained
+        // target JVM.
+        VerifyResult boundary = verifyOneInternal(chain, first,
+                SafeSinkAdapter.Mode.BOUNDARY, requested, "BOUNDARY", fallbackReason);
+        if (boundary == null) {
+            return decorate(result, requested, "BOUNDARY", fallbackReason);
+        }
+        return decorate(boundary, requested, "BOUNDARY", fallbackReason);
+    }
+
+    private static VerifyResult prefixOnlyResult(VerifyResult result, Chain chain) {
+        if (result == null || result.statusCode() != VerifyStatus.SINK_BLOCKED) {
+            return result;
+        }
+        String detail = result.detail() == null ? "" : result.detail();
+        String raw = rawDetail(detail);
+        String decorated = "requested_mode=LIGHT_SAFE_CALL;effective_mode=PREFIX_ONLY;"
+                + "fallback=none;" + raw;
+        return new VerifyResult(result.chainKey(), "PRE_SINK_CONFIRMED", decorated,
+                result.attempt(), result.durationMs(), "PREFIX_CHAIN_CONFIRMED",
+                result.backend(), result.jdk(), result.policyDigest(), false,
+                result.sandboxReady(), result.cleanup(), "LIGHT_SAFE_CALL", "PREFIX_ONLY",
+                "none", "PREFIX_ONLY", chain.sinkRisk().name(), false,
+                "HIGH_RISK_SINK", "PRE_SINK");
+    }
+
+    private VerifyResult verifyOneInternal(Chain chain, OsIsolation.Backend backend,
+                                           SafeSinkAdapter.Mode attemptMode,
+                                           String requestedTier, String effectiveTier,
+                                           String fallbackReason) {
         Path isoDir = null;
         Path nativeRoot = null;
         Process proc = null;
+        ProcessTreeMonitor processMonitor = null;
         OsIsolation.Session isolationSession = null;
+        long runnerStarted = 0L;
         try {
             RuntimeSelection runtime = selectRuntime();
             if (!runtime.available()) {
-                return new VerifyResult(chain.key(), "UNTESTABLE", runtime.reason());
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE", runtime.reason()),
+                        requestedTier, effectiveTier, fallbackReason);
             }
-            if (!isolationBackend.available()) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
-                        "SANDBOX_UNAVAILABLE:OS_BACKEND_REQUIRED:" + isolationBackend.reason());
+            if (backend == null || !backend.available()) {
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:OS_BACKEND_REQUIRED:"
+                                + (backend == null ? "missing" : backend.reason())),
+                        requestedTier, effectiveTier, fallbackReason);
             }
-            if (requireStrictIsolation && !strictOsBackendAvailable()) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
-                        "SANDBOX_UNAVAILABLE:STRICT_OS_REQUIRED:"
-                                + isolationBackend.level().name()
-                                + isolationReason(isolationBackend));
-            }
-            // Java 24 removes the Security Manager path.  It is not a reason to execute an
-            // untrusted target without a boundary: those children are admissible only when the
-            // selected backend proves the production OS_STRICT contract.  Older JDKs retain
-            // the JVM deny-by-default layer as defense in depth.
+            // Every target child, including the boundary canary, must be attached to the single
+            // Job Object backend. A JVM policy is only defense in depth and never replaces it.
             JdkRuntimePolicy runtimePolicy = JdkRuntimePolicy.forFeature(runtime.feature());
-            if (!runtimePolicy.admissible(strictOsBackendAvailable())) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
-                        "SANDBOX_UNAVAILABLE:" + (runtimePolicy.osStrictRequired()
-                                ? "JDK_REQUIRES_OS_STRICT" : "JVM_POLICY_UNSUPPORTED")
-                                + ":jdk=" + runtime.feature());
+            if (!runtimePolicy.admissible(backend.productionReady())) {
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SANDBOX_UNAVAILABLE:JOB_OBJECT_REQUIRED:jdk=" + runtime.feature()
+                                + ":reason=" + runtimePolicy.reason()),
+                        requestedTier, effectiveTier, fallbackReason);
             }
+            String attemptPolicyDigest = policyDigestFor(attemptMode, backend);
+            String attemptPolicyBindingDigest = policyDigestOf(attemptPolicyDigest);
             String entryDotted = chain.entryClass().replace('/', '.');
             String entryMethod = chain.entryMethod();
             String mode = modeOf(chain.entryKind());
@@ -1064,8 +1620,11 @@ public final class ParallelVerifier {
                 // A passive fallback would turn a missing canary artifact into an apparently
                 // successful child run. Dynamic verification is evidence-producing, so fail
                 // closed before any target class is loaded when the exact boundary is absent.
-                return new VerifyResult(chain.key(), "UNTESTABLE",
-                        "CANARY_ARTIFACT_MISSING:" + canaryBootstrap);
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                        "CANARY_ARTIFACT_MISSING:" + canaryBootstrap, 1, 0L,
+                        "VERIFIER_ARTIFACT_MISSING", backend.id(), runtimeLabel(runtime),
+                        policyDigestFor(attemptMode, backend), false, false,
+                        "NOT_STARTED"), requestedTier, effectiveTier, fallbackReason);
             }
 
             // sink canary 插桩：本链 sink 方法入口注入门卫调用（见 SinkCanaryAgent）；
@@ -1087,27 +1646,30 @@ public final class ParallelVerifier {
                         UUID.randomUUID().toString().replace("-", ""),
                         artifactFingerprint());
             } catch (IOException | RuntimeException fingerprintFailure) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "ARTIFACT_FINGERPRINT_UNAVAILABLE:"
-                                + fingerprintFailure.getClass().getSimpleName());
+                                + fingerprintFailure.getClass().getSimpleName(), 1, 0L,
+                        "VERIFIER_CAPABILITY_LIMIT", backend.id(), runtimeLabel(runtime),
+                        policyDigestFor(attemptMode, backend), false, false,
+                        "NOT_STARTED"), requestedTier, effectiveTier, fallbackReason);
             }
             FieldDependencyPlan plan = FieldDependencyPlan.from(
                     chain, mode);
 
-            // 沙箱参数：隔离工作目录/tmpdir/home、净化环境、子 JVM 限核与内存上限；
-            // fork-per-chain 保持类隔离——静态状态不跨链污染。SecurityManager 只在旧版
-            // JDK 上作为纵深防御；JDK 24+ 必须依赖已认证的 OS_STRICT runner。
+            // 隔离工作目录/tmpdir/home、净化环境、子 JVM 限核与内存上限；fork-per-chain
+            // 保持类隔离——静态状态不跨链污染。Job Object 是唯一 OS 边界。
             isoDir = Files.createTempDirectory("just-verify-");
             SafeSinkAdapter.Policy sinkPolicy;
             try {
-                sinkPolicy = switch (sinkMode) {
+                sinkPolicy = switch (attemptMode) {
                     case SAFE_EXEC -> SafeSinkAdapter.safeExecution(isoDir);
                     case SAFE_REAL -> SafeSinkAdapter.safeRealExecution(isoDir);
                     case BOUNDARY -> SafeSinkAdapter.boundary();
                 };
             } catch (IllegalArgumentException policyFailure) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
-                        "SAFE_SINK_POLICY_INVALID:" + policyFailure.getMessage());
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SAFE_SINK_POLICY_INVALID:" + policyFailure.getMessage()),
+                        requestedTier, effectiveTier, fallbackReason);
             }
             SafeSinkAdapter.Decision sinkDecision = SafeSinkAdapter.preflight(sinkPolicy,
                     new SafeSinkAdapter.Sink(chain.category(), chain.sinkClass(),
@@ -1115,26 +1677,29 @@ public final class ParallelVerifier {
             SafeSinkAdapter.RealPlan realPlan = SafeSinkAdapter.realPlan(
                     new SafeSinkAdapter.Sink(chain.category(), chain.sinkClass(),
                             chain.sinkMethod(), sinkDescriptor));
-            if (sinkMode == SafeSinkAdapter.Mode.SAFE_REAL
+            if (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL
                     && (!realPlan.permitted() || !sinkDecision.targetSinkSelected())) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
-                        "SAFE_SANITIZER_UNAVAILABLE:" + realPlan.reason());
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                        "SAFE_SANITIZER_UNAVAILABLE:" + realPlan.reason()),
+                        requestedTier, effectiveTier, fallbackReason);
             }
-            String nativeIndex = sinkMode == SafeSinkAdapter.Mode.SAFE_REAL
+            String nativeIndex = attemptMode == SafeSinkAdapter.Mode.SAFE_REAL
                     ? nativeIndexForCandidate(chain, targetCp) : "";
             Path isoTmp = Files.createDirectories(isoDir.resolve("tmp"));
-            if (sinkMode == SafeSinkAdapter.Mode.SAFE_REAL
+            if (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL
                     && realPlan.kind() == SafeSinkAdapter.RealSinkKind.NATIVE_FIXTURE) {
                 Path parent = isoDir.getParent();
                 if (parent == null) {
-                    return new VerifyResult(chain.key(), "UNTESTABLE",
-                            "SAFE_NATIVE_FIXTURE_ROOT_UNAVAILABLE");
+                    return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                            "SAFE_NATIVE_FIXTURE_ROOT_UNAVAILABLE"),
+                            requestedTier, effectiveTier, fallbackReason);
                 }
                 nativeRoot = Files.createTempDirectory(parent, "just-native-")
                         .toAbsolutePath().normalize();
                 if (!prepareNativeFixture(nativeRoot)) {
-                    return new VerifyResult(chain.key(), "UNTESTABLE",
-                            "SAFE_NATIVE_FIXTURE_UNAVAILABLE");
+                    return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                            "SAFE_NATIVE_FIXTURE_UNAVAILABLE"),
+                            requestedTier, effectiveTier, fallbackReason);
                 }
             }
             Path resultChannelFile = isoDir.resolve("verification.result");
@@ -1160,16 +1725,14 @@ public final class ParallelVerifier {
             }
             command.add("-Djust.verify.isolation-ready=" + isolationReady.toAbsolutePath());
             command.add("-Djust.verify.isolation-token=" + isolationToken);
-            command.add("-Djust.verify.backend=" + isolationBackend.id());
-            command.add("-Djust.verify.isolation-level=" + isolationBackend.level().name());
+            command.add("-Djust.verify.backend=" + backend.id());
+            command.add("-Djust.verify.isolation-level=" + backend.level().name());
             command.add("-Djust.verify.isolation-policy-digest="
-                    + policyBindingDigest);
+                    + attemptPolicyBindingDigest);
             command.add("-Djust.verify.attestation-version="
-                    + isolationBackend.attestationVersion());
-            command.add("-Djust.verify.landlock-required="
-                    + isolationBackend.capabilities().contains("landlock"));
+                    + backend.attestationVersion());
             command.add("-Djust.verify.loopback="
-                    + (sinkMode == SafeSinkAdapter.Mode.SAFE_REAL));
+                    + (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL));
             command.add("-Djava.io.tmpdir=" + isoTmp);
             command.add("-Duser.dir=" + isoDir);
             command.add("-Duser.home=" + isoDir);
@@ -1179,7 +1742,7 @@ public final class ParallelVerifier {
             command.add("-Djava.util.prefs.userRoot=" + isoDir.resolve("prefs"));
             command.add("-Djava.util.prefs.systemRoot=" + isoDir.resolve("system-prefs"));
             command.add("-Djust.verify.sanitized-env=true");
-            command.add("-Djust.verify.sink-mode=" + sinkMode.name());
+            command.add("-Djust.verify.sink-mode=" + attemptMode.name());
             command.add("-Djust.verify.sink-policy-digest=" + sinkPolicy.digest());
             command.add("-Djust.verify.sink-disposition=" + sinkDecision.disposition().name());
             command.add("-Djust.verify.real-kind=" + realPlan.kind().name());
@@ -1197,7 +1760,7 @@ public final class ParallelVerifier {
             command.add("-Djust.verify.sink-category=" + sinkCategory);
             command.add("-Djust.verify.safe-scratch=" + isoTmp.toAbsolutePath());
             command.add("-Djust.verify.safe-java=" + javaExecPath.toAbsolutePath());
-            if (sinkMode == SafeSinkAdapter.Mode.SAFE_REAL) {
+            if (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL) {
                 // System.loadLibrary resolves only the verifier-owned fixture.  The directory
                 // is known before the VM starts, so the JDK's native search path is initialized
                 // without mutating ClassLoader internals after target code is loaded. Native
@@ -1225,7 +1788,7 @@ public final class ParallelVerifier {
                         + entrySpec + "|" + agentSpec + "|" + protocolToken + "|"
                         + protocolIdentity.runId() + "|" + protocolIdentity.chainFingerprint() + "|"
                         + protocolIdentity.sinkFingerprint() + "|" + protocolIdentity.nonce() + "|"
-                        + protocolIdentity.artifactFingerprint() + "|" + sinkMode.name() + "|"
+                        + protocolIdentity.artifactFingerprint() + "|" + attemptMode.name() + "|"
                         + realPlan.kind().name() + "|" + isoTmp.toAbsolutePath() + "|"
                         + (nativeRoot == null ? "" : nativeRoot.toAbsolutePath()) + "|"
                         + nativeIndex);
@@ -1235,7 +1798,7 @@ public final class ParallelVerifier {
                         + protocolToken + "|" + protocolIdentity.runId() + "|"
                         + protocolIdentity.chainFingerprint() + "|" + protocolIdentity.sinkFingerprint() + "|"
                         + protocolIdentity.nonce() + "|" + protocolIdentity.artifactFingerprint()
-                        + "|" + sinkMode.name() + "|" + realPlan.kind().name() + "|"
+                        + "|" + attemptMode.name() + "|" + realPlan.kind().name() + "|"
                         + isoTmp.toAbsolutePath() + "|" + javaExecPath.toAbsolutePath() + "|"
                         + (nativeRoot == null ? "" : nativeRoot.toAbsolutePath()) + "|"
                         + nativeIndex);
@@ -1264,17 +1827,24 @@ public final class ParallelVerifier {
             // length/count-bounded decoder and applies only typed field/proxy operations.
             command.add(chain.constructionPlan() == null
                     ? "" : chain.constructionPlan().encodedForProbe());
-            List<String> launchCommand = isolationBackend.command(command, isoDir,
-                    sinkMode == SafeSinkAdapter.Mode.SAFE_REAL);
+            List<String> launchCommand = backend.command(command, isoDir);
             ProcessBuilder pb = new ProcessBuilder(launchCommand);
             pb.directory(isoDir.toFile());
             pb.redirectErrorStream(true);
             pb.environment().clear();
-            pb.environment().putAll(sanitizedEnvironment(System.getenv(),
-                    runtime.javaHome(), isoDir, isoTmp));
+            pb.environment().putAll(sanitizedEnvironment(System.getenv(), runtime.javaHome(),
+                    isoDir, isoTmp));
+            runnerStarted = System.nanoTime();
             proc = pb.start();
             try {
-                isolationSession = isolationBackend.attach(proc);
+                processMonitor = new ProcessTreeMonitor(proc);
+            } catch (RuntimeException ignored) {
+                // The resource sampler is telemetry only; failure to create its daemon thread
+                // must not change an already valid dynamic attempt.
+                processMonitor = null;
+            }
+            try {
+                isolationSession = backend.attach(proc);
                 // The secret travels over the child's standard input, never in argv, a system
                 // property, or the environment. The probe consumes and closes stdin before it
                 // loads target classes. A target can still write arbitrary stdout, but it
@@ -1283,10 +1853,14 @@ public final class ParallelVerifier {
                 Files.writeString(isolationReady, isolationToken, StandardCharsets.US_ASCII,
                         java.nio.file.StandardOpenOption.CREATE_NEW,
                         java.nio.file.StandardOpenOption.WRITE);
+                recordAttemptPhase("runner_startup", runnerStarted);
             } catch (IOException | RuntimeException isolationFailure) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:OS_ATTACH_OR_HANDSHAKE:"
-                                + isolationFailure.getClass().getSimpleName());
+                                + isolationFailure.getClass().getSimpleName(), 1, 0L,
+                        "SANDBOX_UNAVAILABLE", backend.id(), runtimeLabel(runtime),
+                        attemptPolicyDigest, false, false, "CLEANUP_BEST_EFFORT"),
+                        requestedTier, effectiveTier, fallbackReason);
             }
             OutputCapture capture = new OutputCapture(proc.getInputStream(), MAX_OUTPUT_BYTES);
             Thread outputReader = new Thread(capture, "just-verify-output");
@@ -1301,21 +1875,19 @@ public final class ParallelVerifier {
                 outputReader.join(1_000L);
                 ProtocolEvidence timeoutProtocol = protocolEvidence(resultChannelFile,
                         protocolIdentity, resultChannelSecret);
-                boolean ready = protocolReady(timeoutProtocol);
-                String timeoutDiagnostic = capture.text();
+                boolean ready = protocolReady(timeoutProtocol, backend, attemptPolicyBindingDigest);
                 return authenticatedResult(chain, "TIMEOUT", TIMEOUT_SECONDS + "s",
-                        "PROCESS_TIMEOUT"
-                                + (timeoutDiagnostic.isBlank() ? ""
-                                : ":" + sanitizeDetail(timeoutDiagnostic)), false, ready);
+                        "PROCESS_TIMEOUT", false, ready,
+                        backend, attemptPolicyDigest);
             }
             outputReader.join(1_000L);
             String output = capture.text();
             if (capture.overflow()) {
                 ProtocolEvidence overflowProtocol = protocolEvidence(resultChannelFile,
                         protocolIdentity, resultChannelSecret);
-                boolean ready = protocolReady(overflowProtocol);
+                boolean ready = protocolReady(overflowProtocol, backend, attemptPolicyBindingDigest);
                 return authenticatedResult(chain, "UNTESTABLE", "PROBE_OUTPUT_LIMIT",
-                        "VERIFIER_CAPABILITY_LIMIT", false, ready);
+                        "VERIFIER_CAPABILITY_LIMIT", false, ready, backend, attemptPolicyDigest);
             }
             // ExitOnOutOfMemoryError intentionally terminates the child without a terminal
             // protocol frame.  Treat the diagnostic only as a negative resource outcome: an
@@ -1324,9 +1896,9 @@ public final class ParallelVerifier {
             if (outOfMemoryDiagnostic(output)) {
                 ProtocolEvidence oomProtocol = protocolEvidence(resultChannelFile,
                         protocolIdentity, resultChannelSecret);
-                boolean ready = protocolReady(oomProtocol);
+                boolean ready = protocolReady(oomProtocol, backend, attemptPolicyBindingDigest);
                 return authenticatedResult(chain, "UNTESTABLE", "PROCESS_OOM",
-                        "PROCESS_OOM", false, ready);
+                        "PROCESS_OOM", false, ready, backend, attemptPolicyDigest);
             }
             // redirectErrorStream 合并了 stderr。只接受带本次 token 的 probe marker；目标
             // 工件可以任意写 stdout/stderr，普通文本永远不能升级为动态证据。
@@ -1336,72 +1908,84 @@ public final class ParallelVerifier {
             ProtocolEvidence protocol = protocolEvidence(resultChannelFile, protocolIdentity,
                     resultChannelSecret);
             if (!protocol.bindingValid()) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "PROTOCOL_AUTHENTICATION_FAILED:IDENTITY_MISMATCH", 1, 0L,
-                        "VERIFIER_CAPABILITY_LIMIT", isolationBackend.id(),
-                        runtimeLabel(runtime), policyDigest(), false, false,
-                        "CLEANUP_BEST_EFFORT");
+                        "VERIFIER_CAPABILITY_LIMIT", backend.id(),
+                        runtimeLabel(runtime), attemptPolicyDigest, false, false,
+                        "CLEANUP_BEST_EFFORT"), requestedTier, effectiveTier, fallbackReason);
             }
             if (!protocol.ready()) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:READY_EVENT_MISSING"
                                 + (protocol.terminal() == null ? "" : ": observed=" + protocol.terminal()),
-                        1, 0L, "SANDBOX_UNAVAILABLE");
+                        1, 0L, "SANDBOX_UNAVAILABLE", backend.id(), runtimeLabel(runtime),
+                        attemptPolicyDigest, false, false, "CLEANUP_BEST_EFFORT"),
+                        requestedTier, effectiveTier, fallbackReason);
             }
             if (!protocol.validOrder()) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:READY_EVENT_ORDER_INVALID", 1, 0L,
-                        "SANDBOX_UNAVAILABLE");
+                        "SANDBOX_UNAVAILABLE", backend.id(), runtimeLabel(runtime),
+                        attemptPolicyDigest, false, false, "CLEANUP_BEST_EFFORT"),
+                        requestedTier, effectiveTier, fallbackReason);
             }
-            if (!isolationBackend.id().equals(protocol.readyBackend())) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+            if (!backend.id().equals(protocol.readyBackend())) {
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:READY_BACKEND_MISMATCH", 1, 0L,
-                        "SANDBOX_UNAVAILABLE");
+                        "SANDBOX_UNAVAILABLE", backend.id(), runtimeLabel(runtime),
+                        attemptPolicyDigest, false, false, "CLEANUP_BEST_EFFORT"),
+                        requestedTier, effectiveTier, fallbackReason);
             }
-            if (!policyBindingDigest.equals(protocol.readyPolicyDigest())) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+            if (!attemptPolicyBindingDigest.equals(protocol.readyPolicyDigest())) {
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:READY_POLICY_MISMATCH", 1, 0L,
-                        "SANDBOX_UNAVAILABLE");
+                        "SANDBOX_UNAVAILABLE", backend.id(), runtimeLabel(runtime),
+                        attemptPolicyDigest, false, false, "CLEANUP_BEST_EFFORT"),
+                        requestedTier, effectiveTier, fallbackReason);
             }
-            if (!isolationBackend.attestationVersion().equals(protocol.attestationVersion())) {
-                return new VerifyResult(chain.key(), "UNTESTABLE",
+            if (!backend.attestationVersion().equals(protocol.attestationVersion())) {
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:READY_ATTESTATION_MISMATCH", 1, 0L,
-                        "SANDBOX_UNAVAILABLE");
+                        "SANDBOX_UNAVAILABLE", backend.id(), runtimeLabel(runtime),
+                        attemptPolicyDigest, false, false, "CLEANUP_BEST_EFFORT"),
+                        requestedTier, effectiveTier, fallbackReason);
             }
-            boolean ready = protocolReady(protocol);
-            if (sinkMode == SafeSinkAdapter.Mode.SAFE_REAL && !ready) {
+            boolean ready = protocolReady(protocol, backend, attemptPolicyBindingDigest);
+            if (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL && !ready) {
                 return authenticatedResult(chain, "UNTESTABLE",
                         "SANDBOX_UNAVAILABLE:READY_ATTESTATION_INCOMPLETE",
-                        "SANDBOX_UNAVAILABLE", false, false);
+                        "SANDBOX_UNAVAILABLE", false, false, backend, attemptPolicyDigest);
             }
             String firstLine = protocol.terminal() == null ? "" : protocol.terminal();
             if (firstLine.startsWith("JNI_EXECUTED_SAFE")) {
-                if (sinkMode == SafeSinkAdapter.Mode.SAFE_REAL
+                if (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL
                         && !realEvidenceComplete(firstLine, realPlan.kind().name(),
                         nativeFixtureDigest(nativeFixtureResource()))) {
                     return authenticatedResult(chain, "UNTESTABLE",
                             "REAL_EVIDENCE_INCOMPLETE:JNI", "VERIFIER_CAPABILITY_LIMIT",
-                            false, ready);
+                            false, ready, backend, attemptPolicyDigest);
                 }
                 if (callback != null) callback.onConfirmed(chain, firstLine, true);
                 return authenticatedResult(chain, "JNI_EXECUTED_SAFE", firstLine,
-                        "JNI_LOAD_CALLBACK_SAFE_FIXTURE", true, ready);
+                        "JNI_LOAD_CALLBACK_SAFE_FIXTURE", true, ready, backend,
+                        attemptPolicyDigest);
             }
             if (firstLine.startsWith("SINK_EXECUTED_SAFE")) {
-                if (sinkMode == SafeSinkAdapter.Mode.SAFE_REAL
+                if (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL
                         && !realEvidenceComplete(firstLine, realPlan.kind().name(),
                         nativeFixtureDigest(nativeFixtureResource()))) {
                     return authenticatedResult(chain, "UNTESTABLE",
                             "REAL_EVIDENCE_INCOMPLETE:SINK", "VERIFIER_CAPABILITY_LIMIT",
-                            false, ready);
+                            false, ready, backend, attemptPolicyDigest);
                 }
                 if (callback != null) callback.onConfirmed(chain, firstLine, true);
                 return authenticatedResult(chain, "SINK_EXECUTED_SAFE", firstLine,
-                        "REAL_SINK_BODY_SAFE_ARGUMENTS", true, ready);
+                        "REAL_SINK_BODY_SAFE_ARGUMENTS", true, ready, backend,
+                        attemptPolicyDigest);
             }
             if (firstLine.startsWith("SAFE_EFFECT_OBSERVED")) {
                 return authenticatedResult(chain, "SAFE_EFFECT_OBSERVED", firstLine,
-                        "SAFE_EFFECT_OBSERVED", true, ready);
+                        "SAFE_EFFECT_OBSERVED", true, ready, backend, attemptPolicyDigest);
             }
             if (firstLine.startsWith("SINK_BLOCKED") || firstLine.startsWith("SINK_TRIGGERED")) {
                 if (callback != null) callback.onConfirmed(chain, firstLine, true);
@@ -1410,48 +1994,55 @@ public final class ParallelVerifier {
                         ? "SINK_CANARY_BOUNDARY_ADAPTER" : "SINK_CANARY_BOUNDARY";
                 // The canary throws before the target sink body.  This is the genuine
                 // boundary evidence, not an adapter distortion.
-                return authenticatedResult(chain, "SINK_BLOCKED", detail, evidence, false, ready);
+                return authenticatedResult(chain, "SINK_BLOCKED", detail, evidence, false, ready,
+                        backend, attemptPolicyDigest);
             }
             if (firstLine.startsWith("CONCRETE_REACHED")) {
                 return authenticatedResult(chain, "CONCRETE_REACHED", firstLine,
-                        "CONCRETE_TRIGGER", false, ready);
+                        "CONCRETE_TRIGGER", false, ready, backend, attemptPolicyDigest);
             }
             if (firstLine.startsWith("EXECUTED")) {
                 // 入口方法真实调用且正常返回——链可执行，但未证伪/证实 sink 到达
                 return authenticatedResult(chain, "EXECUTED", firstLine,
-                        "ENTRY_RETURNED", false, ready);
+                        "ENTRY_RETURNED", false, ready, backend, attemptPolicyDigest);
             }
             if (firstLine.startsWith("PARTIAL_PATH")) {
                 return authenticatedResult(chain, "PARTIAL", firstLine,
-                        "PARTIAL_PATH", false, ready);
+                        "PARTIAL_PATH", false, ready, backend, attemptPolicyDigest);
             }
             if (firstLine.startsWith("SANDBOX_UNAVAILABLE")) {
                 return authenticatedResult(chain, "UNTESTABLE", firstLine,
-                        "SANDBOX_UNAVAILABLE", false, ready);
+                        "SANDBOX_UNAVAILABLE", false, ready, backend, attemptPolicyDigest);
             }
             if (firstLine.startsWith("UNTESTABLE")) {
                 return authenticatedResult(chain, "UNTESTABLE", firstLine,
-                        "VERIFIER_CAPABILITY_LIMIT", false, ready);
+                        "VERIFIER_CAPABILITY_LIMIT", false, ready, backend, attemptPolicyDigest);
             }
             int exit = proc.exitValue();
             if (exit != 0) {
                 return authenticatedResult(chain, "PARTIAL",
                         "exit=" + exit + " probe-no-authenticated-status"
                                 + (firstAny == null ? "" : " diagnostic=" + firstAny),
-                        "PARTIAL_PATH", false, ready);
+                        "PARTIAL_PATH", false, ready, backend, attemptPolicyDigest);
             }
             return authenticatedResult(chain, "FAILED",
                     "no-authenticated-probe-status"
                             + (firstAny == null ? "" : " diagnostic=" + firstAny),
-                    "NO_TRIGGER", false, ready);
+                    "NO_TRIGGER", false, ready, backend, attemptPolicyDigest);
 
         } catch (Exception e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            return new VerifyResult(chain.key(), "UNTESTABLE",
-                    e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                    e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName(),
+                    1, 0L, "VERIFIER_CAPABILITY_LIMIT",
+                    backend == null ? "UNKNOWN" : backend.id(), "UNKNOWN",
+                    backend == null ? "UNKNOWN" : policyDigestFor(attemptMode, backend),
+                    false, false, "CLEANUP_BEST_EFFORT"),
+                    requestedTier, effectiveTier, fallbackReason);
         } finally {
+            long cleanupStarted = System.nanoTime();
             // A target is denied Runtime.exec/ProcessBuilder, but a library can still create
             // an already-running descendant before the permission gate is consulted. Always
             // perform the bounded cleanup pass after normal exit as well as on timeout; the
@@ -1461,12 +2052,34 @@ public final class ParallelVerifier {
                 killProcessTree(proc);
             }
             if (isolationSession != null) {
+                OsIsolation.ResourceMetrics metrics = isolationSession.metrics();
+                recordResourceMax("child_peak_rss_mb", metrics.peakRssMb());
+                recordResourceMax("child_peak_job_memory_mb", metrics.peakJobMemoryMb());
+                recordResourceTotal("child_user_cpu_ms", metrics.userCpuMs());
+                recordResourceMax("child_processes_total", metrics.totalProcesses());
+                recordResourceMax("child_processes_active", metrics.activeProcesses());
+            }
+            if (processMonitor != null) {
+                processMonitor.close();
+                recordResourceMax("child_process_peak", processMonitor.peak());
+            }
+            recordResourceMax("uncollected_processes", liveProcessCount(
+                    proc == null ? null : proc.toHandle()));
+            long scratchBytes = saturatedDirectorySize(isoDir);
+            long nativeBytes = saturatedDirectorySize(nativeRoot);
+            recordResourceTotal("scratch_bytes", scratchBytes < 0L || nativeBytes < 0L
+                    ? -1L : saturatedAdd(scratchBytes, nativeBytes));
+            if (isolationSession != null) {
                 isolationSession.close();
             }
             // 每条链一个隔离 cwd/tmp；不能只清理共享的 fat-jar 展开目录，否则批量扫描会
             // 在系统临时目录留下大量 just-verify-* 目录。
             deleteQuietly(isoDir);
             deleteQuietly(nativeRoot);
+            boolean cleaned = !existsNoFollow(isoDir) && !existsNoFollow(nativeRoot);
+            telemetry.recordCleanup(cleaned
+                    && liveProcessCount(proc == null ? null : proc.toHandle()) == 0L);
+            recordAttemptPhase("cleanup", cleanupStarted);
         }
     }
 
@@ -1514,6 +2127,10 @@ public final class ParallelVerifier {
                 fields.put(item.substring(0, equals), item.substring(equals + 1));
             }
         }
+        if (!"1".equals(fields.get("loaded"))
+                || !"1".equals(fields.get("arguments"))) {
+            return false;
+        }
         if (jni) {
             String digest = fields.get("native_digest");
             return "NATIVE_FIXTURE".equals(realKind)
@@ -1539,7 +2156,7 @@ public final class ParallelVerifier {
 
     static record ProtocolEvidence(boolean ready, boolean validOrder,
                                    boolean bindingValid, String readyBackend,
-                                   String readyPolicyDigest, boolean landlockReady,
+                                   String readyPolicyDigest, boolean jobReady,
                                    String attestationVersion,
                                    String terminal) {
         ProtocolEvidence(boolean ready, boolean validOrder, boolean bindingValid,
@@ -1555,13 +2172,18 @@ public final class ParallelVerifier {
     }
 
     private boolean protocolReady(ProtocolEvidence evidence) {
+        return protocolReady(evidence, isolationBackend, policyBindingDigest);
+    }
+
+    private boolean protocolReady(ProtocolEvidence evidence, OsIsolation.Backend backend,
+                                  String bindingDigest) {
         return evidence != null && evidence.bindingValid() && evidence.ready()
                 && evidence.validOrder()
-                && isolationBackend.id().equals(evidence.readyBackend())
-                && policyBindingDigest.equals(evidence.readyPolicyDigest())
-                && isolationBackend.attestationVersion().equals(evidence.attestationVersion())
-                && (!isolationBackend.capabilities().contains("landlock")
-                || evidence.landlockReady());
+                && backend != null
+                && backend.id().equals(evidence.readyBackend())
+                && bindingDigest != null && bindingDigest.equals(evidence.readyPolicyDigest())
+                && backend.attestationVersion().equals(evidence.attestationVersion())
+                && (!backend.id().startsWith("WINDOWS_") || evidence.jobReady());
     }
 
     /**
@@ -1574,7 +2196,7 @@ public final class ParallelVerifier {
         boolean validOrder = true;
         String readyBackend = "";
         String readyPolicyDigest = "";
-        boolean landlockReady = false;
+        boolean jobReady = false;
         String attestationVersion = "";
         String terminal = null;
         if (output == null) {
@@ -1593,7 +2215,7 @@ public final class ParallelVerifier {
                 ReadyPayload readyPayload = readyPayload(status);
                 readyBackend = readyPayload.backend();
                 readyPolicyDigest = readyPayload.policyDigest();
-                landlockReady = readyPayload.landlockReady();
+                jobReady = readyPayload.jobReady();
                 attestationVersion = readyPayload.attestationVersion();
                 continue;
             }
@@ -1605,7 +2227,7 @@ public final class ParallelVerifier {
             }
         }
         return new ProtocolEvidence(ready, validOrder, true, readyBackend,
-                readyPolicyDigest, landlockReady, attestationVersion, terminal);
+                readyPolicyDigest, jobReady, attestationVersion, terminal);
     }
 
     /** Parse only the V2 channel bound to this exact chain, sink and artifact attempt. */
@@ -1615,7 +2237,7 @@ public final class ParallelVerifier {
         boolean allFramesValid = true;
         String readyBackend = "";
         String readyPolicyDigest = "";
-        boolean landlockReady = false;
+        boolean jobReady = false;
         String attestationVersion = "";
         String terminal = null;
         if (output == null || expected == null) {
@@ -1642,7 +2264,7 @@ public final class ParallelVerifier {
                 ReadyPayload readyPayload = readyPayload(status);
                 readyBackend = readyPayload.backend();
                 readyPolicyDigest = readyPayload.policyDigest();
-                landlockReady = readyPayload.landlockReady();
+                jobReady = readyPayload.jobReady();
                 attestationVersion = readyPayload.attestationVersion();
                 continue;
             }
@@ -1658,7 +2280,7 @@ public final class ParallelVerifier {
         }
         boolean bindingValid = sawBoundPrefix && allFramesValid;
         return new ProtocolEvidence(ready, validOrder, bindingValid, readyBackend,
-                readyPolicyDigest, landlockReady, attestationVersion, terminal);
+                readyPolicyDigest, jobReady, attestationVersion, terminal);
     }
 
     /** Read and authenticate the probe-owned result file; target stdout is never sufficient. */
@@ -1735,7 +2357,7 @@ public final class ParallelVerifier {
         }
     }
 
-    private record ReadyPayload(String backend, String policyDigest, boolean landlockReady,
+    private record ReadyPayload(String backend, String policyDigest, boolean jobReady,
                                 String attestationVersion) {
     }
 
@@ -1744,7 +2366,7 @@ public final class ParallelVerifier {
         String payload = colon < 0 ? "" : status.substring(colon + 1).strip();
         String backend = "";
         String policy = "";
-        boolean landlock = false;
+        boolean job = false;
         String attestation = "";
         String[] fields = payload.split("\\|", -1);
         if (fields.length > 0) {
@@ -1759,13 +2381,13 @@ public final class ParallelVerifier {
             String value = fields[i].substring(equals + 1).strip();
             switch (key) {
                 case "policy" -> policy = value;
-                case "landlock" -> landlock = "1".equals(value)
+                case "job" -> job = "1".equals(value)
                         || "true".equalsIgnoreCase(value);
                 case "attestation" -> attestation = value;
                 default -> { }
             }
         }
-        return new ReadyPayload(backend, policy, landlock, attestation);
+        return new ReadyPayload(backend, policy, job, attestation);
     }
 
     private record ProtocolFrame(String status) {
@@ -1790,14 +2412,20 @@ public final class ParallelVerifier {
         if (output == null) {
             return null;
         }
+        List<String> diagnostics = new ArrayList<>();
         for (String line : output.split("\\R")) {
             String trimmed = line.strip();
             if (!trimmed.isEmpty() && !trimmed.startsWith("JUST_VERIFY_V1:")
                     && !trimmed.startsWith("JUST_VERIFY_V2:")) {
-                return trimmed;
+                diagnostics.add(trimmed);
             }
         }
-        return null;
+        if (diagnostics.isEmpty()) {
+            return null;
+        }
+        int from = Math.max(0, diagnostics.size() - 8);
+        String value = String.join(" | ", diagnostics.subList(from, diagnostics.size()));
+        return value.length() > 2048 ? value.substring(value.length() - 2048) : value;
     }
 
     /** Keep shareable reports path-free while retaining stable capability/error categories. */
@@ -2158,11 +2786,6 @@ public final class ParallelVerifier {
         return feature >= 8 && feature < 24;
     }
 
-    private boolean strictOsBackendAvailable() {
-        return isolationBackend.available() && isolationBackend.productionReady()
-                && isolationBackend.level() == OsIsolation.Level.OS_STRICT;
-    }
-
     private static String isolationReason(OsIsolation.Backend backend) {
         if (backend == null || backend.reason() == null || backend.reason().isBlank()) {
             return "";
@@ -2192,29 +2815,31 @@ public final class ParallelVerifier {
         Path currentHome = Paths.get(System.getProperty("java.home", "."))
                 .toAbsolutePath().normalize();
 
-        if (targetJdkHome != null && Files.isRegularFile(javaExecutable(targetJdkHome))) {
+        if (targetJdkHome != null) {
+            Path requestedJava = javaExecutable(targetJdkHome);
+            if (!Files.isRegularFile(requestedJava)) {
+                return new RuntimeSelection(null, null, 0,
+                        "target-jdk-executable-missing");
+            }
             int requestedFeature = jdkFeature(targetJdkHome);
-            if (requestedFeature > 0 && requestedFeature >= required) {
-                Path probe = probeJarFor(requestedFeature);
-                if (probe != null) {
-                    return new RuntimeSelection(targetJdkHome, probe, requestedFeature,
-                            "requested-target-jdk");
-                }
+            if (requestedFeature <= 0) {
+                return new RuntimeSelection(null, null, requestedFeature,
+                        "target-jdk-feature-unknown");
+            }
+            if (requestedFeature < required) {
+                // An explicit target runtime is part of the scan identity.  Falling back to
+                // the scanner JDK changes the JRT/API surface while leaving the user-visible
+                // target selection unchanged, so it is never a valid dynamic result.
+                return new RuntimeSelection(null, null, requestedFeature,
+                        "target-jdk-too-old");
+            }
+            Path probe = probeJarFor(requestedFeature);
+            if (probe == null) {
                 return new RuntimeSelection(null, null, requestedFeature,
                         "verifier-artifact-missing");
             }
-            // A JDK older than the target class version cannot even load the target. If the
-            // scanner JVM can, use it as a transparent compatibility fallback and let the
-            // report retain its existing JDK approximation reason.
-            if (currentFeature >= required) {
-                Path probe = probeJarFor(currentFeature);
-                if (probe != null) {
-                    return new RuntimeSelection(currentHome, probe, currentFeature,
-                            "requested-jdk-too-old-fallback-runtime");
-                }
-            }
-            return new RuntimeSelection(null, null, requestedFeature,
-                    "no-compatible-jdk");
+            return new RuntimeSelection(targetJdkHome, probe, requestedFeature,
+                    "requested-target-jdk");
         }
         if (currentFeature < required) {
             return new RuntimeSelection(null, null, currentFeature, "runtime-jdk-too-old");
@@ -2252,7 +2877,12 @@ public final class ParallelVerifier {
     private static Path javaExecutable(Path javaHome) {
         Path unix = javaHome.resolve("bin").resolve("java");
         Path windows = javaHome.resolve("bin").resolve("java.exe");
-        return Files.isRegularFile(windows) ? windows : unix;
+        Path candidate = Files.isRegularFile(windows) ? windows : unix;
+        try {
+            return Files.isRegularFile(candidate) ? candidate.toRealPath() : candidate;
+        } catch (IOException | RuntimeException ignored) {
+            return candidate;
+        }
     }
 
     private static int requiredFeature(int major) {
@@ -2380,6 +3010,44 @@ public final class ParallelVerifier {
         }
     }
 
+    private static long liveProcessCount(ProcessHandle root) {
+        if (root == null) {
+            return 0L;
+        }
+        try {
+            long count = root.isAlive() ? 1L : 0L;
+            return saturatedAdd(count, root.descendants().filter(ProcessHandle::isAlive).count());
+        } catch (RuntimeException ignored) {
+            return -1L;
+        }
+    }
+
+    private static long saturatedDirectorySize(Path path) {
+        if (path == null || !existsNoFollow(path)) {
+            return 0L;
+        }
+        try (var walk = Files.walk(path)) {
+            long total = 0L;
+            for (Path item : (Iterable<Path>) walk::iterator) {
+                if (!Files.isRegularFile(item, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
+                try {
+                    total = saturatedAdd(total, Math.max(0L, Files.size(item)));
+                } catch (IOException ignored) {
+                    return -1L;
+                }
+            }
+            return total;
+        } catch (IOException | RuntimeException ignored) {
+            return -1L;
+        }
+    }
+
+    private static boolean existsNoFollow(Path path) {
+        return path != null && Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+    }
+
     private static boolean isWindows() {
         return System.getProperty("os.name", "")
                 .toLowerCase(Locale.ROOT).contains("win");
@@ -2443,8 +3111,10 @@ public final class ParallelVerifier {
     }
 
     /**
-     * sink canary 的最小 bootstrap jar（仅含 SinkReachedError.class）：插桩 java.base sink
-     * 时标记类必须对 bootstrap 可见。从自身 jar/class 目录提取类文件现场生成，进程内缓存。
+     * Bootstrap-visible canary/gate classes.  Boundary mode needs the marker only; SAFE_REAL
+     * additionally emits calls to SinkExecutionGate from target bytecode, so the execution gate
+     * and its typed SafeObject helper must live in the same bootstrap-only artifact.  Extract
+     * the small immutable set from the probe code source and cache it per verifier.
      */
     private Path bootstrapCanaryJar() {
         Path jar = bootstrapJar;
@@ -2458,9 +3128,13 @@ public final class ParallelVerifier {
             try {
                 String marker = "/io/just/sast/verify/boot/SinkReachedError.class";
                 String gate = "/io/just/sast/verify/boot/SinkCanaryGate.class";
+                String executionGate = "/io/just/sast/verify/boot/SinkExecutionGate.class";
+                String safeObject = "/io/just/sast/verify/boot/SinkExecutionGate$SafeObject.class";
                 try (var in = ParallelVerifier.class.getResourceAsStream(marker);
-                     var gin = ParallelVerifier.class.getResourceAsStream(gate)) {
-                    if (in == null || gin == null) {
+                     var gin = ParallelVerifier.class.getResourceAsStream(gate);
+                     var ein = ParallelVerifier.class.getResourceAsStream(executionGate);
+                     var sin = ParallelVerifier.class.getResourceAsStream(safeObject)) {
+                    if (in == null || gin == null || ein == null || sin == null) {
                         // 资源缺失（异常构建）：返回不存在路径，由调用方 fail closed
                         return Path.of(System.getProperty("java.io.tmpdir"), "just-missing-boot.jar");
                     }
@@ -2474,6 +3148,14 @@ public final class ParallelVerifier {
                         zip.putNextEntry(new java.util.zip.ZipEntry(
                                 "io/just/sast/verify/boot/SinkCanaryGate.class"));
                         gin.transferTo(zip);
+                        zip.closeEntry();
+                        zip.putNextEntry(new java.util.zip.ZipEntry(
+                                "io/just/sast/verify/boot/SinkExecutionGate.class"));
+                        ein.transferTo(zip);
+                        zip.closeEntry();
+                        zip.putNextEntry(new java.util.zip.ZipEntry(
+                                "io/just/sast/verify/boot/SinkExecutionGate$SafeObject.class"));
+                        sin.transferTo(zip);
                         zip.closeEntry();
                     }
                     ownArtifacts.add(out);
@@ -2507,9 +3189,9 @@ public final class ParallelVerifier {
 
     /**
      * The legacy agent itself must stay in the application loader: verify8 also contains its
-     * package-private ASM transformer.  Only the two dependency-free canary classes belong to
-     * bootstrap, otherwise the JVM may load the transformer from bootstrap and fail with an
-     * IllegalAccessError before the probe starts.
+     * package-private ASM transformer. Only the immutable canary and execution-gate classes
+     * belong to bootstrap, otherwise the JVM may load the transformer from bootstrap and fail
+     * with an IllegalAccessError before the probe starts.
      */
     private Path legacyBootstrapCanaryJar(Path probeJar) {
         Path cached = legacyBootstrapJar;
@@ -2523,9 +3205,14 @@ public final class ParallelVerifier {
             try (java.util.jar.JarFile source = new java.util.jar.JarFile(probeJar.toFile())) {
                 String gate = "io/just/sast/verify/boot/SinkCanaryGate.class";
                 String marker = "io/just/sast/verify/boot/SinkReachedError.class";
+                String executionGate = "io/just/sast/verify/boot/SinkExecutionGate.class";
+                String safeObject = "io/just/sast/verify/boot/SinkExecutionGate$SafeObject.class";
                 java.util.jar.JarEntry gateEntry = source.getJarEntry(gate);
                 java.util.jar.JarEntry markerEntry = source.getJarEntry(marker);
-                if (gateEntry == null || markerEntry == null) {
+                java.util.jar.JarEntry executionGateEntry = source.getJarEntry(executionGate);
+                java.util.jar.JarEntry safeObjectEntry = source.getJarEntry(safeObject);
+                if (gateEntry == null || markerEntry == null
+                        || executionGateEntry == null || safeObjectEntry == null) {
                     return Path.of(System.getProperty("java.io.tmpdir"),
                             "just-missing-legacy-canary-boot.jar");
                 }
@@ -2533,6 +3220,8 @@ public final class ParallelVerifier {
                 try (var zip = new java.util.zip.ZipOutputStream(Files.newOutputStream(out))) {
                     copyJarEntry(source, markerEntry, zip);
                     copyJarEntry(source, gateEntry, zip);
+                    copyJarEntry(source, executionGateEntry, zip);
+                    copyJarEntry(source, safeObjectEntry, zip);
                 }
                 ownArtifacts.add(out);
                 legacyBootstrapJar = out;
@@ -2555,16 +3244,29 @@ public final class ParallelVerifier {
     }
 
     private static void deleteQuietly(Path p) {
-        if (p == null || !Files.exists(p)) {
-            return;
-        }
-        if (Files.isDirectory(p)) {
-            try (var walk = Files.walk(p)) {
-                walk.sorted(Comparator.reverseOrder()).forEach(ParallelVerifier::deleteFileQuietly);
-            } catch (Exception ignored) {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (p == null || !Files.exists(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                return;
             }
-        } else {
-            deleteFileQuietly(p);
+            if (Files.isDirectory(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                try (var walk = Files.walk(p)) {
+                    walk.sorted(Comparator.reverseOrder())
+                            .forEach(ParallelVerifier::deleteFileQuietly);
+                } catch (Exception ignored) {
+                }
+            } else {
+                deleteFileQuietly(p);
+            }
+            if (!Files.exists(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || !isWindows() || attempt == 3) {
+                return;
+            }
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
         }
     }
 
@@ -2573,6 +3275,10 @@ public final class ParallelVerifier {
             Files.deleteIfExists(p);
         } catch (Exception ignored) {
         }
+    }
+
+    private static long saturatedAdd(long left, long right) {
+        return Long.MAX_VALUE - left < right ? Long.MAX_VALUE : left + right;
     }
 
     private synchronized String artifactFingerprint() throws IOException {
@@ -2686,5 +3392,19 @@ public final class ParallelVerifier {
         } catch (java.security.NoSuchAlgorithmException impossible) {
             throw new IllegalStateException("required SHA-256 digest unavailable", impossible);
         }
+    }
+
+    private static String policyDigestFor(SafeSinkAdapter.Mode mode,
+                                          OsIsolation.Backend backend) {
+        SafeSinkAdapter.Mode effectiveMode = mode == null
+                ? SafeSinkAdapter.Mode.BOUNDARY : mode;
+        if (backend == null) {
+            return SafeSinkAdapter.policyDigest(effectiveMode) + ";os=UNKNOWN";
+        }
+        return SafeSinkAdapter.policyDigest(effectiveMode)
+                + ";os=" + backend.policyDigest()
+                + ";attestation=" + backend.attestationVersion()
+                + ";loopback=" + (effectiveMode == SafeSinkAdapter.Mode.SAFE_REAL)
+                + ";job_object=" + (backend.level() == OsIsolation.Level.PROCESS_RESOURCE);
     }
 }

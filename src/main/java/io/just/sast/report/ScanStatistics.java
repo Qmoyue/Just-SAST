@@ -2,9 +2,9 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.VerificationSummary;
 
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 /** 扫描统计。 */
 public record ScanStatistics(
@@ -20,11 +20,11 @@ public record ScanStatistics(
         completeness = completeness == null ? "UNKNOWN" : completeness;
         heapUsedMb = Math.max(0L, heapUsedMb);
         heapPeakMb = Math.max(heapUsedMb, heapPeakMb);
-        completenessReasons = completenessReasons == null ? List.of() : List.copyOf(completenessReasons);
-        phaseMs = phaseMs == null ? Map.of()
-                : java.util.Collections.unmodifiableMap(new LinkedHashMap<>(phaseMs));
-        metrics = metrics == null ? Map.of()
-                : java.util.Collections.unmodifiableMap(new LinkedHashMap<>(metrics));
+        completenessReasons = completenessReasons == null ? List.of() : completenessReasons.stream()
+                .filter(reason -> reason != null && !reason.isBlank())
+                .distinct().sorted().toList();
+        phaseMs = sortedMap(phaseMs);
+        metrics = sortedMap(metrics);
         verification = verification == null ? "UNKNOWN" : verification;
         dynamicVerification = dynamicVerification == null
                 ? VerificationSummary.empty(verification, 0) : dynamicVerification;
@@ -106,5 +106,19 @@ public record ScanStatistics(
             return Long.MAX_VALUE;
         }
         return left + right;
+    }
+
+    private static Map<String, Long> sortedMap(Map<String, Long> values) {
+        if (values == null || values.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Long> sorted = new TreeMap<>();
+        values.forEach((key, value) -> {
+            if (key != null && !key.isBlank() && value != null) {
+                sorted.put(key, value);
+            }
+        });
+        return sorted.isEmpty() ? Map.of()
+                : java.util.Collections.unmodifiableMap(sorted);
     }
 }

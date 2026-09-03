@@ -25,6 +25,9 @@ class PerformanceReportWriterTest {
         assertTrue(json.contains("\"sample_count\":2"));
         assertTrue(json.contains("\"completeness\":\"COMPLETE\""));
         assertTrue(json.contains("\"result_digest_stable\":true"));
+        assertTrue(json.contains("\"phase_ms\":{}"));
+        assertTrue(json.contains("\"resource_metrics\":{}"));
+        assertTrue(json.contains("\"phase_gates\":{}"));
         assertFalse(json.contains("C:\\"), "性能产物不得写入本机绝对路径");
     }
 }

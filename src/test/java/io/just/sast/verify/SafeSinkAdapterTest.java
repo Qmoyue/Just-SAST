@@ -213,7 +213,7 @@ class SafeSinkAdapterTest {
         assertEquals(SafeSinkAdapter.Disposition.REAL_TARGET_SINK,
                 command.decision().disposition());
         assertFalse(network.effectObserved());
-        assertEquals(SafeSinkAdapter.Disposition.REAL_TARGET_SINK,
+        assertEquals(SafeSinkAdapter.Disposition.CANARY_BOUNDARY,
                 network.decision().disposition());
         assertFalse(file.effectObserved());
         assertEquals(SafeSinkAdapter.Disposition.REAL_TARGET_SINK,

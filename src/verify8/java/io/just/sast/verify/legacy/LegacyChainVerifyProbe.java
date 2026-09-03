@@ -72,8 +72,6 @@ public final class LegacyChainVerifyProbe {
     private static String resultChannelSecret = "";
     private static java.io.OutputStream resultChannel;
     private static boolean resultChannelBroken;
-    /** Whether the strict Linux child installed the requested kernel filesystem policy. */
-    private static boolean landlockReady = true;
 
     /** Source-boundary callback shape shared with the Java 17 probe protocol. */
     private static final class SourceTrigger {
@@ -133,18 +131,11 @@ public final class LegacyChainVerifyProbe {
             System.exit(3);
             return;
         }
-        if (!strictOsAttestation()) {
+        String windowsJob = "1";
+        if (!jobObjectAttestation(windowsJob)) {
             emit("SANDBOX_UNAVAILABLE: OS_ATTESTATION_FAILED");
             System.exit(3);
             return;
-        }
-        if (Boolean.parseBoolean(safeProperty("just.verify.landlock-required", "false"))) {
-            landlockReady = installLandlock();
-            if (!landlockReady) {
-                emit("SANDBOX_UNAVAILABLE: LANDLOCK_ATTESTATION_FAILED");
-                System.exit(3);
-                return;
-            }
         }
         List<String[]> fieldLinks = parseLinks(args.length > 1 ? args[1] : "");
         String[] sink = parseSink(args.length > 2 ? args[2] : "");
@@ -159,9 +150,10 @@ public final class LegacyChainVerifyProbe {
         safeScratchRoot = boundedPathProperty("java.io.tmpdir");
         safeNativeScratchRoot = boundedPathProperty("just.verify.native-scratch");
         safeJavaExecutable = locateSafeJavaExecutable();
+        String isolationLevel = safeProperty("just.verify.isolation-level", "NONE");
         if ("SAFE_REAL".equals(safeSinkMode)
-                && !"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
-            emit("SANDBOX_UNAVAILABLE: SAFE_REAL_REQUIRES_OS_STRICT");
+                && !"PROCESS_RESOURCE".equals(isolationLevel)) {
+            emit("SANDBOX_UNAVAILABLE: SAFE_REAL_REQUIRES_RUNNER");
             System.exit(3);
             return;
         }
@@ -194,9 +186,7 @@ public final class LegacyChainVerifyProbe {
                 return;
             }
             emit("SANDBOX_READY: " + safeProperty("just.verify.backend", "unknown")
-                    + "|landlock=" + (Boolean.parseBoolean(
-                    safeProperty("just.verify.landlock-required", "false"))
-                    ? (landlockReady ? "1" : "0") : "na")
+                    + "|job=" + windowsJob
                     + "|attestation=" + attestationVersion);
             // The gate keeps its token in bootstrap memory; do not leave the attestation in the
             // mutable system-properties map where target code could read or replace it.
@@ -296,7 +286,8 @@ public final class LegacyChainVerifyProbe {
             String marker = markerSpec(failure);
             if (marker != null && sameSink(marker, sinkClass, sinkMethod, sinkDescriptor)
                     && entryReached(failure, entryClass, entryMethod)) {
-                emit("SINK_BLOCKED: " + sinkClass);
+                emit("SINK_BLOCKED: " + sinkClass + ";prefix_stop_ms="
+                        + io.just.sast.verify.boot.SinkCanaryGate.prefixStopMs());
                 System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod + " (canary)");
                 System.exit(1);
                 return;
@@ -338,17 +329,39 @@ public final class LegacyChainVerifyProbe {
         boolean body = io.just.sast.verify.boot.SinkExecutionGate.bodyEntered();
         boolean bodyReturned = io.just.sast.verify.boot.SinkExecutionGate.bodyReturned();
         boolean call = io.just.sast.verify.boot.SinkExecutionGate.callObserved();
+        boolean loaded = io.just.sast.verify.boot.SinkExecutionGate.targetLoaded();
+        boolean arguments = io.just.sast.verify.boot.SinkExecutionGate.safeArgumentsAccepted();
         boolean applicationBody = "APPLICATION_BODY".equals(safeSinkKind);
         if ((applicationBody && !bodyReturned) || (!applicationBody && !call)) {
             if (body) {
-                emit("UNTESTABLE: REAL_SINK_BODY_DID_NOT_RETURN;body=1;body_returned=0");
+                emit("UNTESTABLE: REAL_SINK_BODY_DID_NOT_RETURN;body=1;body_returned=0"
+                        + ";class_load_ms="
+                        + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs()
+                        + ";real_call_ms="
+                        + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs());
                 return true;
             }
             if (io.just.sast.verify.boot.SinkExecutionGate.callAttempted()) {
-                emit("UNTESTABLE: REAL_SINK_CALL_DID_NOT_RETURN;attempted=1");
+                emit("UNTESTABLE: REAL_SINK_CALL_DID_NOT_RETURN;attempted=1"
+                        + ";class_load_ms="
+                        + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs()
+                        + ";real_call_ms="
+                        + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs());
                 return true;
             }
             return false;
+        }
+        if (!loaded || !arguments) {
+            emit("UNTESTABLE: REAL_SINK_EVIDENCE_INCOMPLETE;loaded="
+                    + (loaded ? "1" : "0") + ";arguments="
+                    + (arguments ? "1" : "0") + ";body="
+                    + (body ? "1" : "0") + ";body_returned="
+                    + (bodyReturned ? "1" : "0") + ";call="
+                    + (call ? "1" : "0") + ";class_load_ms="
+                    + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs()
+                    + ";real_call_ms="
+                    + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs());
+            return true;
         }
         boolean nativeComplete = io.just.sast.verify.boot.SinkExecutionGate.nativeLoadSucceeded()
                 && io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved();
@@ -364,12 +377,18 @@ public final class LegacyChainVerifyProbe {
                 + ";body_returned=" + (bodyReturned ? "1" : "0")
                 + ";call=" + (call ? "1" : "0")
                 + ";attempted=" + (io.just.sast.verify.boot.SinkExecutionGate.callAttempted() ? "1" : "0")
+                + ";loaded=" + (loaded ? "1" : "0")
+                + ";arguments=" + (arguments ? "1" : "0")
                 + ";native_load=" + (io.just.sast.verify.boot.SinkExecutionGate.nativeLoadSucceeded() ? "1" : "0")
                 + ";native_call=" + (io.just.sast.verify.boot.SinkExecutionGate.nativeCallObserved() ? "1" : "0")
                 + ";native_spec=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.nativeCallSpec())
                 + ";nested_blocked=" + (io.just.sast.verify.boot.SinkExecutionGate.nestedBlocked() ? "1" : "0")
                 + ";native_digest=" + safeLabel(nativeFixtureDigest)
-                + ";sanitizer=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.sanitizer());
+                + ";sanitizer=" + safeLabel(io.just.sast.verify.boot.SinkExecutionGate.sanitizer())
+                + ";class_load_ms="
+                + io.just.sast.verify.boot.SinkExecutionGate.classLoadMs()
+                + ";real_call_ms="
+                + io.just.sast.verify.boot.SinkExecutionGate.terminalCallMs();
         emit(detail);
         System.err.println("SINK_EXECUTED_SAFE: " + sinkClass + "." + sinkMethod
                 + " body=" + (body ? "1" : "0") + " call=" + (call ? "1" : "0")
@@ -417,7 +436,8 @@ public final class LegacyChainVerifyProbe {
                     + " (canary-latched; safe effect observed; target body not entered)");
             return true;
         }
-        emit("SINK_BLOCKED: " + sinkClass);
+        emit("SINK_BLOCKED: " + sinkClass + ";prefix_stop_ms="
+                + io.just.sast.verify.boot.SinkCanaryGate.prefixStopMs());
         System.err.println("SINK_REACHED: " + sinkClass + "." + sinkMethod
                 + " (canary-latched)");
         return true;
@@ -1791,138 +1811,17 @@ public final class LegacyChainVerifyProbe {
         return false;
     }
 
-    /** Strict Linux readiness must be proven from inside the namespace before target loading. */
-    private static boolean strictOsAttestation() {
-        if (!"OS_STRICT".equals(safeProperty("just.verify.isolation-level", "NONE"))) {
-            return true;
-        }
+    /** The parent releases the ready marker only after attaching the Job Object to this PID. */
+    private static boolean jobObjectAttestation(String windowsJob) {
         String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
-        if (os.contains("win")) {
-            return "WINDOWS_APPCONTAINER_STRICT".equals(safeProperty("just.verify.backend", ""))
-                    && io.just.sast.verify.boot.WindowsProcessAttestation.appContainerLow();
-        }
-        if (!os.contains("linux")) {
+        if (!os.contains("win")) {
             return false;
         }
-        try {
-            String[] namespaces = {"user", "mnt", "pid", "net", "ipc", "uts"};
-            for (String namespace : namespaces) {
-                if (!Files.exists(Paths.get("/proc/self/ns", namespace))) {
-                    return false;
-                }
-            }
-            String status = new String(Files.readAllBytes(Paths.get("/proc/self/status")),
-                    "UTF-8");
-            if (!status.matches("(?s).*\\nUid:\\s+65534(?:\\s|$).*")
-                    || !status.matches("(?s).*\\nNoNewPrivs:\\s+1(?:\\s|$).*")
-                    || !status.matches("(?s).*\\nSeccomp:\\s+[12](?:\\s|$).*")) {
-                return false;
-            }
-            String controllers = new String(Files.readAllBytes(
-                    Paths.get("/sys/fs/cgroup/cgroup.controllers")), "UTF-8");
-            if (!(controllers.contains("cpu") && controllers.contains("memory")
-                    && controllers.contains("pids"))) {
-                return false;
-            }
-            if (!cgroupLimitsAttested()) {
-                return false;
-            }
-            if ("true".equalsIgnoreCase(safeProperty("just.verify.loopback", "false"))) {
-                return java.net.NetworkInterface.getByInetAddress(
-                        java.net.InetAddress.getLoopbackAddress()) != null;
-            }
-            return true;
-        } catch (IOException | RuntimeException ignored) {
-            return false;
-        }
-    }
-
-    /** Verify this Java 8 child is placed in a finite cgroup-v2, not only that controllers exist. */
-    private static boolean cgroupLimitsAttested() {
-        try {
-            Path mount = Paths.get("/sys/fs/cgroup");
-            Path cgroupFile = Paths.get("/proc/self/cgroup");
-            if (!Files.isDirectory(mount) || !Files.isRegularFile(cgroupFile)) {
-                return false;
-            }
-            String text = new String(Files.readAllBytes(cgroupFile), "UTF-8");
-            String relative = "";
-            String[] lines = text.split("\\r?\\n");
-            for (String line : lines) {
-                if (line.startsWith("0::")) {
-                    relative = line.substring(3).trim();
-                    break;
-                }
-            }
-            if (relative.length() == 0) {
-                return false;
-            }
-            Path group = mount.resolve(relative.startsWith("/")
-                    ? relative.substring(1) : relative).normalize();
-            if (!group.startsWith(mount) || !Files.isDirectory(group)) {
-                return false;
-            }
-            String runtimeName = java.lang.management.ManagementFactory
-                    .getRuntimeMXBean().getName();
-            int at = runtimeName.indexOf('@');
-            String pid = at > 0 ? runtimeName.substring(0, at) : runtimeName;
-            String processes = new String(Files.readAllBytes(group.resolve("cgroup.procs")), "UTF-8");
-            boolean member = false;
-            for (String process : processes.split("\\r?\\n")) {
-                if (pid.equals(process.trim())) {
-                    member = true;
-                    break;
-                }
-            }
-            if (!member) {
-                return false;
-            }
-            long memory = finiteCgroupValue(new String(
-                    Files.readAllBytes(group.resolve("memory.max")), "UTF-8"));
-            long pids = finiteCgroupValue(new String(
-                    Files.readAllBytes(group.resolve("pids.max")), "UTF-8"));
-            String[] cpu = new String(Files.readAllBytes(group.resolve("cpu.max")), "UTF-8")
-                    .trim().split("\\s+");
-            long quota = cpu.length > 0 && !"max".equals(cpu[0])
-                    ? finiteCgroupValue(cpu[0]) : -1L;
-            return memory > 0L && pids > 0L && quota > 0L;
-        } catch (IOException | RuntimeException ignored) {
-            return false;
-        }
-    }
-
-    private static long finiteCgroupValue(String value) {
-        if (value == null || value.trim().length() == 0 || "max".equals(value.trim())) {
-            return -1L;
-        }
-        try {
-            long parsed = Long.parseLong(value.trim());
-            return parsed > 0L ? parsed : -1L;
-        } catch (NumberFormatException ignored) {
-            return -1L;
-        }
-    }
-
-    /** Install the child-side Landlock filesystem policy before target class loading. */
-    private static boolean installLandlock() {
-        try {
-            List<Path> writable = new ArrayList<Path>();
-            Path temp = Paths.get(System.getProperty("java.io.tmpdir", "."))
-                    .toAbsolutePath().normalize();
-            if (Files.isDirectory(temp)) {
-                writable.add(temp);
-            }
-            String resultFile = boundedPathProperty("just.verify.result-file");
-            if (resultFile.length() > 0) {
-                Path parent = Paths.get(resultFile).toAbsolutePath().normalize().getParent();
-                if (parent != null && Files.isDirectory(parent) && !writable.contains(parent)) {
-                    writable.add(parent);
-                }
-            }
-            return LinuxLandlock.install(writable);
-        } catch (RuntimeException failure) {
-            return false;
-        }
+        String backend = safeProperty("just.verify.backend", "");
+        return "WINDOWS_JOB_OBJECT_JVM_POLICY".equals(backend)
+                && "PROCESS_RESOURCE".equals(
+                safeProperty("just.verify.isolation-level", "NONE"))
+                && "1".equals(windowsJob);
     }
 
     private static String safeProperty(String key, String fallback) {

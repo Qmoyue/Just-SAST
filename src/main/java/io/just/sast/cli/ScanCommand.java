@@ -44,15 +44,15 @@ public final class ScanCommand implements Callable<Integer> {
     boolean noVerify;
 
     @Option(names = "--safe-exec",
-            description = "显式请求安全化 sink adapter；未覆盖的 sink 仍只在 canary 边界观察，绝不执行目标 sink 方法体")
+            description = "显式使用仅 canary 的兼容 adapter；默认动态验证走 LIGHT_SAFE_CALL")
     boolean safeExec;
 
     @Option(names = "--safe-real-sink",
-            description = "在已认证 OS_STRICT runner 内调用精确目标 sink/body；参数按签名替换为固定安全值，不执行危险命令/RCE，必须同时使用 --require-os-isolation")
+            description = "显式声明 SAFE_REAL（默认动态验证已启用）；参数按签名替换为固定安全值，不执行危险命令/RCE")
     boolean safeRealSink;
 
     @Option(names = "--require-os-isolation",
-            description = "动态验证必须使用生产级 OS_STRICT 后端；不可用时 fail closed（默认接受能力降级并报告）")
+            description = "动态验证要求 Job Object；不可用时返回 UNTESTABLE，不启动无隔离真实终点")
     boolean requireOsIsolation;
 
     @Option(names = "--baseline", paramLabel = "<scan-dir>",
@@ -75,6 +75,11 @@ public final class ScanCommand implements Callable<Integer> {
     @Override
     public Integer call() {
         try {
+            // SAFE_REAL is the product default for enabled dynamic verification. Windows uses
+            // the same lightweight Job Object runner whether or not the explicit requirement
+            // bit is set; the bit only changes the cache/report identity and failure policy.
+            boolean useSafeReal = !noVerify && (safeRealSink || !safeExec);
+            boolean useOsIsolation = requireOsIsolation;
             boolean useCache = cache != null && baseline == null && suppressions == null;
             if (cache != null && !useCache) {
                 System.err.println("[just:info] --cache 与 baseline/suppressions 同时使用时跳过缓存，"
@@ -84,8 +89,8 @@ public final class ScanCommand implements Callable<Integer> {
             if (useCache) {
                 try {
                     preflight = ScanCache.preflight(target, deps, rules, jdkHome, fast,
-                            !noVerify, verifyBudget, safeExec, safeRealSink,
-                            requireOsIsolation);
+                            !noVerify, verifyBudget, safeExec, useSafeReal,
+                            useOsIsolation);
                     if (ScanCache.restore(cache, preflight.cacheKey(), output)) {
                         System.err.println("[just:info] 增量缓存命中（报告身份已校验）");
                         return ExitCode.OK.code();
@@ -96,8 +101,8 @@ public final class ScanCommand implements Callable<Integer> {
                 }
             }
             ScanPipeline.ScanResult result = ScanPipeline.run(target, deps, output, rules, stats,
-                    fast, jdkHome, !noVerify, verifyBudget, safeExec, safeRealSink,
-                    requireOsIsolation,
+                    fast, jdkHome, !noVerify, verifyBudget, safeExec, useSafeReal,
+                    useOsIsolation,
                     baseline, suppressions);
             if (useCache && preflight != null) {
                 try {

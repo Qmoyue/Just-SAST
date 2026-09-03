@@ -136,7 +136,19 @@ class ForwardOriginsTest {
 
     @Test
     void summaryCacheRemainsBoundedForFatJars() {
+        MethodInfo hot = new MethodInfo("Hot", "summary", "()V", 0,
+                List.of(new io.just.sast.model.InsnFact(0, Op.RETURN, List.of())),
+                List.of(), false, -1);
+        origins.compute(hot);
         for (int i = 0; i < ForwardOrigins.MAX_CACHE_ENTRIES + ForwardOrigins.MAX_CACHE_BURST + 512; i++) {
+            // Revisit the same structural key shortly before trimming. The shared cache
+            // should give this hot summary one second chance instead of evicting it solely
+            // because a fat-jar admission burst arrived first.
+            if (i == ForwardOrigins.MAX_CACHE_ENTRIES + ForwardOrigins.MAX_CACHE_BURST - 64) {
+                origins.compute(new MethodInfo("Hot", "summary", "()V", 0,
+                        List.of(new io.just.sast.model.InsnFact(0, Op.RETURN, List.of())),
+                        List.of(), false, -1));
+            }
             MethodInfo method = new MethodInfo("Fat", "m" + i, "()V", 0,
                     List.of(new io.just.sast.model.InsnFact(0, Op.RETURN, List.of())),
                     List.of(), false, -1);
@@ -150,6 +162,12 @@ class ForwardOriginsTest {
         }
         assertTrue(origins.cacheSize() <= ForwardOrigins.MAX_CACHE_ENTRIES,
                 "正向摘要缓存必须有界，避免 fat jar 持有全部方法状态，实际=" + origins.cacheSize());
+        long runsBeforeHotLookup = origins.analysisRuns();
+        origins.compute(new MethodInfo("Hot", "summary", "()V", 0,
+                List.of(new io.just.sast.model.InsnFact(0, Op.RETURN, List.of())),
+                List.of(), false, -1));
+        assertEquals(runsBeforeHotLookup, origins.analysisRuns(),
+                "频繁命中的共享摘要应获得一次二次机会，不应因 FIFO admission burst 被重新解释");
         origins.clearCache();
         assertEquals(0, origins.cacheSize());
     }

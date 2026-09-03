@@ -14,7 +14,8 @@ public record Chain(
         int unresolvedHops,
         String sinkDescriptor,
         String sinkRole,
-        ObjectGraphPlan constructionPlan) {
+        ObjectGraphPlan constructionPlan,
+        SinkRisk sinkRisk) {
 
     public Chain {
         hops = hops == null ? List.of() : List.copyOf(hops);
@@ -22,6 +23,7 @@ public record Chain(
         sinkRole = sinkRole == null || sinkRole.isBlank() ? "TERMINAL" : sinkRole;
         constructionPlan = constructionPlan == null || constructionPlan.isEmpty()
                 ? null : constructionPlan;
+        sinkRisk = SinkRisk.resolve(sinkRisk, category, sinkClass, sinkMethod);
     }
 
     /** 兼容扩展点与测试构造：旧调用方未提供 sink 描述符时保持未知。 */
@@ -30,7 +32,7 @@ public record Chain(
                  String sinkClass, String sinkMethod,
                  List<ChainHop> hops, int unresolvedHops) {
         this(ruleId, category, severity, entryClass, entryMethod, entryKind,
-                sinkClass, sinkMethod, hops, unresolvedHops, "", "TERMINAL", null);
+                sinkClass, sinkMethod, hops, unresolvedHops, "", "TERMINAL", null, null);
     }
 
     /** Compatibility constructor for extensions written before sink roles. */
@@ -39,7 +41,8 @@ public record Chain(
                  String sinkClass, String sinkMethod,
                  List<ChainHop> hops, int unresolvedHops, String sinkDescriptor) {
         this(ruleId, category, severity, entryClass, entryMethod, entryKind,
-                sinkClass, sinkMethod, hops, unresolvedHops, sinkDescriptor, "TERMINAL", null);
+                sinkClass, sinkMethod, hops, unresolvedHops, sinkDescriptor, "TERMINAL", null,
+                null);
     }
 
     /** Compatibility constructor for callers that already provide the sink role. */
@@ -50,7 +53,18 @@ public record Chain(
                  String sinkRole) {
         this(ruleId, category, severity, entryClass, entryMethod, entryKind,
                 sinkClass, sinkMethod, hops, unresolvedHops, sinkDescriptor,
-                sinkRole, null);
+                sinkRole, null, null);
+    }
+
+    /** Compatibility constructor for callers that provide a construction plan. */
+    public Chain(String ruleId, String category, String severity,
+                 String entryClass, String entryMethod, String entryKind,
+                 String sinkClass, String sinkMethod,
+                 List<ChainHop> hops, int unresolvedHops, String sinkDescriptor,
+                 String sinkRole, ObjectGraphPlan constructionPlan) {
+        this(ruleId, category, severity, entryClass, entryMethod, entryKind,
+                sinkClass, sinkMethod, hops, unresolvedHops, sinkDescriptor,
+                sinkRole, constructionPlan, null);
     }
 
     public boolean terminalSink() {
@@ -71,6 +85,7 @@ public record Chain(
         append(sb, sinkMethod);
         append(sb, sinkDescriptor);
         append(sb, sinkRole);
+        append(sb, sinkRisk);
         append(sb, constructionPlan == null ? "" : constructionPlan.fingerprint());
         for (ChainHop hop : hops) {
             append(sb, hop.fromOwner());

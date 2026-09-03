@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import io.just.sast.blackboard.SinkRisk;
 
 /** YAML 规则 → RuleSet。 */
 public final class YamlRuleLoader {
@@ -108,8 +109,19 @@ public final class YamlRuleLoader {
         } catch (IllegalArgumentException invalidRole) {
             throw new IOException("sink 规则 " + id + " 的 role 无效: " + invalidRole.getMessage(), invalidRole);
         }
+        Object riskValue = ruleMap.containsKey("sink_risk")
+                ? ruleMap.get("sink_risk") : ruleMap.get("sinkRisk");
+        SinkRisk sinkRisk;
+        try {
+            sinkRisk = riskValue == null
+                    ? SinkRisk.infer(category, callMatcher.ownerType(), callMatcher.name().pattern())
+                    : SinkRisk.parse(riskValue.toString());
+        } catch (IllegalArgumentException invalidRisk) {
+            throw new IOException("sink 规则 " + id + " 的 sink_risk 无效: "
+                    + invalidRisk.getMessage(), invalidRisk);
+        }
         return new Rule.SinkRule(id, category, severity,
-                callMatcher, List.copyOf(tainted), role);
+                callMatcher, List.copyOf(tainted), role, sinkRisk);
     }
 
     private static String requiredString(Map<?, ?> map, String key, String message) throws IOException {

@@ -14,6 +14,8 @@ public final class SinkCanaryGate {
     private static volatile String protocolSinkFingerprint;
     private static volatile String protocolNonce;
     private static volatile String protocolArtifactFingerprint;
+    private static volatile long armedAtNanos;
+    private static volatile long prefixStopMs;
     private static volatile boolean reached;
     private static boolean configured;
     private static boolean protocolConfigured;
@@ -29,6 +31,8 @@ public final class SinkCanaryGate {
         entryClass = dottedClass;
         entryMethod = method;
         entryToken = token;
+        armedAtNanos = System.nanoTime();
+        prefixStopMs = 0L;
         reached = false;
         configured = true;
     }
@@ -73,6 +77,7 @@ public final class SinkCanaryGate {
             if (expectedClass.equals(frame.getClassName())
                     && expectedMethod.equals(frame.getMethodName())) {
                 reached = true;
+                prefixStopMs = elapsedMs(armedAtNanos);
                 throw new SinkReachedError(spec);
             }
         }
@@ -86,11 +91,20 @@ public final class SinkCanaryGate {
         return configured && entryClass != null && entryMethod != null && entryToken != null;
     }
 
+    public static long prefixStopMs() {
+        return prefixStopMs;
+    }
+
     private static boolean blank(String value) {
         return value == null || value.length() == 0;
     }
 
     private static boolean same(String left, String right) {
         return left != null && left.equals(right);
+    }
+
+    private static long elapsedMs(long started) {
+        if (started <= 0L) return 0L;
+        return Math.max(0L, (System.nanoTime() - started) / 1000000L);
     }
 }

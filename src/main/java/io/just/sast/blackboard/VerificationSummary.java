@@ -45,7 +45,9 @@ public record VerificationSummary(
             String policyDigest,
             boolean sinkDistorted,
             boolean sandboxReady,
-            String cleanup) {
+            String cleanup, String requestedMode, String effectiveMode,
+            String fallback, String verificationScope, String sinkRisk,
+            boolean terminalExecuted, String stopReason, String lastConfirmedStage) {
 
         public ChainResult(int rank, String chainKey, String status, String detail,
                            String confidence, int confidenceScore, int attempt,
@@ -62,6 +64,22 @@ public record VerificationSummary(
                     false, "UNKNOWN");
         }
 
+        /** Compatibility constructor retained for report consumers before scope metadata. */
+        public ChainResult(int rank, String chainKey, String status, String detail,
+                           String confidence, int confidenceScore, int attempt,
+                           long durationMs, String evidence, String backend, String jdk,
+                           String policyDigest, boolean sinkDistorted, boolean sandboxReady,
+                           String cleanup) {
+            this(rank, chainKey, status, detail, confidence, confidenceScore, attempt,
+                    durationMs, evidence, backend, jdk, policyDigest, sinkDistorted,
+                    sandboxReady, cleanup,
+                    field(detail, "requested_mode", "UNKNOWN"),
+                    field(detail, "effective_mode", "UNKNOWN"),
+                    field(detail, "fallback", "none"), defaultScope(status), "UNKNOWN",
+                    defaultTerminalExecuted(status), defaultStopReason(status, detail),
+                    defaultLastStage(status));
+        }
+
         public ChainResult {
             chainKey = chainKey == null ? "" : chainKey;
             status = status == null ? "UNKNOWN" : status;
@@ -74,10 +92,65 @@ public record VerificationSummary(
             jdk = normalize(jdk);
             policyDigest = normalize(policyDigest);
             cleanup = normalize(cleanup);
+            requestedMode = normalize(requestedMode);
+            effectiveMode = normalize(effectiveMode);
+            fallback = normalize(fallback);
+            verificationScope = normalize(verificationScope);
+            sinkRisk = normalize(sinkRisk);
+            stopReason = normalize(stopReason);
+            lastConfirmedStage = normalize(lastConfirmedStage);
         }
 
         private static String normalize(String value) {
             return value == null || value.isBlank() ? "UNKNOWN" : value;
+        }
+
+        private static String field(String detail, String name, String fallback) {
+            if (detail == null) return fallback;
+            String marker = name + "=";
+            int start = detail.indexOf(marker);
+            if (start < 0) return fallback;
+            start += marker.length();
+            int end = detail.indexOf(';', start);
+            String value = end < 0 ? detail.substring(start) : detail.substring(start, end);
+            return value.isBlank() ? fallback : value;
+        }
+
+        private static String defaultScope(String status) {
+            return switch (status == null ? "" : status) {
+                case "SINK_BLOCKED" -> "BOUNDARY_ONLY";
+                case "PRE_SINK_CONFIRMED" -> "PREFIX_ONLY";
+                case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> "TERMINAL_EXECUTED_SAFE";
+                default -> "NONE";
+            };
+        }
+
+        private static boolean defaultTerminalExecuted(String status) {
+            return "SINK_EXECUTED_SAFE".equals(status) || "JNI_EXECUTED_SAFE".equals(status);
+        }
+
+        private static String defaultStopReason(String status, String detail) {
+            if ("SINK_BLOCKED".equals(status)) return "SINK_BOUNDARY_CANARY";
+            if ("PRE_SINK_CONFIRMED".equals(status)) return "HIGH_RISK_SINK";
+            if ("SINK_EXECUTED_SAFE".equals(status)
+                    || "JNI_EXECUTED_SAFE".equals(status)) return "SAFE_TERMINAL_RETURNED";
+            if ("SAFE_EFFECT_OBSERVED".equals(status)) return "ADAPTER_EFFECT_ONLY";
+            if ("TIMEOUT".equals(status)) return "PROCESS_TIMEOUT";
+            if ("UNTESTABLE".equals(status) && detail != null
+                    && detail.startsWith("SANDBOX_UNAVAILABLE")) return "SANDBOX_UNAVAILABLE";
+            return "NONE";
+        }
+
+        private static String defaultLastStage(String status) {
+            return switch (status == null ? "" : status) {
+                case "SINK_BLOCKED" -> "SINK_BOUNDARY";
+                case "PRE_SINK_CONFIRMED" -> "PRE_SINK";
+                case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> "SINK_RETURNED";
+                case "SAFE_EFFECT_OBSERVED" -> "ADAPTER_EFFECT";
+                case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER";
+                case "EXECUTED" -> "ENTRY_RETURNED";
+                default -> "NONE";
+            };
         }
     }
 

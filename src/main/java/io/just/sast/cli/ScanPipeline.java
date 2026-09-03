@@ -33,7 +33,6 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -59,40 +58,41 @@ public final class ScanPipeline {
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, false, false, false, null, null);
+                verifyBudget, false, verify, false, null, null);
     }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget, boolean safeExec) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, safeExec, false, false, null, null);
+                verifyBudget, safeExec, verify && !safeExec, false, null, null);
     }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget, boolean safeExec,
-                                 boolean requireStrictIsolation) throws Exception {
+                                 boolean requireOsIsolation) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, safeExec, false, requireStrictIsolation, null, null);
+                verifyBudget, safeExec, verify && !safeExec, requireOsIsolation, null, null);
     }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget, boolean safeExec,
-                                 boolean requireStrictIsolation, Path baseline,
+                                 boolean requireOsIsolation, Path baseline,
                                  Path suppressions) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
-                safeExec, false, requireStrictIsolation, baseline, suppressions);
+                safeExec, verify && !safeExec, requireOsIsolation, baseline, suppressions);
     }
 
     /** Full pipeline entry point with an explicit adapter-owned SAFE_REAL mode. */
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
                                  int verifyBudget, boolean safeExec, boolean safeReal,
-                                 boolean requireStrictIsolation, Path baseline,
+                                 boolean requireOsIsolation, Path baseline,
                                  Path suppressions) throws Exception {
         long start = System.nanoTime();
+        long parentCpuStarted = processCpuTimeMs();
         Map<String, Long> phaseMs = new java.util.LinkedHashMap<>();
         resetHeapPeaks();
 
@@ -136,15 +136,12 @@ public final class ScanPipeline {
         if (safeExec && safeReal) {
             throw new UsageException("--safe-exec 与 --safe-real-sink 不能同时使用");
         }
-        if (safeReal && !requireStrictIsolation) {
-            throw new UsageException("--safe-real-sink 必须同时使用 --require-os-isolation");
-        }
-        if (requireStrictIsolation && !verify) {
+        if (requireOsIsolation && !verify) {
             throw new UsageException("--require-os-isolation 需要启用动态验证（不能与 --no-verify 同时使用）");
         }
 
-        if (requireStrictIsolation || safeReal) {
-            io.just.sast.verify.OsIsolation.prewarmStrict();
+        if (verify) {
+            io.just.sast.verify.OsIsolation.prewarmJobObject();
         }
 
         // Hash immutable inputs once at the scan boundary. Besides making report identity
@@ -228,7 +225,7 @@ public final class ScanPipeline {
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
                         verifyBudget, jdkHome, load.targetMajorVersion(), safeExec, safeReal,
-                        requireStrictIsolation));
+                        requireOsIsolation));
         new Controller(blackboard, KnowledgeSources.discover()).run();
         for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
             phaseMs.put(timing.getKey(), timing.getValue());
@@ -286,7 +283,7 @@ public final class ScanPipeline {
         new io.just.sast.report.ScanIdentityWriter().write(reportLayout, targetArtifactHash,
                 dependencyIdentity, dependencyInventoryHash, rules, jdkHome,
                 load.targetMajorVersion(), fast, verify, verifyBudget, safeExec,
-                safeReal, requireStrictIsolation);
+                safeReal, requireOsIsolation);
         new io.just.sast.report.BaselineSuppressionWriter().write(reportLayout, baseline,
                 suppressions, reportChains, reportCalibrations);
         JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
@@ -317,7 +314,7 @@ public final class ScanPipeline {
                 heapPeakMb(),
                 completenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
                 completenessReasons, phaseMs, scanMetrics(cpg, blackboard, reportChains, reportNotes,
-                        reportVerification),
+                        reportVerification, parentCpuStarted),
                 verify ? blackboard.verificationStatus() : "DISABLED",
                 verify ? reportVerification
                         : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget),
@@ -491,7 +488,8 @@ public final class ScanPipeline {
     private static Map<String, Long> scanMetrics(BuiltCpg cpg, Blackboard blackboard,
                                                  List<Chain> chains,
                                                  Map<String, List<String>> chainNotes,
-                                                 io.just.sast.blackboard.VerificationSummary verification) {
+                                                 io.just.sast.blackboard.VerificationSummary verification,
+                                                 long parentCpuStarted) {
         Map<String, Long> metrics = new java.util.LinkedHashMap<>();
         metrics.put("graph_nodes", (long) cpg.graph().nodeCount());
         metrics.put("graph_edges", (long) cpg.graph().edgeCount());
@@ -525,7 +523,45 @@ public final class ScanPipeline {
                 .getOrDefault("TIMEOUT", 0));
         metrics.put("verification_untestable", (long) verification.statusCounts()
                 .getOrDefault("UNTESTABLE", 0));
+        metrics.putAll(blackboard.verificationResourceMetrics());
+        metrics.put("parent_rss_mb", io.just.sast.verify.OsIsolation.currentProcessRssMb());
+        long parentCpuNow = processCpuTimeMs();
+        metrics.put("parent_cpu_ms", parentCpuStarted >= 0L && parentCpuNow >= parentCpuStarted
+                ? parentCpuNow - parentCpuStarted : -1L);
+        metrics.put("parent_thread_peak", parentThreadPeak());
+        metrics.put("parent_processes_current", currentProcessCount());
         return metrics;
+    }
+
+    private static long processCpuTimeMs() {
+        try {
+            java.lang.management.OperatingSystemMXBean bean =
+                    java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            if (bean instanceof com.sun.management.OperatingSystemMXBean sun) {
+                long nanos = sun.getProcessCpuTime();
+                return nanos < 0L ? -1L : nanos / 1_000_000L;
+            }
+        } catch (RuntimeException ignored) {
+            // Resource telemetry must not affect scan semantics.
+        }
+        return -1L;
+    }
+
+    private static long parentThreadPeak() {
+        try {
+            return Math.max(0L, java.lang.management.ManagementFactory.getThreadMXBean()
+                    .getPeakThreadCount());
+        } catch (RuntimeException ignored) {
+            return -1L;
+        }
+    }
+
+    private static long currentProcessCount() {
+        try {
+            return 1L + java.lang.ProcessHandle.current().descendants().count();
+        } catch (RuntimeException ignored) {
+            return -1L;
+        }
     }
 
     private static void validatePath(Path path, String label, boolean allowDirectory)
@@ -547,7 +583,7 @@ public final class ScanPipeline {
 
     /** 链级注释视图（有注释的链 key → 注释列表快照，报告层消费）。 */
     private static Map<String, List<String>> blackboardNotes(Blackboard blackboard) {
-        Map<String, List<String>> notes = new HashMap<>();
+        Map<String, List<String>> notes = new java.util.TreeMap<>();
         for (Chain chain : blackboard.chains()) {
             List<String> list = blackboard.chainNotesOf(chain.key());
             if (!list.isEmpty()) {

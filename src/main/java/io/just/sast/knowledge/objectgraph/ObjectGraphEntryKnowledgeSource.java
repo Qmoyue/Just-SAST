@@ -240,7 +240,7 @@ public final class ObjectGraphEntryKnowledgeSource implements KnowledgeSource {
         return new Chain(chain.ruleId(), chain.category(), chain.severity(),
                 entry[0], entry[1], entry[2],
                 chain.sinkClass(), chain.sinkMethod(), hops, chain.unresolvedHops(), chain.sinkDescriptor(),
-                chain.sinkRole(), chain.constructionPlan());
+                chain.sinkRole(), chain.constructionPlan(), chain.sinkRisk());
     }
 
     /** 类的第一个机制回调入口（owner, method, entryKind）；无则 null。 */

@@ -116,7 +116,8 @@ public final class PayloadPlanWriter {
                 .append("\",\"method\":\"").append(esc(chain.sinkMethod()))
                 .append("\",\"descriptor\":\"").append(esc(chain.sinkDescriptor()))
                 .append("\",\"role\":\"").append(esc(chain.sinkRole()))
-                .append("\",\"capability\":\"").append(esc(capabilityOf(chain))).append("\"}")
+                .append("\",\"capability\":\"").append(esc(capabilityOf(chain)))
+                .append("\",\"sink_risk\":\"").append(esc(chain.sinkRisk().name())).append("\"}")
                 .append(",\"ranking_evidence\":\"")
                 .append(esc(ChainRanking.evidence(chain, Map.of(chain.key(), notes),
                         verification == null ? Map.of() : Map.of(chain.key(), verification), Set.of())
@@ -145,10 +146,10 @@ public final class PayloadPlanWriter {
                     .append("\",\"strategy\":\"IN_MEMORY_REFERENCE\"}");
         }
         json.append("],\"display_path\":\"").append(esc(displayPath(chain, verification)))
-                .append("\",\"constraints\":[\"TYPE_COMPATIBLE_FIELDS\",\"BOUNDED_DEPTH\",")
-                .append("\"SINK_CANARY_ONLY\"]");
+                .append("\",\"constraints\":");
+        appendConstraints(json, verification);
         if (verification == null) {
-            json.append(",\"verification\":{\"status\":\"NOT_SELECTED\"}");
+            json.append(",\"verification\":{\"status\":\"NOT_SELECTED\",\"verification_group\":\"not_selected\"}");
         } else {
             json.append(",\"verification\":{\"rank\":").append(verification.rank())
                     .append(",\"status\":\"").append(esc(verification.status()))
@@ -156,7 +157,19 @@ public final class PayloadPlanWriter {
                     .append("\",\"confidence\":\"").append(esc(verification.confidence()))
                     .append("\",\"confidence_score\":").append(verification.confidenceScore())
                     .append(",\"attempt\":").append(verification.attempt())
-                    .append(",\"duration_ms\":").append(verification.durationMs()).append('}');
+                    .append(",\"duration_ms\":").append(verification.durationMs())
+                    .append(",\"verification_group\":\"")
+                    .append(ReportEvidence.verificationGroup(verification))
+                    .append("\",\"requested_mode\":\"").append(esc(verification.requestedMode()))
+                    .append("\",\"effective_mode\":\"").append(esc(verification.effectiveMode()))
+                    .append("\",\"fallback\":\"").append(esc(verification.fallback()))
+                    .append("\",\"verification_scope\":\"")
+                    .append(esc(verification.verificationScope()))
+                    .append("\",\"sink_risk\":\"").append(esc(verification.sinkRisk()))
+                    .append("\",\"terminal_executed\":").append(verification.terminalExecuted())
+                    .append(",\"stop_reason\":\"").append(esc(verification.stopReason()))
+                    .append("\",\"last_confirmed_stage\":\"")
+                    .append(esc(verification.lastConfirmedStage())).append('}');
         }
         json.append(",\"limitations\":[\"NO_COMMAND_EXECUTION\",\"NO_NATIVE_LIBRARY_LOAD\",")
                 .append("\"NO_REMOTE_REQUEST\",\"NO_AUTOMATIC_SERIALIZED_BYTES\"]}");
@@ -197,6 +210,18 @@ public final class PayloadPlanWriter {
         json.append("]}");
     }
 
+    private static void appendConstraints(StringBuilder json,
+                                          VerificationSummary.ChainResult verification) {
+        json.append("[\"TYPE_COMPATIBLE_FIELDS\",\"BOUNDED_DEPTH\"");
+        switch (ReportEvidence.verificationGroup(verification)) {
+            case "real_safe_terminal" -> json.append(",\"SAFE_FIXED_ARGUMENTS\",\"TERMINAL_RETURN_OBSERVED\",\"JOB_OBJECT_ATTESTED\"");
+            case "prefix_confirmed_high_risk" -> json.append(",\"PREFIX_ONLY\",\"TERMINAL_NOT_EXECUTED\",\"JOB_OBJECT_ATTESTED\"");
+            case "boundary_only" -> json.append(",\"SINK_CANARY_ONLY\",\"JOB_OBJECT_ATTESTED\"");
+            default -> json.append(",\"SINK_CANARY_ONLY\"");
+        }
+        json.append(']');
+    }
+
     private static void appendConstructionSummary(StringBuilder json,
                                                   ConstructionSummary summary) {
         if (summary == null) {
@@ -222,7 +247,7 @@ public final class PayloadPlanWriter {
         StringBuilder json = new StringBuilder("{\n")
                 .append("  \"schema_version\":1,\n")
                 .append("  \"safety\":\"NO_EXECUTABLE_PAYLOAD\",\n")
-                .append("  \"description\":\"Human/agent-readable chain view; final sink body is never executed\",\n")
+                .append("  \"description\":\"Inert construction plan; verification fields record a separate bounded child-JVM attempt\",\n")
                 .append("  \"plans\":[\n");
         for (int i = 0; i < views.size(); i++) {
             if (i > 0) {
@@ -256,7 +281,10 @@ public final class PayloadPlanWriter {
                 .append(esc(chain.sinkMethod())).append("\",\"role\":\"")
                 .append(esc(chain.sinkRole())).append("\",\"status\":\"")
                 .append(esc(verification == null ? "NOT_SELECTED" : verification.status()))
-                .append("\",\"execution\":\"").append(executionLabel())
+                .append("\",\"execution\":\"").append(executionLabel(verification))
+                .append("\",\"sink_risk\":\"").append(esc(chain.sinkRisk().name()))
+                .append("\",\"verification_group\":\"")
+                .append(ReportEvidence.verificationGroup(verification))
                 .append("\",\"observed_boundary\":\"")
                 .append(observedBoundary(verification)).append("\"},\n")
                 .append(indent).append("  \"construction\":{\"status\":\"")
@@ -292,14 +320,26 @@ public final class PayloadPlanWriter {
     private static void appendVerification(StringBuilder json,
                                            VerificationSummary.ChainResult verification) {
         if (verification == null) {
-            json.append("{\"status\":\"NOT_SELECTED\",\"evidence\":\"NONE\"}");
+            json.append("{\"status\":\"NOT_SELECTED\",\"evidence\":\"NONE\",\"verification_group\":\"not_selected\"}");
             return;
         }
         json.append("{\"status\":\"").append(esc(verification.status()))
                 .append("\",\"evidence\":\"").append(esc(verification.evidence()))
                 .append("\",\"detail\":\"").append(esc(verification.detail()))
                 .append("\",\"attempt\":").append(verification.attempt())
-                .append(",\"duration_ms\":").append(verification.durationMs()).append('}');
+                .append(",\"duration_ms\":").append(verification.durationMs())
+                .append(",\"verification_group\":\"")
+                .append(ReportEvidence.verificationGroup(verification))
+                .append("\",\"requested_mode\":\"").append(esc(verification.requestedMode()))
+                .append("\",\"effective_mode\":\"").append(esc(verification.effectiveMode()))
+                .append("\",\"fallback\":\"").append(esc(verification.fallback()))
+                .append("\",\"verification_scope\":\"")
+                .append(esc(verification.verificationScope()))
+                .append("\",\"sink_risk\":\"").append(esc(verification.sinkRisk()))
+                .append("\",\"terminal_executed\":").append(verification.terminalExecuted())
+                .append(",\"stop_reason\":\"").append(esc(verification.stopReason()))
+                .append("\",\"last_confirmed_stage\":\"")
+                .append(esc(verification.lastConfirmedStage())).append('}');
     }
 
     private static void appendStringArray(StringBuilder json, List<String> values, String indent) {
@@ -334,6 +374,9 @@ public final class PayloadPlanWriter {
                             verification == null ? "NOT_SELECTED" : verification.status()))
                     .append("` (`").append(escMarkdown(verification == null ? "NONE"
                             : verification.evidence())).append("`)\n\n")
+                    .append("- Verification group: `").append(escMarkdown(
+                            ReportEvidence.verificationGroup(verification))).append("`\n")
+                    .append("- Sink risk: `").append(escMarkdown(chain.sinkRisk().name())).append("`\n")
                     .append("### Chain\n\n")
                     .append("`").append(escMarkdown(displayPath(chain, verification))).append("`\n\n")
                     .append("### Steps\n\n");
@@ -394,8 +437,9 @@ public final class PayloadPlanWriter {
         };
     }
 
-    private static String executionLabel() {
-        return "NOT_EXECUTED_BY_INERT_PLAN";
+    private static String executionLabel(VerificationSummary.ChainResult verification) {
+        return verification == null
+                ? "NOT_EXECUTED_BY_INERT_PLAN" : "RECORDED_BY_BOUNDED_CHILD_JVM";
     }
 
     private static String observedBoundary(VerificationSummary.ChainResult verification) {
@@ -450,6 +494,11 @@ public final class PayloadPlanWriter {
         if (verification != null && "SINK_BLOCKED".equals(verification.status())) {
             return "`SINK_CANARY_ONLY`: the real prefix reached the canary and stopped before `"
                     + sink + "` executed. No command, network, native load, or serialized attack bytes are emitted.\n\n";
+        }
+        if (verification != null && "PRE_SINK_CONFIRMED".equals(verification.status())) {
+            return "`PREFIX_ONLY`: the complete observed prefix reached the high-risk sink boundary and "
+                    + "stopped before `" + sink + "` executed. `terminal_executed=false`; no native load, "
+                    + "lookup, network, evaluator, command, or attack serialization is performed.\n\n";
         }
         if (verification != null && "SINK_EXECUTED_SAFE".equals(verification.status())) {
             return "`SINK_EXECUTED_SAFE`: the exact target sink body/call was observed with Just-fixed, type-correct safe arguments under the attested OS runner. The result is intentionally distorted and does not prove malicious controllability or RCE; no dangerous command, network target, native path, or attack bytes are released.\n\n";

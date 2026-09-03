@@ -87,6 +87,7 @@ class MultiFormatReporterTest {
         String json = Files.readString(temp.resolve("findings.json"));
         assertTrue(json.contains("\"verification_status\":\"SINK_BLOCKED\""));
         assertTrue(json.contains("\"verification_evidence\":\"SINK_CANARY_BOUNDARY\""));
+        assertTrue(json.contains("\"verification_group\":\"boundary_only\""));
         assertTrue(json.contains("\"precision\":")
                 && json.contains("\"high_confidence\":false"));
         assertTrue(!json.contains("]}\",\"construction\":"),
@@ -94,5 +95,7 @@ class MultiFormatReporterTest {
         assertTrue(json.endsWith("\n]"));
         assertTrue(Files.readString(temp.resolve("findings.html")).contains("SINK_BLOCKED"));
         assertTrue(Files.readString(temp.resolve("findings.md")).contains("SINK_BLOCKED"));
+        assertTrue(Files.readString(temp.resolve("findings.html")).contains("boundary_only"));
+        assertTrue(Files.readString(temp.resolve("findings.md")).contains("boundary_only"));
     }
 }

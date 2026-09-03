@@ -21,10 +21,10 @@ public final class ScanIdentityWriter {
     public String write(ReportLayout layout, String artifactHash, String dependencyHash,
                         Path rules, Path jdkHome, int targetMajorVersion,
                         boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean requireStrictIsolation) throws IOException {
+                        boolean requireOsIsolation) throws IOException {
         return write(layout, artifactHash, dependencyHash, dependencyHash, rules, jdkHome,
                 targetMajorVersion, fast, verify, verifyBudget, safeExec,
-                false, requireStrictIsolation);
+                false, requireOsIsolation);
     }
 
     /**
@@ -36,22 +36,22 @@ public final class ScanIdentityWriter {
     public String write(ReportLayout layout, String artifactHash, String dependencyIdentityHash,
                         String inventoryHash, Path rules, Path jdkHome, int targetMajorVersion,
                         boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean requireStrictIsolation) throws IOException {
+                        boolean requireOsIsolation) throws IOException {
         return write(layout, artifactHash, dependencyIdentityHash, inventoryHash, rules, jdkHome,
                 targetMajorVersion, fast, verify, verifyBudget, safeExec, false,
-                requireStrictIsolation);
+                requireOsIsolation);
     }
 
     public String write(ReportLayout layout, String artifactHash, String dependencyIdentityHash,
                         String inventoryHash, Path rules, Path jdkHome, int targetMajorVersion,
                         boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean safeReal, boolean requireStrictIsolation) throws IOException {
+                        boolean safeReal, boolean requireOsIsolation) throws IOException {
         String rulesHash = rulesHash(rules);
         String jdkIdentity = jdkIdentity(jdkHome, targetMajorVersion);
         String parameters = "fast=" + fast + ";verify=" + verify + ";verify_budget="
                 + Math.max(0, verifyBudget) + ";safe_exec=" + safeExec
                 + ";safe_real=" + safeReal
-                + ";strict_os=" + requireStrictIsolation;
+                + ";os_isolation=" + requireOsIsolation;
         String canonical = String.join("\n", ENGINE_VERSION, value(artifactHash),
                 value(dependencyIdentityHash), rulesHash, jdkIdentity, parameters);
         String cacheKey = digest(canonical);
@@ -76,9 +76,9 @@ public final class ScanIdentityWriter {
     public static String cacheKey(String artifactHash, String dependencyIdentityHash,
                                   Path rules, Path jdkHome,
                                   boolean fast, boolean verify, int verifyBudget,
-                                  boolean safeExec, boolean requireStrictIsolation) throws IOException {
+                                  boolean safeExec, boolean requireOsIsolation) throws IOException {
         return cacheKey(artifactHash, dependencyIdentityHash, rules, jdkHome, fast, verify,
-                verifyBudget, safeExec, false, requireStrictIsolation);
+                verifyBudget, safeExec, false, requireOsIsolation);
     }
 
     /** Compute a cache identity that includes the explicit SAFE_REAL adapter mode. */
@@ -86,11 +86,11 @@ public final class ScanIdentityWriter {
                                   Path rules, Path jdkHome,
                                   boolean fast, boolean verify, int verifyBudget,
                                   boolean safeExec, boolean safeReal,
-                                  boolean requireStrictIsolation) throws IOException {
+                                  boolean requireOsIsolation) throws IOException {
         String parameters = "fast=" + fast + ";verify=" + verify + ";verify_budget="
                 + Math.max(0, verifyBudget) + ";safe_exec=" + safeExec
                 + ";safe_real=" + safeReal
-                + ";strict_os=" + requireStrictIsolation;
+                + ";os_isolation=" + requireOsIsolation;
         String canonical = String.join("\n", ENGINE_VERSION, value(artifactHash),
                 value(dependencyIdentityHash), rulesHash(rules), jdkIdentity(jdkHome, 0),
                 parameters);

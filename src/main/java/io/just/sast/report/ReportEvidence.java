@@ -45,6 +45,39 @@ final class ReportEvidence {
         return String.join("|", construction(chain, notes, verification).reasons());
     }
 
+    /**
+     * Map the closed verifier state to one mutually-exclusive report bucket.  Reporters must
+     * not derive this from free-form detail text: a high-risk prefix is not a terminal call and
+     * a boundary canary is not a prefix confirmation.
+     */
+    static String verificationGroup(VerificationSummary.ChainResult result) {
+        if (result == null) {
+            return "not_selected";
+        }
+        if ("TERMINAL_EXECUTED_SAFE".equals(result.verificationScope())
+                && result.terminalExecuted()
+                && ("SINK_EXECUTED_SAFE".equals(result.status())
+                || "JNI_EXECUTED_SAFE".equals(result.status()))) {
+            return "real_safe_terminal";
+        }
+        if ("PREFIX_ONLY".equals(result.verificationScope())
+                && !result.terminalExecuted()
+                && "PRE_SINK_CONFIRMED".equals(result.status())) {
+            return "prefix_confirmed_high_risk";
+        }
+        if ("BOUNDARY_ONLY".equals(result.verificationScope())
+                && !result.terminalExecuted()
+                && "SINK_BLOCKED".equals(result.status())) {
+            return "boundary_only";
+        }
+        return "unverified";
+    }
+
+    static String sinkRisk(Chain chain) {
+        return chain == null || chain.sinkRisk() == null
+                ? "UNKNOWN" : chain.sinkRisk().name();
+    }
+
     private static String escape(String value) {
         if (value == null) {
             return "";

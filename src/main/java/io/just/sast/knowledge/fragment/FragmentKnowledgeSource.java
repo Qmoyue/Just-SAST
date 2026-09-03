@@ -131,7 +131,7 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
             Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
                     entryClass, entryMethod, frag.entryKind(),
                     sinkOwner, frag.sinkName(), hops, 0, sinkDescriptor == null ? "" : sinkDescriptor,
-                    rule.role().name(), frag.constructionPlan());
+                    rule.role().name(), frag.constructionPlan(), rule.sinkRisk());
             if (bb.addChain(chain)) {
                 produced++;
             }

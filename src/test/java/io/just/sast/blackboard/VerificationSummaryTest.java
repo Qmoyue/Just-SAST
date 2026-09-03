@@ -33,13 +33,13 @@ class VerificationSummaryTest {
     @Test
     void normalizesAndSortsIsolationCapabilities() {
         VerificationSummary summary = new VerificationSummary(
-                "OS_NAMESPACE", 1, 1, 0, 1, Map.of(), Map.of(), List.of(),
-                "BWRAP", "feature=17", "policy", false, true, "CLEAN", "hash",
-                "OS_NAMESPACE", List.of("network_namespace", "mount_namespace",
-                        "network_namespace"));
+                "PROCESS_RESOURCE", 1, 1, 0, 1, Map.of(), Map.of(), List.of(),
+                "WINDOWS_JOB_OBJECT_JVM_POLICY", "feature=17", "policy", false, true, "CLEAN", "hash",
+                "PROCESS_RESOURCE", List.of("process_tree", "resource_limits",
+                        "process_tree"));
 
-        assertEquals(List.of("mount_namespace", "network_namespace"),
+        assertEquals(List.of("process_tree", "resource_limits"),
                 summary.isolationCapabilities());
-        assertEquals("OS_NAMESPACE", summary.isolationLevel());
+        assertEquals("PROCESS_RESOURCE", summary.isolationLevel());
     }
 }

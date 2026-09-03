@@ -192,7 +192,7 @@ public final class CsvReporter {
                 writeRow(writer, new Row(ChainIds.id(variant.key()), variant.ruleId(),
                         variant.entryClass(), variant.entryMethod(), entryDescriptor(variant), variant.entryKind(),
                         variant.sinkClass(), variant.sinkMethod(), sinkDescriptor(variant),
-                        variant.sinkRole(),
+                        variant.sinkRole(), variant.sinkRisk().name(),
                         rejectReason == null ? String.valueOf(regions.crossings(variant)) : "",
                         pathSummary(variant),
                         rejectReason == null ? "ACCEPTED" : "REJECTED",
@@ -231,6 +231,7 @@ public final class CsvReporter {
                         chain == null ? "" : chain.sinkMethod(),
                         chain == null ? "" : sinkDescriptor(chain),
                         chain == null ? "" : chain.sinkRole(),
+                        chain == null ? "" : chain.sinkRisk().name(),
                         chain == null ? "" : String.valueOf(chain.hops().size()),
                         chain == null ? "" : String.valueOf(chain.unresolvedHops()),
                         ChainIds.sha256(key), calibration.getValue()));
@@ -253,7 +254,7 @@ public final class CsvReporter {
         return chain.ruleId() + "|" + chain.entryClass() + "#" + chain.entryMethod()
                 + "|" + entryDescriptor(chain) + "|"
                 + chain.sinkClass() + "#" + chain.sinkMethod() + "|" + sinkDescriptor(chain)
-                + "|" + chain.category() + "|" + chain.sinkRole();
+                + "|" + chain.category() + "|" + chain.sinkRole() + "|" + chain.sinkRisk().name();
     }
 
     /** 组排序：SINK_BLOCKED 链置顶 → 证据分值降序 → 链长（短优先） → 变体数（多优先）。 */
@@ -295,7 +296,9 @@ public final class CsvReporter {
             + "entry_class,entry_method,entry_descriptor,entry_kind,sink_class,sink_method,sink_kind,"
             + "sink_descriptor,sink_role,chain_length,unresolved_hops,variant_count,patterns,path,evidence,rank_evidence,verify,"
             + "construction_status,construction_type,construction_fields,construction_trigger,construction_sink_control,"
-            + "construction_reasons,verification_status,sink_distorted,sandbox_ready,precision,high_confidence";
+            + "construction_reasons,verification_status,sink_distorted,sandbox_ready,precision,high_confidence,"
+            + "verification_scope,verification_group,sink_risk,terminal_executed,stop_reason,last_confirmed_stage,"
+            + "requested_mode,effective_mode,fallback";
 
     private static final String EDGES_HEADER = "chain_id,step,from_class,from_method,to_class,to_method,"
             + "edge_kind,field,reason";
@@ -306,11 +309,11 @@ public final class CsvReporter {
 
     /** Compact rejection table; full paths live once in chains.csv keyed by variant_id. */
     private static final String CALIBRATIONS_HEADER = "variant_id,rule_id,category,entry_class,entry_method,"
-            + "entry_descriptor,sink_class,sink_method,sink_descriptor,sink_role,chain_length,unresolved_hops,"
+            + "entry_descriptor,sink_class,sink_method,sink_descriptor,sink_role,sink_risk,chain_length,unresolved_hops,"
             + "path_digest,reject_reason";
 
     private static final String CHAINS_HEADER = "variant_id,rule_id,entry_class,entry_method,entry_descriptor,entry_kind,"
-            + "sink_class,sink_method,sink_descriptor,sink_role,region_crossings,path,calibration_status,"
+            + "sink_class,sink_method,sink_descriptor,sink_role,sink_risk,region_crossings,path,calibration_status,"
             + "calibration_reason";
 
     private Row findingRow(String chainId, Chain chain, int variantCount,
@@ -351,7 +354,16 @@ public final class CsvReporter {
                 verification == null ? "NOT_SELECTED" : verification.status(),
                 verification != null && verification.sinkDistorted() ? "true" : "false",
                 verification != null && verification.sandboxReady() ? "true" : "false",
-                precision, Boolean.toString(highConfidence));
+                precision, Boolean.toString(highConfidence),
+                verification == null ? "NONE" : verification.verificationScope(),
+                ReportEvidence.verificationGroup(verification),
+                chain.sinkRisk().name(),
+                verification != null && verification.terminalExecuted() ? "true" : "false",
+                verification == null ? "NOT_SELECTED" : verification.stopReason(),
+                verification == null ? "NONE" : verification.lastConfirmedStage(),
+                verification == null ? "UNKNOWN" : verification.requestedMode(),
+                verification == null ? "UNKNOWN" : verification.effectiveMode(),
+                verification == null ? "none" : verification.fallback());
     }
 
     /** 验证候选摘要（GadgetHunter Vars/Flow/Runtime 静态子集 + 动态验证结果）。 */
@@ -366,6 +378,15 @@ public final class CsvReporter {
                     + ";policy_digest=" + verification.policyDigest()
                     + ";sink_distorted=" + verification.sinkDistorted()
                     + ";sandbox_ready=" + verification.sandboxReady()
+                    + ";verification_scope=" + verification.verificationScope()
+                    + ";verification_group=" + ReportEvidence.verificationGroup(verification)
+                    + ";sink_risk=" + verification.sinkRisk()
+                    + ";terminal_executed=" + verification.terminalExecuted()
+                    + ";stop_reason=" + verification.stopReason()
+                    + ";last_confirmed_stage=" + verification.lastConfirmedStage()
+                    + ";requested_mode=" + verification.requestedMode()
+                    + ";effective_mode=" + verification.effectiveMode()
+                    + ";fallback=" + verification.fallback()
                     + ";cleanup=" + verification.cleanup()
                     + ";" + verifySummary(chain);
         }

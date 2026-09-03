@@ -86,7 +86,7 @@ class ChainPrecisionTest {
                         "app/Holder")), 0, "()V", "TERMINAL");
         VerificationSummary.ChainResult result = new VerificationSummary.ChainResult(
                 1, chain.key(), "SAFE_EFFECT_OBSERVED", "adapter", "DEGRADED", 3, 1,
-                2, "SAFE_EFFECT_OBSERVED", "NSJAIL", "17", "policy", true, true, "CLEAN");
+                2, "SAFE_EFFECT_OBSERVED", "PROCESS_RESOURCE", "17", "policy", true, true, "CLEAN");
 
         ChainPrecision.Assessment assessment = ChainPrecision.assess(chain,
                 List.of("verify:safe-effect-observed"), result);
@@ -96,7 +96,7 @@ class ChainPrecisionTest {
         assertEquals("EXACT_DECLARATION", assessment.fieldPrecision());
         assertEquals("RECOVERED_BOUNDED", assessment.reflectionPrecision());
         assertEquals("SAFE_EFFECT_DISTORTED", assessment.runtime());
-        assertEquals("OS_STRICT_ATTESTED", assessment.isolation());
+        assertEquals("PROCESS_RESOURCE_UNATTESTED", assessment.isolation());
         assertTrue(assessment.reasons().contains("SAFE_ADAPTER_DISTORTED"));
     }
 
@@ -152,7 +152,7 @@ class ChainPrecisionTest {
     }
 
     @Test
-    void highConfidenceRequiresAuthenticatedBoundaryStrictIsolationAndCompleteConstruction() {
+    void highConfidenceRequiresAnUndistortedSafeTerminalAndAttestedJobObject() {
         Chain chain = new Chain("R", "COMMAND_EXEC", "HIGH", "app/Entry", "readObject",
                 "readObject", "java/lang/Runtime", "exec", List.of(
                 new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
@@ -160,16 +160,24 @@ class ChainPrecisionTest {
                 0, "(Ljava/lang/String;)Ljava/lang/Process;", "TERMINAL");
         VerificationSummary.ChainResult boundary = new VerificationSummary.ChainResult(
                 1, chain.key(), "SINK_BLOCKED", "canary", "FEASIBLE", 10, 1, 3,
-                "SINK_CANARY_BOUNDARY", "LINUX_NSJAIL_STRICT", "17", "policy", false,
+                "SINK_CANARY_BOUNDARY", "WINDOWS_JOB_OBJECT_JVM_POLICY", "17", "policy", false,
                 true, "CLEANED");
 
-        assertTrue(ChainPrecision.isHighConfidence(chain,
+        assertFalse(ChainPrecision.isHighConfidence(chain,
                 List.of("verify:constructible", "verify:sink-blocked"), boundary));
+        VerificationSummary.ChainResult safe = new VerificationSummary.ChainResult(
+                1, chain.key(), "SINK_EXECUTED_SAFE", "body=1;body_returned=1",
+                "FEASIBLE", 10, 1, 3, "REAL_SINK_BODY_SAFE_ARGUMENTS",
+                "WINDOWS_JOB_OBJECT_JVM_POLICY", "17", "policy", false, true, "CLEANED",
+                "LIGHT_SAFE_CALL", "LIGHT_SAFE_CALL", "none", "TERMINAL_EXECUTED_SAFE",
+                "CONTROLLED_EFFECT", true, "SAFE_TERMINAL_RETURNED", "SINK_RETURNED");
+        assertTrue(ChainPrecision.isHighConfidence(chain,
+                List.of("verify:constructible"), safe));
         assertFalse(ChainPrecision.isHighConfidence(chain,
                 List.of("verify:constructible", "verify:safe-effect-observed"),
                 new VerificationSummary.ChainResult(1, chain.key(), "SAFE_EFFECT_OBSERVED",
                         "adapter", "DEGRADED", 3, 1, 3, "SAFE_EFFECT_OBSERVED",
-                        "LINUX_NSJAIL_STRICT", "17", "policy", true, true, "CLEANED")));
+                        "WINDOWS_JOB_OBJECT_JVM_POLICY", "17", "policy", true, true, "CLEANED")));
         assertFalse(ChainPrecision.isHighConfidence(chain,
                 List.of("verify:constructible", "degrade:partial-path"), boundary));
     }

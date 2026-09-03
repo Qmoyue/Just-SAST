@@ -10,6 +10,8 @@ import org.objectweb.asm.commons.AdviceAdapter;
 
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.ProtectionDomain;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -42,10 +44,15 @@ public final class SinkCanaryAgent {
         String token = parts[3];
         appendBootstrap(inst, parts[0]);
         if (!configureCanary(parts, entryHash, token)) return;
-        boolean real = parts.length > 9 && REAL_MODE.equals(parts[9]);
+        // The parent wire format uses the public adapter name SAFE_REAL.  Older probe
+        // launchers used the bootstrap-internal name REAL_SANITIZED; accept both so a
+        // packaged probe and a lifecycle test probe cannot silently turn a real call into a
+        // boundary canary because of a mode-label mismatch.
+        boolean real = parts.length > 9
+                && (REAL_MODE.equals(parts[9]) || "SAFE_REAL".equals(parts[9]));
         String realKind = parts.length > 10 ? parts[10] : "";
         Map<String, Set<String>> nativeIndex = parseNativeIndex(parts.length > 14 ? parts[14] : "");
-        String executionToken = real ? newExecutionToken() : token;
+        String executionToken = real ? newExecutionToken(parts) : token;
         if (real && !configureExecution(parts, entryHash, executionToken)) return;
         String entryClass = entrySpec.substring(0, entryHash);
         String entryTail = entrySpec.substring(entryHash + 1);
@@ -82,9 +89,29 @@ public final class SinkCanaryAgent {
         }
     }
 
-    private static String newExecutionToken() {
-        return java.util.UUID.randomUUID().toString().replace("-", "")
-                + java.util.UUID.randomUUID().toString().replace("-", "");
+    private static String newExecutionToken(String[] parts) {
+        // SecureRandom initialization can block on a Windows host with a slow entropy
+        // provider. The launcher token and nonce are already fresh for this attempt and never
+        // reach target code, so derive a distinct capability token without that startup cost.
+        StringBuilder seed = new StringBuilder("JUST_REAL_EXECUTION_V1");
+        for (int i : new int[]{3, 4, 5, 6, 7, 8}) {
+            seed.append('|').append(parts.length > i ? parts[i] : "");
+        }
+        return sha256(seed.toString()) + sha256(seed.append("|secondary").toString());
+    }
+
+    private static String sha256(String value) {
+        try {
+            byte[] bytes = MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder result = new StringBuilder(bytes.length * 2);
+            for (byte item : bytes) {
+                result.append(String.format(java.util.Locale.ROOT, "%02x", item & 0xff));
+            }
+            return result.toString();
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("required SHA-256 digest unavailable", impossible);
+        }
     }
 
     private static boolean configureCanary(String[] parts, int entryHash, String token) {
@@ -231,10 +258,12 @@ public final class SinkCanaryAgent {
                                 ProtectionDomain protectionDomain, byte[] bytes) {
             if (bytes == null || className == null || token.isEmpty()) return null;
             if (real && !className.equals(entryClass) && !sinks.containsKey(className)
-                    && (loader == null || className.startsWith("io/just/sast/"))) {
-                // Bootstrap/JUST classes cannot be target gadget bodies. Avoid parsing the JDK
-                // and the probe on every SAFE_REAL child; target application/dependency classes
-                // still pass through so nested dangerous calls remain blocked.
+                    && (loader == null || loader == SinkCanaryAgent.class.getClassLoader())) {
+                // Boundary mode instruments every application call site so a sink canary is
+                // observable even when the caller is not itself a declared sink class.  The
+                // SAFE_REAL path additionally transforms target URL-loader classes so nested
+                // dangerous calls are blocked, but must not parse the probe/JNA runtime while
+                // the child is starting.
                 return null;
             }
             Set<String> entryMethods = sinks.get(className);
@@ -349,6 +378,7 @@ public final class SinkCanaryAgent {
                 if (exact) {
                     emitExecution("enter", className + "#" + methodName + "#" + methodDesc);
                     sanitizeEntryArguments();
+                    emitExecution("argumentsAccepted", className + "#" + methodName + "#" + methodDesc);
                     changed[0] = true;
                 }
             }
@@ -371,6 +401,14 @@ public final class SinkCanaryAgent {
                 // An uninitialized object cannot remain on the operand stack while a static
                 // guard call is emitted. Stop dangerous constructor paths at NEW and preserve
                 // the original invokespecial as unreachable, verifier-valid bytecode.
+                if (opcode == Opcodes.NEW && "PROCESS_BUILDER_START".equals(realKind)
+                        && "java/lang/ProcessBuilder".equals(type)) {
+                    // JDK 21 may run a reflective bootstrap while initializing ProcessBuilder,
+                    // before the fixed receiver rewrite executes. Arm only the authenticated
+                    // entry thread; the permission gate still requires suppressAccessChecks.
+                    emitExecution("beginProcessBuilderBootstrap", null);
+                    changed[0] = true;
+                }
                 if (opcode == Opcodes.NEW && nestedConstructorType(type)
                         && !exactConstructorOwner(type)) {
                     emitExecution("blockNested", "NESTED");
@@ -479,7 +517,9 @@ public final class SinkCanaryAgent {
                     }
                 }
                 if (exactCall && !constructor) {
-                    emitExecution("beforeCall", owner + "#" + name + "#" + desc);
+                    String spec = owner + "#" + name + "#" + desc;
+                    emitExecution("argumentsAccepted", spec);
+                    emitExecution("beforeCall", spec);
                 }
                 for (int i = 0; i < args.length; i++) loadLocal(locals[i]);
                 String actualName = name;

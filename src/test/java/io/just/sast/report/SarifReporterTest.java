@@ -69,6 +69,7 @@ class SarifReporterTest {
         assertTrue(sarif.contains("\"partialFingerprints\""), sarif);
         assertTrue(sarif.contains("\"precision\":{"), sarif);
         assertTrue(sarif.contains("\"construction\":{"), sarif);
+        assertTrue(sarif.contains("\"verification_group\":\"not_selected\""), sarif);
         // OASIS 规范 schema
         assertTrue(sarif.contains("docs.oasis-open.org/sarif"), sarif);
     }

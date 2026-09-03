@@ -11,6 +11,8 @@ import org.objectweb.asm.commons.AdviceAdapter;
 import java.io.File;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.ProtectionDomain;
 import java.util.Collections;
 import java.util.HashMap;
@@ -47,10 +49,13 @@ public final class LegacySinkCanaryAgent {
         String token = parts[3];
         appendCanaryToBootstrap(inst, parts[0]);
         if (!configureCanary(parts, entryHash, token)) return;
-        boolean real = parts.length > 9 && REAL_MODE.equals(parts[9]);
+        // Accept the public parent wire label as well as the historical bootstrap-internal
+        // label.  A mismatch here would silently downgrade SAFE_REAL to a canary-only run.
+        boolean real = parts.length > 9
+                && (REAL_MODE.equals(parts[9]) || "SAFE_REAL".equals(parts[9]));
         String realKind = parts.length > 10 ? parts[10] : "";
         Map<String, Set<String>> nativeIndex = parseNativeIndex(parts.length > 13 ? parts[13] : "");
-        String executionToken = real ? newExecutionToken() : token;
+        String executionToken = real ? newExecutionToken(parts) : token;
         if (real && !configureExecution(parts, entryHash, executionToken)) return;
         String entryClass = entrySpec.substring(0, entryHash);
         String entryTail = entrySpec.substring(entryHash + 1);
@@ -84,9 +89,26 @@ public final class LegacySinkCanaryAgent {
         }
     }
 
-    private static String newExecutionToken() {
-        return java.util.UUID.randomUUID().toString().replace("-", "")
-                + java.util.UUID.randomUUID().toString().replace("-", "");
+    private static String newExecutionToken(String[] parts) {
+        StringBuilder seed = new StringBuilder("JUST_REAL_EXECUTION_V1");
+        for (int i : new int[]{3, 4, 5, 6, 7, 8}) {
+            seed.append('|').append(parts.length > i ? parts[i] : "");
+        }
+        return sha256(seed.toString()) + sha256(seed.append("|secondary").toString());
+    }
+
+    private static String sha256(String value) {
+        try {
+            byte[] bytes = MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder result = new StringBuilder(bytes.length * 2);
+            for (byte item : bytes) {
+                result.append(String.format(java.util.Locale.ROOT, "%02x", item & 0xff));
+            }
+            return result.toString();
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("required SHA-256 digest unavailable", impossible);
+        }
     }
 
     private static boolean configureCanary(String[] parts, int entryHash, String token) {
@@ -337,7 +359,9 @@ public final class LegacySinkCanaryAgent {
                 if (entry) { emitExecution("entryStart", null); changed[0] = true; }
                 if (exact) {
                     emitExecution("enter", className + "#" + methodName + "#" + methodDesc);
-                    sanitizeEntryArguments(); changed[0] = true;
+                    sanitizeEntryArguments();
+                    emitExecution("argumentsAccepted", className + "#" + methodName + "#" + methodDesc);
+                    changed[0] = true;
                 }
             }
 
@@ -416,7 +440,11 @@ public final class LegacySinkCanaryAgent {
                     loadLocal(receiver); sanitizeReceiver(kind);
                     if ("URL_LOOPBACK".equals(kind) || "SOCKET_LOOPBACK".equals(kind)) { storeLocal(receiver); loadLocal(receiver); }
                 }
-                if (exactCall && !constructor) emitExecution("beforeCall", owner + "#" + name + "#" + desc);
+                if (exactCall && !constructor) {
+                    String spec = owner + "#" + name + "#" + desc;
+                    emitExecution("argumentsAccepted", spec);
+                    emitExecution("beforeCall", spec);
+                }
                 for (int i = 0; i < args.length; i++) loadLocal(locals[i]);
                 super.visitMethodInsn(opcode, owner, name, desc, isInterface);
                 if (exactCall) emitExecution("afterCall", owner + "#" + name + "#" + desc);

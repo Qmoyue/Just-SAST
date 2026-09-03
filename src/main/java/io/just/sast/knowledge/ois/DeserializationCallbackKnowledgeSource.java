@@ -313,7 +313,7 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
             Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
                     entry.owner(), entry.name(), entry.kind(),
                     sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"),
-                    rule.role().name());
+                    rule.role().name(), null, rule.sinkRisk());
             produced += bb.addChain(chain) ? 1 : 0;
         }
         return produced;

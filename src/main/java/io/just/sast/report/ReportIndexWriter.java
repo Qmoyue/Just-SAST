@@ -48,7 +48,7 @@ public final class ReportIndexWriter {
                 .append("### findings/\n\n")
                 .append("Static findings in CSV, SARIF, JSON, HTML, and Markdown forms.\n\n")
                 .append("### verification/\n\n")
-                .append("Dynamic results plus the safe payload review. `SINK_BLOCKED` means the real prefix reached the canary boundary and the sink body was not entered; `SINK_EXECUTED_SAFE`/`JNI_EXECUTED_SAFE` mean the exact target call was observed with fixed safe arguments under an attested strict runner; `CONCRETE_REACHED` means a concrete trigger ran without exact sink proof.\n\n")
+                .append("Dynamic results plus the safe payload review. `SINK_BLOCKED` means the real prefix reached the canary boundary and the sink body was not entered; `SINK_EXECUTED_SAFE` means the exact target body/API returned with fixed safe arguments under an authenticated Job Object; `JNI_EXECUTED_SAFE` is reserved for the Just-owned native fixture contract; `PRE_SINK_CONFIRMED` means a high-risk terminal was intentionally not entered; `CONCRETE_REACHED` means a concrete trigger ran without exact sink proof.\n\n")
                 .append("### evidence/\n\n")
                 .append("Per-hop edges, sink outcomes, calibrations, dormant-gadget evidence, and dependency inventory.\n\n")
                 .append("### meta/\n\n")

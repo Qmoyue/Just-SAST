@@ -150,21 +150,20 @@ class ConfidenceScorerTest {
         Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
                 "readObject", "HIGH", 0);
         ConfidenceScorer.EvidenceVector vector = ConfidenceScorer.vector(c,
-                List.of("verify:sink-blocked"), "OS_STRICT", true);
-        assertEquals(2, vector.isolationScore());
+                List.of("verify:sink-blocked"), "PROCESS_RESOURCE", true);
+        assertEquals(1, vector.isolationScore());
         assertEquals("SINK_CANARY_BOUNDARY", vector.runtimeEvidence());
         assertEquals("FEASIBLE", vector.confidence());
     }
 
     @Test
-    void nonStrictCanaryKeepsPathEvidenceButDoesNotClaimProductionConfidence() {
+    void unavailableCanaryKeepsPathEvidenceButReceivesNoIsolationScore() {
         Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
                 "readObject", "HIGH", 0);
-        assertEquals("DEGRADED(SINK_CANARY_NON_STRICT_OS)", ConfidenceScorer.score(c,
-                List.of("verify:sink-blocked", "degrade:sink-canary-non-strict-os")));
+        assertEquals("FEASIBLE", ConfidenceScorer.score(c,
+                List.of("verify:sink-blocked")));
         ConfidenceScorer.EvidenceVector vector = ConfidenceScorer.vector(c,
-                List.of("verify:sink-blocked", "degrade:sink-canary-non-strict-os"),
-                "PROCESS_RESOURCE", true);
+                List.of("verify:sink-blocked"), "NONE", false);
         assertEquals(0, vector.isolationScore());
     }
 }

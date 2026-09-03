@@ -38,6 +38,7 @@ public final class SinkExecutionGate {
             new InheritableThreadLocal<Boolean>();
 
     private static volatile boolean configured;
+    private static volatile long configuredAtNanos;
     private static volatile String mode = "";
     private static volatile String executionToken = "";
     private static volatile String entryClass = "";
@@ -50,6 +51,10 @@ public final class SinkExecutionGate {
     private static volatile boolean nativeMapConfigured;
     private static volatile boolean bodyEntered;
     private static volatile boolean bodyReturned;
+    private static volatile boolean targetLoaded;
+    private static volatile boolean safeArgumentsAccepted;
+    private static volatile long classLoadMs;
+    private static volatile long terminalCallMs;
     private static volatile boolean callAttempted;
     private static volatile boolean callObserved;
     private static volatile boolean nestedBlocked;
@@ -57,11 +62,15 @@ public final class SinkExecutionGate {
     private static volatile boolean nativeLoadSucceeded;
     private static volatile boolean nativeCallObserved;
     private static volatile String nativeCallSpec = "";
-    private static volatile int realSinkCalls;
+    /** Bound repeated call-site callbacks without mixing them with application-body entries. */
+    private static volatile int callAttempts;
     private static volatile String lastSanitizer = "";
     private static final ThreadLocal<Boolean> BODY_CONTEXT = new ThreadLocal<>();
+    private static final ThreadLocal<Long> BODY_STARTED = new ThreadLocal<>();
     private static final ThreadLocal<String> PENDING_CALL = new ThreadLocal<>();
+    private static final ThreadLocal<Long> CALL_STARTED = new ThreadLocal<>();
     private static final ThreadLocal<Boolean> NATIVE_LOAD_CONTEXT = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> SAFE_PROCESS_BUILDER_CALL = new ThreadLocal<>();
 
     private static final Method SAFE_NOOP = findNoop();
     private static final Constructor<SafeObject> SAFE_CONSTRUCTOR = findSafeConstructor();
@@ -101,6 +110,9 @@ public final class SinkExecutionGate {
         }
         mode = requestedMode;
         executionToken = token;
+        configuredAtNanos = System.nanoTime();
+        classLoadMs = 0L;
+        terminalCallMs = 0L;
         entryClass = requestedEntryClass.replace('/', '.');
         entryMethod = requestedEntryMethod;
         scratchRoot = boundedPath(requestedScratchRoot);
@@ -165,6 +177,13 @@ public final class SinkExecutionGate {
     public static void entryStart(String token) {
         if (sameToken(token) && entryStackFrame()) {
             ENTRY_CONTEXT.set(Boolean.TRUE);
+            // The entry frame can only execute after its defining class has been loaded.
+            // Recording this on the authenticated frame keeps the event on the real-token
+            // path and avoids handing the probe's separate protocol token to target code.
+            if (!targetLoaded) {
+                targetLoaded = true;
+                classLoadMs = elapsedMs(configuredAtNanos);
+            }
         }
     }
 
@@ -182,7 +201,14 @@ public final class SinkExecutionGate {
         }
         bodyEntered = true;
         BODY_CONTEXT.set(Boolean.TRUE);
-        realSinkCalls++;
+        BODY_STARTED.set(System.nanoTime());
+    }
+
+    /** Record that the transformer replaced the exact call/entry arguments with fixed values. */
+    public static void argumentsAccepted(String spec, String token) {
+        if (authorized(spec, token)) {
+            safeArgumentsAccepted = true;
+        }
     }
 
     /** Record a normal return from the exact target sink body. */
@@ -190,29 +216,38 @@ public final class SinkExecutionGate {
         if (authorized(spec, token) && Boolean.TRUE.equals(BODY_CONTEXT.get())) {
             bodyReturned = true;
             BODY_CONTEXT.remove();
+            terminalCallMs = elapsedMs(BODY_STARTED.get());
+            BODY_STARTED.remove();
         }
     }
 
     /** Exact sink call-site observation for native/abstract/JDK methods. */
     public static void beforeCall(String spec, String token) {
-        if (!authorized(spec, token) || realSinkCalls >= 8
+        if (!authorized(spec, token) || callAttempts >= 8
                 || PENDING_CALL.get() != null) {
             return;
         }
         callAttempted = true;
         PENDING_CALL.set(spec);
-        realSinkCalls++;
+        callAttempts++;
+        CALL_STARTED.set(System.nanoTime());
     }
 
     /** Record a target API only after the invocation returned normally. */
     public static void afterCall(String spec, String token) {
-        if (!authorized(spec, token) || realSinkCalls >= 8
+        if (!authorized(spec, token)
                 || !spec.equals(PENDING_CALL.get())) {
             return;
         }
         callObserved = true;
         PENDING_CALL.remove();
-        realSinkCalls++;
+        terminalCallMs = elapsedMs(CALL_STARTED.get());
+        CALL_STARTED.remove();
+        if (safeProcessBuilderSpec(spec)) {
+            // The permission exception is scoped to one exact, agent-injected start call.
+            // A target exception path must not inherit it after the call returned.
+            SAFE_PROCESS_BUILDER_CALL.remove();
+        }
     }
 
     /** A native method call observed from the authenticated entry frame. */
@@ -225,6 +260,7 @@ public final class SinkExecutionGate {
         if (sameToken(token) && trustedEntryFrame()
                 && nativeLoadSucceeded) {
             ENTRY_CONTEXT.set(Boolean.TRUE);
+            targetLoaded = true;
             nativeCallSpec = safeLabel(spec);
             nativeCallObserved = true;
         }
@@ -247,6 +283,24 @@ public final class SinkExecutionGate {
 
     public static boolean bodyReturned() {
         return bodyReturned;
+    }
+
+    public static boolean targetLoaded() {
+        return targetLoaded;
+    }
+
+    public static boolean safeArgumentsAccepted() {
+        return safeArgumentsAccepted;
+    }
+
+    /** Time from agent configuration to the first authenticated entry frame. */
+    public static long classLoadMs() {
+        return classLoadMs;
+    }
+
+    /** Time spent in the exact target body/API call until normal return. */
+    public static long terminalCallMs() {
+        return terminalCallMs;
     }
 
     public static boolean callObserved() {
@@ -379,10 +433,26 @@ public final class SinkExecutionGate {
         }
         builder.command(Arrays.asList(safeJavaExecutable, "-version"));
         builder.redirectInput(ProcessBuilder.Redirect.PIPE);
-        builder.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-        builder.redirectError(ProcessBuilder.Redirect.DISCARD);
+        // PIPE avoids the Windows NUL-device FilePermission check performed by JDK 21.
+        // The verifier-owned command is fixed to `java -version` and produces bounded output;
+        // no target-controlled command or redirection is carried into the real call.
+        builder.redirectOutput(ProcessBuilder.Redirect.PIPE);
+        builder.redirectError(ProcessBuilder.Redirect.PIPE);
+        SAFE_PROCESS_BUILDER_CALL.set(Boolean.TRUE);
         lastSanitizer = "PROCESS_BUILDER_FIXED_JAVA_VERSION";
         return builder;
+    }
+
+    /** Arm the same narrow window before JDK initializes ProcessBuilder on first use. */
+    public static void beginProcessBuilderBootstrap(String token) {
+        if (sameToken(token) && trustedEntryFrame()) {
+            SAFE_PROCESS_BUILDER_CALL.set(Boolean.TRUE);
+        }
+    }
+
+    /** Narrow permission window used only by the fixed ProcessBuilder start call. */
+    public static boolean safeProcessBuilderCallActive() {
+        return Boolean.TRUE.equals(SAFE_PROCESS_BUILDER_CALL.get());
     }
 
     /** A scratch-only path for Files/FileOutputStream families. */
@@ -587,6 +657,12 @@ public final class SinkExecutionGate {
     private static boolean authorized(String spec, String token) {
         return configured && REAL_SANITIZED.equals(mode) && sameToken(token)
                 && exactSink(spec) && trustedEntryFrame();
+    }
+
+    private static boolean safeProcessBuilderSpec(String spec) {
+        return spec != null
+                && (spec.startsWith("java/lang/ProcessBuilder#start#()Ljava/lang/Process;")
+                || spec.startsWith("java.lang.ProcessBuilder#start#()Ljava/lang/Process;"));
     }
 
     private static boolean exactSink(String spec) {
@@ -855,5 +931,12 @@ public final class SinkExecutionGate {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private static long elapsedMs(Long started) {
+        if (started == null || started.longValue() <= 0L) {
+            return 0L;
+        }
+        return Math.max(0L, (System.nanoTime() - started.longValue()) / 1_000_000L);
     }
 }

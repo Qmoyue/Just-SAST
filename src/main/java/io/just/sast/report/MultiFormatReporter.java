@@ -173,6 +173,16 @@ public final class MultiFormatReporter {
                     .append(",\"policy_digest\":\"").append(escJson(result.policyDigest())).append("\"")
                     .append(",\"sink_distorted\":").append(result.sinkDistorted())
                     .append(",\"sandbox_ready\":").append(result.sandboxReady())
+                    .append(",\"requested_mode\":\"").append(escJson(result.requestedMode())).append("\"")
+                    .append(",\"effective_mode\":\"").append(escJson(result.effectiveMode())).append("\"")
+                    .append(",\"fallback\":\"").append(escJson(result.fallback())).append("\"")
+                    .append(",\"verification_scope\":\"").append(escJson(result.verificationScope())).append("\"")
+                    .append(",\"verification_group\":\"")
+                    .append(ReportEvidence.verificationGroup(result)).append("\"")
+                    .append(",\"sink_risk\":\"").append(escJson(result.sinkRisk())).append("\"")
+                    .append(",\"terminal_executed\":").append(result.terminalExecuted())
+                    .append(",\"stop_reason\":\"").append(escJson(result.stopReason())).append("\"")
+                    .append(",\"last_confirmed_stage\":\"").append(escJson(result.lastConfirmedStage())).append("\"")
                     .append(",\"cleanup\":\"").append(escJson(result.cleanup())).append("\"")
                     .append('}');
         }
@@ -237,6 +247,7 @@ public final class MultiFormatReporter {
                             .append("\",\"sink_method\":\"").append(escJson(c.sinkMethod()))
                             .append("\",\"sink_descriptor\":\"").append(escJson(c.sinkDescriptor()))
                             .append("\",\"sink_role\":\"").append(escJson(c.sinkRole()))
+                            .append("\",\"sink_risk\":\"").append(escJson(c.sinkRisk().name()))
                             .append("\",\"ranking_evidence\":\"")
                             .append(escJson(view.ranking().explanation()))
                             .append("\",\"precision\":")
@@ -259,6 +270,24 @@ public final class MultiFormatReporter {
                             .append(Boolean.toString(result != null && result.sinkDistorted()))
                             .append(",\"sandbox_ready\":")
                             .append(Boolean.toString(result != null && result.sandboxReady()))
+                            .append(",\"requested_mode\":\"")
+                            .append(escJson(result == null ? "UNKNOWN" : result.requestedMode()))
+                            .append("\",\"effective_mode\":\"")
+                            .append(escJson(result == null ? "UNKNOWN" : result.effectiveMode()))
+                            .append("\",\"fallback\":\"")
+                            .append(escJson(result == null ? "none" : result.fallback()))
+                            .append("\",\"verification_scope\":\"")
+                            .append(escJson(result == null ? "NONE" : result.verificationScope()))
+                            .append("\",\"verification_group\":\"")
+                            .append(ReportEvidence.verificationGroup(result))
+                            .append("\",\"sink_risk_observed\":\"")
+                            .append(escJson(result == null ? c.sinkRisk().name() : result.sinkRisk()))
+                            .append("\",\"terminal_executed\":")
+                            .append(Boolean.toString(result != null && result.terminalExecuted()))
+                            .append(",\"stop_reason\":\"")
+                            .append(escJson(result == null ? "NOT_SELECTED" : result.stopReason()))
+                            .append("\",\"last_confirmed_stage\":\"")
+                            .append(escJson(result == null ? "NONE" : result.lastConfirmedStage()))
                             .append('}');
                 }
                 writer.write("\n]");
@@ -281,7 +310,7 @@ public final class MultiFormatReporter {
             writer.write("<h1>Just SAST — Gadget Chain Findings</h1>\n");
             writer.append("<p>Total: ").append(Long.toString(chains.stream()
                     .filter(c -> !calibrations.containsKey(c.key())).count())).append(" chains</p>\n");
-            writer.write("<table><tr><th>#</th><th>Rule</th><th>Confidence</th><th>Verification</th><th>High confidence</th><th>Entry</th><th>Sink</th><th>Sink role</th><th>Construction</th><th>Sink control</th><th>Precision</th><th>Rank evidence</th><th>Hops</th></tr>\n");
+            writer.write("<table><tr><th>#</th><th>Rule</th><th>Confidence</th><th>Verification</th><th>Group</th><th>Scope</th><th>Sink risk</th><th>Terminal executed</th><th>High confidence</th><th>Entry</th><th>Sink</th><th>Sink role</th><th>Construction</th><th>Sink control</th><th>Precision</th><th>Rank evidence</th><th>Hops</th></tr>\n");
             int seq = 0;
             for (Chain c : chains) {
                 if (calibrations.containsKey(c.key())) {
@@ -298,6 +327,10 @@ public final class MultiFormatReporter {
                         .append("</td><td class='").append(conf.contains("DEGRADED") ? "DEGRADED" : "FEASIBLE").append("'>").append(conf)
                         .append("</td><td>").append(escHtml(verificationStatus(result, cn,
                                 structuredVerification)))
+                        .append("</td><td>").append(escHtml(ReportEvidence.verificationGroup(result)))
+                        .append("</td><td>").append(escHtml(result == null ? "NONE" : result.verificationScope()))
+                        .append("</td><td>").append(escHtml(c.sinkRisk().name()))
+                        .append("</td><td>").append(Boolean.toString(result != null && result.terminalExecuted()))
                         .append("</td><td>").append(Boolean.toString(view.highConfidence()))
                         .append("</td><td>").append(escHtml(c.entryClass().replace('/', '.'))).append(".").append(escHtml(c.entryMethod()))
                         .append("</td><td>").append(escHtml(c.sinkClass().replace('/', '.'))).append(".").append(escHtml(c.sinkMethod()))
@@ -323,7 +356,7 @@ public final class MultiFormatReporter {
             writer.write("# Just SAST — Gadget Chain Findings\n\n");
             long count = chains.stream().filter(c -> !calibrations.containsKey(c.key())).count();
             writer.append("**Total**: ").append(Long.toString(count)).append(" chains\n\n");
-            writer.write("| # | Rule | Confidence | Verification | High confidence | Entry | Sink | Sink role | Construction | Sink control | Precision | Rank evidence | Hops |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            writer.write("| # | Rule | Confidence | Verification | Group | Scope | Sink risk | Terminal executed | High confidence | Entry | Sink | Sink role | Construction | Sink control | Precision | Rank evidence | Hops |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
             int seq = 0;
             for (Chain c : chains) {
                 if (calibrations.containsKey(c.key())) {
@@ -339,6 +372,10 @@ public final class MultiFormatReporter {
                         .append(" | ").append(escMd(view.confidence()))
                         .append(" | ").append(escMd(verificationStatus(result, cn,
                                 structuredVerification)))
+                        .append(" | ").append(escMd(ReportEvidence.verificationGroup(result)))
+                        .append(" | ").append(escMd(result == null ? "NONE" : result.verificationScope()))
+                        .append(" | ").append(escMd(c.sinkRisk().name()))
+                        .append(" | ").append(Boolean.toString(result != null && result.terminalExecuted()))
                         .append(" | ").append(Boolean.toString(view.highConfidence()))
                         .append(" | `").append(escMd(c.entryClass().replace('/', '.'))).append(".").append(escMd(c.entryMethod())).append("`")
                         .append(" | `").append(escMd(c.sinkClass().replace('/', '.'))).append(".").append(escMd(c.sinkMethod())).append("`")

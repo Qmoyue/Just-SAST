@@ -70,7 +70,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
 
     /** sink 标记（内部传递的规则事实）。 */
     private record SinkMark(String ruleId, String category, String severity, List<Rule.TaintedPos> tainted,
-                            Rule.SinkRole role) {}
+                            Rule.SinkRole role, io.just.sast.blackboard.SinkRisk sinkRisk) {}
     private record LambdaMetadata(List<HandleRef> implementations) {}
 
     /** 每 sink 链上限；全局黑板负责跨 sink 去重，避免并行 worker 持有大批临时链。 */
@@ -263,7 +263,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         List<SinkTask> sinks = new ArrayList<>();
         for (Node call : bb.graph().nodesOfType(NodeType.CALL)) {
             bb.ruleEngine().matchingSink(call).ifPresent(rule -> sinks.add(new SinkTask(call.id(),
-                    new SinkMark(rule.id(), rule.category(), rule.severity(), rule.tainted(), rule.role()))));
+                    new SinkMark(rule.id(), rule.category(), rule.severity(), rule.tainted(), rule.role(),
+                            rule.sinkRisk()))));
         }
         sinks.sort(java.util.Comparator.comparingInt((SinkTask task) -> {
             MethodInfo host = support.methodOf(bb.graph().node(task.callId()).methodOwner(),
@@ -2445,7 +2446,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         Chain chain = new Chain(mark.ruleId(), mark.category(), mark.severity(),
                 entryClass, entryName, entryKind,
                 trace.sinkOwner, trace.sinkMethod, hops, trace.unresolved, trace.sinkDescriptor,
-                mark.role().name());
+                mark.role().name(), null, mark.sinkRisk());
         if (!trace.recordChain(chain)) {
             return 0;
         }

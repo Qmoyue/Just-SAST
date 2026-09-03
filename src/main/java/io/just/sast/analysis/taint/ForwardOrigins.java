@@ -441,6 +441,15 @@ public final class ForwardOrigins {
     private final ConcurrentLinkedQueue<String> cacheOrder = new ConcurrentLinkedQueue<>();
     private final java.util.concurrent.ConcurrentHashMap<String, Boolean> admittedKeys =
             new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * A FIFO admission queue is cheap, but a broad dependency closure can evict a short,
+     * frequently reused JDK summary before the next sink trace asks for it again.  Remember
+     * only whether a retained key has been observed in the shared cache; trim gives such a key
+     * one second chance and moves it to the tail.  This is a bounded eviction hint, not a
+     * semantic cache key, so eviction order cannot change facts or result ordering.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> secondChanceKeys =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final Object cacheTrimLock = new Object();
     private final CpgIndex.CfgProvider cfgProvider;
     private final LongAdder analysisRuns = new LongAdder();
@@ -475,6 +484,8 @@ public final class ForwardOrigins {
          * it is evicted with the same method and never becomes a second unbounded index.
          */
         private final IdentityHashMap<MethodInfo, String> keys = new IdentityHashMap<>();
+        private final Set<MethodInfo> secondChance =
+                Collections.newSetFromMap(new IdentityHashMap<>());
         /** FIFO admission order; evict a bounded prefix instead of flushing all hot summaries. */
         private final Deque<MethodInfo> admissionOrder = new ArrayDeque<>();
         private MethodInfo lastMethod;
@@ -507,6 +518,7 @@ public final class ForwardOrigins {
         if (local.generation != generation) {
             local.values.clear();
             local.keys.clear();
+            local.secondChance.clear();
             local.admissionOrder.clear();
             local.lastMethod = null;
             local.lastResult = null;
@@ -520,6 +532,7 @@ public final class ForwardOrigins {
             Result localResult = local.values.get(method);
             if (localResult != null) {
                 local.cacheHits++;
+                local.secondChance.add(method);
                 local.lastMethod = method;
                 local.lastResult = localResult;
                 return localResult;
@@ -530,6 +543,7 @@ public final class ForwardOrigins {
         Result result = cache.get(key);
         if (result != null) {
             local.cacheHits++;
+            secondChanceKeys.put(key, Boolean.TRUE);
         }
         if (result == null) {
             FutureTask<Result> task = new FutureTask<>(() -> analyze(method, key));
@@ -582,6 +596,11 @@ public final class ForwardOrigins {
             int evictions = Math.max(1, MAX_THREAD_LOCAL_CACHE_ENTRIES / 8);
             while (evictions-- > 0 && !local.admissionOrder.isEmpty()) {
                 MethodInfo victim = local.admissionOrder.removeFirst();
+                if (local.secondChance.remove(victim) && local.values.containsKey(victim)) {
+                    local.admissionOrder.addLast(victim);
+                    evictions++;
+                    continue;
+                }
                 local.values.remove(victim);
                 local.keys.remove(victim);
             }
@@ -631,6 +650,7 @@ public final class ForwardOrigins {
     void clearCache() {
         cache.clear();
         admittedKeys.clear();
+        secondChanceKeys.clear();
         cacheOrder.clear();
         inFlight.clear();
         cacheGeneration.incrementAndGet();
@@ -665,7 +685,7 @@ public final class ForwardOrigins {
     }
 
     private void trimCacheIfNeeded() {
-        if (cache.size() <= MAX_CACHE_ENTRIES + MAX_CACHE_BURST) {
+        if (cache.size() <= MAX_CACHE_ENTRIES) {
             return;
         }
         synchronized (cacheTrimLock) {
@@ -680,6 +700,13 @@ public final class ForwardOrigins {
                         break;
                     }
                     victim = iterator.next();
+                }
+                if (secondChanceKeys.remove(victim) != null && cache.containsKey(victim)) {
+                    // Give a shared hit one bounded second chance. The marker is removed so
+                    // a hot key cannot make a trim loop unbounded; a later hit can promote it
+                    // again before the next trim.
+                    cacheOrder.offer(victim);
+                    continue;
                 }
                 cache.remove(victim);
                 admittedKeys.remove(victim);

@@ -233,17 +233,35 @@ public final class NestedClasspath implements AutoCloseable {
     }
 
     private static void deleteQuietly(Path path) {
-        if (path == null || !Files.exists(path)) {
-            return;
-        }
-        if (Files.isDirectory(path)) {
-            try (var walk = Files.walk(path)) {
-                walk.sorted(Comparator.reverseOrder()).forEach(NestedClasspath::deleteFileQuietly);
-            } catch (IOException ignored) {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (path == null || !Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                return;
             }
-        } else {
-            deleteFileQuietly(path);
+            if (Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                try (var walk = Files.walk(path)) {
+                    walk.sorted(Comparator.reverseOrder())
+                            .forEach(NestedClasspath::deleteFileQuietly);
+                } catch (IOException ignored) {
+                }
+            } else {
+                deleteFileQuietly(path);
+            }
+            if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || !isWindows() || attempt == 3) {
+                return;
+            }
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
         }
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
+                .contains("win");
     }
 
     private static void deleteFileQuietly(Path path) {

@@ -20,6 +20,8 @@ public final class SinkCanaryGate {
     private static volatile String protocolSinkFingerprint;
     private static volatile String protocolNonce;
     private static volatile String protocolArtifactFingerprint;
+    private static volatile long armedAtNanos;
+    private static volatile long prefixStopMs;
     private static volatile boolean reached;
     private static boolean configured;
     private static boolean protocolConfigured;
@@ -39,6 +41,8 @@ public final class SinkCanaryGate {
         entryClass = dottedClass;
         entryMethod = method;
         entryToken = token;
+        armedAtNanos = System.nanoTime();
+        prefixStopMs = 0L;
         reached = false;
         configured = true;
     }
@@ -83,6 +87,7 @@ public final class SinkCanaryGate {
             StackTraceElement frame = stack[i];
             if (ec.equals(frame.getClassName()) && em.equals(frame.getMethodName())) {
                 reached = true;
+                prefixStopMs = elapsedMs(armedAtNanos);
                 throw new SinkReachedError(spec);
             }
         }
@@ -103,6 +108,11 @@ public final class SinkCanaryGate {
         return configured && entryClass != null && entryMethod != null && entryToken != null;
     }
 
+    /** Time from canary arming to the first authenticated sink-boundary hit. */
+    public static long prefixStopMs() {
+        return prefixStopMs;
+    }
+
     /** JDK 24+ 无 SecurityManager 时的第二道 Java 级能力门；目标代码调用危险 API 时直接失败。 */
     public static void deny(String capability) {
         throw new SecurityException("dynamic sandbox denied: " + capability);
@@ -114,5 +124,12 @@ public final class SinkCanaryGate {
 
     private static boolean same(String left, String right) {
         return left != null && left.equals(right);
+    }
+
+    private static long elapsedMs(long started) {
+        if (started <= 0L) {
+            return 0L;
+        }
+        return Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
     }
 }
