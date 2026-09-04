@@ -145,9 +145,13 @@ class SafeSinkAdapterTest {
     @Test
     void fileAdapterRejectsPathsOutsideCanonicalScratch(@TempDir Path scratch) throws Exception {
         SafeSinkAdapter.Policy policy = SafeSinkAdapter.safeExecution(scratch);
-        Path inside = scratch.resolve("nested").resolve("effect.bin");
+        // safeExecution stores the canonical root. Build both candidates from that root so the
+        // assertion remains valid when a Windows temp provider exposes the @TempDir through a
+        // junction or another path alias.
+        Path canonicalScratch = policy.scratchRoot();
+        Path inside = canonicalScratch.resolve("nested").resolve("effect.bin");
         Files.createDirectories(inside.getParent());
-        Path outside = scratch.getParent().resolve("outside-effect.bin");
+        Path outside = canonicalScratch.getParent().resolve("outside-effect.bin");
 
         assertTrue(SafeSinkAdapter.isWithinScratch(policy, inside));
         assertFalse(SafeSinkAdapter.isWithinScratch(policy, outside));
