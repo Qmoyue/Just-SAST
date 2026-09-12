@@ -520,6 +520,9 @@ public final class ScanPipeline {
                 metricCapture.namespaceStatus());
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
+        new io.just.sast.report.ConciseReportWriter().write(reportLayout,
+                exportPolicy == ExportPolicy.STRICT_PRODUCT ? "application" : "component",
+                findingOutput, scanStats);
         transaction.commit();
         JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
         if (stats) {
