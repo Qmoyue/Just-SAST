@@ -257,7 +257,12 @@ public final class SinkCanaryAgent {
         public byte[] transform(ClassLoader loader, String className, Class<?> beingDefined,
                                 ProtectionDomain protectionDomain, byte[] bytes) {
             if (bytes == null || className == null || token.isEmpty()) return null;
-            if (real && !className.equals(entryClass) && !sinks.containsKey(className)
+            // Instrumentation normally supplies JVMS internal names, but a few Windows
+            // class-loading paths expose the binary (dotted) form. Normalize at the boundary
+            // so an otherwise valid entry cannot silently bypass the real-call transformer.
+            String normalizedClassName = className.replace('.', '/');
+            if (real && !normalizedClassName.equals(entryClass)
+                    && !sinks.containsKey(normalizedClassName)
                     && (loader == null || loader == SinkCanaryAgent.class.getClassLoader())) {
                 // Boundary mode instruments every application call site so a sink canary is
                 // observable even when the caller is not itself a declared sink class.  The
@@ -266,9 +271,9 @@ public final class SinkCanaryAgent {
                 // the child is starting.
                 return null;
             }
-            Set<String> entryMethods = sinks.get(className);
-            return real ? realTransform(className, bytes, entryMethods)
-                    : boundaryTransform(className, bytes, entryMethods);
+            Set<String> entryMethods = sinks.get(normalizedClassName);
+            return real ? realTransform(normalizedClassName, bytes, entryMethods)
+                    : boundaryTransform(normalizedClassName, bytes, entryMethods);
         }
 
         private byte[] boundaryTransform(String className, byte[] bytes,

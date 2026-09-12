@@ -169,6 +169,43 @@ class SinkCanaryAgentTest {
     }
 
     @Test
+    void realTransformerNormalizesDottedInstrumentationNames() throws Exception {
+        byte[] original;
+        try (var input = SinkCanaryAgentTest.class.getClassLoader()
+                .getResourceAsStream("fixture/RealSinkFixture.class")) {
+            original = input.readAllBytes();
+        }
+        String descriptor = "(Ljava/lang/String;I)Ljava/lang/String;";
+        var transformer = new SinkCanaryAgent.CanaryTransformer(
+                Map.of("fixture/RealSinkFixture", Set.of("sink#" + descriptor)),
+                "test-token", true, "APPLICATION_BODY", "fixture.RealSinkFixture",
+                "sink", descriptor, Map.of());
+
+        byte[] injected = transformer.transform(null, "fixture.RealSinkFixture", null, null,
+                original);
+
+        assertNotNull(injected, "dotted binary names must still select the entry transformer");
+        AtomicBoolean sanitizer = new AtomicBoolean();
+        new ClassReader(injected).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String methodDescriptor,
+                                             String signature, String[] exceptions) {
+                return new MethodVisitor(Opcodes.ASM9) {
+                    @Override
+                    public void visitMethodInsn(int opcode, String owner, String method,
+                                                String desc, boolean isInterface) {
+                        if ("io/just/sast/verify/boot/SinkExecutionGate".equals(owner)
+                                && "safeString".equals(method)) {
+                            sanitizer.set(true);
+                        }
+                    }
+                };
+            }
+        }, 0);
+        assertTrue(sanitizer.get(), "entry arguments must be sanitized after name normalization");
+    }
+
+    @Test
     void gateThrowsMarkerOnlyWhenEntryFrameOnStack() {
         String selfClass = SinkCanaryAgentTest.class.getName();
         // 入口注册为本测试方法自身——hit() 的真实调用栈上必然存在该帧
