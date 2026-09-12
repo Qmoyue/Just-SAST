@@ -22,6 +22,7 @@ just-fragments.ser
 
 # Local credentials, signing material and machine-specific configuration.
 # Keep examples/template files reviewable; never commit real values.
+/AGENTS.md
 .env
 .env.*
 !.env.example
