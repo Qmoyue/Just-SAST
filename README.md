@@ -74,11 +74,6 @@ java -jar target/just-sast-0.2.0.jar scan \
 
 完整扫描通常使用默认参数；`--fast` 和 `--no-verify` 会改变分析或动态验证范围。
 
-本地回归语料和机器证据位于 `benchmark/`，构建/扫描中间产物位于 `target/`、`just-out/`
-和 `.inspect-n1cat/`；这些目录被 `.gitignore` 排除，不能作为发布输入或提交内容。提交前应检查
-暂存区中没有 JAR、凭据、签名材料、工作站绝对路径或临时报告。根目录 `AGENTS.md` 仅供本地
-代理恢复和执行纪律使用，不属于远程源码发布内容。
-
 ## 输出
 
 ```text
@@ -92,7 +87,6 @@ just-out/
 
 `meta/run.json` 固定记录 `verificationMode`、`targetCodeExecutionPossible`、`targetCodeExecuted`、
 `resourceContainmentOnly`、文件/网络/令牌隔离能力、Job Object 后端和 fail-closed 状态。
-字段契约见 [`docs/schemas/run-v1.schema.json`](docs/schemas/run-v1.schema.json)。
 
 动态状态含义：
 
@@ -123,7 +117,7 @@ mvn test
 mvn package -DskipTests
 ```
 
-Gleipner evaluator 作为外部语义回归使用；其输入、truth、评测脚本和结果不属于生产代码。架构约定见 [docs/architecture.md](docs/architecture.md)，需求契约见 [docs/requirements.md](docs/requirements.md)。
+架构约定见 [docs/architecture.md](docs/architecture.md)，需求契约见 [docs/requirements.md](docs/requirements.md)。
 
 推送形如 `vX.Y.Z` 的 tag，或手动运行 release workflow，会在 JDK17 上重新测试并构建主 JAR
 与目标 JDK 兼容验证器，生成 `SHA256SUMS` 和 GitHub 构建证明；发布前仍应由维护者检查变更和
