@@ -1,32 +1,108 @@
+# Generated builds and downloaded Java targets, including arbitrary filenames.
+# Build public fixtures from source; allow the Maven wrapper bootstrap JAR.
 target/
-just-out/
-.inspect-n1cat/
-.idea/
-*.iml
-.vscode/
+/out/
+/build/
+/dist/
+/release/
+/release-dist/
+/artifacts/
 *.class
-*.log
+*.jar
+*.war
+*.ear
+*.jmod
+!/.mvn/wrapper/maven-wrapper.jar
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
 dependency-reduced-pom.xml
-benchmark/
-.agents/
-/tools/
-/just-sast-*.jar
-just-fragments.ser
+pom.xml.versionsBackup
+pom.xml.releaseBackup
+release.properties
 
-# Local evaluator snapshots and one-off scan evidence.
+# Root-level distribution bundles and checksums are release assets, not source.
+/*.zip
+/*.7z
+/*.rar
+/*.tar
+/*.tar.gz
+/*.tar.xz
+/*.tgz
+/*.sha256
+/*.sha512
+/SHA256SUMS
+/SHA512SUMS
+
+# Local scan output. Keep JSON/Markdown/CSV fixtures elsewhere trackable.
+# Use these root directories for custom outputs instead of arbitrary names.
+just-out/
+/just-out-*/
+/reports/
+/findings/
+/evidence/
+/verification/
+/meta/
+/report.md
+/report.json
+/report.sarif
+/run.json
+/chains.csv
+/findings.csv
+/performance.json
+just-fragments.ser
+/*.ser
 /*-current.txt
 /*.eval.txt
+
+# ReportTransaction/ScanCache siblings and AtomicFiles temporary writes.
+.*.staging-*/
+*.backup-*/
+.*.tmp-*
+
+# Private corpus, experiments, agent state and local helper environments.
+# Root anchoring keeps public src/test fixtures and .github/scripts trackable.
+/benchmark/
+/tools/
+/.agents/
+/.codex/
+/AGENTS.md
+/.inspect-*/
+/work/
+/tmp/
+/temp/
+/.tmp/
+/.cache/
+/cache/
+/just-cache/
+/just-cache-*/
+/.m2/
+/downloads/
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime logs, crash diagnostics and profiler recordings.
+*.log
+*.log.*
 *.hprof
 *.jfr
 *.dump
+*.dumpstream
+*.stackdump
 *.pid
+/javac.*.args
 
-# Local credentials, signing material and machine-specific configuration.
-# Keep examples/template files reviewable; never commit real values.
-/AGENTS.md
+# Local credentials and signing material. Examples contain placeholders only.
 .env
 .env.*
 !.env.example
+!.env.sample
+!.env.template
 *.pem
 *.key
 *.p12
@@ -38,16 +114,25 @@ just-fragments.ser
 *secrets*.json
 *.asc
 
-# OS/editor metadata.
+# Editor/OS metadata and scratch copies.
+.idea/
+*.iml
+.vscode/
 .DS_Store
 Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+*.orig
 
-# Only the public architecture and requirements contracts belong under docs/.
-docs/*
-!docs/
-!docs/architecture.md
-!docs/requirements.md
-!docs/schemas/
-!docs/schemas/*.json
-
-# Local workflow helpers and regression manifests stay outside the remote source tree.
+# Public docs are explicit; handoff plans and experiment histories stay local.
+# Add future public documentation here, never force-add private handoff files.
+/docs/*
+!/docs/
+!/docs/architecture.md
+!/docs/requirements.md
+!/docs/schemas/
+!/docs/schemas/*.json
