@@ -16,6 +16,7 @@ import io.just.sast.model.TypeRef;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.AnnotationNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
@@ -53,7 +54,8 @@ public final class FactsExtractor {
             fields.add(new FieldInfo(node.name, f.name, f.desc, f.access, f.value, f.signature));
         }
         return new ClassInfo(node.name, node.superName, List.copyOf(node.interfaces),
-                node.access, List.copyOf(methods), List.copyOf(fields));
+                node.access, List.copyOf(methods), List.copyOf(fields),
+                annotationDescriptors(node.visibleAnnotations, node.invisibleAnnotations));
     }
 
     private MethodInfo extractMethod(String owner, MethodNode m) {
@@ -93,7 +95,35 @@ public final class FactsExtractor {
                     tc.type));
         }
         return new MethodInfo(owner, m.name, m.desc, m.access, List.copyOf(facts),
-                List.copyOf(tryCatch), hasDebug, firstLine);
+                List.copyOf(tryCatch), hasDebug, firstLine,
+                annotationDescriptors(m.visibleAnnotations, m.invisibleAnnotations));
+    }
+
+    /**
+     * Retain only annotation type descriptors at the ASM boundary.  Values are deliberately not
+     * copied into the core model yet: framework-entry discovery needs the type contract while
+     * route/path strings are presentation/configuration details and must not become an implicit
+     * source of controllability.  Both runtime-visible and runtime-invisible annotations matter
+     * for bytecode-only inputs and the result is deterministic/deduplicated by the model record.
+     */
+    private static List<String> annotationDescriptors(List<AnnotationNode> visible,
+                                                       List<AnnotationNode> invisible) {
+        List<String> descriptors = new ArrayList<>();
+        if (visible != null) {
+            for (AnnotationNode annotation : visible) {
+                if (annotation != null && annotation.desc != null) {
+                    descriptors.add(annotation.desc);
+                }
+            }
+        }
+        if (invisible != null) {
+            for (AnnotationNode annotation : invisible) {
+                if (annotation != null && annotation.desc != null) {
+                    descriptors.add(annotation.desc);
+                }
+            }
+        }
+        return List.copyOf(descriptors);
     }
 
     /** label 引用缺失说明指令序列异常——解析失败计入诊断，绝不静默生成指向 offset 0 的假边。 */

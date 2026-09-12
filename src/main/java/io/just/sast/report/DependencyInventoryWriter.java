@@ -2,6 +2,7 @@ package io.just.sast.report;
 
 import io.just.sast.util.ArchiveLimits;
 import io.just.sast.util.ArtifactFingerprint;
+import io.just.sast.run.InputBudget;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -38,26 +39,58 @@ public final class DependencyInventoryWriter {
     private static final long MAX_PROPERTIES_BYTES = 256L * 1024L;
 
     private record Component(String ref, String kind, String group, String name, String version,
-                             String hash, String source, String parentRef, String error) {
+                             String hash, String source, String parentRef, String error,
+                             String errorDetail) {
+    }
+
+    private record NestedFailure(String code, String detail) {
     }
 
     public String write(ReportLayout layout, Path target, List<Path> dependencies,
                         String targetHash, int targetMajorVersion) throws IOException {
-        return write(layout, target, dependencies, targetHash, targetMajorVersion, null);
+        return write(layout, target, dependencies, targetHash, targetMajorVersion, null,
+                InputBudget.defaults());
     }
 
     /** Reuse hashes gathered by an optional cache preflight instead of reading dependencies twice. */
     public String write(ReportLayout layout, Path target, List<Path> dependencies,
                         String targetHash, int targetMajorVersion,
                         List<String> knownDependencyHashes) throws IOException {
+        return write(layout, target, dependencies, targetHash, targetMajorVersion,
+                knownDependencyHashes, InputBudget.defaults());
+    }
+
+    /** Write inventory while sharing one versioned budget across target and dependencies. */
+    public String write(ReportLayout layout, Path target, List<Path> dependencies,
+                        String targetHash, int targetMajorVersion,
+                        List<String> knownDependencyHashes, InputBudget budget) throws IOException {
+        return write(layout, target, dependencies, targetHash, targetMajorVersion,
+                knownDependencyHashes, budget,
+                (budget == null ? InputBudget.defaults() : budget).tracker());
+    }
+
+    /**
+     * Write inventory while charging all target/dependency/nested reads to a caller-owned
+     * tracker.  This overload is used by preflight/hostile callers that need one aggregate
+     * budget across multiple optional report consumers; the policy and tracker must describe
+     * the same immutable {@link InputBudget}.
+     */
+    public String write(ReportLayout layout, Path target, List<Path> dependencies,
+                        String targetHash, int targetMajorVersion,
+                        List<String> knownDependencyHashes, InputBudget budget,
+                        InputBudget.Tracker tracker) throws IOException {
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        InputBudget.Tracker sharedBudget = tracker == null ? policy.tracker() : tracker;
         Map<String, Component> components = new TreeMap<>();
-        addDirect(components, target, "application", "target", targetHash, "");
+        addDirect(components, target, "application", "target", targetHash, "", sharedBudget,
+                policy);
         List<Path> deps = dependencies == null ? List.of() : dependencies;
         for (int i = 0; i < deps.size(); i++) {
             Path dependency = deps.get(i);
             String knownHash = knownDependencyHashes != null && i < knownDependencyHashes.size()
                     ? knownDependencyHashes.get(i) : null;
-            addDirect(components, dependency, "direct", "dependency-" + (i + 1), knownHash, "");
+            addDirect(components, dependency, "direct", "dependency-" + (i + 1), knownHash, "",
+                    sharedBudget, policy);
         }
         addPlatform(components, targetMajorVersion);
 
@@ -70,7 +103,8 @@ public final class DependencyInventoryWriter {
     }
 
     private void addDirect(Map<String, Component> components, Path input, String kind,
-                           String source, String knownHash, String parentRef) {
+                           String source, String knownHash, String parentRef,
+                           InputBudget.Tracker budget, InputBudget policy) {
         if (input == null) {
             return;
         }
@@ -78,40 +112,56 @@ public final class DependencyInventoryWriter {
         String error = "";
         if (hash == null || hash.isBlank()) {
             try {
-                hash = ArtifactFingerprint.sha256(input);
+                hash = ArtifactFingerprint.sha256(input, budget);
             } catch (IOException | RuntimeException failure) {
                 error = errorCode(failure);
             }
         }
         String fallback = digest("component|" + source + "|" + String.valueOf(input.getFileName()));
         String ref = ref(hash, fallback);
-        Coordinates coordinates = coordinates(input);
+        Coordinates coordinates = coordinates(input, policy, budget);
         put(components, new Component(ref, kind, coordinates.group(), coordinates.name(),
-                coordinates.version(), normalizeHash(hash), source, parentRef, error));
-        String nestedError = addNested(components, input, ref);
-        if (!nestedError.isBlank()) {
+                coordinates.version(), normalizeHash(hash), source, parentRef, error, ""));
+        NestedFailure nestedFailure = addNested(components, input, ref, budget, policy);
+        if (nestedFailure != null) {
             Component current = components.get(ref);
             if (current != null && current.error().isBlank()) {
                 components.put(ref, new Component(current.ref(), current.kind(), current.group(),
                         current.name(), current.version(), current.hash(), current.source(),
-                        current.parentRef(), nestedError));
+                        current.parentRef(), nestedFailure.code(), nestedFailure.detail()));
             }
         }
     }
 
-    private String addNested(Map<String, Component> components, Path input, String parentRef) {
+    private NestedFailure addNested(Map<String, Component> components, Path input, String parentRef,
+                                    InputBudget.Tracker tracker, InputBudget policy) {
         if (!Files.isRegularFile(input) || ArchiveLimits.isLinkOrReparsePoint(input)) {
-            return "";
+            return null;
         }
         try {
-            ArchiveLimits.checkContainerSize(input);
+            ArchiveLimits.checkContainerSize(input, policy);
             List<ZipEntry> entries = new ArrayList<>();
-            ArchiveLimits.Tracker tracker = new ArchiveLimits.Tracker();
-            try (ZipFile zip = new ZipFile(input.toFile())) {
+            Map<String, Integer> seenNames = new LinkedHashMap<>();
+            int ordinal = 0;
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    input, policy, "INVENTORY_ARCHIVE");
+            try (ArchiveLimits.ZipFileHandle handle = ArchiveLimits.openZipFile(snapshot,
+                    "INVENTORY_ARCHIVE")) {
+                ZipFile zip = handle.zip();
                 var iterator = zip.entries();
                 while (iterator.hasMoreElements()) {
                     ZipEntry entry = iterator.nextElement();
-                    if (!ArchiveLimits.safeEntryName(entry.getName())) {
+                    if (entry == null) {
+                        throw new IOException("ARCHIVE_DUPLICATE_ENTRY");
+                    }
+                    ordinal++;
+                    Integer firstOrdinal = seenNames.putIfAbsent(entry.getName(), ordinal);
+                    if (firstOrdinal != null) {
+                        return new NestedFailure("ARCHIVE_DUPLICATE_ENTRY",
+                                duplicateEntryDetail(entry.getName(), firstOrdinal, ordinal,
+                                        policy));
+                    }
+                    if (!ArchiveLimits.safeEntryName(entry.getName(), policy)) {
                         throw new IOException("unsafe archive entry");
                     }
                     tracker.observe(entry);
@@ -125,20 +175,20 @@ public final class DependencyInventoryWriter {
                     try (InputStream stream = zip.getInputStream(entry)) {
                         nestedHash = boundedDigest(stream, tracker);
                     }
-                    Coordinates coordinates = coordinates(Path.of(entry.getName()));
+                    Coordinates coordinates = coordinates(Path.of(entry.getName()), policy, tracker);
                     String ref = ref(nestedHash,
                             digest("nested|" + parentRef + "|" + entry.getName()));
                     put(components, new Component(ref, "nested", coordinates.group(),
                             coordinates.name(), coordinates.version(), nestedHash,
-                            "nested:" + entry.getName(), parentRef, ""));
+                            "nested:" + entry.getName(), parentRef, "", ""));
                 }
             }
-            return "";
+            return null;
         } catch (IOException | RuntimeException ignored) {
             // The main scan remains useful when an optional nested library is malformed. The
             // parent component already records its own hash/error; no guessed dependency is
             // emitted from an unsafe archive.
-            return errorCode(ignored);
+            return new NestedFailure(errorCode(ignored), "");
         }
     }
 
@@ -149,7 +199,7 @@ public final class DependencyInventoryWriter {
         String version = Integer.toString(Math.max(1, major - 44));
         String ref = "jdk:feature:" + version;
         put(components, new Component(ref, "platform", "jdk", "java-runtime", version,
-                "", "target-jdk", "", ""));
+                "", "target-jdk", "", "", ""));
     }
 
     private static void put(Map<String, Component> components, Component component) {
@@ -167,22 +217,79 @@ public final class DependencyInventoryWriter {
         components.put(component.ref(), new Component(component.ref(), kind,
                 first(previous.group(), component.group()), first(previous.name(), component.name()),
                 first(previous.version(), component.version()), component.hash(), source,
-                first(previous.parentRef(), component.parentRef()), first(previous.error(), component.error())));
+                first(previous.parentRef(), component.parentRef()),
+                first(previous.error(), component.error()),
+                first(previous.errorDetail(), component.errorDetail())));
     }
 
     private static String first(String left, String right) {
         return left != null && !left.isBlank() ? left : right == null ? "" : right;
     }
 
-    private static String boundedDigest(InputStream input, ArchiveLimits.Tracker tracker)
+    /**
+     * Return bounded, delimiter-safe detail for the first duplicate central-directory name.
+     * Archive names are input data, so unsafe names are not echoed into a shareable report;
+     * safe names are escaped and capped while ordinal information remains deterministic.
+     */
+    private static String duplicateEntryDetail(String name, int firstOrdinal,
+                                                int duplicateOrdinal, InputBudget policy) {
+        String display = ArchiveLimits.safeEntryName(name, policy)
+                ? escapeDetail(name, 512) : "<unsafe-entry-name>";
+        return "name=" + display + ";firstOrdinal=" + firstOrdinal
+                + ";duplicateOrdinal=" + duplicateOrdinal;
+    }
+
+    private static String escapeDetail(String value, int maxChars) {
+        if (value == null || value.isEmpty()) {
+            return "<empty>";
+        }
+        StringBuilder result = new StringBuilder(Math.min(maxChars, value.length() + 8));
+        int count = 0;
+        for (int offset = 0; offset < value.length() && count < maxChars; ) {
+            int codePoint = value.codePointAt(offset);
+            offset += Character.charCount(codePoint);
+            String escaped;
+            if (codePoint == '\\') {
+                escaped = "\\\\";
+            } else if (codePoint == '=' || codePoint == ';') {
+                escaped = String.format(Locale.ROOT, "\\u%04x", codePoint);
+            } else if (Character.isISOControl(codePoint)) {
+                escaped = String.format(Locale.ROOT, "\\u%04x", codePoint);
+            } else {
+                escaped = new String(Character.toChars(codePoint));
+            }
+            if (result.length() + escaped.length() > maxChars) {
+                result.append("...");
+                break;
+            }
+            result.append(escaped);
+            count++;
+        }
+        return result.toString();
+    }
+
+    private static String boundedDigest(InputStream input, InputBudget.Tracker tracker)
             throws IOException {
         MessageDigest digest = sha256();
         byte[] buffer = new byte[16 * 1024];
         long total = 0L;
-        long limit = Math.min(ArchiveLimits.MAX_ENTRY_UNCOMPRESSED_BYTES,
+        long limit = Math.min(tracker.budget().maxEntryBytes(),
                 tracker.remainingReadBytes());
-        for (int read; (read = input.read(buffer)) >= 0; ) {
+        for (int read; ; ) {
+            tracker.checkTime();
+            read = tracker.readBounded(input, buffer, 0, buffer.length, limit - total,
+                    "nested dependency exceeds inventory limit");
+            if (read < 0) {
+                break;
+            }
             if (read == 0) {
+                int one = tracker.readByteBounded(input, limit - total,
+                        "nested dependency exceeds inventory limit");
+                if (one < 0) {
+                    break;
+                }
+                digest.update((byte) one);
+                total++;
                 continue;
             }
             if (read > limit - total) {
@@ -191,11 +298,11 @@ public final class DependencyInventoryWriter {
             digest.update(buffer, 0, read);
             total += read;
         }
-        tracker.recordRead(total);
         return hex(digest.digest());
     }
 
-    private static Coordinates coordinates(Path input) {
+    private static Coordinates coordinates(Path input, InputBudget policy,
+                                           InputBudget.Tracker tracker) {
         String name = input == null || input.getFileName() == null
                 ? "unknown" : input.getFileName().toString();
         if (name.endsWith(".jar")) {
@@ -206,17 +313,24 @@ public final class DependencyInventoryWriter {
         String version = "unknown";
         try {
             if (Files.isRegularFile(input) && !ArchiveLimits.isLinkOrReparsePoint(input)) {
-                try (ZipFile zip = new ZipFile(input.toFile())) {
+                ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                        input, policy, "INVENTORY_COORDINATES");
+                try (ArchiveLimits.ZipFileHandle handle = ArchiveLimits.openZipFile(snapshot,
+                        "INVENTORY_COORDINATES")) {
+                    ZipFile zip = handle.zip();
                     ZipEntry properties = zip.stream()
                             .filter(entry -> entry.getName().startsWith("META-INF/maven/")
                                     && entry.getName().endsWith("/pom.properties"))
                             .sorted(Comparator.comparing(ZipEntry::getName))
                             .findFirst().orElse(null);
+                    long cap = Math.min(MAX_PROPERTIES_BYTES, policy.maxEntryBytes());
                     if (properties != null && properties.getSize() >= 0
-                            && properties.getSize() <= MAX_PROPERTIES_BYTES) {
+                            && properties.getSize() <= cap) {
                         java.util.Properties values = new java.util.Properties();
                         try (InputStream stream = zip.getInputStream(properties)) {
-                            values.load(stream);
+                            values.load(new java.io.StringReader(new String(
+                                    io.just.sast.util.IoUtil.readAll(stream, cap, tracker),
+                                    StandardCharsets.UTF_8)));
                         }
                         group = value(values.getProperty("groupId"));
                         artifact = value(values.getProperty("artifactId"));
@@ -256,10 +370,34 @@ public final class DependencyInventoryWriter {
                 ? "sha256:" + hash : "unavailable:" + fallback;
     }
 
-    private static String errorCode(Throwable failure) {
+    /**
+     * Project only a closed set of parser boundary reasons into the shareable inventory.  The
+     * provider exception class remains the fallback so local paths and free-form messages never
+     * leak into a deterministic report, while known archive failures retain actionable detail.
+     */
+    static String errorCode(Throwable failure) {
         // Do not copy provider/error messages into a shareable report: they often contain the
         // user's absolute input path. The class is enough to explain an inventory gap; the
-        // scanner's normal diagnostics retain the detailed local failure separately.
+        // scanner's normal diagnostics retain the detailed local failure separately.  A closed
+        // reason allowlist is safe to expose and makes duplicate/hostile archive details useful.
+        String message = failure == null ? "" : String.valueOf(failure.getMessage());
+        for (String reason : List.of(
+                "ARCHIVE_DUPLICATE_ENTRY",
+                "ARCHIVE_CORRUPT",
+                "ARCHIVE_ENTRY_READ_CAP",
+                "ARCHIVE_UNCOMPRESSED_BYTES_CAP",
+                "ARCHIVE_COMPRESSED_BYTES_CAP",
+                "ARCHIVE_PHYSICAL_BYTES_CAP",
+                "ARCHIVE_ENTRY_COUNT_CAP",
+                "INPUT_PARSE_TIME_CAP",
+                "INPUT_STREAM_NO_PROGRESS")) {
+            if (message.contains(reason)) {
+                return reason;
+            }
+        }
+        if (failure instanceof java.util.zip.ZipException) {
+            return "ARCHIVE_CORRUPT";
+        }
         return "UNAVAILABLE:" + (failure == null ? "unknown" : failure.getClass().getSimpleName());
     }
 
@@ -291,7 +429,8 @@ public final class DependencyInventoryWriter {
     }
 
     private static String csvContent(List<Component> components) {
-        StringBuilder csv = new StringBuilder("bom_ref,kind,group,name,version,sha256,source,parent_ref,error\n");
+        StringBuilder csv = new StringBuilder(
+                "bom_ref,kind,group,name,version,sha256,source,parent_ref,error,error_detail\n");
         for (Component component : components) {
             csv.append(csv(component.ref())).append(',')
                     .append(csv(component.kind())).append(',')
@@ -301,7 +440,8 @@ public final class DependencyInventoryWriter {
                     .append(csv(component.hash())).append(',')
                     .append(csv(component.source())).append(',')
                     .append(csv(component.parentRef())).append(',')
-                    .append(csv(component.error())).append('\n');
+                    .append(csv(component.error())).append(',')
+                    .append(csv(component.errorDetail())).append('\n');
         }
         return csv.toString();
     }
@@ -337,6 +477,10 @@ public final class DependencyInventoryWriter {
             if (!component.error().isBlank()) {
                 json.append(",{\"name\":\"just:error\",\"value\":\"")
                         .append(json(component.error())).append("\"}");
+            }
+            if (!component.errorDetail().isBlank()) {
+                json.append(",{\"name\":\"just:error-detail\",\"value\":\"")
+                        .append(json(component.errorDetail())).append("\"}");
             }
             json.append(']');
             if (!component.hash().isBlank() && !"UNAVAILABLE".equals(component.hash())) {

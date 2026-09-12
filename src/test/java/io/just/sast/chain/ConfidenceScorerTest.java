@@ -3,11 +3,13 @@ package io.just.sast.chain;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.VerificationOutcome;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 置信度契约（javadoc 公开计分规则）：逐跳/入口/严重度/模式加分/惩罚与 evidence 因子分解。 */
@@ -96,10 +98,10 @@ class ConfidenceScorerTest {
     }
 
     @Test
-    void directSinkConfirmationSupersedesProbeConstructionWarning() {
+    void sinkBoundaryKeepsProbeConstructionWarningVisible() {
         Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
                 "readObject", "HIGH", 0);
-        assertEquals("FEASIBLE", ConfidenceScorer.score(c,
+        assertEquals("DEGRADED(partial-construct)", ConfidenceScorer.score(c,
                 List.of("degrade:partial-construct", "verify:confirmed")));
         assertTrue(ConfidenceScorer.evidenceScore(c,
                 List.of("degrade:partial-construct", "verify:confirmed")) >= 5);
@@ -118,6 +120,16 @@ class ConfidenceScorerTest {
         assertTrue(ConfidenceScorer.dynamicRank("SAFE_SINK_EXECUTED", List.of())
                 > ConfidenceScorer.dynamicRank("SINK_BLOCKED", List.of()),
                 "legacy adapter label must not become a sink-boundary confirmation");
+    }
+
+    @Test
+    void typedDynamicRankUsesClosedVerificationStatus() {
+        assertEquals(
+                ConfidenceScorer.dynamicRank("SINK_BLOCKED", List.of()),
+                ConfidenceScorer.dynamicRank(VerificationOutcome.Status.SINK_BLOCKED, List.of()));
+        assertEquals(
+                ConfidenceScorer.dynamicRank("SAFE_EFFECT_OBSERVED", List.of()),
+                ConfidenceScorer.dynamicRank(VerificationOutcome.Status.SAFE_EFFECT_OBSERVED, List.of()));
     }
 
     @Test
@@ -165,5 +177,34 @@ class ConfidenceScorerTest {
         ConfidenceScorer.EvidenceVector vector = ConfidenceScorer.vector(c,
                 List.of("verify:sink-blocked"), "NONE", false);
         assertEquals(0, vector.isolationScore());
+    }
+
+    @Test
+    void sinkBoundaryCannotPromoteAnUnresolvedStaticPath() {
+        Chain c = chain(List.of(entry("app/A", "readObject")),
+                "readObject", "HIGH", 4);
+        String score = ConfidenceScorer.score(c, List.of("verify:sink-blocked"));
+        assertEquals("NOT_FEASIBLE", score,
+                "a dynamic boundary is additive evidence and cannot erase unresolved static hops");
+        ConfidenceScorer.ConfidenceTransition transition = ConfidenceScorer.transition(c,
+                List.of("verify:sink-blocked"));
+        assertEquals("STATIC_INFEASIBLE", transition.reasonCode());
+        assertFalse(transition.staticFeasible());
+        assertEquals("SINK_BLOCKED", transition.runtimeStatus());
+    }
+
+    @Test
+    void rankFeaturesSeparateStaticAndDynamicEvidenceDeterministically() {
+        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
+                "readObject", "HIGH", 0);
+        ConfidenceScorer.RankFeatures features = ConfidenceScorer.rankFeatures(c,
+                List.of("verify:sink-blocked", "degrade:partial-construct"));
+        assertEquals(4, features.staticScore());
+        assertEquals(ConfidenceScorer.SINK_BLOCKED_BONUS, features.dynamicScore());
+        assertEquals(8, features.totalScore());
+        assertTrue(features.staticFeasible());
+        assertEquals(1, features.degradationCount());
+        assertEquals(List.of("DYNAMIC_SINK_BLOCKED", "STATIC_DEGRADATION_PRESENT"),
+                features.reasons());
     }
 }

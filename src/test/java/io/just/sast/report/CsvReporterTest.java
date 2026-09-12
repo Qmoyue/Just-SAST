@@ -2,6 +2,7 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
+import io.just.sast.blackboard.FindingState;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.SinkOutcome;
 import io.just.sast.blackboard.VerificationSummary;
@@ -13,6 +14,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -39,7 +41,7 @@ class CsvReporterTest {
         String findings = Files.readString(tmp.resolve("findings.csv"));
         assertTrue(findings.startsWith("\uFEFFchain_id,rule_id"), "BOM + 表头契约");
         assertTrue(findings.contains("construction_status,construction_type,construction_fields")
-                && findings.contains("verification_status,sink_distorted,sandbox_ready"));
+                && findings.contains("verification_status,sink_distorted,resource_containment_ready"));
         assertTrue(findings.contains("verification_scope,verification_group,sink_risk"));
         assertTrue(findings.contains("app/Gadget,readObject"), "保留链在 findings");
         assertFalse(findings.contains("app/Gadget,equals"), "被拒链不进 findings");
@@ -108,5 +110,73 @@ class CsvReporterTest {
         assertTrue(findings.contains("rank=2"), findings);
         assertTrue(findings.contains("app/Gadget.readObject -> app/Sink.run -> java/lang/Runtime.exec"),
                 "代表路径必须与被选作最强证据的动态变体一致");
+    }
+
+    @Test
+    void groupingDoesNotFoldDistinctApplicationTraces(@TempDir Path tmp) throws Exception {
+        Chain first = chain("readObject", "readObject");
+        Chain second = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",
+                "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Sink", "run", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "call", "()V", null),
+                new ChainHop("app/Gadget", "readObject", "app/Sink", "run",
+                        HopKind.DIRECT_CALL, null, "delegates", "()V", null),
+                new ChainHop("app/Gadget", "readObject", "app/Gadget", "readObject",
+                        HopKind.ENTRY, null, "readObject", "", null)), 0);
+        FindingOutputReader reader = new FindingOutputReader();
+        FindingOutputReader.Snapshot base = reader.read(List.of(first, second), Map.of(),
+                Map.of(), null);
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader.Snapshot(
+                base.schemaVersion(), base.findings(), base.byChainKey(), base.verificationByKey(),
+                base.structuredVerification(), Map.of(
+                        first.key(), applicationTrace("app/Root#first()V"),
+                        second.key(), applicationTrace("app/Root#second()V")));
+
+        new CsvReporter().write(ReportLayout.flat(tmp), Map.of(), snapshot,
+                new java.util.LinkedHashMap<>());
+        String findings = Files.readString(tmp.resolve("findings.csv"));
+        assertTrue(findings.contains("app/Root#first()V"), findings);
+        assertTrue(findings.contains("app/Root#second()V"), findings);
+        long rows = findings.lines().filter(line -> line.startsWith(""))
+                .count() - 1;
+        assertEquals(2, rows, "distinct typed application traces must not be folded together");
+    }
+
+    private static ApplicationTrace applicationTrace(String prefix) {
+        return new ApplicationTrace("app/Root", "handle()V", "app/Site", "read()V",
+                "DESERIALIZATION_SITE", "JOINED", prefix, prefix, "dep/Gadget",
+                "java/lang/Runtime", "exec");
+    }
+
+    @Test
+    void snapshotDoesNotInventRejectedCalibrationForUnexportedTypedCandidate(@TempDir Path tmp)
+            throws Exception {
+        Chain candidate = chain("readObject", "readObject");
+        FindingState unanchored = new FindingState(
+                FindingState.EntryStatus.NO_APPLICATION_ENTRY,
+                FindingState.ChainProgress.ENTRY_IDENTIFIED,
+                FindingState.Feasibility.UNKNOWN,
+                FindingState.Completeness.UNKNOWN,
+                FindingState.Verification.NOT_ATTEMPTED,
+                FindingState.Risk.HIGH);
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(candidate), Map.of(), Map.of(), null,
+                Map.of(candidate.key(), unanchored), true);
+
+        assertFalse(snapshot.findings().get(0).exported(),
+                "strict snapshot keeps the unanchored candidate out of product findings");
+        new CsvReporter().write(ReportLayout.flat(tmp), Map.of(), snapshot,
+                new java.util.LinkedHashMap<>());
+
+        String variants = Files.readString(tmp.resolve("chains.csv"));
+        assertTrue(variants.contains("calibration_status,calibration_reason"));
+        assertFalse(variants.contains(",REJECTED,"),
+                "an unexported typed candidate without a calibration reason is not a rejection row");
+        assertTrue(variants.contains(",ACCEPTED,"),
+                "the variant remains available in the audit evidence table");
+
+        String findings = Files.readString(tmp.resolve("findings.csv"));
+        assertEquals(1, findings.lines().count(),
+                "strict report findings must not project an unexported typed candidate");
     }
 }

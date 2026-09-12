@@ -4,6 +4,7 @@ import io.just.sast.blackboard.ObjectGraphPlan;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
+import org.yaml.snakeyaml.inspector.UnTrustedTagInspector;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -14,23 +15,128 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.IdentityHashMap;
 import io.just.sast.blackboard.SinkRisk;
+import io.just.sast.run.InputBudget;
+import io.just.sast.util.IoUtil;
 
 /** YAML 规则 → RuleSet。 */
 public final class YamlRuleLoader {
 
+    /** Rule files are configuration, not an unbounded data interchange format. */
+    /** Compatibility aliases; all limits are supplied by the versioned InputBudget. */
+    static final int MAX_CODE_POINTS = InputBudget.defaults().maxRuleCodePoints();
+    static final int MAX_ALIASES = InputBudget.defaults().maxRuleAliases();
+    static final int MAX_NESTING_DEPTH = InputBudget.defaults().maxRuleNestingDepth();
+    static final int MAX_DOCUMENTS = InputBudget.defaults().maxRuleDocuments();
+    static final int MAX_RULES = InputBudget.defaults().maxRuleCount();
+    static final int MAX_COLLECTION_ITEMS = InputBudget.defaults().maxRuleCollectionItems();
+    static final int MAX_NODES = InputBudget.defaults().maxRuleNodes();
+    static final int MAX_SCALAR_CHARS = InputBudget.defaults().maxRuleScalarChars();
+    static final long MAX_INPUT_BYTES = InputBudget.defaults().maxRuleInputBytes();
+
+    private static final Set<String> ROOT_KEYS = Set.of("rules", "schema_version");
+    private static final Set<String> COMMON_RULE_KEYS = Set.of("id", "kind");
+    private static final Set<String> SINK_KEYS = Set.of("id", "kind", "category", "severity",
+            "match", "tainted", "role", "sinkRole", "sink_risk", "sinkRisk");
+    private static final Set<String> ENTRY_KEYS = Set.of("id", "kind", "entryKind", "direction", "match");
+    private static final Set<String> SOURCE_KEYS = Set.of("id", "kind", "bridge", "match", "safe-config", "tainted");
+    private static final Set<String> MODEL_KEYS = Set.of("id", "kind", "match", "actions");
+    private static final Set<String> FRAGMENT_KEYS = Set.of("id", "kind", "entryClass", "entryKind",
+            "sinkOwner", "sinkName", "sinkDescriptor", "hops", "construction");
+    private static final Set<String> CALL_KEYS = Set.of("owner", "name", "descriptor");
+    private static final Set<String> METHOD_KEYS = Set.of("name", "descriptor", "access");
+    private static final Set<String> CLASS_KEYS = Set.of("implements");
+    private static final Set<String> SAFE_CONFIG_KEYS = Set.of("owner", "methods", "safe-value");
+    private static final Set<String> HOP_KEYS = Set.of("class", "method", "field");
+    private static final Set<String> CONSTRUCTION_KEYS = Set.of("nodes", "fields");
+    private static final Set<String> NODE_KEYS = Set.of("id", "type", "kind", "args");
+    private static final Set<String> FIELD_KEYS = Set.of("owner", "field", "values", "value");
+    private static final Set<String> VALUE_KEYS = Set.of("ref", "class", "string", "int", "long", "boolean", "null");
+
     @SuppressWarnings("unchecked")
     public RuleSet load(InputStream in) throws IOException {
+        return load(in, InputBudget.defaults());
+    }
+
+    /** Load rules with one explicit, versioned input policy. */
+    @SuppressWarnings("unchecked")
+    public RuleSet load(InputStream in, InputBudget budget) throws IOException {
+        return load(in, budget, null);
+    }
+
+    /**
+     * Load rules while charging a caller-owned tracker.  A scan parses the target, dependencies,
+     * JDK classes and rules as one untrusted input set; creating a fresh tracker here would let a
+     * large rule file reset the aggregate byte/time allowance after archive parsing.  The
+     * source-compatible overload above deliberately retains its bounded local tracker for
+     * library callers that do not have a scan capability context.
+     */
+    @SuppressWarnings("unchecked")
+    public RuleSet load(InputStream in, InputBudget budget, InputBudget.Tracker tracker)
+            throws IOException {
         if (in == null) {
             throw new IOException("规则流为空");
         }
-        Object root = new Yaml(new SafeConstructor(new LoaderOptions())).load(in);
+        InputBudget requested = budget == null ? InputBudget.defaults() : budget;
+        InputBudget policy = tracker == null ? requested : tracker.budget();
+        InputBudget.Tracker parseBudget = tracker == null ? policy.tracker() : tracker;
+        LoaderOptions options = new LoaderOptions();
+        options.setCodePointLimit(policy.maxRuleCodePoints());
+        options.setMaxAliasesForCollections(policy.maxRuleAliases());
+        options.setNestingDepthLimit(policy.maxRuleNestingDepth());
+        options.setAllowDuplicateKeys(false);
+        options.setWarnOnDuplicateKeys(false);
+        options.setAllowRecursiveKeys(false);
+        options.setTagInspector(new UnTrustedTagInspector());
+        Object root;
+        try {
+            byte[] source;
+            try {
+                source = IoUtil.readAll(in, policy.maxRuleInputBytes(), parseBudget);
+            } catch (IOException oversized) {
+                throw new IOException("RULE_INPUT_BYTES_LIMIT:" + policy.maxRuleInputBytes(),
+                        oversized);
+            }
+            parseBudget.checkTime();
+            Iterable<Object> documents = new Yaml(new SafeConstructor(options)).loadAll(
+                    new java.io.ByteArrayInputStream(source));
+            java.util.Iterator<Object> iterator = documents.iterator();
+            if (!iterator.hasNext()) {
+                throw new IOException("RULE_YAML_EMPTY");
+            }
+            root = iterator.next();
+            parseBudget.checkTime();
+            if (iterator.hasNext()) {
+                throw new IOException("RULE_DOCUMENT_LIMIT:" + policy.maxRuleDocuments());
+            }
+        } catch (IOException failure) {
+            throw failure;
+        } catch (RuntimeException failure) {
+            // Do not expose SnakeYAML/provider messages as a report-facing contract.  The
+            // concrete exception remains available as a cause for --debug diagnostics.
+            throw new IOException("RULE_YAML_REJECTED:" + failure.getClass().getSimpleName(), failure);
+        }
         if (!(root instanceof Map<?, ?> map)) {
             throw new IOException("规则格式错误：顶层必须是 map");
+        }
+        validateTree(map, "root", policy, parseBudget);
+        rejectUnknownKeys(map, ROOT_KEYS, "root");
+        Object schemaValue = map.get("schema_version");
+        if (schemaValue != null && !(schemaValue instanceof String)) {
+            throw new IOException("RULE_SCHEMA_VERSION_TYPE");
+        }
+        String schemaVersion = schemaValue == null ? RuleSet.YAML_SCHEMA_VERSION
+                : ((String) schemaValue).trim();
+        if (!RuleSet.YAML_SCHEMA_VERSION.equals(schemaVersion)) {
+            throw new IOException("RULE_SCHEMA_VERSION_UNSUPPORTED:" + schemaVersion);
         }
         Object rulesObj = map.get("rules");
         if (!(rulesObj instanceof List<?> list)) {
             throw new IOException("规则格式错误：缺少 rules 列表");
+        }
+        if (list.size() > policy.maxRuleCount()) {
+            throw new IOException("RULE_COUNT_LIMIT:" + policy.maxRuleCount());
         }
         List<Rule.SinkRule> sinks = new ArrayList<>();
         List<Rule.MagicEntryRule> entries = new ArrayList<>();
@@ -39,6 +145,7 @@ public final class YamlRuleLoader {
         List<Rule.FragmentRule> fragments = new ArrayList<>();
         java.util.Set<String> seenIds = new java.util.HashSet<>();
         for (Object item : list) {
+            parseBudget.checkTime();
             if (!(item instanceof Map<?, ?> ruleMap)) {
                 throw new IOException("规则格式错误：rules 列表元素必须是 map，实际 " + item);
             }
@@ -47,6 +154,11 @@ public final class YamlRuleLoader {
             if (id == null || kind == null) {
                 throw new IOException("规则缺少 id/kind 字段（静默跳过会掩盖拼写错误）: " + ruleMap);
             }
+            if (!Set.of("sink", "magic-entry", "source", "model", "chain-fragment").contains(kind)) {
+                throw new IOException("未知规则 kind: " + kind
+                        + "（规则 " + id + "；合法值 sink/magic-entry/source/model/chain-fragment）");
+            }
+            validateRuleKeys(ruleMap, kind, id);
             if (!seenIds.add(id)) {
                 throw new IOException("规则 id 重复: " + id + "（重复规则互相遮蔽，历史事故：基准规则双 FRAG-CC1）");
             }
@@ -64,16 +176,104 @@ public final class YamlRuleLoader {
                 throw new IOException("规则 " + id + " 字段类型或匹配表达式错误: " + e.getMessage(), e);
             }
         }
+        parseBudget.checkTime();
         return new RuleSet(List.copyOf(sinks), List.copyOf(entries), List.copyOf(sources),
-                List.copyOf(models), List.copyOf(fragments));
+                List.copyOf(models), List.copyOf(fragments), schemaVersion);
+    }
+
+    private static void validateRuleKeys(Map<?, ?> map, String kind, String id) throws IOException {
+        Set<String> allowed = switch (kind) {
+            case "sink" -> SINK_KEYS;
+            case "magic-entry" -> ENTRY_KEYS;
+            case "source" -> SOURCE_KEYS;
+            case "model" -> MODEL_KEYS;
+            case "chain-fragment" -> FRAGMENT_KEYS;
+            default -> COMMON_RULE_KEYS;
+        };
+        rejectUnknownKeys(map, allowed, "rule " + id);
+    }
+
+    private static void rejectUnknownKeys(Map<?, ?> map, Set<String> allowed, String context)
+            throws IOException {
+        for (Object key : map.keySet()) {
+            if (!(key instanceof String name)) {
+                throw new IOException("RULE_KEY_TYPE:" + context);
+            }
+            if (!allowed.contains(name)) {
+                throw new IOException("RULE_UNKNOWN_KEY:" + context + ":" + name);
+            }
+        }
+    }
+
+    /** Bound aliases/collections after construction as a second line of defence. */
+    private static void validateTree(Object value, String context, InputBudget budget,
+                                     InputBudget.Tracker parseBudget)
+            throws IOException {
+        IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<>();
+        int[] nodes = {0};
+        validateTree(value, context, 0, seen, nodes, budget, parseBudget);
+    }
+
+    private static void validateTree(Object value, String context, int depth,
+                                     IdentityHashMap<Object, Boolean> seen, int[] nodes,
+                                     InputBudget budget, InputBudget.Tracker parseBudget)
+            throws IOException {
+        parseBudget.checkTime();
+        parseBudget.recordRuleNode();
+        if (++nodes[0] > budget.maxRuleNodes()) {
+            throw new IOException("RULE_NODE_LIMIT:" + budget.maxRuleNodes());
+        }
+        if (depth > budget.maxRuleNestingDepth()) {
+            throw new IOException("RULE_NESTING_LIMIT:" + budget.maxRuleNestingDepth());
+        }
+        if (value == null || value instanceof Number || value instanceof Boolean) {
+            return;
+        }
+        if (value instanceof String text) {
+            int scalarChars = text.codePointCount(0, text.length());
+            parseBudget.recordRuleScalarChars(scalarChars);
+            if (scalarChars > budget.maxRuleScalarChars()) {
+                throw new IOException("RULE_SCALAR_LIMIT:" + budget.maxRuleScalarChars());
+            }
+            return;
+        }
+        if (seen.put(value, Boolean.TRUE) != null) {
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            if (map.size() > budget.maxRuleCollectionItems()) {
+                throw new IOException("RULE_MAP_LIMIT:" + budget.maxRuleCollectionItems() + ":" + context);
+            }
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                parseBudget.recordRuleCollectionItem();
+                validateTree(entry.getKey(), context + ".key", depth + 1, seen, nodes, budget,
+                        parseBudget);
+                validateTree(entry.getValue(), context, depth + 1, seen, nodes, budget,
+                        parseBudget);
+            }
+            return;
+        }
+        if (value instanceof List<?> list) {
+            if (list.size() > budget.maxRuleCollectionItems()) {
+                throw new IOException("RULE_LIST_LIMIT:" + budget.maxRuleCollectionItems() + ":" + context);
+            }
+            for (Object item : list) {
+                parseBudget.recordRuleCollectionItem();
+                validateTree(item, context, depth + 1, seen, nodes, budget, parseBudget);
+            }
+            return;
+        }
+        throw new IOException("RULE_VALUE_TYPE:" + context);
     }
 
     @SuppressWarnings("unchecked")
     private Rule.SinkRule parseSink(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = requiredMap(ruleMap, "match", ruleMap.get("kind") + " 规则 " + id + " 缺少 match 块",
                 ruleMap.get("kind") + " 规则 " + id + " 的 match 必须是 map");
+        rejectUnknownKeys(match, Set.of("call"), "sink rule " + id + " match");
         Map<?, ?> call = requiredMap(match, "call", "sink 规则 " + id + " 缺少 match.call",
                 "sink 规则 " + id + " 的 match.call 必须是 map");
+        rejectUnknownKeys(call, CALL_KEYS, "sink rule " + id + " call");
         Rule.CallMatcher callMatcher = new Rule.CallMatcher(
                 matchOf(call.get("owner")),
                 matchOf(call.get("name")),
@@ -87,6 +287,7 @@ public final class YamlRuleLoader {
             if (!(t instanceof Map<?, ?> pos)) {
                 throw new IOException("sink 规则 " + id + " 的 tainted 项必须是 map");
             }
+            rejectUnknownKeys(pos, Set.of("receiver", "arg"), "sink rule " + id + " tainted");
             boolean receiver = Boolean.TRUE.equals(pos.get("receiver"));
             Object arg = pos.get("arg");
             if (receiver == (arg != null)) {
@@ -148,8 +349,10 @@ public final class YamlRuleLoader {
     private Rule.MagicEntryRule parseEntry(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = requiredMap(ruleMap, "match", "magic-entry 规则 " + id + " 缺少 match 块",
                 "magic-entry 规则 " + id + " 的 match 必须是 map");
+        rejectUnknownKeys(match, Set.of("method", "class"), "magic-entry rule " + id + " match");
         Map<?, ?> method = requiredMap(match, "method", "magic-entry 规则 " + id + " 缺少 match.method",
                 "magic-entry 规则 " + id + " 的 match.method 必须是 map");
+        rejectUnknownKeys(method, METHOD_KEYS, "magic-entry rule " + id + " method");
         Rule.MethodMatcher methodMatcher = new Rule.MethodMatcher(
                 matchOf(method.get("name")),
                 matchNullable(method.get("descriptor")),
@@ -160,8 +363,11 @@ public final class YamlRuleLoader {
             throw new IOException("magic-entry 规则 " + id + " 的 match.class 必须是 map");
         }
         if (cls instanceof Map<?, ?> classMap && classMap.get("implements") != null) {
+            rejectUnknownKeys(classMap, CLASS_KEYS, "magic-entry rule " + id + " class");
             implementsType = requiredString(classMap, "implements",
                     "magic-entry 规则 " + id + " 的 class.implements 不能为空");
+        } else if (cls instanceof Map<?, ?> classMap) {
+            rejectUnknownKeys(classMap, CLASS_KEYS, "magic-entry rule " + id + " class");
         }
         String entryKind = requiredString(ruleMap, "entryKind", "magic-entry 规则 " + id + " 缺少 entryKind");
         String direction = str(ruleMap, "direction");
@@ -178,8 +384,10 @@ public final class YamlRuleLoader {
     private Rule.SourceRule parseSource(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = requiredMap(ruleMap, "match", "source 规则 " + id + " 缺少 match 块",
                 "source 规则 " + id + " 的 match 必须是 map");
+        rejectUnknownKeys(match, Set.of("call"), "source rule " + id + " match");
         Map<?, ?> call = requiredMap(match, "call", "source 规则 " + id + " 缺少 match.call",
                 "source 规则 " + id + " 的 match.call 必须是 map");
+        rejectUnknownKeys(call, CALL_KEYS, "source rule " + id + " call");
         Rule.CallMatcher callMatcher = new Rule.CallMatcher(
                 matchOf(call.get("owner")),
                 matchOf(call.get("name")),
@@ -190,6 +398,7 @@ public final class YamlRuleLoader {
             throw new IOException("source 规则 " + id + " 的 safe-config 必须是 map");
         }
         if (safeObj instanceof Map<?, ?> safeMap) {
+            rejectUnknownKeys(safeMap, SAFE_CONFIG_KEYS, "source rule " + id + " safe-config");
             Match safeOwner = matchOf(safeMap.get("owner"));
             Set<String> methods = new java.util.HashSet<>();
             if (safeMap.get("methods") instanceof List<?> methodList) {
@@ -231,6 +440,7 @@ public final class YamlRuleLoader {
             if (!(item instanceof Map<?, ?> position)) {
                 throw new IOException(context + " 的 tainted 项必须是 map");
             }
+            rejectUnknownKeys(position, Set.of("receiver", "arg"), context + " tainted");
             boolean receiver = Boolean.TRUE.equals(position.get("receiver"));
             Object arg = position.get("arg");
             if (receiver == (arg != null)) {
@@ -258,8 +468,10 @@ public final class YamlRuleLoader {
     private Rule.ModelRule parseModel(String id, Map<?, ?> ruleMap) throws IOException {
         Map<?, ?> match = requiredMap(ruleMap, "match", "model 规则 " + id + " 缺少 match 块",
                 "model 规则 " + id + " 的 match 必须是 map");
+        rejectUnknownKeys(match, Set.of("call"), "model rule " + id + " match");
         Map<?, ?> call = requiredMap(match, "call", "model 规则 " + id + " 缺少 match.call",
                 "model 规则 " + id + " 的 match.call 必须是 map");
+        rejectUnknownKeys(call, CALL_KEYS, "model rule " + id + " call");
         Rule.CallMatcher callMatcher = new Rule.CallMatcher(
                 matchOf(call.get("owner")),
                 matchOf(call.get("name")),
@@ -269,6 +481,7 @@ public final class YamlRuleLoader {
         if (!(actionsObj instanceof Map<?, ?> actionsMap) || actionsMap.isEmpty()) {
             throw new IOException("model 规则 " + id + " 缺少非空 actions 映射");
         }
+        rejectUnknownKeys(actionsMap, Set.of("this", "return"), "model rule " + id + " actions");
         List<Map.Entry<?, ?>> actionEntries = new ArrayList<>(actionsMap.entrySet());
         actionEntries.sort(java.util.Comparator.comparing(e -> String.valueOf(e.getKey())));
         for (Map.Entry<?, ?> e : actionEntries) {
@@ -316,6 +529,7 @@ public final class YamlRuleLoader {
             if (!(h instanceof Map<?, ?> hm)) {
                 throw new IOException("chain-fragment 规则 " + id + " 的 hop 必须是映射");
             }
+            rejectUnknownKeys(hm, HOP_KEYS, "chain-fragment rule " + id + " hop");
             String cls = requireText(hm, "class", "chain-fragment 规则 " + id);
             String method = requireText(hm, "method", "chain-fragment 规则 " + id);
             String field = str(hm, "field");
@@ -341,6 +555,7 @@ public final class YamlRuleLoader {
         if (!(raw instanceof Map<?, ?> plan)) {
             throw new IOException("chain-fragment 规则 " + id + " 的 construction 必须是映射");
         }
+        rejectUnknownKeys(plan, CONSTRUCTION_KEYS, "chain-fragment rule " + id + " construction");
         List<ObjectGraphPlan.Node> nodes = new ArrayList<>();
         Object rawNodes = plan.get("nodes");
         if (rawNodes != null) {
@@ -351,6 +566,7 @@ public final class YamlRuleLoader {
                 if (!(rawNode instanceof Map<?, ?> node)) {
                     throw new IOException("chain-fragment 规则 " + id + " 的 construction node 必须是映射");
                 }
+                rejectUnknownKeys(node, NODE_KEYS, "chain-fragment rule " + id + " construction node");
                 String nodeId = requireText(node, "id", "chain-fragment 规则 " + id + " construction node");
                 String type = requireText(node, "type", "chain-fragment 规则 " + id + " construction node");
                 String kindText = str(node, "kind");
@@ -376,6 +592,7 @@ public final class YamlRuleLoader {
                 if (!(rawField instanceof Map<?, ?> field)) {
                     throw new IOException("chain-fragment 规则 " + id + " 的 construction field 必须是映射");
                 }
+                rejectUnknownKeys(field, FIELD_KEYS, "chain-fragment rule " + id + " construction field");
                 String owner = requireText(field, "owner", "chain-fragment 规则 " + id + " construction field");
                 String name = requireText(field, "field", "chain-fragment 规则 " + id + " construction field");
                 Object rawValues = field.containsKey("values") ? field.get("values") : field.get("value");
@@ -417,6 +634,7 @@ public final class YamlRuleLoader {
             if (!(item instanceof Map<?, ?> value)) {
                 throw new IOException("chain-fragment 规则 " + id + " 的 construction value 必须是映射");
             }
+            rejectUnknownKeys(value, VALUE_KEYS, "chain-fragment rule " + id + " construction value");
             List<ObjectGraphPlan.ValueKind> kinds = new ArrayList<>();
             ObjectGraphPlan.Value parsed = null;
             for (ObjectGraphPlan.ValueKind kind : ObjectGraphPlan.ValueKind.values()) {

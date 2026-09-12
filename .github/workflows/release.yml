@@ -42,12 +42,20 @@ jobs:
       - name: Test and package
         run: mvn -B test package -DskipTests=false
 
+      - name: Verify shaded launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
+          test -f "target/just-sast-${version}-shaded.jar"
+          java -jar "target/just-sast-${version}-shaded.jar" --help >/dev/null
+
       - name: Create release checksums
         shell: bash
         run: |
           set -euo pipefail
           version="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
-          sha256sum "target/just-sast-${version}.jar" \
+          sha256sum "target/just-sast-${version}-shaded.jar" \
             "target/just-sast-${version}-verify8.jar" > target/SHA256SUMS
 
       - name: Attest release artifacts

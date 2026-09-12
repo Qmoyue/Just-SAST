@@ -1,6 +1,7 @@
 package io.just.sast.perf;
 
 import io.just.sast.report.ScanStatistics;
+import io.just.sast.run.RunOutcome;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -146,6 +147,15 @@ public final class PerformanceHarness {
         }
 
         public boolean passed() {
+            return runOutcome().status() == RunOutcome.Status.SUCCESS;
+        }
+
+        /** Canonical performance-run outcome; callers should not reconstruct it from booleans. */
+        public RunOutcome runOutcome() {
+            return RunOutcome.forPerformance(gatesPassed(), !samples.isEmpty());
+        }
+
+        private boolean gatesPassed() {
             return wall != null && staticPhase != null && dynamicPhase != null
                     && wall.passed() && staticPhase.passed() && dynamicPhase.passed()
                     && chainCountStable && completenessStable && resultDigestStable()

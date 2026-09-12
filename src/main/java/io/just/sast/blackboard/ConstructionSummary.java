@@ -61,21 +61,22 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
             fields = "DECLARED_ASSIGNMENTS";
         }
 
-        String dynamic = verification == null ? "" : verification.status();
+        VerificationOutcome.Status dynamic = verification == null
+                ? VerificationOutcome.Status.UNKNOWN : verification.outcomeStatus();
         String trigger;
-        if ("SINK_BLOCKED".equals(dynamic)) {
+        if (dynamic == VerificationOutcome.Status.SINK_BLOCKED) {
             trigger = "DYNAMIC_CANARY_BOUNDARY";
-        } else if ("SINK_EXECUTED_SAFE".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.SINK_EXECUTED_SAFE) {
             trigger = "DYNAMIC_REAL_SINK_SAFE_ARGUMENTS";
-        } else if ("JNI_EXECUTED_SAFE".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.JNI_EXECUTED_SAFE) {
             trigger = "DYNAMIC_JNI_SAFE_FIXTURE";
-        } else if ("SAFE_EFFECT_OBSERVED".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.SAFE_EFFECT_OBSERVED) {
             trigger = "DYNAMIC_SAFE_ADAPTER_BOUNDARY";
-        } else if ("CONCRETE_REACHED".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.CONCRETE_REACHED) {
             trigger = "DYNAMIC_TRIGGER_REACHED";
-        } else if ("EXECUTED".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.EXECUTED) {
             trigger = "DYNAMIC_ENTRY_RETURNED";
-        } else if ("PARTIAL".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.PARTIAL) {
             trigger = "PARTIAL";
         } else if (!chain.hops().isEmpty() && chain.entryClass() != null
                 && !chain.entryClass().isBlank()) {
@@ -87,10 +88,10 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
         String sinkControl;
         if (!chain.terminalSink()) {
             sinkControl = "CAPABILITY_ONLY";
-        } else if ("SINK_BLOCKED".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.SINK_BLOCKED) {
             sinkControl = "DYNAMIC_CANARY_REACHED";
-        } else if ("SINK_EXECUTED_SAFE".equals(dynamic)
-                || "JNI_EXECUTED_SAFE".equals(dynamic)) {
+        } else if (dynamic == VerificationOutcome.Status.SINK_EXECUTED_SAFE
+                || dynamic == VerificationOutcome.Status.JNI_EXECUTED_SAFE) {
             sinkControl = "DYNAMIC_TARGET_SAFE_ARGUMENTS";
         } else if ("SAFE_EFFECT_OBSERVED".equals(dynamic)) {
             sinkControl = "DYNAMIC_ADAPTER_ONLY";
@@ -125,7 +126,7 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
         if (verification == null) {
             reasons.add("DYNAMIC_NOT_SELECTED");
         } else if (verification.sinkDistorted()) {
-            reasons.add("SINK_DISTORTED:" + verification.status());
+            reasons.add("SINK_DISTORTED:" + verification.outcomeStatus().name());
         }
 
         boolean degraded = reasons.stream().anyMatch(reason -> reason.startsWith("degrade:")

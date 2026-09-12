@@ -2,6 +2,7 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ConstructionSummary;
+import io.just.sast.blackboard.VerificationOutcome;
 import io.just.sast.blackboard.VerificationSummary;
 
 import java.util.List;
@@ -54,20 +55,21 @@ final class ReportEvidence {
         if (result == null) {
             return "not_selected";
         }
-        if ("TERMINAL_EXECUTED_SAFE".equals(result.verificationScope())
+        VerificationOutcome outcome = result.outcome();
+        if (outcome.scope() == VerificationOutcome.Scope.TERMINAL_EXECUTED_SAFE
                 && result.terminalExecuted()
-                && ("SINK_EXECUTED_SAFE".equals(result.status())
-                || "JNI_EXECUTED_SAFE".equals(result.status()))) {
+                && (outcome.status() == VerificationOutcome.Status.SINK_EXECUTED_SAFE
+                || outcome.status() == VerificationOutcome.Status.JNI_EXECUTED_SAFE)) {
             return "real_safe_terminal";
         }
-        if ("PREFIX_ONLY".equals(result.verificationScope())
+        if (outcome.scope() == VerificationOutcome.Scope.PREFIX_ONLY
                 && !result.terminalExecuted()
-                && "PRE_SINK_CONFIRMED".equals(result.status())) {
+                && outcome.status() == VerificationOutcome.Status.PRE_SINK_CONFIRMED) {
             return "prefix_confirmed_high_risk";
         }
-        if ("BOUNDARY_ONLY".equals(result.verificationScope())
+        if (outcome.scope() == VerificationOutcome.Scope.BOUNDARY_ONLY
                 && !result.terminalExecuted()
-                && "SINK_BLOCKED".equals(result.status())) {
+                && outcome.status() == VerificationOutcome.Status.SINK_BLOCKED) {
             return "boundary_only";
         }
         return "unverified";

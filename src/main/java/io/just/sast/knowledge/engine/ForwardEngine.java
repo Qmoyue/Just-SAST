@@ -29,6 +29,11 @@ import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
 import io.just.sast.model.TypeRef;
 import io.just.sast.util.JustLogger;
+import io.just.sast.knowledge.engine.ForwardDispatch.Candidates;
+import io.just.sast.knowledge.engine.ForwardDispatch.Key;
+import io.just.sast.knowledge.engine.ForwardDispatch.ResolvedCandidates;
+import io.just.sast.knowledge.engine.ForwardDispatch.SelectionKey;
+import io.just.sast.knowledge.engine.ForwardDispatch.Target;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -215,21 +220,9 @@ public final class ForwardEngine {
     private record LambdaBind(String implOwner, String implName, String implDesc) {}
     /** LambdaMetafactory 的一个实现句柄与 SAM 描述符；仅用于通用 invokedynamic 数据流映射。 */
     private record LambdaShape(HandleRef implementation, String samDescriptor) {}
-    /** 虚分派候选键；同一签名在粗/精扫和多个调用点之间共享解析结果。 */
-    private record DispatchKey(String owner, String name, String desc) {}
-    /** Contextual finite dispatch selection; receiver type/provenance changes the ordering. */
-    private record DispatchSelectionKey(String declaredOwner, String universeOwner,
-                                        String name, String desc, boolean serializedValue) {}
-    /** 已通过可序列化与 JVM 可覆写门的候选，保留原候选 owner 以支持精确类型分派。 */
-    private record DispatchTarget(String candidateOwner, String resolvedOwner) {}
-    /** 层次版本对应的完整子类型闭包；精确 receiver 路径只需消费 raw。 */
-    private record DispatchCandidates(long revision, List<String> raw, boolean truncated) {}
-    /** 层次版本对应的已过滤分派目标；按需构造，避免精确类型路径先扫描全闭包。 */
-    private record ResolvedDispatchCandidates(long revision, List<DispatchTarget> targets,
-                                              boolean truncated) {}
-    private final Map<DispatchKey, DispatchCandidates> dispatchCache = new HashMap<>();
-    private final Map<DispatchKey, ResolvedDispatchCandidates> resolvedDispatchCache = new HashMap<>();
-    private final Map<DispatchSelectionKey, ResolvedDispatchCandidates> contextualDispatchCache = new HashMap<>();
+    private final Map<Key, Candidates> dispatchCache = new HashMap<>();
+    private final Map<Key, ResolvedCandidates> resolvedDispatchCache = new HashMap<>();
+    private final Map<SelectionKey, ResolvedCandidates> contextualDispatchCache = new HashMap<>();
     /** Unknown Method.invoke targets are resolved against the already indexed sink calls;
      * the result is cached by name/parameter shape so reflective-heavy jars do not rescan
      * the complete call graph for every metadata object. */
@@ -270,28 +263,19 @@ public final class ForwardEngine {
     private long originCacheHits;
     private final Blackboard bb;
     private final OriginSupport support;
+    /** Sole owner of forward worklist, fixed-point counters, versions and budgets. */
+    private final ForwardStateStore runState = new ForwardStateStore();
     /**
      * Stable per-method view shared by both coarse/refined rounds. ForwardOrigins already owns
      * the canonical cache; this second index avoids rebuilding CfgKey strings at every callsite
      * and lets the hot engine use a small per-exploration map below.
      */
     private Options options;
-    /** 总事实版本：主摘要和替代 frontier 的任一变化都会递增，用于 sink 检查失效。 */
-    private long factVersion;
-    /** 主摘要版本：仅 primary summary 变化时递增，用于廉价 primary memo 失效。 */
-    private long primaryFactVersion;
-    /** 候选版本：primary 或 alternative frontier 变化时递增，用于 frontier memo 失效。 */
-    private long candidateFactVersion;
-    /** 本轮统计/预算（每轮重置；引擎单所有者，使用普通计数器）。 */
-    private long factCount;
-    private long steps;
-    private long methodPasses;
-    private long primaryFactUpdates;
-    private long alternativeFactUpdates;
-    private final Deque<String> queue = new ArrayDeque<>();
-    /** 队列去重伴随集：queue 中现存的方法键（事实驱动的大语料入队有 5-6 倍重复；
-     *  poll 时移除——处理期间的新入队会进下一轮）。 */
-    private final Set<String> pending = new HashSet<>();
+    /**
+     * Controller 的阶段超时通过 Future.cancel(true) 传入。ForwardOrigins 自身能够
+     * 响应中断，但正向引擎还包含可达闭包、分派、反射和事实队列循环；这些循环也
+     * 必须及时停止，否则超时后仍会占用 CPU 并与后续阶段重叠。
+     */
     /**
      * Controller 的阶段超时通过 Future.cancel(true) 传入。ForwardOrigins 自身能够
      * 响应中断，但正向引擎还包含可达闭包、分派、反射和事实队列循环；这些循环也
@@ -309,8 +293,6 @@ public final class ForwardEngine {
      * The budget is selected from graph size, never from an artifact/class name, and every
      * early stop is reported as an explicit completeness reason.
      */
-    private int stepBudget = DEFAULT_STEP_BUDGET;
-    private int methodPassCap = DEFAULT_METHOD_PASS_CAP;
     private static final int TOPOLOGY_BUILD_CAP = 120_000;
     /** 调用图后序号（GadgetInspector 技术：被调者先、调用者后，事实沿调用链单遍向下流动，
      *  消除"调用者先于被调者处理→事实迟到→重复处理"的 worklist churn）。 */
@@ -336,6 +318,15 @@ public final class ForwardEngine {
         final Set<TaintKey> visiting = new HashSet<>();
         final Set<Long> candidateCallResults = new HashSet<>();
         final Set<TaintKey> candidateInstructions = new HashSet<>();
+        /**
+         * Active serialized-field expansions.  A proxy callback can expose a handler field
+         * through another callback site which points back to the same field.  The ordinary
+         * taint guard keys the receiver origin, so each callback wrapper can evade it and
+         * repeatedly re-enter {@code serializedFieldPaths} until the hop cap.  Keying the
+         * active semantic boundary itself cuts only that recursive field expansion; the
+         * bounded field result is still allowed to flow through other consumers.
+         */
+        final Set<String> serializedFieldExpansions = new HashSet<>();
         final Map<CandidateKey, CandidateMemo> candidateMemo = new HashMap<>(16);
         final IdentityHashMap<MethodInfo, ForwardOrigins.Result> origins = new IdentityHashMap<>(4);
         final IdentityHashMap<MethodInfo, String> methodKeys = new IdentityHashMap<>(16);
@@ -350,6 +341,11 @@ public final class ForwardEngine {
     }
 
     /** 保留中断标记，避免把取消误报为“无链”；同一引擎只记录一次原因。 */
+    /** Immutable run-state boundary for telemetry and characterization consumers. */
+    public ForwardStateStore.Snapshot stateSnapshot() {
+        return runState.snapshot();
+    }
+
     private boolean cancellationRequested() {
         if (!Thread.currentThread().isInterrupted()) {
             return false;
@@ -622,16 +618,12 @@ public final class ForwardEngine {
             buildForwardDemand();
         }
         configureBudgets();
-        boolean firstRun = factVersion == 0;
+        boolean firstRun = runState.factVersion() == 0;
         // 预算按轮重置（每轮独立预算）。非首轮只重入队"受影响方法"：
         // 已污点类的方法 + 已有参数/返回事实的方法 + 已污点字段的读者——
         // 与独立精扫引擎的种子+事实驱动增长等价，规模受控（全量可达集重处理会烧尽预算）；
         // 新事实派生的受影响方法由 addThis/addField/addReturn/addParam 的入队机制自动扩散。
-        steps = 0;
-        methodPasses = 0;
-        factCount = 0;
-        primaryFactUpdates = 0;
-        alternativeFactUpdates = 0;
+        runState.beginRun();
         taintMemo.clear();
         candidateMemoCache.clear();
         deadEnds.clear();
@@ -640,34 +632,29 @@ public final class ForwardEngine {
         if (!firstRun) {
             requeueAffected();
             if (cancellationRequested()) {
-                queue.clear();
-                pending.clear();
+                runState.worklist().clear();
                 return;
             }
         }
         seedEntries();
         if (cancellationRequested() || !ensureTopoOrder()) {
-            queue.clear();
-            pending.clear();
+            runState.worklist().clear();
             return;
         }
         int rounds = 0;
-        while (!queue.isEmpty() && rounds < MAX_ROUNDS && steps < stepBudget
-                && methodPasses < methodPassCap) {
+        while (!runState.worklist().isEmpty() && runState.withinBudget(rounds)) {
             if (cancellationRequested()) {
-                queue.clear();
-                pending.clear();
+                runState.worklist().clear();
                 return;
             }
             rounds++;
+            runState.recordRound();
             List<String> current = new ArrayList<>();
-            for (String key; (key = queue.pollFirst()) != null; ) {
+            for (String key; (key = runState.worklist().poll()) != null; ) {
                 if (cancellationRequested()) {
-                    queue.clear();
-                    pending.clear();
+                    runState.worklist().clear();
                     return;
                 }
-                pending.remove(key);
                 current.add(key);
             }
             // 后序处理（被调者先）：事实合流依赖这个确定顺序；副作用传播保持串行，
@@ -696,29 +683,27 @@ public final class ForwardEngine {
             }
             processCurrentSerial(current);
             if (cancellationRequested()) {
-                queue.clear();
-                pending.clear();
+                runState.worklist().clear();
                 return;
             }
         }
-        if (!queue.isEmpty()) {
+        if (!runState.worklist().isEmpty()) {
             // 截断未收敛：剩余事实未处理，本轮结果可能欠完备（不静默）
-            if (steps >= stepBudget) {
-                bb.markIncomplete("FORWARD_STEP_CAP:" + stepBudget);
+            if (runState.stepLimitReached()) {
+                bb.markIncomplete("FORWARD_STEP_CAP:" + runState.budget().stepLimit());
             }
-            if (methodPasses >= methodPassCap) {
-                bb.markIncomplete("FORWARD_METHOD_CAP:" + methodPassCap);
+            if (runState.methodPassLimitReached()) {
+                bb.markIncomplete("FORWARD_METHOD_CAP:" + runState.budget().methodPassLimit());
             }
-            if (rounds >= MAX_ROUNDS) {
+            if (rounds >= runState.budget().roundLimit()) {
                 bb.markIncomplete("FORWARD_ROUND_CAP");
             }
-            if (steps < stepBudget && methodPasses < methodPassCap && rounds < MAX_ROUNDS) {
+            if (runState.withinBudget(rounds)) {
                 bb.markIncomplete("FORWARD_QUEUE_REMAINS");
             }
             io.just.sast.util.JustLogger.warn("前向污点[{}]：轮数/预算截断，剩余队列 {} 个方法（结果可能欠完备）",
-                    options.expandInterfaces() ? "精扫" : "粗扫", queue.size());
-            queue.clear();
-            pending.clear();
+                    options.expandInterfaces() ? "精扫" : "粗扫", runState.worklist().size());
+            runState.worklist().clear();
         }
         // 不动点后补查尚未由增量 worklist 检查的 sink（仅可达子集内）。
         // 绝大多数 sink 已在宿主方法事实更新后检查；这里保留完整兜底，避免未入队
@@ -733,8 +718,9 @@ public final class ForwardEngine {
         }
         io.just.sast.util.JustLogger.info("前向污点[{}]：可达 {} 个方法，调度 {} 个方法，激活 {} 个方法，处理 {} 次，事实 {} 个（主 {}/替代 {}），轮数 {}，耗时 {} ms",
                 options.expandInterfaces() ? "精扫" : "粗扫", reachable.size(),
-                forwardDemand == null ? reachable.size() : forwardDemand.size(), activeMethods.size(), methodPasses,
-                factCount, primaryFactUpdates, alternativeFactUpdates, rounds,
+                forwardDemand == null ? reachable.size() : forwardDemand.size(), activeMethods.size(),
+                runState.methodPasses(), runState.factCount(), runState.primaryFactUpdates(),
+                runState.alternativeFactUpdates(), rounds,
                 (System.nanoTime() - startedAt) / 1_000_000L);
     }
 
@@ -742,17 +728,13 @@ public final class ForwardEngine {
     private void configureBudgets() {
         int closure = forwardDemand != null ? forwardDemand.size() : reachable.size();
         if (closure > 150_000) {
-            stepBudget = 4_000_000;
-            methodPassCap = 120_000;
+            runState.configureBudget(4_000_000, 120_000, MAX_ROUNDS);
         } else if (closure > 100_000) {
-            stepBudget = 8_000_000;
-            methodPassCap = 250_000;
+            runState.configureBudget(8_000_000, 250_000, MAX_ROUNDS);
         } else if (closure > 50_000) {
-            stepBudget = 12_000_000;
-            methodPassCap = 500_000;
+            runState.configureBudget(12_000_000, 500_000, MAX_ROUNDS);
         } else {
-            stepBudget = DEFAULT_STEP_BUDGET;
-            methodPassCap = DEFAULT_METHOD_PASS_CAP;
+            runState.configureBudget(DEFAULT_STEP_BUDGET, DEFAULT_METHOD_PASS_CAP, MAX_ROUNDS);
         }
     }
 
@@ -808,6 +790,11 @@ public final class ForwardEngine {
                 roots.add(key);
             }
         }
+        // Framework/lifecycle roots are part of the typed demand graph even when no legacy
+        // deserialize rule names them.  This keeps the scheduler able to process an external
+        // endpoint's binding/lookup body without broadening dependency roots by classpath.
+        roots.addAll(bb.applicationEntryIndex().applicationEntryMethods().stream()
+                .filter(reachable::contains).toList());
         // Application/framework deserialization boundaries are source roots even when the
         // source rule is a call rather than a magic entry.
         for (Node call : bb.graph().nodesOfType(NodeType.CALL)) {
@@ -1161,7 +1148,7 @@ public final class ForwardEngine {
             }
             MethodInfo method = resolveMethodKey(key);
             if (method != null) {
-                methodPasses++;
+                runState.recordMethodPass();
                 // Share the method-local exploration between effect transfer and all sinks
                 // hosted by this method.  The CFG/origin result is immutable and the
                 // exploration guards are empty again after each query, so this preserves
@@ -1189,10 +1176,11 @@ public final class ForwardEngine {
             if (cancellationRequested()) {
                 return;
             }
-            if (!force && sinkCheckVersions.getOrDefault(call.id(), Long.MIN_VALUE) == factVersion) {
+            if (!force && sinkCheckVersions.getOrDefault(call.id(), Long.MIN_VALUE)
+                    == runState.factVersion()) {
                 continue;
             }
-            sinkCheckVersions.put(call.id(), factVersion);
+            sinkCheckVersions.put(call.id(), runState.factVersion());
             Rule.SinkRule rule = callRules(call).sink();
             if (rule != null) {
                 checkSink(call, rule, exploration);
@@ -1301,6 +1289,26 @@ public final class ForwardEngine {
                     && isAnalysisEntry(method)
                     && reachable.add(methodNodeKey(method))) {
                 bfs.add(methodNodeKey(method));
+            }
+        }
+        // Typed framework/lifecycle boundaries are not legacy magic-entry rules.  Admit the
+        // application-owned methods to the ordinary call closure, but defer attacker-control
+        // taint to seedApplicationEntries() below.  Thus a main/lifecycle method can provide a
+        // structural execution root without turning static initialization into a source.
+        for (String key : bb.applicationEntryIndex().applicationEntryMethods().stream().sorted().toList()) {
+            if (cancellationRequested()) {
+                return false;
+            }
+            Node method = bb.graph().findMethodNodeKey(key);
+            if (method == null || isJdkOwner(method.owner())) {
+                continue;
+            }
+            if (reachable.size() >= REACHABLE_CAP) {
+                bb.markIncomplete("REACHABLE_CAP:" + REACHABLE_CAP);
+                break;
+            }
+            if (reachable.add(key)) {
+                bfs.add(key);
             }
         }
         for (Node call : bb.graph().nodesOfType(NodeType.CALL)) {
@@ -1432,7 +1440,62 @@ public final class ForwardEngine {
                         seedEntryReceiver(method, List.of(entryHop));
                     });
         }
+        seedApplicationEntries();
         seedSemanticCallbacks();
+    }
+
+    /**
+     * Seed only typed application boundaries that carry an external-control proof.  The
+     * reachability/demand closures include all application entries, but an application-only
+     * lifecycle or service declaration must not become an attacker source merely because it
+     * is executable.  For an external endpoint, the receiver and every declared parameter
+     * are bounded input slots; this covers servlet request objects, Spring/JAX-RS arguments,
+     * and JAX-WS byte[]/DTO payloads without naming a framework or fixture.
+     */
+    private void seedApplicationEntries() {
+        List<io.just.sast.analysis.entry.ApplicationEntryIndex.ExecutionEntry> entries =
+                bb.applicationEntryIndex().executionEntries().stream()
+                        .filter(io.just.sast.analysis.entry.ApplicationEntryIndex.ExecutionEntry::externalControlProven)
+                        .sorted(java.util.Comparator.comparing(
+                                io.just.sast.analysis.entry.ApplicationEntryIndex.ExecutionEntry::methodKey))
+                        .toList();
+        for (var entry : entries) {
+            if (cancellationRequested()) {
+                return;
+            }
+            Node method = bb.graph().findMethodNodeKey(entry.methodKey());
+            if (method == null || !reachable.contains(entry.methodKey())) {
+                continue;
+            }
+            List<ChainHop> path = List.of(new ChainHop(method.owner(), method.name(),
+                    method.owner(), method.name(), HopKind.ENTRY, null, entry.entryKind(),
+                    method.descriptor(), null));
+            MethodInfo info = support.methodOf(method.owner(), method.name(), method.descriptor());
+            if (info != null && !info.isStatic()) {
+                addParam(info.owner(), info.name(), info.descriptor(), 0, path);
+            }
+            int parameterCount;
+            try {
+                parameterCount = Descriptor.paramCount(method.descriptor());
+            } catch (RuntimeException malformed) {
+                bb.markIncomplete("APPLICATION_ENTRY_DESCRIPTOR_INVALID:" + entry.methodKey());
+                continue;
+            }
+            int slot = info != null && !info.isStatic() ? 1 : 0;
+            List<Integer> widths;
+            try {
+                widths = Descriptor.argSlots(method.descriptor(), info != null && info.isStatic());
+            } catch (RuntimeException malformed) {
+                bb.markIncomplete("APPLICATION_ENTRY_DESCRIPTOR_INVALID:" + entry.methodKey());
+                continue;
+            }
+            for (int ordinal = 0; ordinal < parameterCount && ordinal < widths.size(); ordinal++) {
+                // addParam is keyed by JVM local-variable slot (slot 0 is this for an
+                // instance method), so wide long/double parameters advance by two.
+                addParam(method.owner(), method.name(), method.descriptor(), slot, path);
+                slot += widths.get(ordinal);
+            }
+        }
     }
 
     private void seedEntryReceiver(Node method, List<ChainHop> path) {
@@ -1680,7 +1743,7 @@ public final class ForwardEngine {
         if (support.catchProvablyUnreachable(method, (Integer) call.prop("offset"))) {
             return; // catch 不可达守卫（与反向引擎同谓词）
         }
-        if (support.sinkPathProvablyUnreachable(method, (Integer) call.prop("offset"), originResult)) {
+        if (constraintBlocks(method, (Integer) call.prop("offset"), originResult)) {
             // Keep the forward and backward engines on the same exact local-feasibility
             // boundary.  The taint fixed point stays path-insensitive for recall, while
             // an independently proven impossible branch is not allowed to re-introduce a
@@ -1713,18 +1776,18 @@ public final class ForwardEngine {
                     if (cancellationRequested()) {
                         return;
                     }
-                    List<ChainHop> hops = new ArrayList<>(path);
-                    Collections.reverse(hops); // 前向路径翻转为 sink→entry
-                    ChainHop entry = hops.get(hops.size() - 1);
-                    Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
-                            entry.fromOwner(), entry.fromName(),
-                            entry.reason() == null ? "?" : entry.reason(),
-                            call.owner(), call.name(), hops, 0, call.descriptor(), rule.role().name(),
-                            null, rule.sinkRisk());
-                    bb.addChain(chain);
+                    ForwardEvidenceEmitter.emitLazy(rule, call, path).ifPresent(emission ->
+                            bb.addSolverCandidate(emission.candidate(), emission.materializer()));
                 }
             }
         }
+    }
+
+    /** Typed forward gate: only a proof of local unreachability can block a candidate. */
+    private boolean constraintBlocks(MethodInfo method, int offset,
+                                     ForwardOrigins.Result originResult) {
+        return ForwardConstraintPropagation.from(
+                support.sinkPathDecision(method, offset, originResult)).blocksPath();
     }
 
     /**
@@ -1738,21 +1801,21 @@ public final class ForwardEngine {
             ex.truncated = true;
             return null;
         }
-        if (depth > MAX_DEPTH || steps > stepBudget) {
+        if (depth > MAX_DEPTH || runState.steps() > runState.budget().stepLimit()) {
             ex.truncated = true;
             return null;
         }
-        steps++;
+        runState.recordStep();
         TaintKey key = new TaintKey(methodKey(method, ex), origin);
         if (ex.visiting.contains(key)) {
             return null; // 当前摘要递归环：不能写入全局 null 缓存
         }
         TaintMemo memo = taintMemo.get(key);
-        if (memo != null && memo.factVersion() == primaryFactVersion) {
+        if (memo != null && memo.factVersion() == runState.primaryFactVersion()) {
             return memo.path();
         }
         Long deadAt = deadEnds.get(key);
-        if (deadAt != null && deadAt == primaryFactVersion) {
+        if (deadAt != null && deadAt == runState.primaryFactVersion()) {
             return null; // 版本未推进时的死胡同有效；新事实到达（版本推进）后重查
         }
         ex.visiting.add(key);
@@ -1786,11 +1849,11 @@ public final class ForwardEngine {
         if (path != null) {
             // 只有正结果进入摘要缓存；它代表一条已经验证的具体路径，不依赖
             // 当前 Explore 的环守卫上下文。版本号保证后续新事实可以重新求值。
-            taintMemo.put(key, new TaintMemo(primaryFactVersion, path));
+            taintMemo.put(key, new TaintMemo(runState.primaryFactVersion(), path));
         } else if (!subtreeTruncated) {
-            deadEnds.put(key, primaryFactVersion);
+                deadEnds.put(key, runState.primaryFactVersion());
             if (deadEnds.size() > DEAD_END_SWEEP + DEAD_END_SWEEP_BURST) {
-                long version = primaryFactVersion;
+                long version = runState.primaryFactVersion();
                 deadEnds.values().removeIf(v -> v < version);
                 if (deadEnds.size() > DEAD_END_SWEEP) {
                     int remove = deadEnds.size() - DEAD_END_SWEEP;
@@ -1826,14 +1889,14 @@ public final class ForwardEngine {
         // exploration memo; nested expansion still benefits from the primary taint memo.
         boolean memoEligible = ex != null && ex.visiting.isEmpty()
                 && ex.candidateCallResults.isEmpty() && ex.candidateInstructions.isEmpty();
-        long memoVersion = candidateFactVersion;
+        long memoVersion = runState.candidateFactVersion();
         if (memoEligible) {
             CandidateMemo memo = ex.candidateMemo.get(memoKey);
-            if (memo != null && memo.factVersion() == candidateFactVersion) {
+            if (memo != null && memo.factVersion() == runState.candidateFactVersion()) {
                 return memo.paths();
             }
             CandidateMemo shared = candidateMemoCache.get(memoKey);
-            if (shared != null && shared.factVersion() == candidateFactVersion) {
+            if (shared != null && shared.factVersion() == runState.candidateFactVersion()) {
                 ex.candidateMemo.put(memoKey, shared);
                 return shared.paths();
             }
@@ -1901,7 +1964,7 @@ public final class ForwardEngine {
         if (memoEligible && !recursionSuppressed && !subtreeTruncated
                 && ex.visiting.isEmpty() && ex.candidateCallResults.isEmpty()
                 && ex.candidateInstructions.isEmpty()
-                && memoVersion == candidateFactVersion) {
+                && memoVersion == runState.candidateFactVersion()) {
             CandidateMemo memo = new CandidateMemo(memoVersion, List.copyOf(result));
             ex.candidateMemo.put(memoKey, memo);
             candidateMemoCache.put(memoKey, memo);
@@ -1916,7 +1979,7 @@ public final class ForwardEngine {
             return;
         }
         candidateMemoCache.entrySet().removeIf(entry ->
-                entry.getValue().factVersion() != candidateFactVersion);
+                entry.getValue().factVersion() != runState.candidateFactVersion());
         if (candidateMemoCache.size() > MAX_CANDIDATE_MEMO_ENTRIES) {
             int remove = candidateMemoCache.size() - MAX_CANDIDATE_MEMO_ENTRIES;
             var iterator = candidateMemoCache.keySet().iterator();
@@ -2152,7 +2215,7 @@ public final class ForwardEngine {
                 continue;
             }
             ForwardOrigins.Result callerOrigins = origins(caller, ex);
-            if (support.sinkPathProvablyUnreachable(caller, invoke.offset(), callerOrigins)) {
+            if (constraintBlocks(caller, invoke.offset(), callerOrigins)) {
                 continue;
             }
             Set<ValueOrigin> receivers = support.argOriginAtOrdinal(invoke, 0, callerOrigins);
@@ -2219,7 +2282,7 @@ public final class ForwardEngine {
                 continue;
             }
             ForwardOrigins.Result callerOrigins = origins(caller, ex);
-            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+            if (constraintBlocks(caller, call.offset(), callerOrigins)) {
                 continue;
             }
             Set<ValueOrigin> receivers = support.argOriginAtOrdinal(call, -1, callerOrigins);
@@ -2283,7 +2346,7 @@ public final class ForwardEngine {
                 continue;
             }
             ForwardOrigins.Result callerOrigins = origins(caller, ex);
-            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+            if (constraintBlocks(caller, call.offset(), callerOrigins)) {
                 continue;
             }
             int argumentCount = Descriptor.paramCount(call.descriptor());
@@ -2445,6 +2508,17 @@ public final class ForwardEngine {
                 // is already backed by a real deserialization source.
                 return null;
             }
+            // An unconditional source/OIS read inside an application helper can be reached
+            // from a typed external endpoint through an argument or receiver.  Retain that
+            // inherited path as the outer provenance; otherwise this branch would synthesize
+            // a helper-local ENTRY and disconnect the dependency suffix from the application
+            // boundary.  Constrained secondary sources still require sourceInputPath above.
+            if (!isJdkOwner(method.owner()) && source.tainted().isEmpty()) {
+                List<ChainHop> inherited = inheritedSourcePath(method, ex);
+                if (inherited != null) {
+                    return sourceBridgePath(inherited, method, call);
+                }
+            }
             if (!source.tainted().isEmpty()) {
                 return sourceBridgePath(inputPath, method, call);
             }
@@ -2462,6 +2536,19 @@ public final class ForwardEngine {
             // platform class itself.  Keep the callback as the provenance root rather than
             // creating a second global source; callbacks not admitted by OriginSupport remain
             // intentionally opaque.
+            // An application helper may perform the actual OIS read below a framework
+            // endpoint (for example a private controller helper).  Preserve the already
+            // proven endpoint argument/receiver provenance instead of replacing it with a
+            // synthetic helper-local root; otherwise the chain can never join the application
+            // entry even though the bytecode call/argument flow is explicit.  If no inherited
+            // source path exists, retain the historical deserialize callback root.
+            if (!isJdkOwner(method.owner())) {
+                List<ChainHop> inherited = inheritedSourcePath(method, ex);
+                if (inherited != null) {
+                    return appendMethodHop(inherited, method, call.owner(), call.name(),
+                            call.descriptor(), HopKind.DIRECT_CALL, "deserialize", null);
+                }
+            }
             String entryKind = bb.ruleEngine().matchingEntry(method.owner(), method.name(),
                     method.descriptor()).map(Rule.MagicEntryRule::entryKind)
                     .orElse("deserialization");
@@ -2582,6 +2669,31 @@ public final class ForwardEngine {
             return returnPath;
         }
         return null;
+    }
+
+    /** Select the shortest source-backed receiver/argument fact already entering one method. */
+    private List<ChainHop> inheritedSourcePath(MethodInfo method, Explore ex) {
+        if (method == null) {
+            return null;
+        }
+        List<ChainHop> best = null;
+        int firstSlot = method.isStatic() ? 0 : 0;
+        List<Integer> slots;
+        try {
+            slots = Descriptor.argSlots(method.descriptor(), method.isStatic());
+        } catch (RuntimeException malformed) {
+            return null;
+        }
+        int slot = firstSlot;
+        for (int ignored : slots) {
+            for (List<ChainHop> candidate : taintedParamCandidates(slot, method, ex)) {
+                if (candidate != null && (best == null || better(best, candidate))) {
+                    best = candidate;
+                }
+            }
+            slot += ignored;
+        }
+        return best;
     }
 
     /** Require the reused summary to have been learned through this same caller/target edge. */
@@ -3564,31 +3676,52 @@ public final class ForwardEngine {
             bb.markIncomplete("FORWARD_HOP_CAP:" + MAX_HOPS);
             return List.of();
         }
-        List<List<ChainHop>> result = new ArrayList<>();
-        List<List<ChainHop>> receiverPaths = support.isSerializedProxyHandler(method)
-                && field.receiver() instanceof ValueOrigin.Param receiver
-                && receiver.slot() == 0
-                ? serializedProxyInterfaceReceiverPaths(field, method, depth, ex)
-                : taintedCandidates(field.receiver(), method, depth + 1, ex);
-        for (List<ChainHop> receiverPath : receiverPaths) {
-            if (receiverPath == null) {
-                continue;
-            }
-            if (receiverPath.size() >= MAX_HOPS) {
-                bb.markIncomplete("FORWARD_HOP_CAP:" + MAX_HOPS);
-                continue;
-            }
-            if (containsSerializedFieldFlow(receiverPath, method, field)) {
-                bb.markIncomplete("FORWARD_FIELD_CYCLE_CUT");
-                continue;
-            }
-            List<ChainHop> path = new ArrayList<>(receiverPath);
-            path.add(new ChainHop(method.owner(), method.name(), method.owner(), method.name(),
-                    HopKind.FIELD_FLOW, field.field(), "serialized-field", field.descriptor(), null,
-                    field.owner()));
-            result.add(List.copyOf(path));
+        /*
+         * The receiver-origin guard is intentionally value-sensitive, but a serialized proxy
+         * callback can manufacture a fresh wrapper origin on every re-entry.  Protect the
+         * semantic boundary as well so a field/callback cycle is cut before recursively
+         * enumerating another frontier.  This is a cycle cut, not a sink filter: callers still
+         * receive all paths found before the boundary and the explicit reason preserves
+         * completeness accounting.
+         */
+        String expansionKey = methodKey(method, ex) + "|" + field.owner() + "|"
+                + field.field() + "|" + (field.descriptor() == null ? "" : field.descriptor())
+                + "|" + field.isStatic();
+        if (ex != null && !ex.serializedFieldExpansions.add(expansionKey)) {
+            bb.markIncomplete("FORWARD_FIELD_CYCLE_CUT");
+            return List.of();
         }
-        return distinctBestPaths(result);
+        try {
+            List<List<ChainHop>> result = new ArrayList<>();
+            List<List<ChainHop>> receiverPaths = support.isSerializedProxyHandler(method)
+                    && field.receiver() instanceof ValueOrigin.Param receiver
+                    && receiver.slot() == 0
+                    ? serializedProxyInterfaceReceiverPaths(field, method, depth, ex)
+                    : taintedCandidates(field.receiver(), method, depth + 1, ex);
+            for (List<ChainHop> receiverPath : receiverPaths) {
+                if (receiverPath == null) {
+                    continue;
+                }
+                if (receiverPath.size() >= MAX_HOPS) {
+                    bb.markIncomplete("FORWARD_HOP_CAP:" + MAX_HOPS);
+                    continue;
+                }
+                if (containsSerializedFieldFlow(receiverPath, method, field)) {
+                    bb.markIncomplete("FORWARD_FIELD_CYCLE_CUT");
+                    continue;
+                }
+                List<ChainHop> path = new ArrayList<>(receiverPath);
+                path.add(new ChainHop(method.owner(), method.name(), method.owner(), method.name(),
+                        HopKind.FIELD_FLOW, field.field(), "serialized-field", field.descriptor(), null,
+                        field.owner()));
+                result.add(List.copyOf(path));
+            }
+            return distinctBestPaths(result);
+        } finally {
+            if (ex != null) {
+                ex.serializedFieldExpansions.remove(expansionKey);
+            }
+        }
     }
 
     /**
@@ -3641,7 +3774,7 @@ public final class ForwardEngine {
                 continue;
             }
             ForwardOrigins.Result callerOrigins = origins(caller, ex);
-            if (support.sinkPathProvablyUnreachable(caller, call.offset(), callerOrigins)) {
+            if (constraintBlocks(caller, call.offset(), callerOrigins)) {
                 continue;
             }
             for (ValueOrigin receiver : ValueOriginOrder.sorted(
@@ -3731,9 +3864,9 @@ public final class ForwardEngine {
      * 逐调用点实现保持一致；只把结果移到层次版本缓存中。JDK 懒加载期间若层次发生
      * 变化，则丢弃本次快照并重算，避免把不完整闭包当成稳定结果。
      */
-    private DispatchCandidates rawDispatchCandidates(String owner, String name, String desc) {
-        DispatchKey key = new DispatchKey(owner, name, desc);
-        DispatchCandidates cached = dispatchCache.get(key);
+    private Candidates rawDispatchCandidates(String owner, String name, String desc) {
+        Key key = new Key(owner, name, desc);
+        Candidates cached = dispatchCache.get(key);
         long currentRevision = bb.hierarchy().revision();
         if (cached != null && cached.revision() == currentRevision) {
             return cached;
@@ -3746,7 +3879,7 @@ public final class ForwardEngine {
             if (startRevision != endRevision) {
                 continue;
             }
-            DispatchCandidates result = new DispatchCandidates(endRevision, raw, !subtypeResult.complete());
+            Candidates result = new Candidates(endRevision, raw, !subtypeResult.complete());
             dispatchCache.put(key, result);
             if (result.truncated()) {
                 bb.markIncomplete("DISPATCH_SUBTYPE_CAP:" + RAW_DISPATCH_CAP);
@@ -3755,8 +3888,8 @@ public final class ForwardEngine {
         }
     }
 
-    private ResolvedDispatchCandidates resolvedDispatchCandidates(String owner, String name, String desc,
-                                                                   DispatchCandidates rawSnapshot) {
+    private ResolvedCandidates resolvedDispatchCandidates(String owner, String name, String desc,
+                                                          Candidates rawSnapshot) {
         return resolvedDispatchCandidates(owner, owner, name, desc, rawSnapshot, false);
     }
 
@@ -3770,29 +3903,29 @@ public final class ForwardEngine {
      * overrides by an already-built sink-relevance index.  The fallback remains conservative
      * and every cap continues to surface as an explicit completeness reason.
      */
-    private ResolvedDispatchCandidates resolvedDispatchCandidates(String declaredOwner,
+    private ResolvedCandidates resolvedDispatchCandidates(String declaredOwner,
                                                                    String universeOwner,
                                                                    String name,
                                                                    String desc,
-                                                                   DispatchCandidates rawSnapshot,
+                                                                   Candidates rawSnapshot,
                                                                    boolean serializedValue) {
         if (declaredOwner.equals(universeOwner) && !serializedValue) {
             return resolvedDispatchCandidatesPlain(declaredOwner, name, desc, rawSnapshot);
         }
-        DispatchSelectionKey key = new DispatchSelectionKey(declaredOwner, universeOwner,
+        SelectionKey key = new SelectionKey(declaredOwner, universeOwner,
                 name, desc, serializedValue);
-        ResolvedDispatchCandidates cached = contextualDispatchCache.get(key);
+        ResolvedCandidates cached = contextualDispatchCache.get(key);
         long currentRevision = bb.hierarchy().revision();
         if (cached != null && cached.revision() == currentRevision) {
             return cached;
         }
         for (;;) {
             long startRevision = bb.hierarchy().revision();
-            DispatchCandidates effectiveRaw = rawSnapshot.revision() == startRevision
+            Candidates effectiveRaw = rawSnapshot.revision() == startRevision
                     ? rawSnapshot : rawDispatchCandidates(universeOwner, name, desc);
             List<String> raw = effectiveRaw.revision() == startRevision
                     ? effectiveRaw.raw() : List.of();
-            List<DispatchTarget> accepted = contextualDispatchTargets(declaredOwner, universeOwner,
+            List<Target> accepted = contextualDispatchTargets(declaredOwner, universeOwner,
                     name, desc, effectiveRaw, serializedValue);
             long endRevision = bb.hierarchy().revision();
             if (startRevision != endRevision) {
@@ -3801,7 +3934,7 @@ public final class ForwardEngine {
             }
             boolean truncated = effectiveRaw.truncated() || accepted.size() >= 300
                     && raw.size() > accepted.size();
-            ResolvedDispatchCandidates result = new ResolvedDispatchCandidates(endRevision,
+            ResolvedCandidates result = new ResolvedCandidates(endRevision,
                     List.copyOf(accepted), truncated);
             contextualDispatchCache.put(key, result);
             if (truncated) {
@@ -3812,27 +3945,27 @@ public final class ForwardEngine {
     }
 
     /** Existing deterministic lexical resolver for ordinary non-serialization dispatch. */
-    private ResolvedDispatchCandidates resolvedDispatchCandidatesPlain(String owner, String name,
+    private ResolvedCandidates resolvedDispatchCandidatesPlain(String owner, String name,
                                                                         String desc,
-                                                                        DispatchCandidates rawSnapshot) {
-        DispatchKey key = new DispatchKey(owner, name, desc);
-        ResolvedDispatchCandidates cached = resolvedDispatchCache.get(key);
+                                                                        Candidates rawSnapshot) {
+        Key key = new Key(owner, name, desc);
+        ResolvedCandidates cached = resolvedDispatchCache.get(key);
         long currentRevision = bb.hierarchy().revision();
         if (cached != null && cached.revision() == currentRevision) {
             return cached;
         }
         for (;;) {
             long startRevision = bb.hierarchy().revision();
-            DispatchCandidates effectiveRaw = rawSnapshot.revision() == startRevision
+            Candidates effectiveRaw = rawSnapshot.revision() == startRevision
                     ? rawSnapshot : rawDispatchCandidates(owner, name, desc);
             List<String> raw = effectiveRaw.revision() == startRevision
                     ? effectiveRaw.raw() : List.of();
-            List<DispatchTarget> accepted = new ArrayList<>(Math.min(300, raw.size()));
+            List<Target> accepted = new ArrayList<>(Math.min(300, raw.size()));
             for (String candidate : raw) {
                 if (accepted.size() >= 300) {
                     break;
                 }
-        DispatchTarget target = dispatchTarget(owner, candidate, name, desc);
+                Target target = dispatchTarget(owner, candidate, name, desc);
                 if (target != null) {
                     accepted.add(target);
                 }
@@ -3843,7 +3976,7 @@ public final class ForwardEngine {
                 continue;
             }
             boolean truncated = effectiveRaw.truncated() || accepted.size() >= 300 && raw.size() > accepted.size();
-            ResolvedDispatchCandidates result = new ResolvedDispatchCandidates(endRevision,
+            ResolvedCandidates result = new ResolvedCandidates(endRevision,
                     List.copyOf(accepted), truncated);
             resolvedDispatchCache.put(key, result);
             if (truncated) {
@@ -3853,28 +3986,28 @@ public final class ForwardEngine {
         }
     }
 
-    private List<DispatchTarget> contextualDispatchTargets(String declaredOwner,
+    private List<Target> contextualDispatchTargets(String declaredOwner,
                                                             String universeOwner,
                                                             String name, String desc,
-                                                            DispatchCandidates rawSnapshot,
+                                                            Candidates rawSnapshot,
                                                             boolean serializedValue) {
-        List<DispatchTarget> all = new ArrayList<>(rawSnapshot.raw().size());
+        List<Target> all = new ArrayList<>(rawSnapshot.raw().size());
         ClassInfo universe = bb.hierarchy().classInfo(universeOwner);
         if (universe != null && !universe.isInterface()
                 && !java.lang.reflect.Modifier.isAbstract(universe.access())) {
-            DispatchTarget base = dispatchTarget(declaredOwner, universeOwner, name, desc);
+            Target base = dispatchTarget(declaredOwner, universeOwner, name, desc);
             if (base != null) {
                 all.add(base);
             }
         }
         for (String candidate : rawSnapshot.raw()) {
-            DispatchTarget target = dispatchTarget(declaredOwner, candidate, name, desc);
+            Target target = dispatchTarget(declaredOwner, candidate, name, desc);
             if (target != null) {
                 all.add(target);
             }
         }
         if (serializedValue) {
-            List<DispatchTarget> serializable = all.stream()
+            List<Target> serializable = all.stream()
                     .filter(target -> bb.hierarchy().isSerializable(target.candidateOwner()))
                     .toList();
             // An incomplete hierarchy/JDK slice must not turn a useful approximation into a
@@ -3895,16 +4028,16 @@ public final class ForwardEngine {
                     // the ordinary sink-distance tie breaker.  This is only candidate
                     // scheduling; every accepted target remains subject to the same
                     // serializable/JVM-overridable gates and the 300 target cap.
-                    .comparingInt((DispatchTarget target) ->
+                    .comparingInt((Target target) ->
                             serializedDispatchPriority(target, name, desc)).reversed()
-                    .thenComparingInt((DispatchTarget target) -> sinkDistanceRank(target, name, desc))
-                    .thenComparing((DispatchTarget target) -> directDeclarationRank(target, name, desc))
-                    .thenComparing(DispatchTarget::resolvedOwner)
-                    .thenComparing(DispatchTarget::candidateOwner));
+                    .thenComparingInt((Target target) -> sinkDistanceRank(target, name, desc))
+                    .thenComparing((Target target) -> directDeclarationRank(target, name, desc))
+                    .thenComparing(Target::resolvedOwner)
+                    .thenComparing(Target::candidateOwner));
         }
-        List<DispatchTarget> result = new ArrayList<>(Math.min(300, all.size()));
+        List<Target> result = new ArrayList<>(Math.min(300, all.size()));
         Set<String> resolved = new HashSet<>();
-        for (DispatchTarget target : all) {
+        for (Target target : all) {
             // Multiple serializable subclasses commonly inherit the same implementation.
             // Re-emitting that target consumes the finite target budget without adding a
             // distinct forward fact.
@@ -3927,7 +4060,7 @@ public final class ForwardEngine {
      * ordering in the engine (rather than in rules or benchmark code) makes the cap
      * deterministic while preserving the existing conservative wildcard boundary.
      */
-    private int serializedDispatchPriority(DispatchTarget target, String name, String desc) {
+    private int serializedDispatchPriority(Target target, String name, String desc) {
         MethodInfo method = support.methodOf(target.resolvedOwner(), name, desc);
         if (method == null) {
             return 0;
@@ -3978,16 +4111,16 @@ public final class ForwardEngine {
                 || "convert".equals(name) || "deserialize".equals(name);
     }
 
-    private int sinkDistanceRank(DispatchTarget target, String name, String desc) {
+    private int sinkDistanceRank(Target target, String name, String desc) {
         return support.sinkDistanceOf(OriginSupport.methodKeyOf(target.resolvedOwner(), name, desc));
     }
 
-    private int directDeclarationRank(DispatchTarget target, String name, String desc) {
+    private int directDeclarationRank(Target target, String name, String desc) {
         return support.methodOf(target.candidateOwner(), name, desc) == null ? 1 : 0;
     }
 
     /** 单个候选的 JVM 语义过滤；null 表示该候选不能成为污点动态目标。 */
-    private DispatchTarget dispatchTarget(String owner, String candidate, String name, String desc) {
+    private Target dispatchTarget(String owner, String candidate, String name, String desc) {
         // Do not impose an OIS Serializable constraint here. This resolver is also used by
         // framework-source and ordinary object-flow chains, where a non-serializable receiver
         // is valid (for example a deserializer callback delegates into an application helper).
@@ -3997,7 +4130,7 @@ public final class ForwardEngine {
         if (resolved == null || !bb.hierarchy().isOverridableDispatchTarget(owner, candidate, name, desc)) {
             return null;
         }
-        return new DispatchTarget(candidate, resolved);
+        return new Target(candidate, resolved);
     }
 
     /** 精扫：污点命中接口调用且仅声明目标（实现>枚举上限未物化）时，按上限展开实现类。 */
@@ -4055,9 +4188,9 @@ public final class ForwardEngine {
         // resolveMethod + 可覆写检查。
         String universeOwner = dispatchUniverseOwner(owner, receiverOrigins, method);
         boolean serializedValue = isJavaSerializationValue(receiverPath);
-        DispatchCandidates dispatch = rawDispatchCandidates(universeOwner, call.name(), call.descriptor());
+        Candidates dispatch = rawDispatchCandidates(universeOwner, call.name(), call.descriptor());
         List<String> rawCandidates = dispatch.raw();
-        List<DispatchTarget> candidates = null;
+        List<Target> candidates = null;
         // A1+#1 FLASH 混合分派增强：receiver 的运行时类型精确解析
         // NEW→精确类名 | FieldRead→字段声明类型（具体类时精确） | 其他→保持 CHA
         if (receiverPath != null && rawCandidates.size() > 1) {
@@ -4075,7 +4208,7 @@ public final class ForwardEngine {
                         if (!rawCandidates.contains(preciseType)) {
                             continue;
                         }
-                        DispatchTarget precise = dispatchTarget(owner, preciseType,
+                        Target precise = dispatchTarget(owner, preciseType,
                                 call.name(), call.descriptor());
                         candidates = precise == null ? List.of() : List.of(precise);
                         break;
@@ -4088,7 +4221,7 @@ public final class ForwardEngine {
                             call.descriptor(), dispatch, serializedValue)
                     .targets();
         }
-        for (DispatchTarget target : candidates) {
+        for (Target target : candidates) {
             if (cancellationRequested()) {
                 return;
             }
@@ -4158,7 +4291,7 @@ public final class ForwardEngine {
         if (ownerInfo == null) {
             return;
         }
-        for (DispatchTarget target : resolvedDispatchCandidates(owner, call.name(), call.descriptor(),
+        for (Target target : resolvedDispatchCandidates(owner, call.name(), call.descriptor(),
                 rawDispatchCandidates(owner, call.name(), call.descriptor())).targets()) {
             if (cancellationRequested()) {
                 return;
@@ -5059,7 +5192,7 @@ public final class ForwardEngine {
                                                   Explore ex, ForwardOrigins.Result invokeOrigins,
                                                   MethodInfo target, int firstArgumentOrdinal,
                                                   boolean constructor, boolean unresolvedTarget) {
-        if (support.sinkPathProvablyUnreachable(caller, call.offset(), invokeOrigins)) {
+        if (constraintBlocks(caller, call.offset(), invokeOrigins)) {
             return;
         }
         activateReachable(target);
@@ -5145,14 +5278,14 @@ public final class ForwardEngine {
                                                 Explore ex, ForwardOrigins.Result invokeOrigins,
                                                 MethodInfo target, int argumentArrayOrdinal,
                                                 boolean constructor, boolean unresolvedTarget) {
-        if (support.sinkPathProvablyUnreachable(caller, call.offset(), invokeOrigins)) {
+        if (constraintBlocks(caller, call.offset(), invokeOrigins)) {
             // The reflective operation itself is behind a proven-failed lookup or a local
             // impossible guard.  Do not manufacture a target fact merely because the
             // metadata resolver found a syntactic candidate.
             return;
         }
         if (!constructor && !unresolvedTarget
-                && !support.reflectiveInvokeMayReach(target, call, invokeOrigins)) {
+                && !support.reflectiveInvocationDecision(target, call, invokeOrigins).preservesPath()) {
             // Method.invoke has JVM-level receiver/access preconditions.  Exact null or
             // inaccessible targets are not dispatch edges; unknown values stay conservative
             // inside OriginSupport.reflectiveInvokeMayReach.
@@ -5568,14 +5701,9 @@ public final class ForwardEngine {
             if (path == null || path.isEmpty()) {
                 continue;
             }
-            List<ChainHop> hops = new ArrayList<>(path);
-            Collections.reverse(hops);
-            ChainHop entry = hops.get(hops.size() - 1);
-            bb.addChain(new Chain(rule.id(), rule.category(), rule.severity(),
-                    entry.fromOwner(), entry.fromName(),
-                    entry.reason() == null ? "?" : entry.reason(),
-                    target.owner(), target.name(), hops, unresolvedTarget ? 1 : 0,
-                    target.descriptor(), rule.role().name(), null, rule.sinkRisk()));
+            ForwardEvidenceEmitter.emitLazy(rule, target.owner(), target.name(),
+                    target.descriptor(), path, unresolvedTarget ? 1 : 0, true).ifPresent(emission ->
+                    bb.addSolverCandidate(emission.candidate(), emission.materializer()));
         }
     }
 
@@ -5956,9 +6084,7 @@ public final class ForwardEngine {
         if (!effectInstructions.containsKey(methodKey) && !sinkCallsByMethod.containsKey(methodKey)) {
             return;
         }
-        if (pending.add(methodKey)) {
-            queue.add(methodKey);
-        }
+        runState.worklist().offer(methodKey);
     }
 
     private void activateAndEnqueue(String methodKey) {
@@ -5997,18 +6123,11 @@ public final class ForwardEngine {
      * callback is a genuine runtime entry for a subtype without an override.
      */
     private void recordPrimaryFact() {
-        factVersion++;
-        primaryFactVersion++;
-        candidateFactVersion++;
-        factCount++;
-        primaryFactUpdates++;
+        runState.recordPrimaryFact();
     }
 
     private void recordAlternativeFact() {
-        factVersion++;
-        candidateFactVersion++;
-        factCount++;
-        alternativeFactUpdates++;
+        runState.recordAlternativeFact();
     }
 
     private void addThis(String className, List<ChainHop> path, boolean propagateSubtypes) {
@@ -6720,4 +6839,5 @@ public final class ForwardEngine {
     private static String methodNodeKey(Node method) {
         return OriginSupport.methodKeyOf(method.owner(), method.name(), method.descriptor());
     }
+
 }

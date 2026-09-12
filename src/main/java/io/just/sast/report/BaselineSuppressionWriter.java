@@ -3,6 +3,8 @@ package io.just.sast.report;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.chain.ChainIds;
 import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.IoUtil;
+import io.just.sast.run.InputBudget;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -42,17 +44,27 @@ public final class BaselineSuppressionWriter {
 
     public void write(ReportLayout layout, Path baseline, Path suppressions,
                       List<Chain> chains, Map<String, String> calibrations) throws IOException {
+        write(layout, baseline, suppressions, chains, calibrations, InputBudget.defaults());
+    }
+
+    /** Read baseline/suppression inputs under one explicit versioned policy. */
+    public void write(ReportLayout layout, Path baseline, Path suppressions,
+                      List<Chain> chains, Map<String, String> calibrations,
+                      InputBudget budget) throws IOException {
         if (baseline == null && suppressions == null) {
             return;
         }
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        InputBudget.Tracker tracker = policy.tracker();
         Map<String, Chain> current = new TreeMap<>();
         for (Chain chain : chains == null ? List.<Chain>of() : chains) {
             if (chain != null) {
                 current.putIfAbsent(identity(chain), chain);
             }
         }
-        Set<String> old = baseline == null ? Set.of() : readBaseline(baseline);
-        List<Selector> selectors = suppressions == null ? List.of() : readSelectors(suppressions);
+        Set<String> old = baseline == null ? Set.of() : readBaseline(baseline, policy, tracker);
+        List<Selector> selectors = suppressions == null ? List.of()
+                : readSelectors(suppressions, policy, tracker);
         Set<String> usedSelectors = new LinkedHashSet<>();
         List<Row> rows = new ArrayList<>();
         for (Map.Entry<String, Chain> entry : current.entrySet()) {
@@ -80,7 +92,8 @@ public final class BaselineSuppressionWriter {
                 safe(chain.sinkClass()), safe(chain.sinkMethod()), safe(sinkDescriptor(chain)));
     }
 
-    private static Set<String> readBaseline(Path baseline) throws IOException {
+    private static Set<String> readBaseline(Path baseline, InputBudget policy,
+                                             InputBudget.Tracker tracker) throws IOException {
         Path csv = baseline;
         if (Files.isDirectory(baseline)) {
             csv = baseline.resolve("findings").resolve("findings.csv");
@@ -93,7 +106,8 @@ public final class BaselineSuppressionWriter {
                 || Files.size(csv) > MAX_BASELINE_BYTES) {
             throw new IOException("baseline findings.csv not found: " + baseline.toAbsolutePath());
         }
-        List<String> lines = Files.readAllLines(csv, StandardCharsets.UTF_8);
+        List<String> lines = readBoundedLines(csv, MAX_BASELINE_BYTES, policy, tracker,
+                "baseline");
         List<String> header = null;
         Map<String, Integer> indexes = new LinkedHashMap<>();
         Set<String> identities = new TreeSet<>();
@@ -127,7 +141,8 @@ public final class BaselineSuppressionWriter {
         return Set.copyOf(identities);
     }
 
-    private static List<Selector> readSelectors(Path file) throws IOException {
+    private static List<Selector> readSelectors(Path file, InputBudget policy,
+                                                InputBudget.Tracker tracker) throws IOException {
         if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)
                 || ArchiveLimits.isLinkOrReparsePoint(file)
                 || Files.size(file) > MAX_SUPPRESSION_BYTES) {
@@ -135,7 +150,8 @@ public final class BaselineSuppressionWriter {
                     + file.toAbsolutePath());
         }
         List<Selector> result = new ArrayList<>();
-        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+        for (String line : readBoundedLines(file, MAX_SUPPRESSION_BYTES, policy, tracker,
+                "suppression")) {
             String value = line.strip();
             if (value.isEmpty() || value.startsWith("#")) {
                 continue;
@@ -152,6 +168,38 @@ public final class BaselineSuppressionWriter {
         }
         result.sort(Comparator.comparing(Selector::raw));
         return List.copyOf(result);
+    }
+
+    private static List<String> readBoundedLines(Path file, long maxBytes,
+                                                 InputBudget policy,
+                                                 InputBudget.Tracker tracker,
+                                                 String label) throws IOException {
+        if (file == null || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)
+                || ArchiveLimits.isLinkOrReparsePoint(file)) {
+            throw new IOException(label + " input is not a regular non-link file");
+        }
+        ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                file, policy, label.toUpperCase(java.util.Locale.ROOT) + "_INPUT");
+        long size = snapshot.fileAttributes().size();
+        long limit = Math.min(maxBytes, Math.min(policy.maxPhysicalBytes(),
+                policy.maxEntryBytes()));
+        if (size > limit) {
+            throw new IOException(label + " input exceeds limit: " + limit);
+        }
+        byte[] bytes;
+        try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(file,
+                label.toUpperCase(java.util.Locale.ROOT) + "_INPUT");
+             var input = opened.stream()) {
+            bytes = IoUtil.readAll(input, limit, tracker);
+        }
+        try {
+            ArchiveLimits.verifyRegularFileUnchanged(snapshot,
+                    label.toUpperCase(java.util.Locale.ROOT) + "_INPUT");
+        } catch (IOException changed) {
+            throw new IOException(label + " input changed during read", changed);
+        }
+        String text = new String(bytes, StandardCharsets.UTF_8);
+        return List.of(text.split("\\R", -1));
     }
 
     private static boolean matches(String identity, Chain chain, List<Selector> selectors,

@@ -1,5 +1,6 @@
 package io.just.sast.cli;
 
+import io.just.sast.run.ExitReason;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 
@@ -23,7 +24,7 @@ public final class JustMain implements Runnable {
         if (Runtime.version().feature() != 17) {
             System.err.println("[just:error] Just 主进程必须使用 JDK 17（当前 "
                     + Runtime.version().feature() + ")");
-            System.exit(78);
+            System.exit(ExitReason.UNSUPPORTED_RUNTIME.code());
             return;
         }
         int code = new CommandLine(new JustMain()).execute(args);

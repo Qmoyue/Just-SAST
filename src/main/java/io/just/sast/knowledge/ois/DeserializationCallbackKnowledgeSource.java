@@ -4,6 +4,7 @@ import io.just.sast.analysis.taint.ForwardOrigins;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.analysis.taint.ValueOrigin;
 import io.just.sast.analysis.taint.ValueOriginOrder;
+import io.just.sast.analysis.entry.ApplicationEntryIndex;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
@@ -11,13 +12,16 @@ import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
+import io.just.sast.blackboard.RunProduct;
 import io.just.sast.config.Rule;
+import io.just.sast.config.RuleSchemaV2;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.Descriptor;
 import io.just.sast.model.MethodInfo;
+import io.just.sast.util.ChainMaterializer;
 import io.just.sast.util.JustLogger;
 
 import java.util.ArrayDeque;
@@ -27,7 +31,11 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 /**
  * 反序列化回调知识源（ANALYSIS 阶段，自足）。
@@ -74,6 +82,16 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
     }
 
     @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.PROGRAM_MODEL);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.ANALYSIS_CHAINS);
+    }
+
+    @Override
     public void init(Blackboard blackboard) {
         this.bb = blackboard;
         this.support = blackboard.originSupport();
@@ -95,12 +113,12 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                 if (resolverMethod == null) {
                     continue;
                 }
-                List<ChainHop> machinery = machineryTo(resolver, callback, callsByMethod);
+                DeferredMachinery machinery = machineryTo(resolver, callback, callsByMethod);
                 if (machinery == null) {
                     continue;
                 }
-                for (Node sinkCall : paramDrivenSinks(resolverMethod)) {
-                    chains += emitChains(sinkCall, machinery, callsByMethod);
+                for (ParamDrivenSink sink : paramDrivenSinks(resolverMethod)) {
+                    chains += emitChains(sink, machinery, callsByMethod);
                     if (chains >= MAX_CHAINS) {
                         JustLogger.info("OIS 回调：达到链数上限 {}", MAX_CHAINS);
                         bb.markIncomplete("OIS_CALLBACK_CHAIN_CAP:" + MAX_CHAINS);
@@ -131,8 +149,8 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
      * 重写方法内：规则命中的 sink 调用，且污点位置来源由回调参数（slot 1）直接
      * 或经一层调用派生（如 desc.getName()）。常量参数不报。
      */
-    private List<Node> paramDrivenSinks(MethodInfo resolverMethod) {
-        List<Node> result = new ArrayList<>();
+    private List<ParamDrivenSink> paramDrivenSinks(MethodInfo resolverMethod) {
+        List<ParamDrivenSink> result = new ArrayList<>();
         String resolverKey = OriginSupport.methodKey(resolverMethod);
         for (io.just.sast.model.InsnFact insn : resolverMethod.instructions()) {
             if (!insn.op().isInvoke()) {
@@ -143,19 +161,19 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                 continue;
             }
             Node call = bb.graph().node(callId);
-            if (bb.ruleEngine().matchingSink(call).isPresent() && paramDriven(call, resolverMethod)) {
-                result.add(call);
+            Rule.SinkRule rule = bb.ruleEngine().matchingSink(call).orElse(null);
+            if (rule != null && paramDriven(call, resolverMethod, rule)) {
+                result.add(new ParamDrivenSink(call, rule));
             }
         }
         return result;
     }
 
-    private boolean paramDriven(Node call, MethodInfo in) {
+    private boolean paramDriven(Node call, MethodInfo in, Rule.SinkRule rule) {
         ForwardOrigins.State state = support.origins().compute(in).stateBefore().get(call.prop("offset"));
         if (state == null) {
             return false;
         }
-        Rule.SinkRule rule = bb.ruleEngine().matchingSink(call).orElseThrow();
         int paramCount = Descriptor.paramCount(call.strProp("desc"));
         for (Rule.TaintedPos pos : rule.tainted()) {
             int depth = pos instanceof Rule.TaintedPos.Arg a ? paramCount - 1 - a.index() : paramCount;
@@ -194,7 +212,8 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
     }
 
     /** 机制路径：调用图上 OIS.readObject/readUnshared →…→ 重写方法的有界 BFS，返回 entry→sink 顺序的跳。 */
-    private List<ChainHop> machineryTo(String resolver, Callback callback, Map<String, List<Node>> callsByMethod) {
+    private DeferredMachinery machineryTo(String resolver, Callback callback,
+                                          Map<String, List<Node>> callsByMethod) {
         Node start = machineryStart();
         if (start == null) {
             return null;
@@ -207,7 +226,10 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
         while (!work.isEmpty()) {
             Node cur = work.poll();
             if (cur.strProp("owner").equals(resolver) && cur.strProp("name").equals(callback.name())) {
-                return buildPath(parentCall, cur);
+                Map<Node, Node> stableParents = Map.copyOf(parentCall);
+                int pathHopCount = pathHopCount(stableParents, cur);
+                return new DeferredMachinery(pathHopCount,
+                        () -> buildPath(stableParents, cur));
             }
             if (hopCount(parentCall, cur, start) >= MAX_MACHINERY_HOPS) {
                 continue;
@@ -274,9 +296,31 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
         return hops;
     }
 
+    /** Count the same evidence hops as {@link #buildPath(Map, Node)} without allocating them. */
+    private int pathHopCount(Map<Node, Node> parentCall, Node target) {
+        int count = 0;
+        Node cur = target;
+        while (true) {
+            Node call = parentCall.get(cur);
+            if (call == null) {
+                break;
+            }
+            Node caller = bb.graph().findMethodNode(call.strProp("methodOwner"),
+                    call.strProp("methodName"), call.strProp("methodDesc"));
+            if (caller == null) {
+                break;
+            }
+            count++;
+            cur = caller;
+        }
+        return count;
+    }
+
     /** 组装链：入口取 OIS 宿主的最近 magic-entry 祖先（无则记 deserialization 源），宿主数有上限。 */
-    private int emitChains(Node sinkCall, List<ChainHop> machinery, Map<String, List<Node>> callsByMethod) {
-        Rule.SinkRule rule = bb.ruleEngine().matchingSink(sinkCall).orElseThrow();
+    private int emitChains(ParamDrivenSink sink, DeferredMachinery machinery,
+                           Map<String, List<Node>> callsByMethod) {
+        Node sinkCall = sink.call();
+        Rule.SinkRule rule = sink.rule();
         Node startNode = machineryStart();
         String readName = startNode.strProp("name");
         String readDesc = startNode.strProp("desc");
@@ -298,23 +342,42 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                 continue; // 宿主自建普通 OIS（内联 new ObjectInputStream）：运行时类型恒为基类，重写回调不可能触发
             }
             EntryRef entry = nearestEntry(host);
-            // 前向路径：入口 →(host 若非入口) → readObject → 机制 → resolver；链内统一 entry-last
-            List<ChainHop> forward = new ArrayList<>(machinery);
-            if (!entry.owner().equals(host.owner()) || !entry.name().equals(host.name())) {
-                forward.add(0, new ChainHop(entry.owner(), entry.name(), host.owner(), host.name(),
-                        HopKind.DIRECT_CALL, null, "call", host.descriptor(), null));
-            }
-            forward.add(0, new ChainHop(host.owner(), host.name(), OIS, readName,
-                    HopKind.DIRECT_CALL, null, "call", readDesc, null));
-            List<ChainHop> hops = new ArrayList<>(forward);
-            java.util.Collections.reverse(hops);
-            hops.add(new ChainHop(entry.owner(), entry.name(), entry.owner(), entry.name(),
-                    HopKind.ENTRY, null, entry.kind(), entry.desc(), null));
-            Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
-                    entry.owner(), entry.name(), entry.kind(),
-                    sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"),
-                    rule.role().name(), null, rule.sinkRisk());
-            produced += bb.addChain(chain) ? 1 : 0;
+            // 前向路径：入口 →(host 若非入口) → readObject → 机制 → resolver；链内统一 entry-last。
+            // 只在 typed admission 接受后构造反转路径，避免为被入口索引拒绝的候选复制 machinery。
+            boolean hostCall = !entry.owner().equals(host.owner()) || !entry.name().equals(host.name());
+            int machineryHopCount = machinery.hopCount();
+            int hopCount = machineryHopCount + (hostCall ? 1 : 0) + 2;
+            boolean continuation = !RuleSchemaV2.isTerminalSink(rule)
+                    && !RuleSchemaV2.bridgesFor(rule).isEmpty();
+            ApplicationEntryIndex.ProducerCandidate candidate =
+                    new ApplicationEntryIndex.ProducerCandidate(rule.id(), rule.category(),
+                            rule.severity(), entry.owner(), entry.name(), entry.desc(), entry.kind(),
+                            sinkCall.strProp("owner"), sinkCall.strProp("name"),
+                            sinkCall.strProp("desc"), rule.role().name(), rule.sinkRisk(), continuation);
+            Supplier<Chain> materializer = () -> {
+                List<ChainHop> materializedMachinery = machinery.materializer().get();
+                if (materializedMachinery == null || materializedMachinery.size() != machineryHopCount) {
+                    return null;
+                }
+                List<ChainHop> forward = new ArrayList<>(materializedMachinery);
+                if (hostCall) {
+                    forward.add(0, new ChainHop(entry.owner(), entry.name(), host.owner(), host.name(),
+                            HopKind.DIRECT_CALL, null, "call", host.descriptor(), null));
+                }
+                forward.add(0, new ChainHop(host.owner(), host.name(), OIS, readName,
+                        HopKind.DIRECT_CALL, null, "call", readDesc, null));
+                java.util.Collections.reverse(forward);
+                forward.add(new ChainHop(entry.owner(), entry.name(), entry.owner(), entry.name(),
+                        HopKind.ENTRY, null, entry.kind(), entry.desc(), null));
+                if (forward.size() != hopCount) {
+                    return null;
+                }
+                return new Chain(rule.id(), rule.category(), rule.severity(), entry.owner(),
+                        entry.name(), entry.kind(), sinkCall.strProp("owner"), sinkCall.strProp("name"),
+                        forward, 0, sinkCall.strProp("desc"), rule.role().name(), null, rule.sinkRisk());
+            };
+            CallbackProducer producer = new CallbackProducer(candidate, materializer);
+            produced += bb.addSolverCandidate(producer.candidate(), producer.materializer()) ? 1 : 0;
         }
         return produced;
     }
@@ -331,6 +394,64 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
     }
 
     private record EntryRef(String owner, String name, String kind, String desc) {}
+
+    /** A callback sink paired with its already-resolved rule to avoid a second hot-path lookup. */
+    private record ParamDrivenSink(Node call, Rule.SinkRule rule) {
+        private ParamDrivenSink {
+            if (call == null || rule == null) {
+                throw new IllegalArgumentException("callback sink requires call/rule");
+            }
+        }
+    }
+
+    /** Typed callback endpoint plus a stable deferred chain payload. */
+    record CallbackProducer(ApplicationEntryIndex.ProducerCandidate candidate,
+                            Supplier<Chain> materializer) {
+        CallbackProducer {
+            candidate = Objects.requireNonNull(candidate, "candidate");
+            materializer = ChainMaterializer.memoize(Objects.requireNonNull(materializer, "materializer"));
+        }
+    }
+
+    /** Typed callback machinery descriptor; path hops are shared and built only after admission. */
+    record DeferredMachinery(int hopCount, Supplier<List<ChainHop>> materializer) {
+        DeferredMachinery {
+            if (hopCount < 0 || materializer == null) {
+                throw new IllegalArgumentException("callback machinery requires hop count/materializer");
+            }
+            Supplier<List<ChainHop>> delegate = materializer;
+            AtomicReference<MachineryMaterialization> cached = new AtomicReference<>();
+            materializer = () -> {
+                MachineryMaterialization existing = cached.get();
+                if (existing == null) {
+                    synchronized (cached) {
+                        existing = cached.get();
+                        if (existing == null) {
+                            try {
+                                List<ChainHop> built = delegate.get();
+                                existing = new MachineryMaterialization(
+                                        built == null ? null : List.copyOf(built), null);
+                            } catch (RuntimeException failure) {
+                                // A deterministic path-construction failure is a typed,
+                                // fail-closed result. Cache it so every candidate sharing this
+                                // machinery observes the same failure without rerunning the path.
+                                existing = new MachineryMaterialization(null, failure);
+                            }
+                            cached.set(existing);
+                        }
+                    }
+                }
+                if (existing.failure() != null) {
+                    throw existing.failure();
+                }
+                return existing.hops();
+            };
+        }
+    }
+
+    /** Null-aware terminal state for one deferred callback path, including typed failures. */
+    private record MachineryMaterialization(List<ChainHop> hops, RuntimeException failure) {
+    }
 
     /**
      * 宿主的 OIS 读调用：receiver 来源全部为方法内 `new ObjectInputStream` 的内联构造

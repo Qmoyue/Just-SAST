@@ -45,16 +45,38 @@ public record ReportLayout(Path root, Path findings, Path verification,
         return new ReportLayout(normalized, normalized, normalized, normalized, normalized);
     }
 
-    private static void ensureDirectory(Path directory) throws IOException {
-        if (Files.exists(directory, LinkOption.NOFOLLOW_LINKS)
-                && (ArchiveLimits.isLinkOrReparsePoint(directory)
-                || !Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS))) {
-            throw new IOException("report directory is not a real directory: " + directory);
+    /** Create each parent component without following a link/reparse point. */
+    static void ensureDirectory(Path directory) throws IOException {
+        if (directory == null) {
+            throw new IOException("report directory is missing");
         }
-        Files.createDirectories(directory);
-        if (ArchiveLimits.isLinkOrReparsePoint(directory)
-                || !Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
-            throw new IOException("report directory is not a real directory: " + directory);
+        Path normalized = directory.toAbsolutePath().normalize();
+        Path current = normalized.getRoot();
+        if (current == null || ArchiveLimits.isLinkOrReparsePoint(current)) {
+            throw new IOException("report directory root is unsafe: " + directory);
+        }
+        for (Path component : normalized) {
+            current = current.resolve(component);
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                if (ArchiveLimits.isLinkOrReparsePoint(current)
+                        || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("report directory is not a real directory: " + current);
+                }
+            } else {
+                try {
+                    Files.createDirectory(current);
+                } catch (java.nio.file.FileAlreadyExistsException raced) {
+                    if (ArchiveLimits.isLinkOrReparsePoint(current)
+                            || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                        throw new IOException("report directory is not a real directory: "
+                                + current, raced);
+                    }
+                }
+            }
+            if (ArchiveLimits.isLinkOrReparsePoint(current)
+                    || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("report directory changed during creation: " + current);
+            }
         }
     }
 }

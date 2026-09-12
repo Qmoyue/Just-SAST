@@ -243,6 +243,11 @@
             </goals>
             <configuration>
               <createDependencyReducedPom>false</createDependencyReducedPom>
+              <!-- Keep the Maven main artifact as the thin, reproducible input.  The
+                   shaded launcher is an attached classifier so a subsequent package
+                   cannot feed the previous uber JAR back into Shade. -->
+              <shadedArtifactAttached>true</shadedArtifactAttached>
+              <shadedClassifierName>shaded</shadedClassifierName>
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <mainClass>io.just.sast.cli.JustMain</mainClass>

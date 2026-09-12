@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -50,5 +51,40 @@ class BlackboardFactTest {
         IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
                 () -> bb.publishFact(new MutableFact()));
         assertTrue(failure.getMessage().contains("immutable records"));
+    }
+
+    @Test
+    void runProductsAreTypedAppendOnlyAndSingletonSafe() {
+        Blackboard bb = empty();
+        assertTrue(bb.hasProduct(RunProduct.PROGRAM_MODEL));
+        assertEquals(Set.of(RunProduct.PROGRAM_MODEL), bb.availableProducts());
+
+        bb.publishProduct(RunProduct.ANALYSIS_CHAINS, "backward-taint", Phase.ANALYSIS);
+        bb.publishProduct(RunProduct.ANALYSIS_CHAINS, "forward-taint", Phase.ANALYSIS);
+        assertTrue(bb.hasProduct(RunProduct.ANALYSIS_CHAINS));
+        assertEquals(Set.of("backward-taint", "forward-taint"),
+                bb.productProducers().get(RunProduct.ANALYSIS_CHAINS));
+        assertEquals(2, bb.facts(RunProductPublication.class).size());
+        assertThrows(UnsupportedOperationException.class,
+                () -> bb.productProducers().get(RunProduct.ANALYSIS_CHAINS).clear());
+
+        bb.publishProduct(RunProduct.VERIFICATION_RESULTS, "verify", Phase.CALIBRATION);
+        assertThrows(IllegalStateException.class,
+                () -> bb.publishProduct(RunProduct.VERIFICATION_RESULTS, "other", Phase.CALIBRATION));
+    }
+
+    @Test
+    void legacyVerificationStatusIsOnlyAProjectionOfTheSummaryOwner() {
+        Blackboard bb = empty();
+        bb.setVerificationStatus("UNTESTABLE");
+        assertEquals("UNTESTABLE", bb.verificationStatus());
+        assertEquals("UNTESTABLE", bb.verificationSummary().capability());
+
+        VerificationSummary detailed = VerificationSummary.empty("READY", 3);
+        bb.setVerificationSummary(detailed);
+        bb.setVerificationStatus("TIMEOUT");
+        assertEquals("TIMEOUT", bb.verificationSummary().capability());
+        assertEquals(detailed.results(), bb.verificationSummary().results());
+        assertEquals(3, bb.verificationSummary().budget());
     }
 }

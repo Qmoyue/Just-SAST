@@ -9,6 +9,7 @@ import io.just.sast.config.Rule;
 import io.just.sast.config.RuleSet;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.MethodInfo;
+import io.just.sast.run.RunOutcome;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -72,6 +73,9 @@ class SarifReporterTest {
         assertTrue(sarif.contains("\"verification_group\":\"not_selected\""), sarif);
         // OASIS 规范 schema
         assertTrue(sarif.contains("docs.oasis-open.org/sarif"), sarif);
+        // Strict SARIF consumers reject a trailing comma before the object closes.
+        assertFalse(sarif.contains("\"startLine\": 42},\n          }"),
+                "region must be the final physicalLocation member:\n" + sarif);
     }
 
     @Test
@@ -87,6 +91,8 @@ class SarifReporterTest {
                 "同组变体应折叠为一个 result:\n" + sarif);
         // 无层次接线时不输出 region（不造假日行号）
         assertFalse(sarif.contains("startLine"));
+        assertFalse(sarif.contains("artifactLocation\": {\"uri\": \"app/Gadget.class\"},\n          }"),
+                "artifactLocation must not be followed by a trailing comma when region is absent:\n" + sarif);
     }
 
     @Test
@@ -124,5 +130,17 @@ class SarifReporterTest {
                         && !sarif.contains("\"chain_length\":2"),
                 "SARIF must choose the same strongest variant as the shared evidence tuple:\n"
                         + sarif);
+    }
+
+    @Test
+    void exposesCanonicalRunOutcomeOnlyWhenThePipelineSuppliesIt(@TempDir Path tmp) throws Exception {
+        Path out = tmp.resolve("sarif-outcome");
+        new SarifReporter().withRules(rules()).write(
+                ReportLayout.flat(out), new FindingOutputReader().read(
+                        List.of(chain("HIGH")), Map.of(), Map.of(), null),
+                RunOutcome.forScan("PARTIAL", "PARTIAL", List.of("TIMEOUT")));
+        String sarif = Files.readString(out.resolve("findings.sarif"));
+        assertTrue(sarif.contains("\"just/run_outcome\""));
+        assertTrue(sarif.contains("\"status\":\"PARTIAL\""));
     }
 }

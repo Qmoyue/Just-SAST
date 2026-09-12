@@ -54,14 +54,29 @@ class MultiFormatReporterTest {
 
         String metadata = Files.readString(temp.resolve("scan-metadata.json"));
         String dynamic = Files.readString(temp.resolve("dynamic-verification.json"));
+        String run = Files.readString(temp.resolve("run.json"));
         assertTrue(metadata.contains("\"dynamic_verification\""));
+        assertTrue(metadata.contains("\"run_outcome\":{\"schema_version\":1")
+                && metadata.contains("\"status\":\"PARTIAL\""));
         assertTrue(metadata.contains("\"schema_version\":1")
+                && metadata.contains("\"verificationMode\":\"AUTO\"")
+                && metadata.contains("\"targetCodeExecutionPossible\":true")
+                && metadata.contains("\"resourceContainmentOnly\":true")
+                && metadata.contains("\"filesystemIsolation\":false")
                 && metadata.contains("\"isolation_level\":\"UNKNOWN\"")
                 && metadata.contains("\"isolation_capabilities\":[]")
                 && metadata.contains("\"artifact_sha256\":\"UNKNOWN\"")
                 && metadata.contains("\"heap_peak_mb\":12")
                 && metadata.contains("\"chain_proof_completeness\":\"UNKNOWN\"")
-                && metadata.contains("\"metrics\":{\"graph_nodes\":3}"));
+                && metadata.contains("\"metrics\":{\"graph_nodes\":3}")
+                && metadata.contains("\"metric_status\":{}")
+                && metadata.contains("\"metric_namespaces\":{}")
+                && metadata.contains("\"metric_namespace_status\":{}"));
+        assertTrue(run.contains("\"kind\":\"just-run\"")
+                && run.contains("\"run_outcome\":{\"schema_version\":1")
+                && run.contains("\"verificationMode\":\"AUTO\"")
+                && run.contains("\"targetCodeExecutionPossible\":true")
+                && run.contains("\"recommendedForUntrustedArtifacts\":false"));
         assertTrue(dynamic.contains("\"status\":\"CONFIRMED\"")
                 && dynamic.contains("\"schema_version\":1")
                 && dynamic.contains("\"artifact_sha256\":\"UNKNOWN\"")
@@ -88,6 +103,8 @@ class MultiFormatReporterTest {
         assertTrue(json.contains("\"verification_status\":\"SINK_BLOCKED\""));
         assertTrue(json.contains("\"verification_evidence\":\"SINK_CANARY_BOUNDARY\""));
         assertTrue(json.contains("\"verification_group\":\"boundary_only\""));
+        assertTrue(json.contains("\"last_confirmed_stage\":\"SINK_BOUNDARY\""),
+                "findings.json must close the last_confirmed_stage JSON string");
         assertTrue(json.contains("\"precision\":")
                 && json.contains("\"high_confidence\":false"));
         assertTrue(!json.contains("]}\",\"construction\":"),

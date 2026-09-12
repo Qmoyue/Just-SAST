@@ -63,6 +63,11 @@ public final class OriginSupport {
     private final Map<String, Long> missingMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private final ClassHierarchy hierarchy;
     private final RuleEngine ruleEngine;
+    /** Target-application class scope; an unknown scope keeps compatibility root semantics. */
+    private final Set<String> applicationOwners;
+    private final boolean applicationScopeKnown;
+    /** Typed application execution roots supplied by the entry index. */
+    private final Set<String> applicationEntryMethods;
     /** 入口下游闭包（惰性一次构建）：反向剪枝与链剪枝共用。 */
     private Set<String> entryDownstream;
     /** 入口 BFS 距离（与下游闭包同一次遍历产出）：反向探索按离入口近者优先。 */
@@ -234,15 +239,40 @@ public final class OriginSupport {
             new ConcurrentHashMap<>();
 
     public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine, boolean fast) {
-        this(graph, hierarchy, ruleEngine, fast, CpgIndex.empty());
+        this(graph, hierarchy, ruleEngine, fast, CpgIndex.empty(), Set.of(), false);
     }
 
     public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine,
                          boolean fast, CpgIndex cpgIndex) {
+        this(graph, hierarchy, ruleEngine, fast, cpgIndex, Set.of(), false);
+    }
+
+    /** Build shared support with an explicit target-application ownership scope. */
+    public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine,
+                         boolean fast, CpgIndex cpgIndex, Set<String> applicationOwners,
+                         boolean applicationScopeKnown) {
+        this(graph, hierarchy, ruleEngine, fast, cpgIndex, applicationOwners,
+                applicationScopeKnown, Set.of());
+    }
+
+    /**
+     * Build shared support with the typed application-entry roots.  The set is a semantic
+     * input to the reachability closure, not a second rule source; callers should obtain it
+     * from {@code ApplicationEntryIndex.applicationEntryMethods()} so framework/lifecycle
+     * boundaries and configured entries share one owner.
+     */
+    public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine,
+                         boolean fast, CpgIndex cpgIndex, Set<String> applicationOwners,
+                         boolean applicationScopeKnown, Set<String> applicationEntryMethods) {
         this.graph = graph;
         this.cpgIndex = cpgIndex == null ? CpgIndex.empty() : cpgIndex;
         this.hierarchy = hierarchy;
         this.ruleEngine = ruleEngine;
+        this.applicationOwners = applicationOwners == null ? Set.of()
+                : java.util.Collections.unmodifiableSet(new java.util.TreeSet<>(applicationOwners));
+        this.applicationScopeKnown = applicationScopeKnown;
+        this.applicationEntryMethods = applicationEntryMethods == null ? Set.of()
+                : java.util.Collections.unmodifiableSet(new java.util.TreeSet<>(applicationEntryMethods));
         this.frameworkPackages = deriveFrameworkPackages();
         // CALL ids are already grouped by host method in the frozen CPG. Forward transfer
         // can therefore resolve an invoke by (method key, offset) without allocating the
@@ -274,6 +304,11 @@ public final class OriginSupport {
     /** Forward summaries are a per-scan memo only; release them before the scan is returned. */
     public int forwardOriginCacheSize() {
         return origins.cacheSize();
+    }
+
+    /** Structural estimate of retained forward summaries; never substitutes for process RSS. */
+    public long forwardOriginCacheBytesEstimate() {
+        return origins.cacheBytesEstimate();
     }
 
     public long forwardOriginComputeCalls() {
@@ -324,10 +359,7 @@ public final class OriginSupport {
     }
 
     private static Set<ValueOrigin> orderedOrigins(Collection<ValueOrigin> values) {
-        if (values == null || values.isEmpty()) {
-            return Set.of();
-        }
-        return Collections.unmodifiableSet(new LinkedHashSet<>(ValueOriginOrder.sorted(values)));
+        return OriginLattice.snapshot(values).values();
     }
 
     /**
@@ -340,7 +372,11 @@ public final class OriginSupport {
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             var source = ruleEngine.matchingSource(call.strProp("owner"), call.strProp("name"),
                     call.strProp("desc"));
-            if (source.isPresent() && isUnconditionalDeserializeSource(source.get())) {
+            if (source.flatMap(rule -> SerializationModel.source(rule, call.strProp("owner"),
+                    call.strProp("name"), call.strProp("desc")))
+                    .filter(SerializationModel.Boundary::externalInput)
+                    .filter(boundary -> boundary.direction() == SerializationModel.Direction.DESERIALIZE)
+                    .isPresent()) {
                 return true;
             }
         }
@@ -348,25 +384,23 @@ public final class OriginSupport {
     }
 
     private static boolean isDeserializeSource(io.just.sast.config.Rule.SourceRule source) {
-        return source != null && !"serialize".equalsIgnoreCase(source.bridge());
+        return SerializationModel.source(source, "", "", "")
+                .map(boundary -> boundary.direction() == SerializationModel.Direction.DESERIALIZE)
+                .orElse(false);
     }
 
     private static boolean isUnconditionalDeserializeSource(io.just.sast.config.Rule.SourceRule source) {
-        return isDeserializeSource(source) && (source.tainted() == null || source.tainted().isEmpty());
+        return SerializationModel.source(source, "", "", "")
+                .map(boundary -> boundary.externalInput()
+                        && boundary.direction() == SerializationModel.Direction.DESERIALIZE)
+                .orElse(false);
     }
 
     private boolean isDeserializeEntry(io.just.sast.config.Rule.MagicEntryRule entry,
                                        String owner) {
-        if (entry == null || !"deserialize".equalsIgnoreCase(entry.direction())) {
-            return false;
-        }
-        // InvocationHandler.invoke is a callback contract, not a deserialization
-        // source by itself.  A serializable handler becomes attacker-controlled only
-        // after an actual proxy callback edge (for example a Method collection invoke)
-        // has been justified.  Treating every serializable implementation as a root
-        // creates a short synthetic path to its sinks and hides the real trigger.
-        return !"proxyInvoke".equals(entry.entryKind())
-                && !SERIALIZED_TRIGGER_ENTRY_KINDS.contains(entry.entryKind());
+        return SerializationModel.magicEntry(entry, owner,
+                entry == null ? "" : entry.entryKind(),
+                "").isPresent();
     }
 
     /**
@@ -1666,6 +1700,15 @@ public final class OriginSupport {
         return reflectiveClassesBySite;
     }
 
+    /**
+     * Build the immutable method-level origin product used by new consumers.  The legacy
+     * {@link #origins()} accessor remains a compatibility projection until all callers have
+     * migrated, but no caller needs to know the cache/engine owner when using this API.
+     */
+    public OriginSummary summary(MethodInfo method) {
+        return OriginSummaryBuilder.build(method, method == null ? null : origins.compute(method));
+    }
+
     public ForwardOrigins origins() {
         return origins;
     }
@@ -1693,8 +1736,21 @@ public final class OriginSupport {
         // still cross an already-admitted framework method.
         Set<String> scheduled = new HashSet<>();
         Set<String> expanded = new HashSet<>();
+        // A known application scope is a hard admission boundary.  Dependency/JDK callbacks,
+        // wildcard reflection and proxy families may only enter the semantic closure when a
+        // target-owned execution root or source host exists.  Compatibility callers without a
+        // scope retain their historical closure for now, but the typed ApplicationEntryIndex
+        // will still reject those results from the default product report.
+        boolean applicationRootAvailable = !applicationScopeKnown || hasKnownApplicationRoot(graph);
+        // The entry index is built before this support object and carries framework/lifecycle
+        // roots that cannot be recovered from the legacy magic/source rules.  Admit only the
+        // immutable, application-owned method keys supplied by that index; dependency/JDK
+        // classes are still blocked by applicationOwnerAllowed below.
+        if (applicationScopeKnown && !applicationEntryMethods.isEmpty()) {
+            applicationRootAvailable = true;
+        }
         List<Node> proxyTargets = new ArrayList<>();
-        if (!proxyMethodInvokeSites.isEmpty()) {
+        if (applicationRootAvailable && !proxyMethodInvokeSites.isEmpty()) {
             for (Node candidate : graph.nodesOfType(NodeType.METHOD)) {
                 String owner = candidate.strProp("owner");
                 if (isJdk(owner)) {
@@ -1708,8 +1764,28 @@ public final class OriginSupport {
         }
         Map<String, Integer> sinkDistances = sinkDistances(graph);
         sinkDistanceIndex = Map.copyOf(sinkDistances);
+        // The ordinary reverse sink slice is the cheap demand oracle for entry expansion.
+        // Keep explicit semantic callback families as additional roots because those edges are
+        // intentionally absent from the CPG (serialized proxy, JDK deserialization callback,
+        // Method-collection and JNI bridges).  Methods which are reachable from an application
+        // root but cannot reach a terminal through either oracle are retained as roots only; we
+        // do not expand their callees.  This is the P3.1 performance seam: it removes the old
+        // whole-entry closure without turning a missing direct edge into a negative proof.
+        Set<String> terminalDemand = new HashSet<>(sinkDistances.keySet());
+        terminalDemand.addAll(applicationEntryMethods);
+        // Proxy callbacks are semantic edges.  Keep only callback methods already proven to
+        // participate in a bounded terminal reverse slice; application roots remain admitted
+        // independently so a later bridge can still explain an unresolved suffix.
+        for (Node target : proxyTargets) {
+            String key = methodKeyOf(target.strProp("owner"), target.strProp("name"),
+                    target.strProp("desc"));
+            if (sinkDistances.containsKey(key) || applicationEntryMethods.contains(key)) {
+                terminalDemand.add(key);
+            }
+        }
         List<Node> jdkCallbacks = new ArrayList<>();
-        for (Node candidate : graph.nodesOfType(NodeType.METHOD)) {
+        for (Node candidate : applicationRootAvailable
+                ? graph.nodesOfType(NodeType.METHOD) : List.<Node>of()) {
             String owner = candidate.strProp("owner");
             if (!isJdk(owner)) {
                 continue;
@@ -1751,6 +1827,7 @@ public final class OriginSupport {
             String key = methodKeyOf(callback.strProp("owner"), callback.strProp("name"),
                     callback.strProp("desc"));
             callbackKeys.add(key);
+            terminalDemand.add(key);
             if (downstream.add(key)) {
                 depths.put(key, 1);
             }
@@ -1760,15 +1837,54 @@ public final class OriginSupport {
             }
         }
         deserializationCallbackEntries = orderedStrings(callbackKeys);
+
+        // Framework and lifecycle roots are ordinary execution roots for the reachability
+        // closure, but they do not by themselves assert attacker control.  ForwardEngine
+        // decides which of these roots receive an external taint seed from the typed entry
+        // status.  Keeping them in this closure is necessary for a later entry → binding /
+        // lookup → dependency join and does not manufacture a source fact here.
+        if (applicationRootAvailable && applicationScopeKnown) {
+            List<String> applicationRoots = new ArrayList<>(applicationEntryMethods);
+            applicationRoots.sort(String::compareTo);
+            for (String key : applicationRoots) {
+                Node root = methodNodeOf(graph, key);
+                if (root == null || !applicationOwnerAllowed(root.strProp("owner"))) {
+                    continue;
+                }
+                if (downstream.add(key)) {
+                    depths.put(key, 0);
+                }
+                if (scheduled.add(key)) {
+                    work.add(root);
+                    workDepth.add(0);
+                }
+            }
+        }
         buildMethodCollectionTargets(graph, sinkDistances);
+        for (Node target : methodCollectionTargetMethods) {
+            terminalDemand.add(methodKeyOf(target.strProp("owner"), target.strProp("name"),
+                    target.strProp("desc")));
+        }
+        for (Node handler : serializedProxyHandlerMethods) {
+            terminalDemand.add(methodKeyOf(handler.strProp("owner"), handler.strProp("name"),
+                    handler.strProp("desc")));
+        }
+        for (List<Node> targets : nativeCallbackTargetsBySite.values()) {
+            for (Node target : targets) {
+                terminalDemand.add(methodKeyOf(target.strProp("owner"), target.strProp("name"),
+                        target.strProp("desc")));
+            }
+        }
         // A handler can be supplied by serialized state while the JDK proxy is
         // assembled outside the artifact.  Admit that bounded callback family
         // only when a compatible Method-collection invoke site exists; the
         // handler list alone is not a global source.
-        if (!serializedProxyHandlerMethods.isEmpty() && !methodCollectionInvokeSites.isEmpty()) {
+        if (applicationRootAvailable && !serializedProxyHandlerMethods.isEmpty()
+                && !methodCollectionInvokeSites.isEmpty()) {
             for (Node handler : serializedProxyHandlerMethods) {
                 String handlerKey = methodKeyOf(handler.strProp("owner"),
                         handler.strProp("name"), handler.strProp("desc"));
+                terminalDemand.add(handlerKey);
                 if (downstream.add(handlerKey)) {
                     depths.put(handlerKey, 1);
                 }
@@ -1783,11 +1899,12 @@ public final class OriginSupport {
         // application-side interface call is still a finite callback boundary; admit the
         // serializable handler family so sink analysis can apply the method-name/argument
         // constraints instead of dropping handler-hosted sinks at the reachability gate.
-        if (!serializedProxyHandlerMethods.isEmpty()
+        if (applicationRootAvailable && !serializedProxyHandlerMethods.isEmpty()
                 && !serializedProxyInterfaceCallSites.isEmpty()) {
             for (Node handler : serializedProxyHandlerMethods) {
                 String handlerKey = methodKeyOf(handler.strProp("owner"),
                         handler.strProp("name"), handler.strProp("desc"));
+                terminalDemand.add(handlerKey);
                 if (downstream.add(handlerKey)) {
                     depths.put(handlerKey, 1);
                 }
@@ -1807,16 +1924,19 @@ public final class OriginSupport {
             // 是根语义收敛，不是按样本删除某个 gadget。
             var entry = ruleEngine.matchingEntry(m.strProp("owner"), m.strProp("name"),
                     m.strProp("desc"));
-            if (!isJdk(m.strProp("owner")) && entry.isPresent()
-                    && isDeserializeEntry(entry.get(), m.strProp("owner"))
-                    && downstream.add(key)) {
-                depths.put(key, 0);
-            }
-            if (!isJdk(m.strProp("owner")) && entry.isPresent()
-                    && isDeserializeEntry(entry.get(), m.strProp("owner"))
-                    && scheduled.add(key)) {
-                work.add(m);
-                workDepth.add(0);
+            if (!isJdk(m.strProp("owner")) && applicationOwnerAllowed(m.strProp("owner"))
+                    && entry.isPresent()
+                    && isDeserializeEntry(entry.get(), m.strProp("owner"))) {
+                // A configured application deserialize callback is a semantic root even when
+                // the body has no direct terminal path yet; keep it available for bridge proof.
+                terminalDemand.add(key);
+                if (downstream.add(key)) {
+                    depths.put(key, 0);
+                }
+                if (scheduled.add(key)) {
+                    work.add(m);
+                    workDepth.add(0);
+                }
             }
         }
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
@@ -1835,12 +1955,19 @@ public final class OriginSupport {
                         call.strProp("methodName"), call.strProp("methodDesc"));
                 String key = host != null ? methodKeyOf(
                         host.strProp("owner"), host.strProp("name"), host.strProp("desc")) : null;
-                if (host != null && key != null && downstream.add(key)) {
-                    depths.put(key, 0);
-                }
-                if (host != null && key != null && scheduled.add(key)) {
-                    work.add(host);
-                    workDepth.add(0);
+                if (host != null && applicationOwnerAllowed(host.strProp("owner"))
+                        && key != null) {
+                    // A source host is an explicit deserialize boundary.  It is retained even
+                    // if reverse terminal demand is currently unknown; its callees remain
+                    // demand-filtered until a typed bridge proves the continuation.
+                    terminalDemand.add(key);
+                    if (downstream.add(key)) {
+                        depths.put(key, 0);
+                    }
+                    if (scheduled.add(key)) {
+                        work.add(host);
+                        workDepth.add(0);
+                    }
                 }
             }
         }
@@ -1849,7 +1976,7 @@ public final class OriginSupport {
         // Serializable getter 都作为根；在 fat jar 中这会把大量无关 DTO 的方法
         // 推进 forward fixed-point，既不增加可证明召回，又会把复杂度推向 O(all public
         // bean methods)。sinkDistances 已在本次闭包构建前建立，并包含有限字段反向流。
-        if (!javabeanWildcardSites.isEmpty()) {
+        if (applicationRootAvailable && !javabeanWildcardSites.isEmpty()) {
             Set<String> getterClasses = computeSerializableWithGetters(graph);
             for (String cls : orderedStrings(getterClasses)) {
                 var ci = hierarchy.classInfo(cls);
@@ -1883,7 +2010,7 @@ public final class OriginSupport {
         // 框架供给只枚举已加载目标/依赖中的 public bean 方法，不依赖 JDK 全量加载；
         // 因此 --fast 也必须保留这条低成本的入口语义，否则 Fastjson/XStream 等
         // 通过 JavaBean setter 触发的应用类 sink 会在快速扫描中整体消失。
-        if (hasFrameworkBoundary) {
+        if (applicationRootAvailable && hasFrameworkBoundary) {
             int added = 0;
             for (Node m : graph.nodesOfType(NodeType.METHOD)) {
                 String owner = m.strProp("owner");
@@ -1920,6 +2047,74 @@ public final class OriginSupport {
                 io.just.sast.util.JustLogger.info("框架反射供给：{} 个 sink-relevant 方法入闭包", added);
             }
         }
+        // Preserve only the first application/de-serialization prefix hop when the cheap
+        // reverse sink oracle cannot see a semantic edge yet.  The two supported shapes are
+        // (a) an array/container helper that reads the same field as the entry and performs an
+        // array-element store, and (b) a bridge call that consumes a lambda produced by the
+        // entry.  Both are typed entry-to-chain joins; an arbitrary helper is deliberately not
+        // admitted.  JDK internals remain governed by the bounded callback/bridge indexes
+        // above, and deeper ordinary calls still require terminalDemand.
+        List<String> rootKeys = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : depths.entrySet()) {
+            if (entry.getValue() != null && entry.getValue() == 0) {
+                rootKeys.add(entry.getKey());
+            }
+        }
+        rootKeys.sort(String::compareTo);
+        for (String rootKey : rootKeys) {
+            MethodInfo rootMethod = methodInfoOfKey(graph, rootKey);
+            if (rootMethod == null) {
+                continue;
+            }
+            Set<String> rootReadFields = new HashSet<>();
+            for (InsnFact instruction : rootMethod.instructions()) {
+                if (instruction.op().isFieldRead()) {
+                    String field = fieldKey(instruction);
+                    if (!field.isBlank()) {
+                        rootReadFields.add(field);
+                    }
+                }
+            }
+            Set<Long> terminalLambdaFactories = new HashSet<>();
+            ForwardOrigins.Result rootOrigins = null;
+            for (Node call : graph.callsOfMethod(rootKey)) {
+                if (!"DYNAMIC".equals(call.strProp("invokeKind"))) {
+                    continue;
+                }
+                for (Edge edge : call.out()) {
+                    if (edge.type() != EdgeType.LAMBDA) {
+                        continue;
+                    }
+                    String targetKey = methodKeyOf(edge.to().strProp("owner"),
+                            edge.to().strProp("name"), edge.to().strProp("desc"));
+                    if (terminalDemand.contains(targetKey)) {
+                        terminalLambdaFactories.add(call.id());
+                        break;
+                    }
+                }
+            }
+            if (!terminalLambdaFactories.isEmpty()) {
+                rootOrigins = origins.compute(rootMethod);
+            }
+            for (Node call : graph.callsOfMethod(rootKey)) {
+                boolean arrayBridge = directArrayContainerBridge(call, rootReadFields, graph);
+                boolean lambdaBridge = !terminalLambdaFactories.isEmpty()
+                        && consumesLambdaFactory(call, rootMethod, rootOrigins,
+                        terminalLambdaFactories);
+                if (!arrayBridge && !lambdaBridge) {
+                    continue;
+                }
+                for (Edge edge : call.out()) {
+                    Node callee = edge.to();
+                    String owner = callee.strProp("owner");
+                    if (isJdk(owner) && edge.type() != EdgeType.LAMBDA) {
+                        continue;
+                    }
+                    terminalDemand.add(methodKeyOf(owner, callee.strProp("name"),
+                            callee.strProp("desc")));
+                }
+            }
+        }
         while (!work.isEmpty()) {
             Node m = work.poll();
             int depth = workDepth.poll();
@@ -1946,6 +2141,9 @@ public final class OriginSupport {
                                 continue;
                             }
                             String mk = methodKeyOf(cls, mi.name(), mi.descriptor());
+                            if (!terminalDemand.contains(mk)) {
+                                continue;
+                            }
                             if (downstream.add(mk)) {
                                 depths.put(mk, depth + 1);
                             }
@@ -1983,6 +2181,9 @@ public final class OriginSupport {
                             for (var mi2 : ci2.methods()) {
                                 if (javaBeanMatches(mi2, kind)) {
                                     String mk2 = methodKeyOf(cls2, mi2.name(), mi2.descriptor());
+                                    if (!terminalDemand.contains(mk2)) {
+                                        continue;
+                                    }
                                     if (downstream.add(mk2)) {
                                         depths.put(mk2, depth + 1);
                                     }
@@ -2001,6 +2202,9 @@ public final class OriginSupport {
                         Node callee = edge.to();
                         String calleeKey = methodKeyOf(callee.strProp("owner"),
                                 callee.strProp("name"), callee.strProp("desc"));
+                        if (!terminalDemand.contains(calleeKey)) {
+                            continue;
+                        }
                         if (downstream.add(calleeKey)) {
                             depths.put(calleeKey, depth + 1);
                         }
@@ -2022,6 +2226,9 @@ public final class OriginSupport {
                                     continue;
                                 }
                                 String mk2 = methodKeyOf(cls, mi2.name(), mi2.descriptor());
+                                if (!terminalDemand.contains(mk2)) {
+                                    continue;
+                                }
                                 if (downstream.add(mk2)) {
                                     depths.put(mk2, depth + 1);
                                 }
@@ -2042,6 +2249,9 @@ public final class OriginSupport {
                         for (Node target : proxyTargets) {
                             String targetKey = methodKeyOf(target.strProp("owner"),
                                     target.strProp("name"), target.strProp("desc"));
+                            if (!terminalDemand.contains(targetKey)) {
+                                continue;
+                            }
                             if (downstream.add(targetKey)) {
                                 depths.put(targetKey, depth + 1);
                             }
@@ -2062,6 +2272,9 @@ public final class OriginSupport {
                     for (Node target : nativeCallbackTargets(call)) {
                         String targetKey = methodKeyOf(target.strProp("owner"),
                                 target.strProp("name"), target.strProp("desc"));
+                        if (!terminalDemand.contains(targetKey)) {
+                            continue;
+                        }
                         if (downstream.add(targetKey)) {
                             depths.put(targetKey, depth + 1);
                         }
@@ -2108,6 +2321,9 @@ public final class OriginSupport {
                                 String resolved = (String) t[0];
                                 Node mn = (Node) t[1];
                                 String mk = methodKeyOf(resolved, callName, callDesc);
+                                if (!terminalDemand.contains(mk)) {
+                                    continue;
+                                }
                                 if (downstream.add(mk)) {
                                     depths.put(mk, depth + 1);
                                 }
@@ -2141,6 +2357,9 @@ public final class OriginSupport {
             if (written != null) {
                 for (String fieldKey : written) {
                     for (String reader : fieldReaders.getOrDefault(fieldKey, List.of())) {
+                        if (!terminalDemand.contains(reader)) {
+                            continue;
+                        }
                         if (downstream.add(reader)) {
                             depths.put(reader, depth + 1);
                         }
@@ -2160,6 +2379,83 @@ public final class OriginSupport {
                 downstream.size(), sinkDistances.size(), deserializationCallbackEntries.size(),
                 methodCollectionTargetMethods.size(), serializedProxyInterfaceCallSites.size());
         return downstream;
+    }
+
+    /**
+     * Whether a direct entry call is the bounded array/container bridge used by the
+     * demand closure.  Reading a field and then storing an element of that array is the
+     * bytecode shape that cannot be represented by the ordinary field-writer reverse index.
+     */
+    private boolean directArrayContainerBridge(Node call, Set<String> rootReadFields,
+                                               Graph graph) {
+        if (call == null || rootReadFields == null || rootReadFields.isEmpty()) {
+            return false;
+        }
+        String calleeKey = methodKeyOf(call.strProp("owner"), call.strProp("name"),
+                call.strProp("desc"));
+        MethodInfo callee = methodInfoOfKey(graph, calleeKey);
+        if (callee == null) {
+            return false;
+        }
+        boolean readsSharedField = false;
+        boolean storesArrayElement = false;
+        for (InsnFact instruction : callee.instructions()) {
+            if (instruction.op().isFieldRead()
+                    && rootReadFields.contains(fieldKey(instruction))) {
+                readsSharedField = true;
+            }
+            Op op = instruction.op();
+            if (op == Op.IASTORE || op == Op.LASTORE || op == Op.FASTORE
+                    || op == Op.DASTORE || op == Op.AASTORE || op == Op.BASTORE
+                    || op == Op.CASTORE || op == Op.SASTORE) {
+                storesArrayElement = true;
+            }
+        }
+        return readsSharedField && storesArrayElement;
+    }
+
+    /**
+     * Match a call whose argument/receiver carries the result of a sink-relevant lambda
+     * factory in the same entry method.  ForwardOrigins already computes the immutable value
+     * origin; this small recursive matcher only follows the wrappers that can preserve a
+     * lambda object (field receiver and call result), so it cannot turn arbitrary values into
+     * bridge evidence.
+     */
+    private boolean consumesLambdaFactory(Node call, MethodInfo host,
+                                          ForwardOrigins.Result result,
+                                          Set<Long> factories) {
+        if (call == null || host == null || result == null || factories == null
+                || factories.isEmpty()) {
+            return false;
+        }
+        int parameterCount = Descriptor.paramCount(call.descriptor());
+        for (int ordinal = -1; ordinal < parameterCount; ordinal++) {
+            for (ValueOrigin value : argOriginAtOrdinal(call, ordinal, result)) {
+                if (containsLambdaFactory(value, factories, new HashSet<>())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean containsLambdaFactory(ValueOrigin value, Set<Long> factories,
+                                          Set<ValueOrigin> visiting) {
+        if (value == null || !visiting.add(value)) {
+            return false;
+        }
+        try {
+            if (value instanceof ValueOrigin.CallResult callResult
+                    && factories.contains(callResult.callNodeId())) {
+                return true;
+            }
+            if (value instanceof ValueOrigin.FieldRead fieldRead) {
+                return containsLambdaFactory(fieldRead.receiver(), factories, visiting);
+            }
+            return false;
+        } finally {
+            visiting.remove(value);
+        }
     }
 
     /** Activate the global field-reader index only when an entry-relevant method writes a field. */
@@ -2306,6 +2602,54 @@ public final class OriginSupport {
         return internalName.startsWith("java/") || internalName.startsWith("javax/")
                 || internalName.startsWith("jdk/") || internalName.startsWith("sun/")
                 || internalName.startsWith("com/sun/");
+    }
+
+    /**
+     * Check for one target-owned execution/source root before admitting dependency callback
+     * families.  This is deliberately a cheap graph/rule scan and does not infer reachability
+     * from a public method, classpath presence or a dependency class name.
+     */
+    private boolean hasKnownApplicationRoot(Graph graph) {
+        if (!applicationScopeKnown || graph == null) {
+            return false;
+        }
+        if (!applicationEntryMethods.isEmpty()) {
+            return true;
+        }
+        for (Node method : graph.nodesOfType(NodeType.METHOD)) {
+            String owner = method.strProp("owner");
+            if (!applicationOwnerAllowed(owner) || isJdk(owner)) {
+                continue;
+            }
+            var entry = ruleEngine.matchingEntry(owner, method.strProp("name"),
+                    method.strProp("desc"));
+            if (entry.isPresent() && isDeserializeEntry(entry.get(), owner)) {
+                return true;
+            }
+        }
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            if (!isOisRead(call)
+                    && ruleEngine.matchingSource(call.strProp("owner"), call.strProp("name"),
+                    call.strProp("desc")).filter(OriginSupport::isUnconditionalDeserializeSource)
+                    .isEmpty()) {
+                continue;
+            }
+            Node host = graph.findMethodNode(call.strProp("methodOwner"),
+                    call.strProp("methodName"), call.strProp("methodDesc"));
+            if (host != null && applicationOwnerAllowed(host.strProp("owner"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * In production the frontend supplies the first artifact's class scope.  Compatibility
+     * callers that do not know that scope retain the historical behavior until they migrate;
+     * a known scope fails closed for dependency-only deserialize roots.
+     */
+    private boolean applicationOwnerAllowed(String owner) {
+        return !applicationScopeKnown || (owner != null && applicationOwners.contains(owner));
     }
 
     /** JVM 调用指令中只有 static 与 invokedynamic 没有隐含 receiver。 */
@@ -2471,8 +2815,9 @@ public final class OriginSupport {
         if (values == null || values.isEmpty() || method == null) {
             return Set.of();
         }
+        OriginSummary summary = summary(method);
         return exactConcreteTypes(values, method, beforeOffset,
-                origins.compute(method));
+                summary.result());
     }
 
     /** Same local proof when the caller already owns the method's immutable summary. */
@@ -2616,7 +2961,7 @@ public final class OriginSupport {
     }
 
     private ReceiverDispatchSummary receiverDispatchSummary(Node call, MethodInfo caller) {
-        return receiverDispatchSummary(call, caller, origins.compute(caller));
+        return receiverDispatchSummary(call, caller, summary(caller).result());
     }
 
     private ReceiverDispatchSummary receiverDispatchSummary(Node call, MethodInfo caller,
@@ -3282,6 +3627,11 @@ public final class OriginSupport {
         return false;
     }
 
+    /** Typed projection of the exception-handler filter; the boolean API remains compatibility-only. */
+    public FilterAnalysis.Decision catchFilterDecision(MethodInfo method, int sinkOffset) {
+        return FilterAnalysis.exceptionHandler(catchProvablyUnreachable(method, sinkOffset));
+    }
+
     /**
      * Prove that a sink has no normal CFG path from the method entry using only exact local
      * facts.  The ordinary taint engines intentionally merge both sides of branches; that is
@@ -3358,6 +3708,13 @@ public final class OriginSupport {
                 constantProof.set(previous);
             }
         }
+    }
+
+    /** Typed path-filter result used by new solver/report consumers. */
+    public FilterAnalysis.Decision sinkPathDecision(MethodInfo method, int sinkOffset,
+                                                    ForwardOrigins.Result result) {
+        boolean unreachable = sinkPathProvablyUnreachable(method, sinkOffset, result);
+        return FilterAnalysis.cfgPath(unreachable, constantProofBudgetExceeded());
     }
 
     private boolean hasPathProofFeature(MethodInfo method) {
@@ -3816,6 +4173,19 @@ public final class OriginSupport {
             }
         }
         return true;
+    }
+
+    /** Typed reflective precondition result; unknown facts preserve the path. */
+    public FilterAnalysis.Decision reflectiveInvocationDecision(MethodInfo target, Node invoke,
+                                                                ForwardOrigins.Result result) {
+        return FilterAnalysis.reflectiveInvocation(reflectiveInvokeMayReach(target, invoke, result));
+    }
+
+    /** Compatibility overload that obtains the host summary through the summary owner. */
+    public FilterAnalysis.Decision reflectiveInvocationDecision(MethodInfo target, Node invoke) {
+        MethodInfo host = enclosingMethod(invoke);
+        return reflectiveInvocationDecision(target, invoke,
+                host == null ? null : summary(host).result());
     }
 
     private Boolean knownBranchResult(MethodInfo method, ForwardOrigins.Result result,
@@ -5073,26 +5443,17 @@ public final class OriginSupport {
     }
 
     private static boolean sameField(InsnFact insn, ValueOrigin.FieldRead field) {
-        if (insn == null || insn.fieldRef() == null || field == null
-                || !insn.fieldRef().owner().equals(field.owner())
-                || !insn.fieldRef().name().equals(field.field())) {
-            return false;
-        }
-        boolean staticField = insn.op() == Op.GETSTATIC || insn.op() == Op.PUTSTATIC;
-        if (staticField != field.isStatic()) {
-            return false;
-        }
-        return field.descriptor() == null || field.descriptor().isBlank()
-                || insn.fieldRef().descriptor() == null
-                || field.descriptor().equals(insn.fieldRef().descriptor());
+        return FieldAliasTransfer.declaration(insn)
+                .flatMap(left -> FieldAliasTransfer.declaration(field)
+                        .filter(right -> FieldAliasTransfer.same(left, right)))
+                .isPresent();
     }
 
     private static boolean sameField(ValueOrigin.FieldRead left, ValueOrigin.FieldRead right) {
-        return left.owner().equals(right.owner()) && left.field().equals(right.field())
-                && left.isStatic() == right.isStatic()
-                && (left.descriptor() == null || left.descriptor().isBlank()
-                || right.descriptor() == null || right.descriptor().isBlank()
-                || left.descriptor().equals(right.descriptor()));
+        return FieldAliasTransfer.declaration(left)
+                .flatMap(leftAlias -> FieldAliasTransfer.declaration(right)
+                        .filter(rightAlias -> FieldAliasTransfer.same(leftAlias, rightAlias)))
+                .isPresent();
     }
 
     private boolean nullReceiverMayThrow(MethodInfo method, ForwardOrigins.Result result,
@@ -5817,10 +6178,7 @@ public final class OriginSupport {
 
     /** ObjectInputStream 读调用（反序列化数据源，无条件可控）。 */
     public static boolean isOisRead(Node call) {
-        String owner = call.owner();
-        String name = call.name();
-        return "java/io/ObjectInputStream".equals(owner)
-                && (name.equals("readObject") || name.equals("readUnshared") || name.equals("readFields"));
+        return call != null && SerializationModel.isOisRead(call.owner(), call.name(), call.descriptor());
     }
 
     /** 指令按值消耗的栈条目数（cat-2 值亦为单条目，条目数 = 值数）。 */
@@ -5853,8 +6211,8 @@ public final class OriginSupport {
     }
 
     private static String fieldKey(InsnFact insn) {
-        FieldRef ref = insn.fieldRef();
-        boolean isStatic = insn.op() == Op.GETSTATIC || insn.op() == Op.PUTSTATIC;
-        return ref.owner() + "#" + ref.name() + "#" + ref.descriptor() + "#" + isStatic;
+        return FieldAliasTransfer.declaration(insn)
+                .map(FieldAliasTransfer::legacyKey)
+                .orElse("");
     }
 }

@@ -4,7 +4,12 @@ import io.just.sast.perf.PerformanceHarness;
 import io.just.sast.perf.PerformanceProfile;
 import io.just.sast.report.PerformanceReportWriter;
 import io.just.sast.report.ScanStatistics;
+import io.just.sast.run.ExitReason;
+import io.just.sast.run.InputBudget;
+import io.just.sast.run.RunOutcome;
 import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.IoUtil;
+import io.just.sast.verify.VerificationDefaults;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
@@ -14,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -35,6 +41,8 @@ import java.security.NoSuchAlgorithmException;
  */
 @Command(name = "perf", description = "在固定 runner 上测量扫描 p50/p95 与结果稳定性")
 public final class PerformanceCommand implements Callable<Integer> {
+
+    private static final InputBudget OUTPUT_INPUT_POLICY = InputBudget.defaults();
 
     private static final long DISABLED_LIMIT = Long.MAX_VALUE;
     private static final Pattern NUMBER = Pattern.compile(
@@ -61,20 +69,23 @@ public final class PerformanceCommand implements Callable<Integer> {
     @Option(names = "--fast", description = "快速模式；结果完整性仍会如实记录")
     boolean fast;
 
-    @Option(names = "--no-verify", description = "关闭动态验证，仅测静态扫描")
+    @Option(names = "--no-verify", description = "关闭动态验证，仅测静态扫描；适用于来源不明或不可信制品")
     boolean noVerify;
 
-    @Option(names = "--safe-exec", description = "显式使用仅 canary 的兼容 adapter；默认动态验证走 LIGHT_SAFE_CALL")
+    @Option(names = "--safe-exec", hidden = true,
+            description = "已弃用的兼容调试选项；不改变目标信任模型")
     boolean safeExec;
 
-    @Option(names = "--safe-real-sink", description = "显式声明 SAFE_REAL；默认动态验证已启用")
+    @Option(names = "--safe-real-sink", hidden = true,
+            description = "已弃用的兼容调试选项；固定参数调用不等于隔离或真实利用")
     boolean safeRealSink;
 
-    @Option(names = "--require-os-isolation", description = "动态验证要求 Job Object；不可用时返回 UNTESTABLE")
+    @Option(names = "--require-os-isolation", hidden = true,
+            description = "已弃用的兼容选项；动态验证始终 fail-closed")
     boolean requireOsIsolation;
 
-    @Option(names = "--verify-budget", defaultValue = "20", paramLabel = "<N>",
-            description = "每次扫描的动态验证预算")
+    @Option(names = "--verify-budget", defaultValue = VerificationDefaults.VERIFY_BUDGET_TEXT,
+            paramLabel = "<N>", description = "每次扫描的规范化 finding 组动态验证预算")
     int verifyBudget;
 
     @Option(names = "--mode", defaultValue = "hot", paramLabel = "<hot|cold>",
@@ -139,6 +150,7 @@ public final class PerformanceCommand implements Callable<Integer> {
     public Integer call() {
         Path createdRoot = null;
         try {
+            printVerificationDisclosure(noVerify);
             profileLimits = limitsFile == null ? null : readProfile(limitsFile);
             validateOptions();
             boolean cold = "cold".equalsIgnoreCase(mode);
@@ -156,13 +168,13 @@ public final class PerformanceCommand implements Callable<Integer> {
                 PerformanceReportWriter.write(report, result, cold ? "cold" : "hot");
             }
             System.out.print(json);
-            return result.passed() ? ExitCode.OK.code() : ExitCode.INTERNAL.code();
+            return RunOutcome.forPerformance(result.passed(), !result.samples().isEmpty()).exitCode();
         } catch (ScanPipeline.UsageException e) {
             System.err.println("[just:error] " + e.getMessage());
-            return ExitCode.USAGE.code();
+            return RunOutcome.usage("PERFORMANCE_USAGE", e.getMessage()).exitCode();
         } catch (Exception e) {
             System.err.println("[just:error] 性能测量失败: " + e);
-            return ExitCode.INTERNAL.code();
+            return RunOutcome.failed("PERFORMANCE_FAILURE", e.getClass().getSimpleName()).exitCode();
         } finally {
             if (createdRoot != null) {
                 deleteTree(createdRoot);
@@ -252,7 +264,7 @@ public final class PerformanceCommand implements Callable<Integer> {
             long started = System.nanoTime();
             ScanStatistics statistics = scanOnce(output);
             samples.add(PerformanceHarness.sample(i + 1, elapsedMs(started), statistics,
-                    resultDigest(output)));
+                    resultDigest(output, OUTPUT_INPUT_POLICY, OUTPUT_INPUT_POLICY.tracker())));
         }
         return PerformanceHarness.report(warmups, samples, limits());
     }
@@ -262,7 +274,7 @@ public final class PerformanceCommand implements Callable<Integer> {
         boolean useOsIsolation = requireOsIsolation;
         return ScanPipeline.run(target, deps, output, rules, false, fast, jdkHome,
                 !noVerify, verifyBudget, safeExec, useSafeReal, useOsIsolation,
-                null, null).stats();
+                null, null, false, ScanPipeline.ExportPolicy.STRICT_PRODUCT).stats();
     }
 
     private PerformanceHarness.Report runCold(Path root) throws Exception {
@@ -279,7 +291,6 @@ public final class PerformanceCommand implements Callable<Integer> {
 
     private PerformanceHarness.Sample runColdOnce(Path output, int iteration)
             throws Exception {
-        Files.createDirectories(output);
         List<String> command = new ArrayList<>();
         command.add(javaExecutable());
         if (launcherJar != null) {
@@ -319,14 +330,16 @@ public final class PerformanceCommand implements Callable<Integer> {
             terminateProcessTree(process);
             throw new IOException("cold scan timed out after " + processTimeoutMs + " ms");
         }
-        if (process.exitValue() != ExitCode.OK.code()) {
+        if (process.exitValue() != ExitReason.OK.code()) {
             throw new IOException("cold scan exited with code " + process.exitValue());
         }
         Path metadata = output.resolve("meta").resolve("scan-metadata.json");
         if (!Files.isRegularFile(metadata, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("cold scan did not produce scan metadata");
         }
-        String json = Files.readString(metadata, StandardCharsets.UTF_8);
+        InputBudget.Tracker outputBudget = OUTPUT_INPUT_POLICY.tracker();
+        String json = readBoundedText(metadata, OUTPUT_INPUT_POLICY, outputBudget,
+                "PERFORMANCE_METADATA");
         long wall = elapsedMs(started);
         long staticMs = objectNumber(json, "phase_ms", "static", 0L);
         long dynamicMs = objectNumber(json, "phase_ms", "verify", 0L);
@@ -338,7 +351,7 @@ public final class PerformanceCommand implements Callable<Integer> {
         String completeness = string(json, "completeness", "UNKNOWN");
         PerformanceHarness.Sample sample = new PerformanceHarness.Sample(iteration, wall, staticMs,
                 dynamicMs, heapUsed, heapPeak, rss, chains, completeness,
-                resultDigest(output), objectNumbers(json, "phase_ms"),
+                resultDigest(output, OUTPUT_INPUT_POLICY, outputBudget), objectNumbers(json, "phase_ms"),
                 resourceNumbers(json, "metrics"), verificationDurations(json));
         return sample;
     }
@@ -348,7 +361,8 @@ public final class PerformanceCommand implements Callable<Integer> {
      * because it contains elapsed time and host observations; the findings plus the complete
      * variant evidence are the user-visible static result and must agree across runs.
      */
-    private static String resultDigest(Path output) throws IOException {
+    private static String resultDigest(Path output, InputBudget policy,
+                                       InputBudget.Tracker tracker) throws IOException {
         Path findings = output.resolve("findings").resolve("findings.csv");
         Path chains = output.resolve("evidence").resolve("chains.csv");
         if (!Files.isRegularFile(findings, LinkOption.NOFOLLOW_LINKS)
@@ -357,8 +371,8 @@ public final class PerformanceCommand implements Callable<Integer> {
         }
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            updateDigest(digest, "findings", findings);
-            updateDigest(digest, "chains", chains);
+            updateDigest(digest, "findings", findings, policy, tracker);
+            updateDigest(digest, "chains", chains, policy, tracker);
             StringBuilder hex = new StringBuilder(64);
             for (byte value : digest.digest()) {
                 hex.append(String.format(Locale.ROOT, "%02x", value));
@@ -369,20 +383,84 @@ public final class PerformanceCommand implements Callable<Integer> {
         }
     }
 
-    private static void updateDigest(MessageDigest digest, String name, Path file)
+    private static void updateDigest(MessageDigest digest, String name, Path file,
+                                     InputBudget policy, InputBudget.Tracker tracker)
             throws IOException {
         byte[] label = name.getBytes(StandardCharsets.UTF_8);
         digest.update((byte) label.length);
         digest.update(label);
-        try (InputStream input = Files.newInputStream(file)) {
+        ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                file, policy, "PERFORMANCE_RESULT");
+        BasicFileAttributes before = snapshot.fileAttributes();
+        long limit = Math.min(policy.maxEntryBytes(), tracker.remainingReadBytes());
+        if (before.size() > policy.maxEntryBytes() || before.size() > limit) {
+            throw new IOException("PERFORMANCE_RESULT_INPUT_LIMIT:" + policy.maxEntryBytes());
+        }
+        try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(file, "PERFORMANCE_RESULT");
+             InputStream input = opened.stream()) {
             byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) >= 0) {
-                if (read > 0) {
-                    digest.update(buffer, 0, read);
+            long total = 0L;
+            for (int read; ; ) {
+                tracker.checkTime();
+                read = tracker.readBounded(input, buffer, 0, buffer.length, limit - total,
+                        "PERFORMANCE_RESULT_INPUT_LIMIT:" + limit);
+                if (read < 0) {
+                    break;
                 }
+                if (read == 0) {
+                    int one = tracker.readByteBounded(input, limit - total,
+                            "PERFORMANCE_RESULT_INPUT_LIMIT:" + limit);
+                    if (one < 0) {
+                        break;
+                    }
+                    buffer[0] = (byte) one;
+                    read = 1;
+                }
+                if (read > limit - total) {
+                    throw new IOException("PERFORMANCE_RESULT_INPUT_LIMIT:" + limit);
+                }
+                digest.update(buffer, 0, read);
+                total += read;
             }
         }
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "PERFORMANCE_RESULT");
+    }
+
+    private static String readBoundedText(Path file, InputBudget policy,
+                                          InputBudget.Tracker tracker, String label)
+            throws IOException {
+        ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                file, policy, label);
+        BasicFileAttributes before = snapshot.fileAttributes();
+        long limit = Math.min(policy.maxEntryBytes(), tracker.remainingReadBytes());
+        if (before.size() > policy.maxEntryBytes() || before.size() > limit) {
+            throw new IOException(label + "_INPUT_LIMIT:" + policy.maxEntryBytes());
+        }
+        byte[] bytes;
+        try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(file, label);
+             InputStream input = opened.stream()) {
+            bytes = IoUtil.readAll(input, limit, tracker);
+        }
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, label);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    /** Package-local hostile contract seam; production result reads use the same snapshot. */
+    static ArchiveLimits.FileReadSnapshot snapshotResultForContract(Path file) throws IOException {
+        return ArchiveLimits.snapshotRegularFile(file, OUTPUT_INPUT_POLICY,
+                "PERFORMANCE_RESULT");
+    }
+
+    /** Package-local hostile contract seam; production result reads use the same snapshot. */
+    static void verifyResultSnapshotForContract(ArchiveLimits.FileReadSnapshot snapshot)
+            throws IOException {
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "PERFORMANCE_RESULT");
+    }
+
+    /** Package-local hostile contract seam for shared metadata/result input accounting. */
+    static String readBoundedTextForContract(Path file, InputBudget policy,
+                                             InputBudget.Tracker tracker) throws IOException {
+        return readBoundedText(file, policy, tracker, "PERFORMANCE_METADATA");
     }
 
     private PerformanceHarness.Limits limits() {
@@ -556,22 +634,79 @@ public final class PerformanceCommand implements Callable<Integer> {
     }
 
     private static void deleteTree(Path root) {
-        try {
-            if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)
-                    || ArchiveLimits.isLinkOrReparsePoint(root)) {
-                return;
-            }
-            try (var stream = Files.walk(root)) {
-                stream.sorted(Comparator.reverseOrder()).forEach(path -> {
-                    try {
-                        Files.deleteIfExists(path);
-                    } catch (IOException ignored) {
-                        // A failed cleanup is not converted into a successful performance gate.
-                    }
-                });
-            }
-        } catch (IOException ignored) {
-            // The report/gate result remains the primary outcome; callers can retain --work-dir.
+        deleteTreeBounded(root, OUTPUT_INPUT_POLICY);
+    }
+
+    /**
+     * Bounded, no-follow cleanup for performance-run output.  Cleanup is deliberately fail
+     * closed: if the tree exceeds the shared input policy or changes into a link/reparse point,
+     * no partial deletion is attempted and the caller may retain the work directory for
+     * diagnosis.  This protects the runner itself without claiming a provider-independent
+     * TOCTOU guarantee.
+     */
+    static boolean deleteTreeBounded(Path root, InputBudget budget) {
+        if (root == null) {
+            return true;
         }
+        Path normalized = root.toAbsolutePath().normalize();
+        try {
+            if (!Files.exists(normalized, LinkOption.NOFOLLOW_LINKS)) {
+                return true;
+            }
+            if (ArchiveLimits.isLinkOrReparsePoint(normalized)) {
+                return false;
+            }
+            InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+            InputBudget.Tracker tracker = policy.tracker();
+            List<Path> entries = new ArrayList<>();
+            try (var stream = Files.walk(normalized)) {
+                var iterator = stream.iterator();
+                while (iterator.hasNext()) {
+                    tracker.checkTime();
+                    Path path = iterator.next();
+                    Path candidate = path.toAbsolutePath().normalize();
+                    if (!candidate.startsWith(normalized)
+                            || ArchiveLimits.isLinkOrReparsePoint(path)) {
+                        return false;
+                    }
+                    Path relativePath = normalized.relativize(candidate);
+                    if (relativePath.getNameCount() > policy.maxPathDepth()) {
+                        return false;
+                    }
+                    String relative = relativePath.toString().replace('\\', '/');
+                    if (!relative.isBlank() && !ArchiveLimits.safeEntryName(relative, policy)) {
+                        return false;
+                    }
+                    BasicFileAttributes attributes = Files.readAttributes(path,
+                            BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    tracker.observeFile(relative.isBlank() ? "<root>" : relative,
+                            attributes.isRegularFile() ? attributes.size() : 0L);
+                    entries.add(path);
+                }
+            }
+            entries.sort(Comparator.reverseOrder());
+            for (Path path : entries) {
+                if (!Files.deleteIfExists(path)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (IOException | RuntimeException failure) {
+            return false;
+        }
+    }
+
+    private static void printVerificationDisclosure(boolean noVerify) {
+        if (noVerify) {
+            System.err.println("[just:info] perf verificationMode=STATIC_ONLY; "
+                    + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
+                    + "recommendedForUntrustedArtifacts=true");
+            return;
+        }
+        System.err.println("[just:warning] perf verificationMode=AUTO; "
+                + "targetCodeExecutionPossible=true; targetTrust=TRUSTED_LOCAL_TARGET_REQUIRED; "
+                + "resourceContainmentOnly=true; filesystemIsolation=false; "
+                + "networkIsolation=false; isolationFailure=FAIL_CLOSED; "
+                + "use --no-verify for untrusted artifacts");
     }
 }

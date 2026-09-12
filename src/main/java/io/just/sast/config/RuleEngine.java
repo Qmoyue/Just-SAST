@@ -34,6 +34,14 @@ public final class RuleEngine {
         return rules;
     }
 
+    /** Typed hierarchy query for index builders that own subtype-aware source facts. */
+    public boolean isSubtypeOf(String owner, String target) {
+        if (owner == null || owner.isBlank() || target == null || target.isBlank()) {
+            return false;
+        }
+        return hierarchy.isSubtypeOf(owner, target);
+    }
+
     public Optional<Rule.SinkRule> matchingSink(Node call) {
         if (call == null) {
             return Optional.empty();

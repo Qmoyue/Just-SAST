@@ -33,7 +33,8 @@ JAR / WAR / class 目录 + 可选依赖 + 目标 JDK
 - 每条链保留 `rule_id`、entry、sink、逐跳 edge、字段依赖、校准状态和完整性原因。
 - 默认动态验证在 Windows Job Object 子 JVM 中运行。可证明的精确 sink/body 使用固定安全参数真实调用；高风险终点只确认到最终危险操作之前，并在报告中区分范围。
 - Windows Job Object 限制进程树、内存、进程数、CPU time、墙钟时间并在关闭时回收子进程；它是 process/resource containment，不声明完整文件系统或系统网络控制。
-- SAFE_REAL 仅支持类型和 descriptor 可证明的安全调用：命令使用 Just 自有 JDK 的固定 `-version`，文件使用 scratch，网络和 native/类加载等高风险终点不进入最终调用。该状态表示安全可调用性，不表示 RCE。
+- 默认 `scan` 使用 `verificationMode=AUTO`：静态分析完成后才进行轻量 prefix/boundary 验证。目标代码可能被加载或初始化，因此只适用于用户主动选择的本地/可信制品；Job Object 只有进程/资源 containment，不提供文件系统、网络、令牌或 syscall 隔离。验证失败时 fail-closed，不会在无 containment 时启动目标。
+- 兼容的 `SAFE_REAL`/`SAFE_EXEC` 仅表示 Just-owned 固定参数或 canary 适配器调用，结果带有失真，不能证明真实 exploit、RCE 或目标 sink 副作用。来源不明或潜在恶意 JAR 请使用 `--no-verify`。
 - 通过 `KnowledgeSource`、Blackboard、YAML 规则和 ServiceLoader 扩展分析语义。
 
 ## 构建与运行
@@ -66,12 +67,16 @@ java -jar target/just-sast-0.2.0.jar scan \
 | `--jdk-home=<path>` | 目标 JDK；Java 8 使用 `rt.jar`，Java 9+ 使用 `jrt-fs` |
 | `--output=<path>` | 报告目录，默认 `just-out` |
 | `--rules=<path>` | 自定义 YAML 规则 |
-| `--verify-budget=<N>` | 动态验证候选预算，默认 `20` |
+| `--verify-budget=<N>` | 动态验证规范化 finding 组预算，默认 `32`；显式值仍为硬上限 |
 | `--stats` | 输出阶段统计 |
 | `--fast` | 减少 JDK 运行库加载，适合快速预览 |
-| `--no-verify` | 只执行静态分析 |
+| `--no-verify` | 只执行静态分析；不加载/初始化目标回调，适用于不可信制品 |
 
 完整扫描通常使用默认参数；`--fast` 和 `--no-verify` 会改变分析或动态验证范围。
+
+本地回归语料和机器证据位于 `benchmark/`，构建/扫描中间产物位于 `target/`、`just-out/`
+和 `.inspect-n1cat/`；这些目录被 `.gitignore` 排除，不能作为发布输入或提交内容。提交前应检查
+暂存区中没有 JAR、凭据、签名材料、工作站绝对路径或临时报告。
 
 ## 输出
 
@@ -84,13 +89,17 @@ just-out/
 └─ meta/           # 扫描身份、阶段统计和元数据
 ```
 
+`meta/run.json` 固定记录 `verificationMode`、`targetCodeExecutionPossible`、`targetCodeExecuted`、
+`resourceContainmentOnly`、文件/网络/令牌隔离能力、Job Object 后端和 fail-closed 状态。
+字段契约见 [`docs/schemas/run-v1.schema.json`](docs/schemas/run-v1.schema.json)。
+
 动态状态含义：
 
 | 状态 | 含义 |
 | --- | --- |
 | `SINK_BLOCKED` | 真实前置链抵达精确 sink 边界，canary 阻断方法体 |
 | `PRE_SINK_CONFIRMED` | 高风险终点前的完整前置链已确认，最终危险调用未进入 |
-| `SINK_EXECUTED_SAFE` | 固定安全参数下的精确 API/body 正常返回，带 `sink_distorted=true` |
+| `SINK_EXECUTED_SAFE` | Just-owned 固定参数下的精确 API/body 返回，带 `sink_distorted=true`；不代表真实危险副作用 |
 | `JNI_EXECUTED_SAFE` | Just 自有 native fixture 完成受约束的 load、callback 和正常返回；不代表目标 JAR 的 native load |
 | `CONCRETE_REACHED` | 运行到安全观察点，但未形成精确 sink 证据 |
 | `PARTIAL` | 只完成部分构造或触发 |

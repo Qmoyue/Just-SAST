@@ -7,6 +7,7 @@ import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
+import io.just.sast.blackboard.RunProduct;
 import io.just.sast.util.JustLogger;
 
 import java.util.HashMap;
@@ -82,6 +83,16 @@ public final class GadgetPatternKnowledgeSource implements KnowledgeSource {
     @Override
     public int priority() {
         return 400;
+    }
+
+    @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.COMPOSED_CHAINS, RunProduct.CALIBRATED_CHAINS);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.CALIBRATED_CHAINS);
     }
 
     @Override

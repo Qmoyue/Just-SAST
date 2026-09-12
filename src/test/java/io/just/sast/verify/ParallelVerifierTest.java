@@ -3,6 +3,7 @@ package io.just.sast.verify;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.io.FilePermission;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -13,11 +14,13 @@ import java.util.Map;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.run.InputBudget;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 子 JVM 的环境边界是动态验证的用户可见安全契约。 */
@@ -53,6 +56,21 @@ class ParallelVerifierTest {
         ParallelVerifier.VerifyResult oom = new ParallelVerifier.VerifyResult(
                 "chain", "UNTESTABLE", "PROCESS_OOM");
         assertEquals("PROCESS_OOM", oom.evidence());
+    }
+
+    @Test
+    void scratchObservationFailureCannotRemainPositiveEvidence() {
+        ParallelVerifier.VerifyResult positive = new ParallelVerifier.VerifyResult(
+                "chain", "SINK_BLOCKED", "boundary");
+
+        ParallelVerifier.VerifyResult guarded =
+                ParallelVerifier.scratchObservationResultForContract(
+                        positive, "VERIFY_SCRATCH_LINK_OR_REPARSE");
+
+        assertEquals(ParallelVerifier.VerifyStatus.UNTESTABLE, guarded.statusCode());
+        assertEquals("SCRATCH_TREE_OBSERVATION_FAILED", guarded.evidence());
+        assertEquals("UNTESTABLE", guarded.stopReason());
+        assertFalse(guarded.terminalExecuted());
     }
 
     @Test
@@ -264,6 +282,82 @@ class ParallelVerifierTest {
     }
 
     @Test
+    void childResultMacMatchesIndependentParentHmac() {
+        String secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        String frame = "JUST_VERIFY_V2:token:run:chain:sink:nonce:artifact:"
+                + "SANDBOX_READY: WINDOWS_JOB_OBJECT_JVM_POLICY|job=1";
+        assertEquals(ParallelVerifier.resultMac(secret, frame),
+                ChainVerifyProbe.resultMacForContract(secret, frame));
+    }
+
+    @Test
+    void resultChannelInputIsBoundedBeforeProtocolParsing(@TempDir Path tmp) throws Exception {
+        ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
+                "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
+        String secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        Path result = tmp.resolve("verification.result");
+        Files.writeString(result, "x".repeat(128), StandardCharsets.US_ASCII);
+        io.just.sast.run.InputBudget policy = io.just.sast.run.InputBudget.defaults()
+                .withArchiveLimits(4096, 4096, 64, 16, 16,
+                        io.just.sast.run.InputBudget.defaults().maxArchiveNesting(),
+                        io.just.sast.run.InputBudget.defaults().maxClassEntries());
+
+        ParallelVerifier.ProtocolEvidence evidence = ParallelVerifier.protocolEvidence(
+                result, identity, secret, policy);
+        assertFalse(evidence.bindingValid(), "oversized result channel must stay unknown");
+    }
+
+    @Test
+    void resultChannelReusesCallerOwnedInputTracker(@TempDir Path tmp) throws Exception {
+        ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
+                "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
+        String secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        Path result = tmp.resolve("verification.result");
+        Files.writeString(result, "JUST_VERIFY_RESULT_V1:ignored\n",
+                StandardCharsets.US_ASCII);
+        InputBudget policy = InputBudget.defaults();
+        class FailingTracker extends InputBudget.Tracker {
+            FailingTracker() {
+                super(policy);
+            }
+
+            @Override
+            public synchronized void checkTime() throws java.io.IOException {
+                throw new java.io.IOException("CONTRACT_CALLER_TRACKER_REUSED");
+            }
+        }
+
+        ParallelVerifier.ProtocolEvidence evidence = ParallelVerifier.protocolEvidence(
+                result, identity, secret, policy, new FailingTracker());
+        assertEquals(ParallelVerifier.ProtocolFailure.RESULT_FILE_UNREADABLE,
+                evidence.failure(), "result parsing must charge the caller-owned tracker");
+    }
+
+    @Test
+    void resultChannelParentReplacementFailsClosed(@TempDir Path tmp) throws Exception {
+        Path parent = Files.createDirectory(tmp.resolve("parent"));
+        Path result = parent.resolve("verification.result");
+        Files.writeString(result, "JUST_VERIFY_RESULT_V1:ignored\n",
+                StandardCharsets.US_ASCII);
+        var snapshot = ParallelVerifier.snapshotResultForContract(result);
+        var before = Files.readAttributes(parent,
+                java.nio.file.attribute.BasicFileAttributes.class,
+                java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                before.fileKey() != null || before.creationTime().toMillis() != 0L,
+                "provider does not expose a stable directory identity");
+        Files.delete(result);
+        Files.delete(parent);
+        Files.createDirectory(parent);
+        Files.writeString(result, "JUST_VERIFY_RESULT_V1:ignored\n",
+                StandardCharsets.US_ASCII);
+        IOException failure = assertThrows(IOException.class,
+                () -> ParallelVerifier.verifyResultSnapshotForContract(snapshot));
+        assertTrue(failure.getMessage().contains("VERIFICATION_RESULT_CHANGED_DURING_READ"),
+                failure.getMessage());
+    }
+
+    @Test
     void readyEventCarriesTheVersionedIsolationAttestation() {
         ParallelVerifier.ProtocolIdentity identity = new ParallelVerifier.ProtocolIdentity(
                 "token", "run", "chain-fingerprint", "sink-fingerprint", "nonce", "artifact");
@@ -388,6 +482,20 @@ class ParallelVerifierTest {
         } finally {
             verifier.cleanup();
         }
+    }
+
+    @Test
+    void jdkReleaseReaderUsesCallerPolicyAndRejectsOversizedMetadata(@TempDir Path tmp)
+            throws Exception {
+        Path jdk = Files.createDirectories(tmp.resolve("jdk"));
+        Files.writeString(jdk.resolve("release"), "JAVA_VERSION=\"17.0.19\"\n"
+                + "#".repeat(512), StandardCharsets.UTF_8);
+        io.just.sast.run.InputBudget policy = io.just.sast.run.InputBudget.defaults()
+                .withArchiveLimits(4096, 4096, 64, 32, 16,
+                        io.just.sast.run.InputBudget.defaults().maxArchiveNesting(),
+                        io.just.sast.run.InputBudget.defaults().maxClassEntries());
+
+        assertEquals(-1, ParallelVerifier.jdkFeature(jdk, policy));
     }
 
     @Test

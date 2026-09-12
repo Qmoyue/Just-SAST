@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/cli-contract-v1.schema.json",
+  "schema": "cli-contract-v1",
+  "contract_id": "JUST-PROD-D009-V1",
+  "title": "Just CLI contract evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "schema", "contract_id", "status", "valid", "cases", "safety"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "schema": {"const": "cli-contract-v1"},
+    "contract_id": {"const": "JUST-PROD-D009-V1"},
+    "status": {"enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "valid": {"type": "boolean"},
+    "generated_at": {"type": "string"},
+    "launcher": {"type": "string", "minLength": 1},
+    "java": {"type": "string", "minLength": 1},
+    "reason_code": {"type": "string", "minLength": 1},
+    "message": {"type": "string"},
+    "checks": {"type": "array", "items": {"type": "string"}},
+    "no_verify_case": {"const": "STATIC_ONLY"},
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "expected_exit", "purpose"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "status": {"enum": ["CHARACTERIZED", "PASS", "FAIL"]},
+          "expected_exit": {"type": "integer"},
+          "actual_exit": {"type": "integer"},
+          "timed_out": {"type": "boolean"},
+          "stdout_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "wall_ms": {"type": "integer", "minimum": 0},
+          "stdout_contract": {"type": "boolean"},
+          "stderr_contract": {"type": "boolean"},
+          "purpose": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_code_executed", "network_access", "arbitrary_payload"],
+      "properties": {
+        "target_code_executed": {"enum": ["NO", "UNKNOWN"]},
+        "network_access": {"const": "NOT_INVOKED"},
+        "arbitrary_payload": {"const": "NOT_INVOKED"}
+      }
+    }
+  }
+}

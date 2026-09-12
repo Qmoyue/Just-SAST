@@ -1,10 +1,13 @@
 package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.LoadResult;
+import io.just.sast.model.ProgramUniverse;
 import io.just.sast.model.ParseDiagnostic;
 import io.just.sast.util.JustLogger;
 import io.just.sast.util.AdaptiveParallelism;
+import io.just.sast.run.InputBudget;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -27,7 +30,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class BytecodeFrontend {
 
+    /**
+     * Closed state for the aggregate input-budget context carried by {@link Inputs}.
+     *
+     * <p>The distinction is intentionally observable without making callers infer it from a
+     * nullable tracker and a compatibility boolean.  A local tracker still permits bounded
+     * parsing, but it cannot claim ownership of the scan-wide budget used by the production
+     * streaming path.</p>
+     */
+    public enum CallerContextStatus {
+        CALLER_OWNED,
+        LOCAL_TRACKER,
+        MISSING
+    }
+
     private final JarReader jarReader = new JarReader();
+    private final InputBudget inputBudget;
     /** ASM 的输入是只读的；每个 worker 使用自己的 reader，避免共享可变 extractor 状态。 */
     private final ThreadLocal<ClassFileReader> classFileReaders =
             ThreadLocal.withInitial(ClassFileReader::new);
@@ -38,13 +56,70 @@ public final class BytecodeFrontend {
     /** 原始 class bytes 的上界；解析结果本身仍由后续 CPG 阶段持有。 */
     private static final int STREAM_BATCH_SIZE = 64;
 
+    public BytecodeFrontend() {
+        this(InputBudget.defaults());
+    }
+
+    /** Construct a frontend with one immutable policy for every archive/class parse. */
+    public BytecodeFrontend(InputBudget budget) {
+        this.inputBudget = budget == null ? InputBudget.defaults() : budget;
+    }
+
     /** 已读取但尚未解析的目标输入；用于 JDK 切片先解析应用，再复用同一批字节。 */
     public record Inputs(List<ClassBytes> classes, List<ParseDiagnostic> diagnostics,
-                         List<String> completenessReasons) {
+                         List<String> completenessReasons, InputBudget.Tracker tracker,
+                         boolean callerContextProvided) {
         public Inputs {
             classes = classes == null ? List.of() : List.copyOf(classes);
             diagnostics = diagnostics == null ? List.of() : List.copyOf(diagnostics);
             completenessReasons = completenessReasons == null ? List.of() : List.copyOf(completenessReasons);
+            // A legacy caller can construct the five-argument record directly.  Never let a
+            // null tracker plus a forged flag claim scan-wide accounting; load(Inputs) would
+            // otherwise create a fresh local budget while reporting a complete context.
+            callerContextProvided = callerContextProvided && tracker != null;
+        }
+
+        /** Compatibility constructor for callers that do not own an aggregate input budget. */
+        public Inputs(List<ClassBytes> classes, List<ParseDiagnostic> diagnostics,
+                      List<String> completenessReasons) {
+            this(classes, diagnostics, completenessReasons, null, false);
+        }
+
+        /**
+         * Source-compatible four-argument constructor. A supplied tracker is caller-owned only
+         * when the caller explicitly marks that context; the legacy overload remains partial
+         * rather than silently claiming scan-wide accounting.
+         */
+        public Inputs(List<ClassBytes> classes, List<ParseDiagnostic> diagnostics,
+                      List<String> completenessReasons, InputBudget.Tracker tracker) {
+            this(classes, diagnostics, completenessReasons, tracker, tracker != null);
+        }
+
+        /**
+         * Returns the typed caller-context state used by reports and compatibility diagnostics.
+         * The result is derived from the normalized record state, so a forged
+         * {@code callerContextProvided=true} with a null tracker remains {@link
+         * CallerContextStatus#MISSING}.
+         */
+        public CallerContextStatus callerContextStatus() {
+            if (callerContextProvided) {
+                return CallerContextStatus.CALLER_OWNED;
+            }
+            return tracker == null ? CallerContextStatus.MISSING : CallerContextStatus.LOCAL_TRACKER;
+        }
+    }
+
+    /**
+     * Result of the one-pass target/dependency load with an explicit application scope.
+     * The set contains only successfully parsed classes emitted by the first target artifact;
+     * dependency and JDK classes are never inferred to be application-owned by position in the
+     * final merged class map.
+     */
+    public record ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames) {
+        public ScopedLoad {
+            load = load == null ? new LoadResult(Map.of(), List.of(), 0, 0) : load;
+            applicationClassNames = applicationClassNames == null ? java.util.Set.of()
+                    : java.util.Set.copyOf(applicationClassNames);
         }
     }
 
@@ -68,24 +143,95 @@ public final class BytecodeFrontend {
 
     /** Load using a target JDK feature for multi-release archive selection. */
     public LoadResult loadStreaming(List<Path> targets, int targetFeature) {
-        try (ParsingSession session = new ParsingSession()) {
-            StreamingAccumulator accumulator = new StreamingAccumulator(session);
+        return loadStreaming(targets, targetFeature, null);
+    }
+
+    /**
+     * Load target/dependency inputs while charging every archive and filesystem entry to the
+     * caller-owned tracker.  The compatibility overload above deliberately creates a fresh
+     * tracker; the scan pipeline passes its one scan-wide tracker so a second frontend entry
+     * cannot reset aggregate limits between target and dependency artifacts.
+     */
+    public LoadResult loadStreaming(List<Path> targets, int targetFeature,
+                                    InputBudget.Tracker callerTracker) {
+        return loadStreamingInternal(targets, targetFeature, callerTracker, false).load();
+    }
+
+    /**
+     * One-pass load that also records the successfully parsed class names from the application
+     * target.  This is the provenance input for the demand-driven entry index; it avoids the
+     * former ChainComposer re-read of the target artifact and does not retain raw bytes.
+     */
+    public ScopedLoad loadStreamingWithApplicationScope(List<Path> targets, int targetFeature,
+                                                         InputBudget.Tracker callerTracker) {
+        return loadStreamingInternal(targets, targetFeature, callerTracker, true);
+    }
+
+    private ScopedLoad loadStreamingInternal(List<Path> targets, int targetFeature,
+                                              InputBudget.Tracker callerTracker,
+                                              boolean captureApplicationScope) {
+        InputBudget.Tracker inputTracker = callerTracker == null
+                ? inputBudget.tracker() : callerTracker;
+        try (ParsingSession session = new ParsingSession(inputTracker)) {
+            StreamingAccumulator accumulator = new StreamingAccumulator(session,
+                    captureApplicationScope);
             if (targets == null) {
-                return accumulator.result();
+                return accumulator.scopedResult();
             }
-            for (Path target : targets) {
+            for (int artifactIndex = 0; artifactIndex < targets.size(); artifactIndex++) {
+                Path target = targets.get(artifactIndex);
+                accumulator.setArtifactIndex(artifactIndex);
                 try {
                     JarReader.StreamResult stream = jarReader.streamDetailed(target,
-                            accumulator::accept, targetFeature);
+                            accumulator::accept, targetFeature, inputBudget, inputTracker);
                     accumulator.addReasons(stream.completenessReasons());
                 } catch (IOException e) {
-                    accumulator.diagnostics.add(new ParseDiagnostic(target.toString(), e.getMessage()));
-                    JustLogger.error("读取输入失败 {}: {}", target, e.getMessage());
+                    String origin = target == null ? "<null>" : target.toString();
+                    accumulator.diagnostics.add(new ParseDiagnostic(origin, e.getMessage()));
+                    JustLogger.error("读取输入失败 {}: {}", origin, e.getMessage());
+                }
+                // Keep artifact ownership aligned with the synchronous reader callback.  A
+                // flush at the boundary also shortens the lifetime of the preceding artifact's
+                // raw byte batch without creating a new parsing session or executor.
+                accumulator.flush();
+            }
+            return accumulator.scopedResult();
+        }
+    }
+
+    /**
+     * Typed frontend entry point.  The returned universe contains immutable class facts and
+     * report-safe content identities for the requested artifacts; no raw bytes escape.
+     */
+    public ProgramUniverse loadUniverse(List<Path> targets) {
+        return loadUniverse(targets, 0);
+    }
+
+    /** Load an immutable universe using the selected multi-release/JDK feature. */
+    public ProgramUniverse loadUniverse(List<Path> targets, int targetFeature) {
+        return loadUniverse(targets, targetFeature, null);
+    }
+
+    /** Typed universe load using a caller-owned aggregate input tracker. */
+    public ProgramUniverse loadUniverse(List<Path> targets, int targetFeature,
+                                        InputBudget.Tracker callerTracker) {
+        LoadResult result = loadStreaming(targets, targetFeature, callerTracker);
+        List<ArtifactProvenance> provenance = new ArrayList<>();
+        if (targets != null) {
+            for (Path target : targets) {
+                try {
+                    provenance.add(ArtifactProvenance.fromPath(target,
+                            ArtifactProvenance.Role.UNKNOWN, inputBudget, callerTracker));
+                } catch (IOException failure) {
+                    // Keep parsing output usable, but make the missing identity explicit in
+                    // the immutable model instead of silently inventing a digest.
+                    String name = target == null || target.getFileName() == null
+                            ? "<unknown>" : target.getFileName().toString();
+                    provenance.add(ArtifactProvenance.unknown(name, ArtifactProvenance.Role.UNKNOWN));
                 }
             }
-            accumulator.flush();
-            return accumulator.result();
         }
+        return ProgramUniverse.of(result, provenance);
     }
 
     /** 读取输入文件但不解析，供调用方在不重复读取/解析目标的情况下规划外部类切片。 */
@@ -95,12 +241,21 @@ public final class BytecodeFrontend {
 
     /** Read raw class inputs using a target JDK feature for multi-release selection. */
     public Inputs read(List<Path> targets, int targetFeature) {
+        return read(targets, targetFeature, null);
+    }
+
+    /** Read raw class inputs using a caller-owned aggregate tracker. */
+    public Inputs read(List<Path> targets, int targetFeature,
+                       InputBudget.Tracker callerTracker) {
         List<ParseDiagnostic> diagnostics = new ArrayList<>();
         List<String> completenessReasons = new ArrayList<>();
         List<ClassBytes> inputs = new ArrayList<>();
+        InputBudget.Tracker inputTracker = callerTracker == null
+                ? inputBudget.tracker() : callerTracker;
         for (Path target : targets) {
             try {
-                JarReader.ReadResult read = jarReader.readDetailed(target, targetFeature);
+                JarReader.ReadResult read = jarReader.readDetailed(target, targetFeature,
+                        inputBudget, inputTracker);
                 completenessReasons.addAll(read.completenessReasons());
                 inputs.addAll(read.classes());
             } catch (IOException e) {
@@ -109,15 +264,41 @@ public final class BytecodeFrontend {
             }
         }
         return new Inputs(inputs, diagnostics,
-                List.copyOf(new java.util.LinkedHashSet<>(completenessReasons)));
+                List.copyOf(new java.util.LinkedHashSet<>(completenessReasons)), inputTracker,
+                callerTracker != null);
     }
 
     /** 解析已经读取的目标输入。目标类本身先入图，保留输入顺序和诊断顺序。 */
     public LoadResult load(Inputs input) {
+        return loadInternal(input, input == null ? null : input.tracker(),
+                input != null && input.callerContextProvided());
+    }
+
+    /**
+     * Parse a previously read batch while retaining its caller-owned aggregate tracker.  The
+     * explicit overload is useful for legacy {@link Inputs} values constructed without a
+     * tracker; production read→load paths carry the tracker in the value itself.
+     */
+    public LoadResult load(Inputs input, InputBudget.Tracker callerTracker) {
+        return loadInternal(input, callerTracker, callerTracker != null
+                || (input != null && input.callerContextProvided()));
+    }
+
+    private LoadResult loadInternal(Inputs input, InputBudget.Tracker callerTracker,
+                                    boolean callerContextProvided) {
+        if (input == null) {
+            return new LoadResult(Map.of(), List.of(), 0, 0, List.of("NULL_INPUTS"));
+        }
         Map<String, ClassInfo> classes = new LinkedHashMap<>();
         List<ParseDiagnostic> diagnostics = new ArrayList<>(input.diagnostics());
         LinkedHashSet<String> completenessReasons = new LinkedHashSet<>(input.completenessReasons());
-        List<ParsedClass> parsed = parse(input.classes());
+        // The source-compatible three-argument Inputs constructor predates the scan-wide
+        // tracker.  Keep it usable for extensions, but make the missing aggregate capability
+        // explicit instead of silently presenting a fresh local budget as production-safe.
+        if (!callerContextProvided) {
+            completenessReasons.add("INPUT_BUDGET_CALLER_CONTEXT_MISSING");
+        }
+        List<ParsedClass> parsed = parse(input.classes(), callerTracker);
         int maxMajor = 0;
         for (ParsedClass result : parsed) {
             if (result.diagnostic() != null) {
@@ -135,13 +316,22 @@ public final class BytecodeFrontend {
 
     /** 在已有目标结果上追加外部类，避免 JDK 切片规划时再次解析目标类。 */
     public LoadResult load(LoadResult base, List<ClassBytes> extraClassBytes) {
+        return load(base, extraClassBytes, null);
+    }
+
+    /** Append external classes while charging the same scan-owned tracker as the base load. */
+    public LoadResult load(LoadResult base, List<ClassBytes> extraClassBytes,
+                           InputBudget.Tracker callerTracker) {
         if (extraClassBytes == null || extraClassBytes.isEmpty()) {
             return base;
         }
         Map<String, ClassInfo> classes = new LinkedHashMap<>(base.classes());
         List<ParseDiagnostic> diagnostics = new ArrayList<>(base.diagnostics());
         LinkedHashSet<String> completenessReasons = new LinkedHashSet<>(base.completenessReasons());
-        for (ParsedClass result : parse(extraClassBytes)) {
+        if (callerTracker == null) {
+            completenessReasons.add("INPUT_BUDGET_CALLER_CONTEXT_MISSING");
+        }
+        for (ParsedClass result : parse(extraClassBytes, callerTracker)) {
             // 应用类优先；与旧的 target + extra 装载契约一致，重复 extra 也不产生新诊断。
             if (classes.containsKey(result.className())) {
                 completenessReasons.add("DUPLICATE_CLASS:" + result.className());
@@ -160,28 +350,40 @@ public final class BytecodeFrontend {
 
     /** 目标输入 + 外部类的兼容入口。 */
     public LoadResult load(Inputs input, List<ClassBytes> extraClassBytes) {
-        return load(load(input), extraClassBytes);
+        InputBudget.Tracker tracker = input == null ? null : input.tracker();
+        LoadResult base = loadInternal(input, tracker,
+                input != null && input.callerContextProvided());
+        return load(base, extraClassBytes, input != null && input.callerContextProvided()
+                ? tracker : null);
     }
 
     private List<ParsedClass> parse(List<ClassBytes> inputs) {
-        try (ParsingSession session = new ParsingSession()) {
+        return parse(inputs, null);
+    }
+
+    private List<ParsedClass> parse(List<ClassBytes> inputs, InputBudget.Tracker callerTracker) {
+        InputBudget.Tracker tracker = callerTracker == null
+                ? inputBudget.tracker() : callerTracker;
+        try (ParsingSession session = new ParsingSession(tracker)) {
             return session.parse(inputs);
         }
     }
 
-    private List<ParsedClass> parseSequential(List<ClassBytes> inputs) {
+    private List<ParsedClass> parseSequential(List<ClassBytes> inputs,
+                                              InputBudget.Tracker tracker) {
         List<ParsedClass> result = new ArrayList<>(inputs.size());
         for (int i = 0; i < inputs.size(); i++) {
-                result.add(parseOne(inputs.get(i)));
+                result.add(parseOne(inputs.get(i), tracker));
         }
         return result;
     }
 
-    private List<ParsedClass> parseParallel(List<ClassBytes> inputs, ExecutorService executor) {
+    private List<ParsedClass> parseParallel(List<ClassBytes> inputs, ExecutorService executor,
+                                            InputBudget.Tracker tracker) {
         List<Future<ParsedClass>> futures = new ArrayList<>(inputs.size());
         for (int i = 0; i < inputs.size(); i++) {
             final int index = i;
-            futures.add(executor.submit(() -> parseOne(inputs.get(index))));
+            futures.add(executor.submit(() -> parseOne(inputs.get(index), tracker)));
         }
         List<ParsedClass> result = new ArrayList<>(inputs.size());
         for (Future<ParsedClass> future : futures) {
@@ -198,12 +400,12 @@ public final class BytecodeFrontend {
         return result;
     }
 
-    private ParsedClass parseOne(ClassBytes bytes) {
+    private ParsedClass parseOne(ClassBytes bytes, InputBudget.Tracker tracker) {
         try {
             if (bytes == null || bytes.bytes() == null || bytes.className() == null) {
                 throw new IllegalArgumentException("missing class input metadata");
             }
-            ClassInfo info = classFileReaders.get().read(bytes.bytes());
+            ClassInfo info = classFileReaders.get().read(bytes.bytes(), inputBudget, tracker);
             if (!bytes.className().equals(info.internalName())) {
                 return new ParsedClass(bytes.className(), ClassFileReader.majorOf(bytes.bytes()), null,
                         new ParseDiagnostic(bytes.origin(), "CLASS_NAME_MISMATCH: expected "
@@ -221,15 +423,23 @@ public final class BytecodeFrontend {
     /** 单个扫描的有界前端累加器；flush 后立即丢弃本批次原始 bytes。 */
     private final class StreamingAccumulator {
         private final ParsingSession parsingSession;
+        private final boolean captureApplicationScope;
         private final Map<String, ClassInfo> classes = new LinkedHashMap<>();
         private final List<ParseDiagnostic> diagnostics = new ArrayList<>();
         private final LinkedHashSet<String> completenessReasons = new LinkedHashSet<>();
+        private final LinkedHashSet<String> applicationClassNames = new LinkedHashSet<>();
         private final List<ClassBytes> batch = new ArrayList<>(STREAM_BATCH_SIZE);
         private int filesScanned;
         private int maxMajor;
+        private int artifactIndex;
 
-        private StreamingAccumulator(ParsingSession parsingSession) {
+        private StreamingAccumulator(ParsingSession parsingSession, boolean captureApplicationScope) {
             this.parsingSession = parsingSession;
+            this.captureApplicationScope = captureApplicationScope;
+        }
+
+        private void setArtifactIndex(int artifactIndex) {
+            this.artifactIndex = Math.max(0, artifactIndex);
         }
 
         private void accept(ClassBytes bytes) {
@@ -250,10 +460,16 @@ public final class BytecodeFrontend {
             if (batch.isEmpty()) {
                 return;
             }
-            for (ParsedClass parsed : parsingSession.parse(batch)) {
+            List<ParsedClass> parsedClasses = parsingSession.parse(batch);
+            for (int i = 0; i < parsedClasses.size(); i++) {
+                ParsedClass parsed = parsedClasses.get(i);
                 if (parsed.diagnostic() != null) {
                     diagnostics.add(parsed.diagnostic());
                     continue;
+                }
+                if (captureApplicationScope && artifactIndex == 0
+                        && isApplicationArtifactClass(batch.get(i))) {
+                    applicationClassNames.add(parsed.className());
                 }
                 if (classes.putIfAbsent(parsed.className(), parsed.info()) != null) {
                     completenessReasons.add("DUPLICATE_CLASS:" + parsed.className());
@@ -267,6 +483,21 @@ public final class BytecodeFrontend {
             return new LoadResult(classes, List.copyOf(diagnostics), filesScanned, maxMajor,
                     List.copyOf(completenessReasons));
         }
+
+        private ScopedLoad scopedResult() {
+            return new ScopedLoad(result(), applicationClassNames);
+        }
+    }
+
+    private static boolean isApplicationArtifactClass(ClassBytes bytes) {
+        if (bytes == null || bytes.origin() == null) {
+            return true;
+        }
+        String origin = bytes.origin().replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
+        // JarReader retains the physical nested path in origin.  A class below either
+        // BOOT-INF/lib or WEB-INF/lib belongs to an embedded dependency, never to the
+        // application execution scope, even though it was read from the first target file.
+        return !origin.contains("!boot-inf/lib/") && !origin.contains("!web-inf/lib/");
     }
 
     /**
@@ -276,9 +507,14 @@ public final class BytecodeFrontend {
      * frontend operation and is closed before analysis starts.
      */
     private final class ParsingSession implements AutoCloseable {
+        private final InputBudget.Tracker tracker;
         private AdaptiveParallelism.Lease lease;
         private ExecutorService executor;
         private int workers = 1;
+
+        private ParsingSession(InputBudget.Tracker tracker) {
+            this.tracker = tracker == null ? inputBudget.tracker() : tracker;
+        }
 
         private List<ParsedClass> parse(List<ClassBytes> inputs) {
             if (inputs == null || inputs.isEmpty()) {
@@ -286,9 +522,9 @@ public final class BytecodeFrontend {
             }
             ensureParallelism(inputs.size());
             if (executor == null || workers <= 1 || inputs.size() < PARALLEL_PARSE_THRESHOLD) {
-                return parseSequential(inputs);
+                return parseSequential(inputs, tracker);
             }
-            return parseParallel(inputs, executor);
+            return parseParallel(inputs, executor, tracker);
         }
 
         private void ensureParallelism(int taskCount) {

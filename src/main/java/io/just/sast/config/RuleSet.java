@@ -10,7 +10,15 @@ import java.util.Set;
 /** 编译后的规则集。 */
 public record RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magicEntries,
                       List<Rule.SourceRule> sources, List<Rule.ModelRule> models,
-                      List<Rule.FragmentRule> fragments) {
+                      List<Rule.FragmentRule> fragments, String schemaVersion) {
+
+    public static final String YAML_SCHEMA_VERSION = "JUST-RULES-YAML-V1";
+
+    public RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magicEntries,
+                   List<Rule.SourceRule> sources, List<Rule.ModelRule> models,
+                   List<Rule.FragmentRule> fragments) {
+        this(sinks, magicEntries, sources, models, fragments, YAML_SCHEMA_VERSION);
+    }
 
     public RuleSet {
         sinks = sinks == null ? List.of() : List.copyOf(sinks);
@@ -18,6 +26,11 @@ public record RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magic
         sources = sources == null ? List.of() : List.copyOf(sources);
         models = models == null ? List.of() : List.copyOf(models);
         fragments = fragments == null ? List.of() : List.copyOf(fragments);
+        schemaVersion = schemaVersion == null || schemaVersion.isBlank()
+                ? YAML_SCHEMA_VERSION : schemaVersion.trim();
+        if (!YAML_SCHEMA_VERSION.equals(schemaVersion)) {
+            throw new IllegalArgumentException("unsupported YAML rule schema: " + schemaVersion);
+        }
     }
 
     /** A non-fatal rule quality finding; loading remains strict for structural errors. */

@@ -20,14 +20,13 @@ import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.io.Serializable;
-import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -41,7 +40,27 @@ import java.util.TreeMap;
 /** Java 8-compatible fork-per-chain verifier. */
 public final class LegacyChainVerifyProbe {
 
+    private static final int[] SHA256_K = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+            0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+            0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+            0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+            0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    };
+
     private static final int MAX_SERIALIZED_BYTES = 8 * 1024 * 1024;
+    /** Java-8 verifier compatibility budget; the parent owns the Java-17 InputBudget policy. */
+    private static final String LEGACY_INPUT_BUDGET_V1 = "JUST-INPUT-BUDGET-V1";
+    private static final int LEGACY_MARKER_MAX_BYTES = 256;
+    private static final long LEGACY_NATIVE_MAX_BYTES = 16L * 1024L * 1024L;
+    private static final int LEGACY_NATIVE_HEADER_MAX_BYTES = 4096;
+    private static final int LEGACY_MAX_PATH_DEPTH = 512;
     private static final String PROTOCOL_PREFIX = "JUST_VERIFY_V1:";
     private static String protocolToken = "";
     private static String protocolRunId = "";
@@ -477,7 +496,7 @@ public final class LegacyChainVerifyProbe {
                     : Paths.get(safeNativeScratchRoot).toAbsolutePath().normalize();
             if ((safeNativeScratchRoot.length() > 0 && nativeRoot.equals(scratch))
                     || (safeNativeScratchRoot.length() > 0
-                    && io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(nativeRoot))
+                    && legacyLinkOrReparse(nativeRoot))
                     || !Files.isDirectory(nativeRoot, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return false;
             String resourceName = trustedNativeResource();
             String expectedDigest = trustedNativeDigest(resourceName);
@@ -486,7 +505,7 @@ public final class LegacyChainVerifyProbe {
                     .normalize();
             if (!output.startsWith(nativeRoot)
                     || !Files.isRegularFile(output, java.nio.file.LinkOption.NOFOLLOW_LINKS)
-                    || io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(output)) return false;
+                    || legacyLinkOrReparse(output)) return false;
             MessageDigest resourceDigest = MessageDigest.getInstance("SHA-256");
             long resourceBytes = 0L;
             InputStream input = LegacyChainVerifyProbe.class.getResourceAsStream(resourceName);
@@ -505,24 +524,11 @@ public final class LegacyChainVerifyProbe {
             }
             if (resourceBytes == 0L) return false;
             if (!expectedDigest.equalsIgnoreCase(hex(resourceDigest.digest()))) return false;
+            byte[] outputBytes = readStableBoundedFile(output, LEGACY_NATIVE_MAX_BYTES);
+            if (outputBytes == null || outputBytes.length == 0) return false;
             MessageDigest outputDigest = MessageDigest.getInstance("SHA-256");
-            long outputBytes = 0L;
-            InputStream outputInput = Files.newInputStream(output);
-            try {
-                byte[] buffer = new byte[32 * 1024];
-                int read;
-                while ((read = outputInput.read(buffer)) >= 0) {
-                    if (read == 0) continue;
-                    outputBytes += read;
-                    if (outputBytes > 16L * 1024L * 1024L) return false;
-                    outputDigest.update(buffer, 0, read);
-                }
-            } finally {
-                outputInput.close();
-            }
-            String fileHex = hex(outputDigest.digest());
-            if (outputBytes == 0L || !expectedDigest.equalsIgnoreCase(fileHex)
-                    || !nativeCompatible(output)) {
+            String fileHex = hex(outputDigest.digest(outputBytes));
+            if (!expectedDigest.equalsIgnoreCase(fileHex) || !nativeCompatible(output)) {
                 return false;
             }
             String outputPath = output.toAbsolutePath().normalize().toString();
@@ -597,19 +603,9 @@ public final class LegacyChainVerifyProbe {
 
     private static boolean nativeCompatible(Path path) {
         try {
-            byte[] header = new byte[4096];
-            int length = 0;
-            InputStream input = Files.newInputStream(path, StandardOpenOption.READ);
-            try {
-                while (length < header.length) {
-                    int read = input.read(header, length, header.length - length);
-                    if (read < 0) break;
-                    if (read == 0) continue;
-                    length += read;
-                }
-            } finally {
-                input.close();
-            }
+            byte[] header = readStableBoundedPrefix(path, LEGACY_NATIVE_HEADER_MAX_BYTES);
+            if (header == null) return false;
+            int length = header.length;
             String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
             int arch = normalizedArch(System.getProperty("os.arch", "").toLowerCase(
                     java.util.Locale.ROOT));
@@ -774,19 +770,126 @@ public final class LegacyChainVerifyProbe {
     }
 
     private static String resultMac(String frame) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(resultChannelSecret.getBytes(StandardCharsets.US_ASCII),
-                    "HmacSHA256"));
-            byte[] digest = mac.doFinal(frame.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(digest.length * 2);
-            for (byte value : digest) {
-                hex.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
-            }
-            return hex.toString();
-        } catch (GeneralSecurityException impossible) {
+        if (!validResultSecret(resultChannelSecret) || frame == null) {
             return "";
         }
+        byte[] key = resultChannelSecret.getBytes(StandardCharsets.US_ASCII);
+        byte[] message = frame.getBytes(StandardCharsets.UTF_8);
+        if (key.length > 64) {
+            key = sha256Bytes(key);
+        }
+        byte[] innerPad = new byte[64];
+        byte[] outerPad = new byte[64];
+        for (int i = 0; i < 64; i++) {
+            byte value = i < key.length ? key[i] : 0;
+            innerPad[i] = (byte) (value ^ 0x36);
+            outerPad[i] = (byte) (value ^ 0x5c);
+        }
+        byte[] innerInput = new byte[innerPad.length + message.length];
+        System.arraycopy(innerPad, 0, innerInput, 0, innerPad.length);
+        System.arraycopy(message, 0, innerInput, innerPad.length, message.length);
+        byte[] inner = sha256Bytes(innerInput);
+        byte[] outerInput = new byte[outerPad.length + inner.length];
+        System.arraycopy(outerPad, 0, outerInput, 0, outerPad.length);
+        System.arraycopy(inner, 0, outerInput, outerPad.length, inner.length);
+        byte[] digest = sha256Bytes(outerInput);
+        return hexBytes(digest);
+    }
+
+    private static String hexBytes(byte[] bytes) {
+        if (bytes == null) {
+            return "";
+        }
+        char[] result = new char[bytes.length * 2];
+        final char[] digits = "0123456789abcdef".toCharArray();
+        for (int i = 0; i < bytes.length; i++) {
+            int value = bytes[i] & 0xff;
+            result[i * 2] = digits[value >>> 4];
+            result[i * 2 + 1] = digits[value & 0x0f];
+        }
+        return new String(result);
+    }
+
+    private static byte[] sha256Bytes(byte[] input) {
+        byte[] source = input == null ? new byte[0] : input;
+        long bitLength = ((long) source.length) * 8L;
+        int paddedLength = ((source.length + 9 + 63) / 64) * 64;
+        byte[] padded = new byte[paddedLength];
+        System.arraycopy(source, 0, padded, 0, source.length);
+        padded[source.length] = (byte) 0x80;
+        for (int i = 0; i < 8; i++) {
+            padded[padded.length - 1 - i] = (byte) (bitLength >>> (i * 8));
+        }
+        int h0 = 0x6a09e667;
+        int h1 = 0xbb67ae85;
+        int h2 = 0x3c6ef372;
+        int h3 = 0xa54ff53a;
+        int h4 = 0x510e527f;
+        int h5 = 0x9b05688c;
+        int h6 = 0x1f83d9ab;
+        int h7 = 0x5be0cd19;
+        int[] w = new int[64];
+        for (int offset = 0; offset < padded.length; offset += 64) {
+            for (int i = 0; i < 16; i++) {
+                int base = offset + (i * 4);
+                w[i] = ((padded[base] & 0xff) << 24)
+                        | ((padded[base + 1] & 0xff) << 16)
+                        | ((padded[base + 2] & 0xff) << 8)
+                        | (padded[base + 3] & 0xff);
+            }
+            for (int i = 16; i < 64; i++) {
+                int s0 = Integer.rotateRight(w[i - 15], 7)
+                        ^ Integer.rotateRight(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+                int s1 = Integer.rotateRight(w[i - 2], 17)
+                        ^ Integer.rotateRight(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+                w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+            }
+            int a = h0;
+            int b = h1;
+            int c = h2;
+            int d = h3;
+            int e = h4;
+            int f = h5;
+            int g = h6;
+            int h = h7;
+            for (int i = 0; i < 64; i++) {
+                int s1 = Integer.rotateRight(e, 6) ^ Integer.rotateRight(e, 11)
+                        ^ Integer.rotateRight(e, 25);
+                int ch = (e & f) ^ (~e & g);
+                int t1 = h + s1 + ch + SHA256_K[i] + w[i];
+                int s0 = Integer.rotateRight(a, 2) ^ Integer.rotateRight(a, 13)
+                        ^ Integer.rotateRight(a, 22);
+                int maj = (a & b) ^ (a & c) ^ (b & c);
+                int t2 = s0 + maj;
+                h = g;
+                g = f;
+                f = e;
+                e = d + t1;
+                d = c;
+                c = b;
+                b = a;
+                a = t1 + t2;
+            }
+            h0 += a;
+            h1 += b;
+            h2 += c;
+            h3 += d;
+            h4 += e;
+            h5 += f;
+            h6 += g;
+            h7 += h;
+        }
+        int[] words = {h0, h1, h2, h3, h4, h5, h6, h7};
+        byte[] digest = new byte[32];
+        for (int i = 0; i < words.length; i++) {
+            int word = words[i];
+            int base = i * 4;
+            digest[base] = (byte) (word >>> 24);
+            digest[base + 1] = (byte) (word >>> 16);
+            digest[base + 2] = (byte) (word >>> 8);
+            digest[base + 3] = (byte) word;
+        }
+        return digest;
     }
 
     private static void closeResultChannel() {
@@ -1764,6 +1867,128 @@ public final class LegacyChainVerifyProbe {
         return null;
     }
 
+    /** Immutable identity captured around a legacy verifier-owned file read. */
+    private static final class FileIdentity {
+        private final long size;
+        private final long modifiedMillis;
+        private final long createdMillis;
+        private final Object fileKey;
+
+        private FileIdentity(BasicFileAttributes attributes) {
+            this.size = attributes.size();
+            this.modifiedMillis = attributes.lastModifiedTime().toMillis();
+            this.createdMillis = attributes.creationTime().toMillis();
+            this.fileKey = attributes.fileKey();
+        }
+
+        private boolean same(FileIdentity other) {
+            if (other == null || size != other.size || modifiedMillis != other.modifiedMillis
+                    || createdMillis != other.createdMillis) {
+                return false;
+            }
+            return fileKey == null ? other.fileKey == null : fileKey.equals(other.fileKey);
+        }
+    }
+
+    /**
+     * Read a bounded verifier-owned file while rejecting links/reparse points and replacement
+     * races.  The marker and native fixture are not scanner artifacts, so this Java-8 helper is
+     * the compatibility projection of the versioned parent InputBudget rather than a second
+     * archive parser.  Callers must treat a null result as unavailable and fail closed.
+     */
+    private static byte[] readStableBoundedFile(Path path, long maxBytes) throws IOException {
+        return readStableBounded(path, maxBytes, false);
+    }
+
+    /** Read at most {@code maxBytes} for an executable-header preflight. */
+    private static byte[] readStableBoundedPrefix(Path path, long maxBytes) throws IOException {
+        return readStableBounded(path, maxBytes, true);
+    }
+
+    private static byte[] readStableBounded(Path path, long maxBytes, boolean prefix)
+            throws IOException {
+        if (path == null || maxBytes < 0L) return null;
+        Path normalized;
+        try {
+            normalized = path.toAbsolutePath().normalize();
+        } catch (RuntimeException invalidPath) {
+            return null;
+        }
+        if (!legacyPathAllowed(normalized)) return null;
+        FileIdentity before = readFileIdentity(normalized);
+        if (before == null || !Files.isRegularFile(normalized, LinkOption.NOFOLLOW_LINKS)
+                || legacyLinkOrReparse(normalized)
+                || (!prefix && before.size > maxBytes)) {
+            return null;
+        }
+        ByteArrayOutputStream output = new ByteArrayOutputStream(
+                (int) Math.min(32L * 1024L, Math.min(maxBytes, Math.max(32L, before.size))));
+        long total = 0L;
+        try (InputStream input = Files.newInputStream(normalized, StandardOpenOption.READ)) {
+            byte[] buffer = new byte[32 * 1024];
+            while (total < maxBytes) {
+                int want = (int) Math.min((long) buffer.length, maxBytes - total);
+                int read = input.read(buffer, 0, want);
+                if (read < 0) break;
+                if (read == 0) continue;
+                output.write(buffer, 0, read);
+                total += read;
+            }
+            if (!prefix && total == maxBytes && input.read() >= 0) {
+                return null;
+            }
+        }
+        if (!verifyStableIdentity(normalized, before)) return null;
+        return output.toByteArray();
+    }
+
+    private static FileIdentity readFileIdentity(Path path) {
+        try {
+            BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            return attributes.isRegularFile() ? new FileIdentity(attributes) : null;
+        } catch (IOException | RuntimeException failure) {
+            return null;
+        }
+    }
+
+    /** Verify the same regular, non-link file still exists after a bounded read. */
+    private static boolean verifyStableIdentity(Path path, FileIdentity before) {
+        return before != null && !legacyLinkOrReparse(path) && before.same(readFileIdentity(path));
+    }
+
+    private static boolean legacyPathAllowed(Path path) {
+        try {
+            if (path.getNameCount() > LEGACY_MAX_PATH_DEPTH) return false;
+            Path current = path;
+            int depth = 0;
+            while (current != null && depth++ <= LEGACY_MAX_PATH_DEPTH) {
+                if (legacyLinkOrReparse(current)) return false;
+                current = current.getParent();
+            }
+            return current == null;
+        } catch (RuntimeException failure) {
+            return false;
+        }
+    }
+
+    /** DOS reparse checks are available on Windows; any provider error is fail-closed. */
+    private static boolean legacyLinkOrReparse(Path path) {
+        if (path == null) return true;
+        try {
+            if (Files.isSymbolicLink(path)) return true;
+            Object reparse = Files.getAttribute(path, "dos:reparsePoint",
+                    LinkOption.NOFOLLOW_LINKS);
+            return Boolean.TRUE.equals(reparse);
+        } catch (UnsupportedOperationException | IllegalArgumentException failure) {
+            // The Unix/default provider has no DOS reparse attribute; the symbolic-link check
+            // above is still meaningful and the portable provider is not rejected wholesale.
+            return false;
+        } catch (IOException | SecurityException failure) {
+            return true;
+        }
+    }
+
     private static Class<?> load(String name) throws ClassNotFoundException {
         ClassLoader loader = applicationLoader != null
                 ? applicationLoader : Thread.currentThread().getContextClassLoader();
@@ -1792,8 +2017,9 @@ public final class LegacyChainVerifyProbe {
         long deadline = System.nanoTime() + 5L * 1000000000L;
         while (System.nanoTime() < deadline) {
             try {
-                if (Files.isRegularFile(markerPath) && Files.size(markerPath) <= 256L) {
-                    String actual = new String(Files.readAllBytes(markerPath), "US-ASCII").trim();
+                byte[] markerBytes = readStableBoundedFile(markerPath, LEGACY_MARKER_MAX_BYTES);
+                if (markerBytes != null) {
+                    String actual = new String(markerBytes, "US-ASCII").trim();
                     if (expected.equals(actual)) {
                         return true;
                     }

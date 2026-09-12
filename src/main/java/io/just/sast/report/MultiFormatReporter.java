@@ -30,7 +30,8 @@ public final class MultiFormatReporter {
     private record ChainView(String confidence, ChainRanking.Evidence ranking,
                              ChainPrecision.Assessment precision,
                              boolean highConfidence,
-                             ConstructionSummary construction) {
+                             ConstructionSummary construction,
+                             ApplicationTrace applicationTrace) {
     }
 
     public void write(Path outDir, List<Chain> chains,
@@ -53,12 +54,35 @@ public final class MultiFormatReporter {
         chains = chains == null ? List.of() : chains;
         calibrations = calibrations == null ? Map.of() : calibrations;
         notes = notes == null ? Map.of() : notes;
+        write(layout, new FindingOutputReader().read(chains, calibrations, notes, verification));
+    }
+
+    /** Render a previously frozen snapshot; all formats in a pipeline can share one reader. */
+    public void write(ReportLayout layout, FindingOutputReader.Snapshot snapshot)
+            throws IOException {
+        if (layout == null) {
+            throw new IOException("report layout is null");
+        }
+        if (snapshot == null) {
+            throw new IOException("finding output snapshot is null");
+        }
+        List<Chain> chains = snapshot.findings().stream()
+                .map(FindingOutputReader.Finding::chain).toList();
+        Map<String, String> calibrations = new java.util.TreeMap<>();
+        Map<String, List<String>> notes = new java.util.TreeMap<>();
+        for (FindingOutputReader.Finding finding : snapshot.findings()) {
+            if (!finding.exported()) {
+                calibrations.putIfAbsent(finding.chain().key(), finding.calibration());
+            }
+            notes.putIfAbsent(finding.chain().key(), finding.notes());
+        }
         Files.createDirectories(layout.findings());
-        Map<String, VerificationSummary.ChainResult> verificationByKey = verificationByKey(verification);
-        boolean structuredVerification = verification != null;
+        Map<String, VerificationSummary.ChainResult> verificationByKey =
+                snapshot.verificationByKey();
+        boolean structuredVerification = snapshot.structuredVerification();
         List<Chain> orderedChains = new ArrayList<>(chains);
         orderedChains.sort(ChainRanking.comparator(notes, verificationByKey, Set.of()));
-        Map<String, ChainView> views = buildViews(orderedChains, notes, verificationByKey);
+        Map<String, ChainView> views = buildViews(orderedChains, snapshot);
         // E1: JSON
         writeJson(layout.findings().resolve("findings.json"), orderedChains, calibrations, notes,
                 verificationByKey, structuredVerification, views);
@@ -78,9 +102,13 @@ public final class MultiFormatReporter {
     public void writeMetadata(ReportLayout layout, ScanStatistics stats) throws IOException {
         Files.createDirectories(layout.meta());
         Files.createDirectories(layout.verification());
+        io.just.sast.run.RunOutcome runOutcome = stats == null
+                ? io.just.sast.run.RunOutcome.notRun("MISSING_SCAN_STATISTICS", "")
+                : stats.runOutcome();
         StringBuilder sb = new StringBuilder("{\n")
                 .append("  \"schema_version\":1,")
                 .append("\n")
+                .append("  \"run_outcome\":").append(runOutcome.toCanonicalJson()).append(",\n")
                 .append("  \"files_scanned\":").append(stats.filesScanned())
                 .append(",\"classes_loaded\":").append(stats.classesLoaded())
                 .append(",\"diagnostics\":").append(stats.diagnostics())
@@ -117,6 +145,43 @@ public final class MultiFormatReporter {
             Map.Entry<String, Long> metric = metrics.get(i);
             sb.append('"').append(escJson(metric.getKey())).append("\":").append(metric.getValue());
         }
+        sb.append("},\"metric_status\":{");
+        List<Map.Entry<String, String>> metricStatus = new ArrayList<>(stats.metricStatus().entrySet());
+        metricStatus.sort(Map.Entry.comparingByKey());
+        for (int i = 0; i < metricStatus.size(); i++) {
+            if (i > 0) sb.append(',');
+            Map.Entry<String, String> metric = metricStatus.get(i);
+            sb.append('"').append(escJson(metric.getKey())).append("\":\"")
+                    .append(escJson(metric.getValue())).append('"');
+        }
+        sb.append("},\"metric_namespaces\":{");
+        List<Map.Entry<String, Map<String, Long>>> namespaces =
+                new ArrayList<>(stats.metricNamespaces().entrySet());
+        namespaces.sort(Map.Entry.comparingByKey());
+        for (int i = 0; i < namespaces.size(); i++) {
+            if (i > 0) sb.append(',');
+            Map.Entry<String, Map<String, Long>> namespace = namespaces.get(i);
+            sb.append('"').append(escJson(namespace.getKey())).append("\":{");
+            List<Map.Entry<String, Long>> values = new ArrayList<>(namespace.getValue().entrySet());
+            values.sort(Map.Entry.comparingByKey());
+            for (int j = 0; j < values.size(); j++) {
+                if (j > 0) sb.append(',');
+                Map.Entry<String, Long> value = values.get(j);
+                sb.append('"').append(escJson(value.getKey())).append("\":")
+                        .append(value.getValue());
+            }
+            sb.append('}');
+        }
+        sb.append("},\"metric_namespace_status\":{");
+        List<Map.Entry<String, String>> namespaceStatus =
+                new ArrayList<>(stats.metricNamespaceStatus().entrySet());
+        namespaceStatus.sort(Map.Entry.comparingByKey());
+        for (int i = 0; i < namespaceStatus.size(); i++) {
+            if (i > 0) sb.append(',');
+            Map.Entry<String, String> status = namespaceStatus.get(i);
+            sb.append('"').append(escJson(status.getKey())).append("\":\"")
+                    .append(escJson(status.getValue())).append('"');
+        }
         sb.append("},\"dynamic_verification\":");
         appendVerificationJson(sb, stats.dynamicVerification());
         sb.append("\n}\n");
@@ -126,38 +191,95 @@ public final class MultiFormatReporter {
         dynamic.append('\n');
         AtomicFiles.writeUtf8(layout.verification().resolve("dynamic-verification.json"),
                 dynamic.toString());
+        StringBuilder run = new StringBuilder("{\n  \"schema_version\":1,\n  \"kind\":\"just-run\",\n  \"run_outcome\":")
+                .append(runOutcome.toCanonicalJson()).append(',');
+        appendRunDisclosure(run, stats.dynamicVerification());
+        run.append("\n}\n");
+        AtomicFiles.writeUtf8(layout.meta().resolve("run.json"), run.toString());
     }
 
     private static void appendVerificationJson(StringBuilder sb, VerificationSummary summary) {
+        VerificationSummary safeSummary = summary == null
+                ? VerificationSummary.empty("UNKNOWN", 0) : summary;
+        VerificationSummary.SafetyDisclosure disclosure = safeSummary.safetyDisclosure();
         sb.append('{')
                 .append("\"schema_version\":1,")
-                .append("\"capability\":\"").append(escJson(summary.capability())).append("\"")
-                .append(",\"backend\":\"").append(escJson(summary.backend())).append("\"")
-                .append(",\"isolation_level\":\"").append(escJson(summary.isolationLevel())).append("\"")
+                .append("\"capability\":\"").append(escJson(safeSummary.capability())).append("\"")
+                .append(",\"verification_mode\":\"").append(escJson(disclosure.verificationMode()))
+                .append("\",\"verificationMode\":\"").append(escJson(disclosure.verificationMode()))
+                .append("\",\"target_code_execution_possible\":")
+                .append(disclosure.targetCodeExecutionPossible())
+                .append(",\"targetCodeExecutionPossible\":")
+                .append(disclosure.targetCodeExecutionPossible())
+                .append(",\"target_code_executed\":\"")
+                .append(escJson(disclosure.targetCodeExecuted()))
+                .append("\",\"targetCodeExecuted\":\"")
+                .append(escJson(disclosure.targetCodeExecuted())).append('"')
+                .append(",\"resource_containment_only\":")
+                .append(disclosure.resourceContainmentOnly())
+                .append(",\"resourceContainmentOnly\":")
+                .append(disclosure.resourceContainmentOnly())
+                .append(",\"filesystem_isolation\":")
+                .append(disclosure.filesystemIsolation())
+                .append(",\"filesystemIsolation\":")
+                .append(disclosure.filesystemIsolation())
+                .append(",\"network_isolation\":")
+                .append(disclosure.networkIsolation())
+                .append(",\"networkIsolation\":")
+                .append(disclosure.networkIsolation())
+                .append(",\"token_isolation\":")
+                .append(disclosure.tokenIsolation())
+                .append(",\"tokenIsolation\":")
+                .append(disclosure.tokenIsolation())
+                .append(",\"dangerous_sink_executed\":")
+                .append(disclosure.dangerousSinkExecuted())
+                .append(",\"dangerousSinkExecuted\":")
+                .append(disclosure.dangerousSinkExecuted())
+                .append(",\"recommended_for_untrusted_artifacts\":")
+                .append(disclosure.recommendedForUntrustedArtifacts())
+                .append(",\"recommendedForUntrustedArtifacts\":")
+                .append(disclosure.recommendedForUntrustedArtifacts())
+                .append(",\"target_trust\":\"").append(escJson(disclosure.targetTrust()))
+                .append("\",\"isolation_backend\":\"")
+                .append(escJson(disclosure.isolationBackend()))
+                .append("\",\"isolationBackend\":\"")
+                .append(escJson(disclosure.isolationBackend()))
+                .append("\",\"isolation_status\":\"")
+                .append(escJson(disclosure.isolationStatus()))
+                .append("\",\"isolationStatus\":\"")
+                .append(escJson(disclosure.isolationStatus()))
+                .append("\",\"fail_closed_on_isolation_failure\":")
+                .append(disclosure.failClosedOnIsolationFailure())
+                .append(",\"failClosedOnIsolationFailure\":")
+                .append(disclosure.failClosedOnIsolationFailure())
+                .append(",\"capability_gaps\":");
+        appendStrings(sb, disclosure.capabilityGaps());
+        sb.append(",\"backend\":\"").append(escJson(safeSummary.backend())).append("\"")
+                .append(",\"isolation_level\":\"").append(escJson(safeSummary.isolationLevel())).append("\"")
                 .append(",\"isolation_capabilities\":");
-        appendStrings(sb, summary.isolationCapabilities());
-        sb.append(",\"jdk\":\"").append(escJson(summary.jdk())).append("\"")
+        appendStrings(sb, safeSummary.isolationCapabilities());
+        sb.append(",\"jdk\":\"").append(escJson(safeSummary.jdk())).append("\"")
                 .append(",\"attestation_version\":\"")
-                .append(escJson(summary.attestationVersion())).append("\"")
-                .append(",\"policy_digest\":\"").append(escJson(summary.policyDigest())).append("\"")
-                .append(",\"artifact_sha256\":\"").append(escJson(summary.artifactHash())).append("\"")
-                .append(",\"sink_distorted\":").append(summary.sinkDistorted())
-                .append(",\"sandbox_ready\":").append(summary.sandboxReady())
-                .append(",\"cleanup\":\"").append(escJson(summary.cleanup())).append("\"")
-                .append(",\"budget\":").append(summary.budget())
-                .append(",\"constructible\":").append(summary.constructible())
-                .append(",\"rejected\":").append(summary.rejected())
-                .append(",\"selected\":").append(summary.selected())
+                .append(escJson(safeSummary.attestationVersion())).append("\"")
+                .append(",\"policy_digest\":\"").append(escJson(safeSummary.policyDigest())).append("\"")
+                .append(",\"artifact_sha256\":\"").append(escJson(safeSummary.artifactHash())).append("\"")
+                .append(",\"sink_distorted\":").append(safeSummary.sinkDistorted())
+                .append(",\"resource_containment_ready\":").append(safeSummary.sandboxReady())
+                .append(",\"cleanup\":\"").append(escJson(safeSummary.cleanup())).append("\"")
+                .append(",\"budget\":").append(safeSummary.budget())
+                .append(",\"constructible\":").append(safeSummary.constructible())
+                .append(",\"rejected\":").append(safeSummary.rejected())
+                .append(",\"selected\":").append(safeSummary.selected())
                 .append(",\"status_counts\":");
-        appendCounts(sb, summary.statusCounts());
+        appendCounts(sb, safeSummary.statusCounts());
         sb.append(",\"detail_counts\":");
-        appendCounts(sb, summary.detailCounts());
+        appendCounts(sb, safeSummary.detailCounts());
         sb.append(",\"results\":[");
-        for (int i = 0; i < summary.results().size(); i++) {
+        for (int i = 0; i < safeSummary.results().size(); i++) {
             if (i > 0) {
                 sb.append(',');
             }
-            VerificationSummary.ChainResult result = summary.results().get(i);
+            VerificationSummary.ChainResult result = safeSummary.results().get(i);
             sb.append('{')
                     .append("\"rank\":").append(result.rank())
                     .append(",\"chain_key\":\"").append(escJson(result.chainKey())).append("\"")
@@ -172,7 +294,7 @@ public final class MultiFormatReporter {
                     .append(",\"jdk\":\"").append(escJson(result.jdk())).append("\"")
                     .append(",\"policy_digest\":\"").append(escJson(result.policyDigest())).append("\"")
                     .append(",\"sink_distorted\":").append(result.sinkDistorted())
-                    .append(",\"sandbox_ready\":").append(result.sandboxReady())
+                    .append(",\"resource_containment_ready\":").append(result.sandboxReady())
                     .append(",\"requested_mode\":\"").append(escJson(result.requestedMode())).append("\"")
                     .append(",\"effective_mode\":\"").append(escJson(result.effectiveMode())).append("\"")
                     .append(",\"fallback\":\"").append(escJson(result.fallback())).append("\"")
@@ -187,6 +309,34 @@ public final class MultiFormatReporter {
                     .append('}');
         }
         sb.append("]}");
+    }
+
+    private static void appendRunDisclosure(StringBuilder sb, VerificationSummary summary) {
+        VerificationSummary.SafetyDisclosure disclosure = (summary == null
+                ? VerificationSummary.empty("UNKNOWN", 0) : summary).safetyDisclosure();
+        sb.append("\n  \"verificationMode\":\"").append(escJson(disclosure.verificationMode()))
+                .append("\",\n  \"targetCodeExecutionPossible\":")
+                .append(disclosure.targetCodeExecutionPossible())
+                .append(",\n  \"targetCodeExecuted\":\"")
+                .append(escJson(disclosure.targetCodeExecuted())).append("\",\n  \"resourceContainmentOnly\":")
+                .append(disclosure.resourceContainmentOnly())
+                .append(",\n  \"filesystemIsolation\":")
+                .append(disclosure.filesystemIsolation())
+                .append(",\n  \"networkIsolation\":")
+                .append(disclosure.networkIsolation())
+                .append(",\n  \"tokenIsolation\":")
+                .append(disclosure.tokenIsolation())
+                .append(",\n  \"dangerousSinkExecuted\":")
+                .append(disclosure.dangerousSinkExecuted())
+                .append(",\n  \"recommendedForUntrustedArtifacts\":")
+                .append(disclosure.recommendedForUntrustedArtifacts())
+                .append(",\n  \"targetTrust\":\"").append(escJson(disclosure.targetTrust()))
+                .append("\",\n  \"isolationBackend\":\"")
+                .append(escJson(disclosure.isolationBackend())).append("\",\n  \"isolationStatus\":\"")
+                .append(escJson(disclosure.isolationStatus())).append("\",\n  \"failClosedOnIsolationFailure\":")
+                .append(disclosure.failClosedOnIsolationFailure())
+                .append(",\n  \"capabilityGaps\":");
+        appendStrings(sb, disclosure.capabilityGaps());
     }
 
     private static void appendStrings(StringBuilder sb, List<String> values) {
@@ -260,6 +410,33 @@ public final class MultiFormatReporter {
                             .append(",\"chain_length\":").append(Integer.toString(c.hops().size()))
                             .append(",\"unresolved_hops\":").append(Integer.toString(c.unresolvedHops()))
                             .append(",\"path\":\"").append(escJson(CsvReporter.pathSummary(c)))
+                            .append("\",\"application_entry_class\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().applicationEntryClass()))
+                            .append("\",\"application_entry_method\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().applicationEntryMethod()))
+                            .append("\",\"application_site_class\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().applicationSiteClass()))
+                            .append("\",\"application_site_method\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().applicationSiteMethod()))
+                            .append("\",\"application_site_kind\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().applicationSiteKind()))
+                            .append("\",\"application_join_kind\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().joinKind()))
+                            .append("\",\"application_chain_entry_method\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().chainEntryMethod()))
+                            .append("\",\"application_entry_prefix_path\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().entryPrefixPath()))
+                            .append("\",\"application_path\":\"")
+                            .append(escJson(view.applicationTrace() == null ? ""
+                                    : view.applicationTrace().applicationPath(c)))
                             .append("\",\"verification_status\":\"").append(escJson(verify))
                             .append("\",\"verification_evidence\":\"")
                             .append(escJson(result == null ? "" : result.evidence()))
@@ -268,7 +445,7 @@ public final class MultiFormatReporter {
                             .append(",\"verify\":\"").append(escJson(verify)).append('"')
                             .append(",\"sink_distorted\":")
                             .append(Boolean.toString(result != null && result.sinkDistorted()))
-                            .append(",\"sandbox_ready\":")
+                            .append(",\"resource_containment_ready\":")
                             .append(Boolean.toString(result != null && result.sandboxReady()))
                             .append(",\"requested_mode\":\"")
                             .append(escJson(result == null ? "UNKNOWN" : result.requestedMode()))
@@ -288,6 +465,7 @@ public final class MultiFormatReporter {
                             .append(escJson(result == null ? "NOT_SELECTED" : result.stopReason()))
                             .append("\",\"last_confirmed_stage\":\"")
                             .append(escJson(result == null ? "NONE" : result.lastConfirmedStage()))
+                            .append('"')
                             .append('}');
                 }
                 writer.write("\n]");
@@ -310,7 +488,7 @@ public final class MultiFormatReporter {
             writer.write("<h1>Just SAST — Gadget Chain Findings</h1>\n");
             writer.append("<p>Total: ").append(Long.toString(chains.stream()
                     .filter(c -> !calibrations.containsKey(c.key())).count())).append(" chains</p>\n");
-            writer.write("<table><tr><th>#</th><th>Rule</th><th>Confidence</th><th>Verification</th><th>Group</th><th>Scope</th><th>Sink risk</th><th>Terminal executed</th><th>High confidence</th><th>Entry</th><th>Sink</th><th>Sink role</th><th>Construction</th><th>Sink control</th><th>Precision</th><th>Rank evidence</th><th>Hops</th></tr>\n");
+            writer.write("<table><tr><th>#</th><th>Rule</th><th>Confidence</th><th>Verification</th><th>Group</th><th>Scope</th><th>Sink risk</th><th>Terminal executed</th><th>High confidence</th><th>Application entry</th><th>Application path</th><th>Chain entry</th><th>Sink</th><th>Sink role</th><th>Construction</th><th>Sink control</th><th>Precision</th><th>Rank evidence</th><th>Hops</th></tr>\n");
             int seq = 0;
             for (Chain c : chains) {
                 if (calibrations.containsKey(c.key())) {
@@ -332,6 +510,10 @@ public final class MultiFormatReporter {
                         .append("</td><td>").append(escHtml(c.sinkRisk().name()))
                         .append("</td><td>").append(Boolean.toString(result != null && result.terminalExecuted()))
                         .append("</td><td>").append(Boolean.toString(view.highConfidence()))
+                        .append("</td><td>").append(escHtml(view.applicationTrace() == null ? ""
+                                : view.applicationTrace().entryDisplay()))
+                        .append("</td><td class='path'>").append(escHtml(view.applicationTrace() == null ? ""
+                                : view.applicationTrace().applicationPath(c)))
                         .append("</td><td>").append(escHtml(c.entryClass().replace('/', '.'))).append(".").append(escHtml(c.entryMethod()))
                         .append("</td><td>").append(escHtml(c.sinkClass().replace('/', '.'))).append(".").append(escHtml(c.sinkMethod()))
                         .append("</td><td>").append(escHtml(c.sinkRole()))
@@ -356,7 +538,7 @@ public final class MultiFormatReporter {
             writer.write("# Just SAST — Gadget Chain Findings\n\n");
             long count = chains.stream().filter(c -> !calibrations.containsKey(c.key())).count();
             writer.append("**Total**: ").append(Long.toString(count)).append(" chains\n\n");
-            writer.write("| # | Rule | Confidence | Verification | Group | Scope | Sink risk | Terminal executed | High confidence | Entry | Sink | Sink role | Construction | Sink control | Precision | Rank evidence | Hops |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            writer.write("| # | Rule | Confidence | Verification | Group | Scope | Sink risk | Terminal executed | High confidence | Application entry | Application path | Chain entry | Sink | Sink role | Construction | Sink control | Precision | Rank evidence | Hops |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
             int seq = 0;
             for (Chain c : chains) {
                 if (calibrations.containsKey(c.key())) {
@@ -377,6 +559,10 @@ public final class MultiFormatReporter {
                         .append(" | ").append(escMd(c.sinkRisk().name()))
                         .append(" | ").append(Boolean.toString(result != null && result.terminalExecuted()))
                         .append(" | ").append(Boolean.toString(view.highConfidence()))
+                        .append(" | `").append(escMd(view.applicationTrace() == null ? ""
+                                : view.applicationTrace().entryDisplay())).append("`")
+                        .append(" | `").append(escMd(view.applicationTrace() == null ? ""
+                                : view.applicationTrace().applicationPath(c))).append("`")
                         .append(" | `").append(escMd(c.entryClass().replace('/', '.'))).append(".").append(escMd(c.entryMethod())).append("`")
                         .append(" | `").append(escMd(c.sinkClass().replace('/', '.'))).append(".").append(escMd(c.sinkMethod())).append("`")
                         .append(" | ").append(escMd(c.sinkRole()))
@@ -468,22 +654,22 @@ public final class MultiFormatReporter {
     }
 
     private static Map<String, ChainView> buildViews(
-            List<Chain> chains,
-            Map<String, List<String>> notes,
-            Map<String, VerificationSummary.ChainResult> verification) {
+            List<Chain> chains, FindingOutputReader.Snapshot snapshot) {
         Map<String, ChainView> views = new HashMap<>(Math.max(16, chains.size() * 2));
         for (Chain chain : chains) {
             if (views.containsKey(chain.key())) {
                 continue;
             }
-            List<String> chainNotes = notes.getOrDefault(chain.key(), List.of());
-            VerificationSummary.ChainResult result = verification.get(chain.key());
+            FindingOutputReader.Finding finding = snapshot.byChainKey().get(chain.key());
+            if (finding == null) {
+                // Defensive only: the reader is built from the same immutable chain list.  Do
+                // not let a future caller silently invent a second semantic source.
+                continue;
+            }
             views.put(chain.key(), new ChainView(
-                    ConfidenceScorer.score(chain, chainNotes),
-                    ChainRanking.evidence(chain, notes, verification, Set.of()),
-                    ChainPrecision.assess(chain, chainNotes, result),
-                    ChainPrecision.isHighConfidence(chain, chainNotes, result),
-                    ReportEvidence.construction(chain, chainNotes, result)));
+                    finding.confidence().bucket(), finding.ranking(), finding.precision(),
+                    finding.highConfidence(), finding.construction(),
+                    snapshot.applicationTrace(chain.key())));
         }
         return views;
     }
@@ -491,20 +677,8 @@ public final class MultiFormatReporter {
     private static String verificationStatus(VerificationSummary.ChainResult result,
                                              List<String> notes,
                                              boolean structuredVerification) {
-        if (result != null) {
-            return result.status();
-        }
-        if (structuredVerification) {
-            return "NOT_SELECTED";
-        }
-        if (notes != null) {
-            for (String note : notes) {
-                if (note != null && note.startsWith("verify:")) {
-                    return note.substring("verify:".length()).toUpperCase();
-                }
-            }
-        }
-        return "NOT_SELECTED";
+        return FindingOutputReader.legacyVerificationStatus(result, notes,
+                structuredVerification);
     }
 
     @FunctionalInterface

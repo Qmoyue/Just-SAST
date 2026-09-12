@@ -7,6 +7,7 @@ import io.just.sast.config.Rule;
 import io.just.sast.config.RuleSet;
 import io.just.sast.cpg.build.BuiltCpg;
 import io.just.sast.cpg.build.CpgBuilder;
+import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
@@ -30,8 +31,10 @@ import org.objectweb.asm.Type;
 import java.lang.reflect.Modifier;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -293,6 +296,51 @@ class OriginSupportFeasibilityTest {
         assertTrue(support.isSerializedProxyHandler(handlerMethod));
         assertEquals(List.of(methodNode), support.serializedProxyHandlerMethods(),
                 "serialized proxy callbacks must be indexed without requiring Proxy.newProxyInstance");
+    }
+
+    @Test
+    void entryClosureDropsReachableMethodsWithNoTerminalDemand() {
+        String app = "fixture/app/Ingress";
+        String helper = "fixture/app/Noise";
+        String relevant = "fixture/lib/Relevant";
+        String runtime = "java/lang/Runtime";
+        String sinkDesc = "(Ljava/lang/String;)Ljava/lang/Process;";
+        Graph graph = new Graph();
+        graph.methodNode(app, "handle", "()V", false);
+        graph.methodNode(helper, "helper", "()V", false);
+        graph.methodNode(relevant, "trigger", "()V", false);
+        graph.methodNode(runtime, "exec", sinkDesc, true);
+        Node helperCall = graph.addCallNode(helper, "helper", "()V", "STATIC", null, 0,
+                app, "handle", "()V");
+        Node relevantCall = graph.addCallNode(relevant, "trigger", "()V", "STATIC", null, 1,
+                app, "handle", "()V");
+        Node sink = graph.addCallNode(runtime, "exec", sinkDesc, "VIRTUAL", null, 0,
+                relevant, "trigger", "()V");
+        graph.addEdge(helperCall, graph.findMethodNode(helper, "helper", "()V"),
+                io.just.sast.cpg.graph.EdgeType.INVOKES, "STATIC");
+        graph.addEdge(relevantCall, graph.findMethodNode(relevant, "trigger", "()V"),
+                io.just.sast.cpg.graph.EdgeType.INVOKES, "STATIC");
+        graph.addEdge(sink, graph.findMethodNode(runtime, "exec", sinkDesc),
+                io.just.sast.cpg.graph.EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        Rule.SinkRule sinkRule = new Rule.SinkRule("runtime-exec", "COMMAND", "HIGH",
+                new Rule.CallMatcher(Match.of(runtime), Match.of("exec"), Match.of(sinkDesc)),
+                List.of(new Rule.TaintedPos.Arg(0)), Rule.SinkRole.TERMINAL);
+        Rule.MagicEntryRule entryRule = new Rule.MagicEntryRule("app-handler", "handle",
+                new Rule.MethodMatcher(Match.of("handle"), Match.of("()V"), false), null,
+                "lifecycle");
+        RuleEngine engine = new RuleEngine(new RuleSet(List.of(sinkRule), List.of(entryRule),
+                List.of(), List.of(), List.of()), new ClassHierarchy(Map.of(), null));
+        OriginSupport support = new OriginSupport(graph, new ClassHierarchy(Map.of(), null),
+                engine, false, CpgIndex.empty(), Set.of(app), true,
+                Set.of(app + "#handle()V"));
+
+        Set<String> closure = support.entryDownstream(graph);
+        assertTrue(closure.contains(relevant + "#trigger()V"),
+                "terminal-relevant dependency method must remain in the entry demand closure");
+        assertFalse(closure.contains(helper + "#helper()V"),
+                "a reachable helper with no terminal demand must not expand the whole closure");
     }
 
     private static OriginSupport emptySupport() {

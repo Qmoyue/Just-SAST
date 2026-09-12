@@ -1,5 +1,6 @@
 package io.just.sast.knowledge.framework;
 
+import io.just.sast.analysis.entry.ApplicationEntryIndex;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
@@ -8,7 +9,9 @@ import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
+import io.just.sast.blackboard.RunProduct;
 import io.just.sast.config.Rule;
+import io.just.sast.config.RuleSchemaV2;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Node;
@@ -16,6 +19,7 @@ import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.InsnFact;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
+import io.just.sast.util.ChainMaterializer;
 import io.just.sast.util.JustLogger;
 
 import java.util.ArrayDeque;
@@ -25,7 +29,10 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 /**
  * 统一框架桥接引擎（ANALYSIS 阶段，自足）。
@@ -57,6 +64,16 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
     @Override
     public int priority() {
         return 400;
+    }
+
+    @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.PROGRAM_MODEL);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.ANALYSIS_CHAINS);
     }
 
     @Override
@@ -105,17 +122,38 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                 }
                 Node fwCall = bb.graph().node(callId);
                 // 管线 BFS（包前缀剪枝）到反射 sink，保留完整调用点路径
-                List<Node> path = findReflectiveSinkPath(fwCall, ref.owner());
+                DeferredFrameworkPath path = findReflectiveSinkPath(fwCall, ref.owner());
                 if (path == null) {
                     continue;
                 }
-                Node sinkCall = path.get(path.size() - 1);
+                Node sinkCall = path.sinkCaller();
                 var sinkRule = bb.ruleEngine().matchingSink(sinkCall);
                 if (sinkRule.isEmpty()) {
                     continue;
                 }
-                Chain chain = assemble(info, path, sinkCall, sinkRule.get(), matched);
-                if (chain != null && bb.addChain(chain)) {
+                Rule.SinkRule rule = sinkRule.get();
+                // Preserve the old null result before publishing a candidate.  The endpoint
+                // descriptor is cheap; the path-to-Chain assembly remains behind the supplier.
+                if (support.enclosingMethod(sinkCall) == null) {
+                    continue;
+                }
+                String bridge = matched.bridge() != null ? matched.bridge() : "deserialize";
+                boolean continuation = !RuleSchemaV2.isTerminalSink(rule)
+                        && !RuleSchemaV2.bridgesFor(rule).isEmpty();
+                ApplicationEntryIndex.ProducerCandidate candidate =
+                        new ApplicationEntryIndex.ProducerCandidate(rule.id(), rule.category(),
+                                rule.severity(), info.owner(), info.name(), info.descriptor(), bridge,
+                                sinkCall.strProp("owner"), sinkCall.strProp("name"),
+                                sinkCall.strProp("desc"), rule.role().name(), rule.sinkRisk(),
+                                continuation);
+                FrameworkProducer producer = new FrameworkProducer(candidate, () -> {
+                    List<Node> materializedPath = path.materializer().get();
+                    if (materializedPath == null || materializedPath.size() != path.pathSize()) {
+                        return null;
+                    }
+                    return assemble(info, materializedPath, sinkCall, rule, matched);
+                });
+                if (bb.addSolverCandidate(producer.candidate(), producer.materializer())) {
                     chains++;
                     if (chains >= MAX_CHAINS) {
                         JustLogger.warn("框架桥接：达到链数上限 {}，剩余入口未处理", MAX_CHAINS);
@@ -134,7 +172,7 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
     }
 
     /** 包前缀剪枝 BFS：框架入口沿同包方法到反射 sink，返回入口→…→sink 的调用点路径。 */
-    private List<Node> findReflectiveSinkPath(Node fwCall, String fwOwner) {
+    private DeferredFrameworkPath findReflectiveSinkPath(Node fwCall, String fwOwner) {
         String fwPrefix = packagePrefix(fwOwner, 3);
         Map<Node, Node> parent = new HashMap<>();
         Deque<Node> work = new ArrayDeque<>();
@@ -154,7 +192,13 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                     String owner = callee.strProp("owner");
                     String name = callee.strProp("name");
                     if (isReflectiveSink(owner, name)) {
-                        return buildPath(parent, call, fwCall);
+                        Map<Node, Node> stableParent = Map.copyOf(parent);
+                        int pathSize = pathSize(stableParent, call, fwCall);
+                        if (pathSize <= 0) {
+                            return null;
+                        }
+                        return new DeferredFrameworkPath(call, pathSize,
+                                () -> buildPath(stableParent, call, fwCall));
                     }
                     if (!owner.startsWith(fwPrefix)) {
                         continue;
@@ -204,6 +248,18 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
         }
         java.util.Collections.reverse(path);
         return path;
+    }
+
+    /** Count the same bounded caller path as {@link #buildPath} without allocating its list. */
+    private static int pathSize(Map<Node, Node> parent, Node sinkCaller, Node fwCall) {
+        int size = 0;
+        for (Node cur = sinkCaller; cur != null; cur = parent.get(cur)) {
+            size++;
+            if (cur.id() == fwCall.id()) {
+                return size;
+            }
+        }
+        return 0;
     }
 
     private static boolean isReflectiveSink(String owner, String name) {
@@ -256,5 +312,59 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
             sb.append(parts[i]);
         }
         return sb.toString();
+    }
+
+    /**
+     * Framework BFS endpoint metadata with a memoized caller-path materializer.  The path is
+     * frozen only after an accepted typed producer asks for it; rejected candidates pay only
+     * the bounded BFS parent-map bookkeeping and path length count.
+     */
+    record DeferredFrameworkPath(Node sinkCaller, int pathSize, Supplier<List<Node>> materializer) {
+        DeferredFrameworkPath {
+            sinkCaller = Objects.requireNonNull(sinkCaller, "sinkCaller");
+            if (pathSize <= 0) {
+                throw new IllegalArgumentException("framework path size must be positive");
+            }
+            Supplier<List<Node>> delegate = Objects.requireNonNull(materializer, "materializer");
+            AtomicReference<PathMaterializationState> cached = new AtomicReference<>();
+            materializer = () -> {
+                PathMaterializationState existing = cached.get();
+                if (existing != null) {
+                    return existing.valueOrThrow();
+                }
+                synchronized (cached) {
+                    existing = cached.get();
+                    if (existing == null) {
+                        try {
+                            List<Node> built = delegate.get();
+                            existing = new PathMaterializationState(
+                                    built == null ? null : List.copyOf(built), null);
+                        } catch (RuntimeException failure) {
+                            existing = new PathMaterializationState(null, failure);
+                        }
+                        cached.set(existing);
+                    }
+                    return existing.valueOrThrow();
+                }
+            };
+        }
+
+        private record PathMaterializationState(List<Node> path, RuntimeException failure) {
+            private List<Node> valueOrThrow() {
+                if (failure != null) {
+                    throw failure;
+                }
+                return path;
+            }
+        }
+    }
+
+    /** Typed framework endpoint plus a stable deferred chain payload. */
+    record FrameworkProducer(ApplicationEntryIndex.ProducerCandidate candidate,
+                             Supplier<Chain> materializer) {
+        FrameworkProducer {
+            candidate = Objects.requireNonNull(candidate, "candidate");
+            materializer = ChainMaterializer.memoize(Objects.requireNonNull(materializer, "materializer"));
+        }
     }
 }

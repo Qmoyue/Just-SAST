@@ -31,6 +31,22 @@ public interface KnowledgeSource {
         return 500;
     }
 
+    /**
+     * Typed products required before this source can run.  Empty sets retain the compatible
+     * event-only extension contract; they must not be interpreted as an implicit dependency.
+     */
+    default Set<RunProduct> requiresProducts() {
+        return Set.of();
+    }
+
+    /**
+     * Typed products contributed by this source.  Chain products are append-only contributions
+     * merged by the Blackboard's single product owner; singleton products have one producer.
+     */
+    default Set<RunProduct> providesProducts() {
+        return Set.of();
+    }
+
     /** Plugin contract version; incompatible versions are rejected during discovery. */
     default int contractVersion() {
         return CONTRACT_VERSION;

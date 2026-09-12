@@ -2,9 +2,14 @@ package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.JdkClassSource;
+import io.just.sast.model.JdkSourceInfo;
+import io.just.sast.run.InputBudget;
+import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.IoUtil;
 import io.just.sast.util.JustLogger;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -13,6 +18,8 @@ import java.nio.file.FileSystemNotFoundException;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.LinkOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.spi.FileSystemProvider;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,6 +27,7 @@ import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 /**
@@ -33,6 +41,10 @@ public final class JrtClassSource implements JdkClassSource {
     /** 与反序列化链相关的 JDK 模块（全量加载集）。 */
     public static final List<String> DESER_MODULES = List.of(
             "java.base", "java.naming", "java.rmi", "java.management", "java.scripting", "java.sql",
+            // Swing's EventListenerList is used by the declared JDK gadget fragments.  It is
+            // outside the default java.* core modules, but still part of the target JDK image
+            // and must be discoverable without requiring an unbounded whole-image walk.
+            "java.desktop",
             // TemplatesImpl and the XML transformer implementation are part of
             // the JDK XML module. They are a common deserialization sink even
             // when the application bytecode reaches them through reflection,
@@ -49,25 +61,62 @@ public final class JrtClassSource implements JdkClassSource {
     private final Set<String> missingClasses = ConcurrentHashMap.newKeySet();
     /** Package-to-module candidates avoid walking every configured module on the first miss. */
     private final Map<String, List<String>> packageIndex = new ConcurrentHashMap<>();
+    /** One policy/tracker covers all classes read from this JDK image during a scan. */
+    private final InputBudget budget;
+    private final InputBudget.Tracker inputTracker;
+    private final Set<String> accountedClasses = ConcurrentHashMap.newKeySet();
+    private final AtomicInteger classEntries = new AtomicInteger();
+    private final AtomicInteger indexedClasses = new AtomicInteger();
+    private volatile String budgetFailure;
     private volatile boolean fullIndexBuilt;
     private final int feature;
+    private final JdkSourceInfo sourceInfo;
     private volatile boolean closed;
 
     private JrtClassSource(FileSystem jrt, int feature) {
-        this(jrt, feature, null);
+        this(jrt, feature, null, InputBudget.defaults(), null);
     }
 
     private JrtClassSource(FileSystem jrt, int feature, URLClassLoader ownerLoader) {
+        this(jrt, feature, ownerLoader, InputBudget.defaults(), null);
+    }
+
+    private JrtClassSource(FileSystem jrt, int feature, URLClassLoader ownerLoader,
+                           InputBudget budget) {
+        this(jrt, feature, ownerLoader, budget, null);
+    }
+
+    private JrtClassSource(FileSystem jrt, int feature, URLClassLoader ownerLoader,
+                           InputBudget budget, InputBudget.Tracker callerTracker) {
         this.jrt = jrt;
         this.feature = Math.max(0, feature);
         this.ownerLoader = ownerLoader;
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        this.inputTracker = callerTracker == null ? policy.tracker() : callerTracker;
+        // A caller-owned tracker is the aggregate authority.  Using its policy for all local
+        // limits prevents a source from observing one budget while enforcing another.
+        this.budget = callerTracker == null ? policy : callerTracker.budget();
+        this.sourceInfo = new JdkSourceInfo(ownerLoader == null
+                ? JdkSourceInfo.ImageKind.RUNTIME_JRT
+                : JdkSourceInfo.ImageKind.TARGET_JRT, this.feature);
     }
 
     /** 运行时 JDK 自身的 jrt 文件系统（JVM 启动即存在）。 */
     public static JrtClassSource runtime() {
+        return runtime(InputBudget.defaults());
+    }
+
+    /** Runtime JRT source under an explicit immutable input policy. */
+    public static JrtClassSource runtime(InputBudget budget) {
+        return runtime(budget, null);
+    }
+
+    /** Runtime JRT source reusing the scan's caller-owned input tracker. */
+    public static JrtClassSource runtime(InputBudget budget,
+                                         InputBudget.Tracker callerTracker) {
         try {
             return new JrtClassSource(FileSystems.getFileSystem(URI.create("jrt:/")),
-                    Runtime.version().feature());
+                    Runtime.version().feature(), null, budget, callerTracker);
         } catch (FileSystemNotFoundException e) {
             throw new IllegalStateException("运行时无 jrt 文件系统（非模块化 JDK？）", e);
         }
@@ -79,18 +128,66 @@ public final class JrtClassSource implements JdkClassSource {
      * （实测 Path 变体在 jrt-fs 上未实现，URI 变体 + java.home 是可行路径）。
      */
     public static JrtClassSource external(Path jdkHome) throws IOException {
-        Path jrtFsJar = jdkHome.resolve("lib").resolve("jrt-fs.jar");
-        if (!Files.exists(jrtFsJar)) {
-            throw new IOException("目标 JDK 缺少 lib/jrt-fs.jar: " + jdkHome);
+        return external(jdkHome, InputBudget.defaults());
+    }
+
+    /** Mount an external JDK image under an explicit immutable input policy. */
+    public static JrtClassSource external(Path jdkHome, InputBudget budget) throws IOException {
+        return external(jdkHome, budget, null);
+    }
+
+    /** Mount an external JDK image while charging its metadata and classes to a caller tracker. */
+    public static JrtClassSource external(Path jdkHome, InputBudget budget,
+                                          InputBudget.Tracker callerTracker) throws IOException {
+        InputBudget requested = budget == null ? InputBudget.defaults() : budget;
+        InputBudget.Tracker accounting = callerTracker == null
+                ? requested.tracker() : callerTracker;
+        InputBudget policy = callerTracker == null ? requested : accounting.budget();
+        if (jdkHome == null) {
+            throw new IOException("目标 JDK 目录为空");
         }
+        Path normalizedHome = jdkHome.toAbsolutePath().normalize();
+        // A Jabba-managed `default` home is commonly a junction/symlink. The JDK home is a
+        // trusted toolchain input; validate the actual jrt-fs.jar leaf below instead of
+        // rejecting that managed alias.
+        if (!Files.isDirectory(normalizedHome)) {
+            throw new IOException("目标 JDK 目录不是安全目录: " + normalizedHome);
+        }
+        Path effectiveHome = trustedHome(normalizedHome);
+        Path jrtFsJar = effectiveHome.resolve("lib").resolve("jrt-fs.jar");
+        if (!Files.isRegularFile(jrtFsJar, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                || ArchiveLimits.isLinkOrReparsePoint(jrtFsJar)) {
+            throw new IOException("目标 JDK 缺少安全的 lib/jrt-fs.jar: " + normalizedHome);
+        }
+        ArchiveLimits.checkContainerSize(jrtFsJar, policy);
+        ArchiveLimits.FileReadSnapshot providerSnapshot = ArchiveLimits.snapshotRegularFile(
+                jrtFsJar, policy, "JRT_PROVIDER");
         URLClassLoader loader = new URLClassLoader(new URL[] {jrtFsJar.toUri().toURL()},
                 ClassLoader.getPlatformClassLoader());
         try {
             for (FileSystemProvider candidate : ServiceLoader.load(FileSystemProvider.class, loader)) {
                 if ("jrt".equalsIgnoreCase(candidate.getScheme())) {
                     FileSystem fs = candidate.newFileSystem(URI.create("jrt:/"),
-                            Map.of("java.home", jdkHome.toAbsolutePath().toString()));
-                    return new JrtClassSource(fs, readFeature(jdkHome), loader);
+                            Map.of("java.home", effectiveHome.toString()));
+                    try {
+                        // jrt-fs.jar is the provider code used to mount the target image.  A
+                        // replacement between the leaf check and ServiceLoader construction
+                        // must not be silently accepted as target-JDK evidence.  Once the
+                        // provider is mounted its in-memory classloader/FS is independent of
+                        // later edits to the jar, so this bracket is intentionally limited to
+                        // the construction boundary.
+                        ArchiveLimits.verifyRegularFileUnchanged(providerSnapshot,
+                                "JRT_PROVIDER");
+                    } catch (IOException | RuntimeException failure) {
+                        try {
+                            fs.close();
+                        } catch (IOException closeFailure) {
+                            failure.addSuppressed(closeFailure);
+                        }
+                        throw failure;
+                    }
+                    return new JrtClassSource(fs, readFeature(effectiveHome, policy, accounting),
+                            loader, policy, accounting);
                 }
             }
         } catch (IOException | RuntimeException failure) {
@@ -103,8 +200,17 @@ public final class JrtClassSource implements JdkClassSource {
 
     /** 兜底构造：先试 external，目标不是模块化 JDK（无 jrt-fs.jar）返回 null 由调用方降级。 */
     public static JrtClassSource externalOrNull(Path jdkHome) {
+        return externalOrNull(jdkHome, InputBudget.defaults());
+    }
+
+    public static JrtClassSource externalOrNull(Path jdkHome, InputBudget budget) {
+        return externalOrNull(jdkHome, budget, null);
+    }
+
+    public static JrtClassSource externalOrNull(Path jdkHome, InputBudget budget,
+                                                InputBudget.Tracker callerTracker) {
         try {
-            return external(jdkHome);
+            return external(jdkHome, budget, callerTracker);
         } catch (IOException e) {
             JustLogger.warn("外部 JDK jrt-fs 挂载失败（{}），回退运行时镜像", e.getMessage());
             return null;
@@ -118,7 +224,11 @@ public final class JrtClassSource implements JdkClassSource {
             return null;
         }
         try {
-            return reader.read(bytes.bytes());
+            return reader.read(bytes.bytes(), budget, inputTracker);
+        } catch (IOException structuralFailure) {
+            budgetFailure = structuralFailure.getMessage();
+            JustLogger.debug("JDK 类结构预算拒绝 {}: {}", internalName, structuralFailure.getMessage());
+            return null;
         } catch (Exception e) {
             JustLogger.debug("JDK 类加载失败 {}: {}", internalName, e.getMessage());
             return null;
@@ -136,16 +246,30 @@ public final class JrtClassSource implements JdkClassSource {
             if (!Files.exists(classFile)) {
                 return null;
             }
-            return new ClassBytes(internalName, Files.readAllBytes(classFile), "jdk:/" + module);
+            return readClassFile(module, internalName, classFile);
+        } catch (BudgetInputException failure) {
+            budgetFailure = failure.getMessage();
+            JustLogger.debug("JDK 类读取预算拒绝 {}: {}", internalName, failure.getMessage());
+            return null;
         } catch (Exception e) {
             JustLogger.debug("JDK 类加载失败 {}: {}", internalName, e.getMessage());
             return null;
         }
     }
 
+    /** Stable completeness reasons collected while optional JDK classes are requested. */
+    public List<String> completenessReasons() {
+        return budgetFailure == null ? List.of() : List.of(budgetFailure);
+    }
+
     /** Feature represented by this JRT image, used for multi-release archive selection. */
     public int feature() {
         return feature;
+    }
+
+    @Override
+    public JdkSourceInfo sourceInfo() {
+        return sourceInfo;
     }
 
     /** Close only resources owned by external(Path); runtime() remains process-owned. */
@@ -187,7 +311,8 @@ public final class JrtClassSource implements JdkClassSource {
     private String moduleOfChecked(String internalName) throws IOException {
         if (internalName == null || internalName.isBlank()
                 || internalName.indexOf('[') >= 0
-                || (internalName.startsWith("L") && internalName.endsWith(";"))) {
+                || (internalName.startsWith("L") && internalName.endsWith(";"))
+                || !ArchiveLimits.safeEntryName(internalName + ".class", budget)) {
             return null;
         }
         String cached = moduleIndex.get(internalName);
@@ -209,14 +334,27 @@ public final class JrtClassSource implements JdkClassSource {
                 return moduleIndex.get(internalName);
             }
         }
+        // A caller-owned tracker may have exhausted while reading the package index. Do not
+        // fall through to the bounded full-module walk: that would reset the effective budget
+        // through a different metadata path and could turn an incomplete lookup into a false
+        // result.
+        if (budgetFailure != null) {
+            return null;
+        }
         if (!fullIndexBuilt) {
             // Unknown JDK names used to trigger a walk of every module.  Just's default
             // deserialization model has a bounded module surface; indexing only that surface
             // keeps a missing optional type from turning one lookup into a full JRT scan.
             synchronized (this) {
                 if (!fullIndexBuilt) {
-                    buildFullIndex(DESER_MODULES);
-                    fullIndexBuilt = true;
+                    try {
+                        buildFullIndex(DESER_MODULES);
+                    } finally {
+                        // A failed/limited index is still terminal for this source. Repeating
+                        // the walk for every unresolved type would turn one bounded lookup
+                        // into an unbounded retry loop and would not improve completeness.
+                        fullIndexBuilt = true;
+                    }
                 }
             }
         }
@@ -248,8 +386,29 @@ public final class JrtClassSource implements JdkClassSource {
             }
             List<String> modules;
             try (Stream<Path> children = Files.list(packagePath)) {
-                modules = children.map(path -> path.getFileName().toString())
-                        .sorted().toList();
+                List<String> observed = new ArrayList<>();
+                var iterator = children.iterator();
+                while (iterator.hasNext()) {
+                    Path modulePath = iterator.next();
+                    try {
+                        inputTracker.checkTime();
+                        inputTracker.observeFilesystemEntry();
+                    } catch (IOException budgetFailure) {
+                        this.budgetFailure = "JDK_PACKAGE_INDEX_INPUT_BUDGET";
+                        throw budgetFailure;
+                    }
+                    if (modulePath == null || isMutableProviderLink(modulePath)) {
+                        this.budgetFailure = "JDK_PACKAGE_INDEX_LINK";
+                        throw new IOException(this.budgetFailure);
+                    }
+                    Path fileName = modulePath.getFileName();
+                    if (fileName == null || fileName.toString().isBlank()) {
+                        this.budgetFailure = "JDK_PACKAGE_INDEX_ENTRY_INVALID";
+                        throw new IOException(this.budgetFailure);
+                    }
+                    observed.add(fileName.toString());
+                }
+                modules = observed.stream().sorted().toList();
             }
             List<String> stable = List.copyOf(modules);
             packageIndex.putIfAbsent(packageName, stable);
@@ -272,14 +431,170 @@ public final class JrtClassSource implements JdkClassSource {
 
     private static String packageName(String internalName) {
         int slash = internalName.lastIndexOf('/');
-        return slash < 0 ? "" : internalName.substring(0, slash);
+        // The JRT /packages index uses the module-system package spelling (dots), while
+        // class names arriving from ASM use JVM internal-name slashes.
+        return slash < 0 ? "" : internalName.substring(0, slash).replace('/', '.');
     }
 
-    private static int readFeature(java.nio.file.Path jdkHome) {
+    /** JRT entries are immutable provider objects; DOS reparse probing mislabels them on some
+     * Windows providers. Filesystem-backed fallbacks still use the shared link guard. */
+    private static boolean isMutableProviderLink(Path path) {
+        if (path == null) {
+            return true;
+        }
+        try {
+            String scheme = path.getFileSystem().provider().getScheme();
+            return !"jrt".equalsIgnoreCase(scheme)
+                    && ArchiveLimits.isLinkOrReparsePoint(path);
+        } catch (RuntimeException failure) {
+            return true;
+        }
+    }
+
+    /** Immutable identity bracketing one class-entry read from a JRT provider. */
+    record ClassEntrySnapshot(Path path, BasicFileAttributes attributes) {
+        ClassEntrySnapshot {
+            path = path == null ? null : path.toAbsolutePath().normalize();
+            if (attributes == null) {
+                throw new IllegalArgumentException("class-entry attributes are required");
+            }
+        }
+
+        /** Expose provider identity strength so callers do not infer content equality. */
+        ArchiveLimits.IdentityStrength identityStrength() {
+            return ArchiveLimits.identityStrength(path, attributes);
+        }
+    }
+
+    private ClassBytes readClassFile(String module, String internalName, Path classFile)
+            throws IOException {
+        String key = module + "/" + internalName;
+        ClassEntrySnapshot snapshot = snapshotClassEntry(classFile);
+        long size = snapshot.attributes().size();
+        if (size > budget.maxEntryBytes()) {
+            throw new BudgetInputException("JDK_CLASS_BYTES_CAP:" + budget.maxEntryBytes());
+        }
+        if (accountedClasses.add(key)) {
+            int count = classEntries.incrementAndGet();
+            if (count > budget.maxClassEntries()) {
+                throw new BudgetInputException("JDK_CLASS_ENTRIES_CAP:" + budget.maxClassEntries());
+            }
+            try {
+                inputTracker.observeFile("jdk:/" + key + ".class", size);
+            } catch (IOException failure) {
+                throw new BudgetInputException("JDK_INPUT_BUDGET", failure);
+            }
+        }
+        try (IoUtil.OpenedInput opened = openClassInput(classFile);
+             InputStream input = opened.stream()) {
+            byte[] bytes = IoUtil.readAll(input,
+                    Math.min(size, budget.maxEntryBytes()), inputTracker);
+            verifyClassEntryUnchanged(snapshot);
+            return new ClassBytes(internalName, bytes, "jdk:/" + module);
+        } catch (IOException failure) {
+            throw new BudgetInputException(failure.getMessage() == null
+                    ? "JDK_INPUT_BUDGET" : failure.getMessage(), failure);
+        }
+    }
+
+    private static ClassEntrySnapshot snapshotClassEntry(Path path) throws IOException {
+        if (path == null) {
+            throw new IOException("JDK_CLASS_ENTRY_NOT_REGULAR");
+        }
+        BasicFileAttributes attributes = readClassAttributes(path);
+            if (!attributes.isRegularFile() || ArchiveLimits.isLinkOrReparsePoint(path)) {
+                throw new IOException("JDK_CLASS_ENTRY_NOT_REGULAR");
+            }
+        return new ClassEntrySnapshot(path, attributes);
+    }
+
+    private static void verifyClassEntryUnchanged(ClassEntrySnapshot snapshot)
+            throws IOException {
+        if (snapshot == null || snapshot.path() == null) {
+            throw new IOException("JDK_CLASS_CHANGED_DURING_READ");
+        }
+        BasicFileAttributes current = readClassAttributes(snapshot.path());
+        BasicFileAttributes expected = snapshot.attributes();
+        if (!sameClassEntryIdentity(expected, current)) {
+            throw new IOException("JDK_CLASS_CHANGED_DURING_READ");
+        }
+    }
+
+    /**
+     * The JRT provider is immutable but does not implement the NOFOLLOW_LINKS option.  Keep
+     * the strict option on providers that support it and use the provider's ordinary read only
+     * for this virtual image; a JRT class entry cannot be replaced by a filesystem symlink.
+     */
+    private static BasicFileAttributes readClassAttributes(Path path) throws IOException {
+        try {
+            return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (UnsupportedOperationException unsupported) {
+            return Files.readAttributes(path, BasicFileAttributes.class);
+        }
+    }
+
+    private static IoUtil.OpenedInput openClassInput(Path path) throws IOException {
+        String scheme = path == null ? "" : path.getFileSystem().provider().getScheme();
+        if ("jrt".equalsIgnoreCase(scheme)) {
+            return IoUtil.openImmutableProviderFile(path, "JDK_CLASS");
+        }
+        return IoUtil.openRegularFile(path, "JDK_CLASS");
+    }
+
+    private static boolean sameClassEntryIdentity(BasicFileAttributes expected,
+                                                   BasicFileAttributes current) {
+        if (expected.isRegularFile() != current.isRegularFile()
+                || expected.size() != current.size()
+                || !expected.creationTime().equals(current.creationTime())
+                || !expected.lastModifiedTime().equals(current.lastModifiedTime())) {
+            return false;
+        }
+        if (expected.fileKey() != null || current.fileKey() != null) {
+            return expected.fileKey() != null && current.fileKey() != null
+                    && expected.fileKey().equals(current.fileKey());
+        }
+        // JRT providers commonly expose no fileKey.  A non-zero creation time is the
+        // portable replacement signal; epoch sentinels on both sides are accepted for
+        // immutable providers whose metadata intentionally omits identity.
+        return expected.creationTime().toMillis() == 0L
+                && current.creationTime().toMillis() == 0L
+                || expected.creationTime().equals(current.creationTime());
+    }
+
+    /** Package-local hostile contract seam; production reads use the same snapshot logic. */
+    static ClassEntrySnapshot snapshotClassEntryForContract(Path path) throws IOException {
+        return snapshotClassEntry(path);
+    }
+
+    /** Package-local hostile contract seam; production reads use the same verification logic. */
+    static void verifyClassEntryForContract(ClassEntrySnapshot snapshot) throws IOException {
+        verifyClassEntryUnchanged(snapshot);
+    }
+
+    private static int readFeature(java.nio.file.Path jdkHome, InputBudget budget,
+                                   InputBudget.Tracker tracker) {
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        InputBudget.Tracker accounting = tracker == null ? policy.tracker() : tracker;
         try {
             java.nio.file.Path release = jdkHome.resolve("release");
-            if (java.nio.file.Files.isRegularFile(release)) {
-                for (String line : java.nio.file.Files.readAllLines(release)) {
+            if (java.nio.file.Files.isRegularFile(release,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && !ArchiveLimits.isLinkOrReparsePoint(release)) {
+                long size = Files.size(release);
+                if (size > Math.min(64L * 1024L, policy.maxEntryBytes())) {
+                    return 0;
+                }
+                byte[] bytes;
+                ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                        release, policy, "JRT_RELEASE");
+                try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(
+                        release, "JRT_RELEASE")) {
+                    bytes = IoUtil.readAll(opened.stream(),
+                            Math.min(64L * 1024L, policy.maxEntryBytes()), accounting);
+                }
+                ArchiveLimits.verifyRegularFileUnchanged(snapshot, "JRT_RELEASE");
+                for (String line : new String(bytes, java.nio.charset.StandardCharsets.UTF_8)
+                        .split("\\R")) {
                     if (!line.startsWith("JAVA_VERSION=")) {
                         continue;
                     }
@@ -305,12 +620,42 @@ public final class JrtClassSource implements JdkClassSource {
                 continue;
             }
             try (Stream<Path> walk = Files.walk(module)) {
-                walk.filter(p -> p.toString().endsWith(".class")).forEach(p -> {
-                    String rel = module.relativize(p).toString().replace('\\', '/');
-                    String className = rel.substring(0, rel.length() - 6);
-                    moduleIndex.putIfAbsent(className, moduleName);
-                });
+                try {
+                    walk.forEach(p -> {
+                        try {
+                            inputTracker.checkTime();
+                            accountIndexPath(module, p);
+                            if (!p.toString().endsWith(".class")) {
+                                return;
+                            }
+                            String rel = module.relativize(p).toString().replace('\\', '/');
+                            if (!ArchiveLimits.safeEntryName(rel, budget)) {
+                                throw new IOException("JDK_CLASS_INDEX_PATH_CAP:" + budget.maxPathChars());
+                            }
+                            String className = rel.substring(0, rel.length() - 6);
+                            if (indexedClasses.incrementAndGet() > budget.maxClassEntries()) {
+                                throw new IOException("JDK_CLASS_INDEX_CAP:" + budget.maxClassEntries());
+                            }
+                            moduleIndex.putIfAbsent(className, moduleName);
+                        } catch (IOException failure) {
+                            throw new java.io.UncheckedIOException(failure);
+                        }
+                    });
+                } catch (java.io.UncheckedIOException failure) {
+                    budgetFailure = failure.getCause().getMessage();
+                    throw failure.getCause();
+                }
             }
+        }
+    }
+
+    private static final class BudgetInputException extends IOException {
+        private BudgetInputException(String message) {
+            super(message);
+        }
+
+        private BudgetInputException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -319,6 +664,36 @@ public final class JrtClassSource implements JdkClassSource {
             loader.close();
         } catch (IOException | RuntimeException e) {
             JustLogger.debug("外部 JDK jrt 类加载器关闭失败: {}", e.getMessage());
+        }
+    }
+
+    /** Resolve only the trusted toolchain root; untrusted artifact paths never use this path. */
+    private static Path trustedHome(Path normalizedHome) throws IOException {
+        if (!ArchiveLimits.isLinkOrReparsePoint(normalizedHome)) {
+            return normalizedHome;
+        }
+        try {
+            Path linkTarget = Files.readSymbolicLink(normalizedHome);
+            Path resolved = (linkTarget.isAbsolute()
+                    ? linkTarget : normalizedHome.getParent().resolve(linkTarget))
+                    .toAbsolutePath().normalize();
+            if (!Files.isDirectory(resolved)
+                    || ArchiveLimits.isLinkOrReparsePoint(resolved)) {
+                throw new IOException("目标 JDK 真实目录不是安全目录");
+            }
+            return resolved;
+        } catch (IOException | RuntimeException linkReadFailure) {
+            try {
+                Path resolved = normalizedHome.toRealPath();
+                if (!Files.isDirectory(resolved)
+                        || ArchiveLimits.isLinkOrReparsePoint(resolved)) {
+                    throw new IOException("目标 JDK 真实目录不是安全目录");
+                }
+                return resolved;
+            } catch (IOException | RuntimeException realPathFailure) {
+                realPathFailure.addSuppressed(linkReadFailure);
+                throw new IOException("目标 JDK 目录别名无法解析", realPathFailure);
+            }
         }
     }
 
@@ -331,20 +706,61 @@ public final class JrtClassSource implements JdkClassSource {
             if (!Files.isDirectory(modulePath)) {
                 continue;
             }
+            List<Path> classFiles;
             try (Stream<Path> walk = Files.walk(modulePath)) {
-                walk.filter(p -> p.toString().endsWith(".class")).forEach(p -> {
+                try {
+                    classFiles = walk.peek(path -> {
+                                try {
+                                    inputTracker.checkTime();
+                                    accountIndexPath(modulePath, path);
+                                } catch (IOException failure) {
+                                    throw new java.io.UncheckedIOException(failure);
+                                }
+                            })
+                            .filter(p -> p.toString().endsWith(".class"))
+                            .sorted().toList();
+                } catch (java.io.UncheckedIOException failure) {
+                    budgetFailure = failure.getCause() == null
+                            ? "JDK_CLASS_INDEX_INPUT_BUDGET" : failure.getCause().getMessage();
+                    throw failure.getCause() == null
+                            ? new IOException(budgetFailure) : failure.getCause();
+                }
+            }
+            for (Path p : classFiles) {
                     String rel = modulePath.relativize(p).toString().replace('\\', '/');
                     String className = rel.substring(0, rel.length() - 6);
                     try {
-                        result.add(new ClassBytes(className, Files.readAllBytes(p), "jdk:/" + module));
+                        result.add(readClassFile(module, className, p));
+                    } catch (BudgetInputException failure) {
+                        budgetFailure = failure.getMessage();
+                        throw failure;
                     } catch (IOException e) {
                         JustLogger.debug("JDK 类读取失败 {}: {}", className, e.getMessage());
                     }
-                });
             }
         }
         result.sort(java.util.Comparator.comparing(ClassBytes::className)
                 .thenComparing(ClassBytes::origin));
         return result;
+    }
+
+    /** Charge every path visited by an explicit JRT index/list walk to the caller tracker. */
+    private void accountIndexPath(Path moduleRoot, Path path) throws IOException {
+        if (moduleRoot == null || path == null) {
+            throw new IOException("JDK_CLASS_INDEX_INPUT_BUDGET");
+        }
+        String relative = moduleRoot.equals(path) ? "" : moduleRoot.relativize(path)
+                .toString().replace('\\', '/');
+        if (!relative.isBlank() && !ArchiveLimits.safeEntryName(relative, budget)) {
+            throw new IOException("JDK_CLASS_INDEX_PATH_CAP:" + budget.maxPathChars());
+        }
+        try {
+            inputTracker.observeFilesystemEntry();
+        } catch (IOException failure) {
+            throw new IOException("JDK_CLASS_INDEX_INPUT_BUDGET", failure);
+        }
+        if (ArchiveLimits.isLinkOrReparsePoint(path)) {
+            throw new IOException("JDK_CLASS_INDEX_LINK");
+        }
     }
 }

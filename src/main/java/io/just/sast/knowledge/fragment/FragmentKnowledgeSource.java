@@ -1,5 +1,6 @@
 package io.just.sast.knowledge.fragment;
 
+import io.just.sast.analysis.entry.ApplicationEntryIndex;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
@@ -8,13 +9,20 @@ import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
+import io.just.sast.blackboard.RunProduct;
 import io.just.sast.config.Rule;
+import io.just.sast.config.RuleSchemaV2;
 import io.just.sast.model.ClassInfo;
+import io.just.sast.util.ChainMaterializer;
 import io.just.sast.util.JustLogger;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * 片段知识源（COMPOSITION，IOCD-lite）：chain-fragment 规则声明公开已知链片段，
@@ -43,6 +51,16 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
     @Override
     public int priority() {
         return 150;
+    }
+
+    @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.ANALYSIS_CHAINS);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.COMPOSED_CHAINS);
     }
 
     @Override
@@ -109,30 +127,53 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
                 case "readResolve" -> "readResolve";
                 default -> "readObject";
             };
-            List<ChainHop> hops = new ArrayList<>();
-            Rule.HopSpec last = frag.hops().get(frag.hops().size() - 1);
-            hops.add(new ChainHop(hopClassMap.getOrDefault(last.cls(), last.cls()), last.method(), sinkOwner, frag.sinkName(),
-                    HopKind.DIRECT_CALL, null, "fragment", sinkDescriptor == null ? "" : sinkDescriptor, null));
-            String prevClass = hopClassMap.getOrDefault(last.cls(), last.cls());
-            String prevMethod = last.method();
-            for (int i = frag.hops().size() - 2; i >= 0; i--) {
-                Rule.HopSpec hop = frag.hops().get(i);
-                hops.add(new ChainHop(hopClassMap.getOrDefault(hop.cls(), hop.cls()), hop.method(), prevClass, prevMethod,
-                        hop.field() != null ? HopKind.FIELD_FLOW : HopKind.DIRECT_CALL,
-                        hop.field(), "fragment", "", null));
-                prevClass = hopClassMap.getOrDefault(hop.cls(), hop.cls());
-                prevMethod = hop.method();
-            }
-            hops.add(new ChainHop(entryClass, entryMethod, prevClass, prevMethod,
-                    HopKind.DIRECT_CALL, null, "fragment", "", null));
-            hops.add(new ChainHop(entryClass, entryMethod, entryClass, entryMethod,
-                    HopKind.ENTRY, null, frag.entryKind(), entryDescriptor(entryClass, entryMethod), null));
             Rule.SinkRule rule = sinkRule.get();
-            Chain chain = new Chain(rule.id(), rule.category(), rule.severity(),
-                    entryClass, entryMethod, frag.entryKind(),
-                    sinkOwner, frag.sinkName(), hops, 0, sinkDescriptor == null ? "" : sinkDescriptor,
-                    rule.role().name(), frag.constructionPlan(), rule.sinkRisk());
-            if (bb.addChain(chain)) {
+            String materializedSinkDescriptor = sinkDescriptor == null ? "" : sinkDescriptor;
+            String materializedEntryDescriptor = entryDescriptor(entryClass, entryMethod);
+            List<Rule.HopSpec> fragmentHops = List.copyOf(frag.hops());
+            Map<String, String> resolvedHopClasses = Map.copyOf(hopClassMap);
+            int expectedHopCount = fragmentHops.size() + 2;
+            boolean continuation = ApplicationEntryIndex.hasTypedContinuationEvidence(frag.entryKind())
+                    || (!RuleSchemaV2.isTerminalSink(rule)
+                    && !RuleSchemaV2.bridgesFor(rule).isEmpty());
+            ApplicationEntryIndex.ProducerCandidate candidate = new ApplicationEntryIndex.ProducerCandidate(
+                    rule.id(), rule.category(), rule.severity(), entryClass, entryMethod,
+                    materializedEntryDescriptor, frag.entryKind(), sinkOwner, frag.sinkName(),
+                    materializedSinkDescriptor, rule.role().name(), rule.sinkRisk(), continuation);
+            Supplier<Chain> materializer = () -> {
+                if (fragmentHops.isEmpty()) {
+                    return null;
+                }
+                Rule.HopSpec last = fragmentHops.get(fragmentHops.size() - 1);
+                List<ChainHop> hops = new ArrayList<>(expectedHopCount);
+                hops.add(new ChainHop(resolvedHopClasses.getOrDefault(last.cls(), last.cls()),
+                        last.method(), sinkOwner, frag.sinkName(), HopKind.DIRECT_CALL, null,
+                        "fragment", materializedSinkDescriptor, null));
+                String prevClass = resolvedHopClasses.getOrDefault(last.cls(), last.cls());
+                String prevMethod = last.method();
+                for (int i = fragmentHops.size() - 2; i >= 0; i--) {
+                    Rule.HopSpec hop = fragmentHops.get(i);
+                    hops.add(new ChainHop(resolvedHopClasses.getOrDefault(hop.cls(), hop.cls()),
+                            hop.method(), prevClass, prevMethod,
+                            hop.field() != null ? HopKind.FIELD_FLOW : HopKind.DIRECT_CALL,
+                            hop.field(), "fragment", "", null));
+                    prevClass = resolvedHopClasses.getOrDefault(hop.cls(), hop.cls());
+                    prevMethod = hop.method();
+                }
+                hops.add(new ChainHop(entryClass, entryMethod, prevClass, prevMethod,
+                        HopKind.DIRECT_CALL, null, "fragment", "", null));
+                hops.add(new ChainHop(entryClass, entryMethod, entryClass, entryMethod,
+                        HopKind.ENTRY, null, frag.entryKind(), materializedEntryDescriptor, null));
+                if (hops.size() != expectedHopCount) {
+                    return null;
+                }
+                return new Chain(rule.id(), rule.category(), rule.severity(),
+                        entryClass, entryMethod, frag.entryKind(), sinkOwner, frag.sinkName(),
+                        hops, 0, materializedSinkDescriptor, rule.role().name(),
+                        frag.constructionPlan(), rule.sinkRisk());
+            };
+            FragmentProducer producer = new FragmentProducer(candidate, materializer);
+            if (bb.addSolverCandidate(producer.candidate(), producer.materializer())) {
                 produced++;
             }
         }
@@ -213,5 +254,14 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
             case "readObject" -> "(Ljava/io/ObjectInputStream;)V";
             default -> "";
         };
+    }
+
+    /** Typed fragment endpoint plus a stable deferred chain payload. */
+    record FragmentProducer(ApplicationEntryIndex.ProducerCandidate candidate,
+                            Supplier<Chain> materializer) {
+        FragmentProducer {
+            candidate = Objects.requireNonNull(candidate, "candidate");
+            materializer = ChainMaterializer.memoize(Objects.requireNonNull(materializer, "materializer"));
+        }
     }
 }

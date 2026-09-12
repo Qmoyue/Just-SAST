@@ -8,6 +8,7 @@ import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
+import io.just.sast.blackboard.RunProduct;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.Descriptor;
 import io.just.sast.model.FieldInfo;
@@ -49,6 +50,16 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
     @Override
     public int priority() {
         return 100;
+    }
+
+    @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.COMPOSED_CHAINS);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.CALIBRATED_CHAINS);
     }
 
     @Override

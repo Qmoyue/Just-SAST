@@ -12,12 +12,27 @@ public record MethodInfo(
         List<InsnFact> instructions,
         List<TryCatchFact> tryCatch,
         boolean hasDebugInfo,
-        int entryLine) {
+        int entryLine,
+        List<String> annotationDescriptors) {
+
+    /** Compatibility constructor for model producers predating annotation retention. */
+    public MethodInfo(String owner, String name, String descriptor, int access,
+                      List<InsnFact> instructions, List<TryCatchFact> tryCatch,
+                      boolean hasDebugInfo, int entryLine) {
+        this(owner, name, descriptor, access, instructions, tryCatch, hasDebugInfo,
+                entryLine, List.of());
+    }
 
     /** 兼容构造：无行号信息（entryLine = -1，SARIF 定位缺省不输出 region）。 */
     public MethodInfo(String owner, String name, String descriptor, int access,
                       List<InsnFact> instructions, List<TryCatchFact> tryCatch, boolean hasDebugInfo) {
         this(owner, name, descriptor, access, instructions, tryCatch, hasDebugInfo, -1);
+    }
+
+    public MethodInfo {
+        annotationDescriptors = annotationDescriptors == null ? List.of()
+                : annotationDescriptors.stream().filter(value -> value != null && !value.isBlank())
+                .map(String::trim).distinct().sorted().toList();
     }
 
     /** 约定：instructions 按下标稠密排列，instructions.get(offset).offset() == offset。 */

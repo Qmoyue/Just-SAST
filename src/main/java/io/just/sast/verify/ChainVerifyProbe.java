@@ -1,4 +1,8 @@
 package io.just.sast.verify;
+import io.just.sast.run.InputBudget;
+import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.IoUtil;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -16,14 +20,12 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
-import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Collections;
@@ -34,8 +36,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.jar.JarEntry;
-import java.util.jar.JarFile;
+import java.util.zip.ZipEntry;
 
 /**
  * 链级验证探针：沿链的 FIELD_FLOW 跳构造完整对象图，触发入口方法，
@@ -55,9 +56,28 @@ import java.util.jar.JarFile;
  */
 public final class ChainVerifyProbe {
 
+    /** SHA-256 round constants for the provider-independent result-channel HMAC. */
+    private static final int[] SHA256_K = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+            0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+            0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+            0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+            0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    };
+
     private static final int MAX_GRAPH_OBJECTS = 128;
     private static final int MAX_PROXY_INTERFACES = 64;
     private static final int MAX_PROXY_METHODS = 128;
+    /** Child-side classpath discovery is target-controlled input, not a free filesystem walk. */
+    private static final int MAX_DISCOVERY_ENTRIES = 65_536;
+    private static final int MAX_DISCOVERY_PATH_DEPTH = 128;
+    private static final long MAX_DISCOVERY_MILLIS = 2_000L;
     /** Parent/child result channel version. Plain target stdout is never a result channel. */
     private static final String PROTOCOL_PREFIX = "JUST_VERIFY_V1:";
     private static String protocolToken = "";
@@ -169,7 +189,7 @@ public final class ChainVerifyProbe {
         boolean unresolvedReflectiveTarget = args.length > 3
                 && "UNRESOLVED".equals(args[3]);
         SourceTrigger sourceTrigger = parseSourceTrigger(args.length > 4 ? args[4] : "");
-        GraphPlan graphPlan = parseGraphPlan(args.length > 6 ? args[6] : "");
+        ProbeObjectPlan graphPlan = ProbeObjectPlan.parse(args.length > 6 ? args[6] : "");
         if (args.length > 6 && args[6] != null && !args[6].isBlank() && graphPlan == null) {
             emit("PARTIAL_PATH: construction-plan-invalid");
             System.exit(0);
@@ -419,7 +439,7 @@ public final class ChainVerifyProbe {
             // a target/package branch to the probe. Every node is still bounded and allocated
             // without calling a target constructor unless a rule explicitly uses CONSTRUCTOR.
             if (graphPlan != null && !graphPlan.isEmpty()) {
-                applyGraphPlan(graphPlan, entryInstance, instances, serializedProbeGraph,
+                applyObjectPlan(graphPlan, entryInstance, instances, serializedProbeGraph,
                         unlinkedFields);
             }
 
@@ -808,196 +828,8 @@ public final class ChainVerifyProbe {
         return result;
     }
 
-    /** A probe-local mirror of ObjectGraphPlan; verify8 stays Java 8 compatible. */
-    private enum GraphNodeKind { ALLOCATE, PROXY, REFLECTIVE_PROXY, CONSTRUCTOR }
-
-    private static final class GraphValue {
-        private final String kind;
-        private final String value;
-
-        private GraphValue(String kind, String value) {
-            this.kind = kind;
-            this.value = value == null ? "" : value;
-        }
-    }
-
-    private static final class GraphNode {
-        private final String id;
-        private final String type;
-        private final GraphNodeKind kind;
-        private final List<GraphValue> arguments;
-
-        private GraphNode(String id, String type, GraphNodeKind kind, List<GraphValue> arguments) {
-            this.id = id;
-            this.type = type;
-            this.kind = kind;
-            this.arguments = arguments;
-        }
-    }
-
-    private static final class GraphField {
-        private final String owner;
-        private final String field;
-        private final List<GraphValue> values;
-
-        private GraphField(String owner, String field, List<GraphValue> values) {
-            this.owner = owner;
-            this.field = field;
-            this.values = values;
-        }
-    }
-
-    private static final class GraphPlan {
-        private final List<GraphNode> nodes;
-        private final List<GraphField> fields;
-
-        private GraphPlan(List<GraphNode> nodes, List<GraphField> fields) {
-            this.nodes = nodes;
-            this.fields = fields;
-        }
-
-        private boolean isEmpty() {
-            return nodes.isEmpty() && fields.isEmpty();
-        }
-    }
-
-    /** Parse the ObjectGraphPlan v1 count/length-prefixed representation. */
-    private static GraphPlan parseGraphPlan(String encoded) {
-        if (encoded == null || encoded.isEmpty()) {
-            return new GraphPlan(List.of(), List.of());
-        }
-        try {
-            GraphCursor cursor = new GraphCursor(encoded);
-            if (!cursor.take("v1;")) {
-                return null;
-            }
-            if (!cursor.take('N')) {
-                return null;
-            }
-            int nodeCount = cursor.count();
-            if (!cursor.take(';') || nodeCount < 0 || nodeCount > 64) {
-                return null;
-            }
-            List<GraphNode> nodes = new ArrayList<>(nodeCount);
-            Set<String> ids = new java.util.HashSet<>();
-            for (int i = 0; i < nodeCount; i++) {
-                String id = cursor.text();
-                String type = cursor.text();
-                String kindText = cursor.text();
-                int argCount = cursor.count();
-                if (id == null || type == null || kindText == null || argCount < 0 || argCount > 16
-                        || !cursor.take(';') || !ids.add(id)) {
-                    return null;
-                }
-                GraphNodeKind kind;
-                try {
-                    kind = GraphNodeKind.valueOf(kindText);
-                } catch (IllegalArgumentException invalidKind) {
-                    return null;
-                }
-                List<GraphValue> arguments = new ArrayList<>(argCount);
-                for (int a = 0; a < argCount; a++) {
-                    String valueKind = cursor.text();
-                    String value = cursor.text();
-                    if (valueKind == null || value == null || !validGraphValueKind(valueKind)) {
-                        return null;
-                    }
-                    arguments.add(new GraphValue(valueKind, value));
-                }
-                nodes.add(new GraphNode(id, type, kind, arguments));
-            }
-            if (!cursor.take('F')) {
-                return null;
-            }
-            int fieldCount = cursor.count();
-            if (!cursor.take(';') || fieldCount < 0 || fieldCount > 128) {
-                return null;
-            }
-            List<GraphField> fields = new ArrayList<>(fieldCount);
-            for (int i = 0; i < fieldCount; i++) {
-                String owner = cursor.text();
-                String field = cursor.text();
-                int valueCount = cursor.count();
-                if (owner == null || field == null || valueCount <= 0 || valueCount > 32
-                        || !cursor.take(';')) {
-                    return null;
-                }
-                List<GraphValue> values = new ArrayList<>(valueCount);
-                for (int v = 0; v < valueCount; v++) {
-                    String valueKind = cursor.text();
-                    String value = cursor.text();
-                    if (valueKind == null || value == null || !validGraphValueKind(valueKind)) {
-                        return null;
-                    }
-                    values.add(new GraphValue(valueKind, value));
-                }
-                fields.add(new GraphField(owner, field, values));
-            }
-            return cursor.atEnd() ? new GraphPlan(nodes, fields) : null;
-        } catch (RuntimeException malformed) {
-            return null;
-        }
-    }
-
-    private static boolean validGraphValueKind(String kind) {
-        return "REF".equals(kind) || "CLASS".equals(kind) || "STRING".equals(kind)
-                || "INT".equals(kind) || "LONG".equals(kind) || "BOOLEAN".equals(kind)
-                || "NULL".equals(kind);
-    }
-
-    /** Small parser kept allocation-bounded by the plan limits and each length prefix. */
-    private static final class GraphCursor {
-        private final String input;
-        private int offset;
-
-        private GraphCursor(String input) {
-            this.input = input;
-        }
-
-        private boolean take(String value) {
-            if (!input.startsWith(value, offset)) {
-                return false;
-            }
-            offset += value.length();
-            return true;
-        }
-
-        private boolean take(char value) {
-            if (offset >= input.length() || input.charAt(offset) != value) {
-                return false;
-            }
-            offset++;
-            return true;
-        }
-
-        private int count() {
-            int start = offset;
-            while (offset < input.length() && Character.isDigit(input.charAt(offset))) {
-                offset++;
-            }
-            if (start == offset || offset >= input.length()) {
-                throw new IllegalArgumentException("missing count");
-            }
-            return Integer.parseInt(input.substring(start, offset));
-        }
-
-        private String text() {
-            int length = count();
-            if (!take(':') || length < 0 || length > 512 || offset + length > input.length()) {
-                throw new IllegalArgumentException("invalid text");
-            }
-            String value = input.substring(offset, offset + length);
-            offset += length;
-            return value;
-        }
-
-        private boolean atEnd() {
-            return offset == input.length();
-        }
-    }
-
-    /** Resolve and apply a rule-declared shape; every failure remains a partial-path reason. */
-    private static void applyGraphPlan(GraphPlan plan, Object entryInstance,
+    /** Resolve and apply a rule-declared object shape; every failure remains a partial-path reason. */
+    private static void applyObjectPlan(ProbeObjectPlan plan, Object entryInstance,
                                        Map<String, Object> instances,
                                        boolean serializationSemantics,
                                        List<String> unlinked) {
@@ -1005,13 +837,13 @@ public final class ChainVerifyProbe {
         if (entryInstance != null) {
             bindings.put("entry", entryInstance);
         }
-        Set<GraphNode> pending = java.util.Collections.newSetFromMap(
-                new IdentityHashMap<GraphNode, Boolean>());
+        Set<ProbeObjectPlan.Node> pending = java.util.Collections.newSetFromMap(
+                new IdentityHashMap<ProbeObjectPlan.Node, Boolean>());
         pending.addAll(plan.nodes);
         int passes = Math.max(1, plan.nodes.size() + 1);
         for (int pass = 0; pass < passes && !pending.isEmpty(); pass++) {
             boolean progress = false;
-            for (GraphNode node : new ArrayList<>(pending)) {
+            for (ProbeObjectPlan.Node node : new ArrayList<>(pending)) {
                 if ("entry".equals(node.id) && entryInstance != null) {
                     bindings.put(node.id, entryInstance);
                     pending.remove(node);
@@ -1020,8 +852,8 @@ public final class ChainVerifyProbe {
                 }
                 List<Object> args = new ArrayList<>(node.arguments.size());
                 boolean resolved = true;
-                for (GraphValue value : node.arguments) {
-                    ResolvedGraphValue resolvedValue = resolveGraphValue(value, bindings);
+                for (ProbeObjectPlan.Value value : node.arguments) {
+                    ResolvedObjectValue resolvedValue = resolveObjectValue(value, bindings);
                     if (!resolvedValue.resolved) {
                         resolved = false;
                         break;
@@ -1034,11 +866,11 @@ public final class ChainVerifyProbe {
                 try {
                     Class<?> type = load(node.type.replace('/', '.'));
                     Object object;
-                    if (node.kind == GraphNodeKind.PROXY) {
+                    if (node.kind == ProbeObjectPlan.NodeKind.PROXY) {
                         Object handler = args.isEmpty() ? null : args.get(0);
                         object = handler instanceof InvocationHandler
                                 ? newProxy(type, (InvocationHandler) handler) : null;
-                    } else if (node.kind == GraphNodeKind.REFLECTIVE_PROXY) {
+                    } else if (node.kind == ProbeObjectPlan.NodeKind.REFLECTIVE_PROXY) {
                         // This adapter is intentionally probe-owned. It preserves the
                         // interface-to-target dispatch shape while avoiding initialization of
                         // a target framework handler whose static logger/bootstrap may perform
@@ -1052,8 +884,8 @@ public final class ChainVerifyProbe {
                         if (object != null) {
                             graphAdapterUsed = true;
                         }
-                    } else if (node.kind == GraphNodeKind.CONSTRUCTOR) {
-                        object = constructGraphNode(type, args);
+                    } else if (node.kind == ProbeObjectPlan.NodeKind.CONSTRUCTOR) {
+                        object = constructObjectNode(type, args);
                     } else {
                         // ALLOCATE is the safe default even for a non-Serializable helper:
                         // Unsafe allocation skips arbitrary target constructors. Field plans
@@ -1080,12 +912,12 @@ public final class ChainVerifyProbe {
                 break;
             }
         }
-        for (GraphNode node : pending) {
+        for (ProbeObjectPlan.Node node : pending) {
             unlinked.add(node.id + ":node-reference-unresolved");
         }
         SandboxSecurityManager.beginProxyBootstrap();
         try {
-            for (var assignment : plan.fields) {
+            for (ProbeObjectPlan.Field assignment : plan.fields) {
                 Object owner = bindings.get(assignment.owner);
                 if (owner == null) {
                     owner = instances.get(assignment.owner.replace('/', '.'));
@@ -1096,8 +928,8 @@ public final class ChainVerifyProbe {
                 }
                 List<Object> values = new ArrayList<>(assignment.values.size());
                 boolean resolved = true;
-                for (GraphValue value : assignment.values) {
-                    ResolvedGraphValue resolvedValue = resolveGraphValue(value, bindings);
+                for (ProbeObjectPlan.Value value : assignment.values) {
+                    ResolvedObjectValue resolvedValue = resolveObjectValue(value, bindings);
                     if (!resolvedValue.resolved) {
                         resolved = false;
                         break;
@@ -1114,10 +946,10 @@ public final class ChainVerifyProbe {
                     continue;
                 }
                 try {
-                    Object assigned = graphFieldValue(field.getType(), values);
-                    if (assigned == GraphFieldFailure.VALUE) {
+                    Object assigned = objectFieldValue(field.getType(), values);
+                    if (assigned == ObjectFieldFailure.VALUE) {
                         unlinked.add(assignment.owner + "." + assignment.field + ":type-mismatch");
-                    } else if (!setGraphField(field, owner, assigned)) {
+                    } else if (!setObjectField(field, owner, assigned)) {
                         unlinked.add(assignment.owner + "." + assignment.field
                                 + ":field-write-denied");
                     }
@@ -1131,45 +963,45 @@ public final class ChainVerifyProbe {
         }
     }
 
-    private static final class ResolvedGraphValue {
+    private static final class ResolvedObjectValue {
         private final boolean resolved;
         private final Object value;
 
-        private ResolvedGraphValue(boolean resolved, Object value) {
+        private ResolvedObjectValue(boolean resolved, Object value) {
             this.resolved = resolved;
             this.value = value;
         }
     }
 
-    private static ResolvedGraphValue resolveGraphValue(GraphValue value,
+    private static ResolvedObjectValue resolveObjectValue(ProbeObjectPlan.Value value,
                                                         Map<String, Object> bindings) {
         try {
             switch (value.kind) {
                 case "REF":
                     return bindings.containsKey(value.value)
-                            ? new ResolvedGraphValue(true, bindings.get(value.value))
-                            : new ResolvedGraphValue(false, null);
+                            ? new ResolvedObjectValue(true, bindings.get(value.value))
+                            : new ResolvedObjectValue(false, null);
                 case "CLASS":
-                    return new ResolvedGraphValue(true, load(value.value.replace('/', '.')));
+                    return new ResolvedObjectValue(true, load(value.value.replace('/', '.')));
                 case "STRING":
-                    return new ResolvedGraphValue(true, value.value);
+                    return new ResolvedObjectValue(true, value.value);
                 case "INT":
-                    return new ResolvedGraphValue(true, Integer.valueOf(value.value));
+                    return new ResolvedObjectValue(true, Integer.valueOf(value.value));
                 case "LONG":
-                    return new ResolvedGraphValue(true, Long.valueOf(value.value));
+                    return new ResolvedObjectValue(true, Long.valueOf(value.value));
                 case "BOOLEAN":
-                    return new ResolvedGraphValue(true, Boolean.valueOf(value.value));
+                    return new ResolvedObjectValue(true, Boolean.valueOf(value.value));
                 case "NULL":
-                    return new ResolvedGraphValue(true, null);
+                    return new ResolvedObjectValue(true, null);
                 default:
-                    return new ResolvedGraphValue(false, null);
+                    return new ResolvedObjectValue(false, null);
             }
         } catch (Throwable failure) {
-            return new ResolvedGraphValue(false, null);
+            return new ResolvedObjectValue(false, null);
         }
     }
 
-    private static Object constructGraphNode(Class<?> type, List<Object> arguments)
+    private static Object constructObjectNode(Class<?> type, List<Object> arguments)
             throws Exception {
         for (Constructor<?> constructor : type.getDeclaredConstructors()) {
             Class<?>[] parameterTypes = constructor.getParameterTypes();
@@ -1257,31 +1089,31 @@ public final class ChainVerifyProbe {
         return Void.class;
     }
 
-    private enum GraphFieldFailure { VALUE }
+    private enum ObjectFieldFailure { VALUE }
 
-    private static Object graphFieldValue(Class<?> fieldType, List<Object> values) {
+    private static Object objectFieldValue(Class<?> fieldType, List<Object> values) {
         if (fieldType.isArray()) {
             Object array = java.lang.reflect.Array.newInstance(fieldType.getComponentType(), values.size());
             for (int i = 0; i < values.size(); i++) {
                 Object value = values.get(i);
                 if (value == null && fieldType.getComponentType().isPrimitive()) {
-                    return GraphFieldFailure.VALUE;
+                    return ObjectFieldFailure.VALUE;
                 }
                 if (value != null && !box(fieldType.getComponentType()).isInstance(value)) {
-                    return GraphFieldFailure.VALUE;
+                    return ObjectFieldFailure.VALUE;
                 }
                 java.lang.reflect.Array.set(array, i, value);
             }
             return array;
         }
         if (values.size() != 1) {
-            return GraphFieldFailure.VALUE;
+            return ObjectFieldFailure.VALUE;
         }
         Object value = values.get(0);
         if (value == null) {
-            return fieldType.isPrimitive() ? GraphFieldFailure.VALUE : null;
+            return fieldType.isPrimitive() ? ObjectFieldFailure.VALUE : null;
         }
-        return box(fieldType).isInstance(value) ? value : GraphFieldFailure.VALUE;
+        return box(fieldType).isInstance(value) ? value : ObjectFieldFailure.VALUE;
     }
 
     /**
@@ -1291,7 +1123,7 @@ public final class ChainVerifyProbe {
      * This never invokes a target setter or constructor and remains inside the probe-only
      * serialization bootstrap scope.
      */
-    private static boolean setGraphField(Field field, Object target, Object value) {
+    private static boolean setObjectField(Field field, Object target, Object value) {
         if (Modifier.isStatic(field.getModifiers())) {
             return false;
         }
@@ -1394,41 +1226,160 @@ public final class ChainVerifyProbe {
         return null;
     }
 
-    private static List<Class<?>> discoverApplicationHandlers(ClassLoader loader) {
-        TreeSet<String> names = new TreeSet<>();
-        String classPath = targetClassPath();
+    /**
+     * Enumerate classpath class resources with a hard entry/time/depth budget.  The child runs
+     * target code in the same JVM as this adapter, so a target-controlled directory or JAR must
+     * never turn proxy/callback discovery into an unbounded filesystem or ZIP walk.  Results are
+     * sorted for deterministic candidate selection; hitting a bound returns the entries already
+     * observed and leaves the caller with an honest partial hypothesis.
+     */
+    static List<String> boundedClassPathEntries(String classPath, int maxEntries) {
+        return boundedClassPathEntries(classPath, maxEntries, "",
+                InputBudget.defaults().tracker());
+    }
+
+    /** Package-local contract seam for sharing one archive budget across discovery roots. */
+    static List<String> boundedClassPathEntries(String classPath, int maxEntries,
+                                                InputBudget.Tracker callerTracker) {
+        InputBudget.Tracker tracker = callerTracker == null
+                ? InputBudget.defaults().tracker() : callerTracker;
+        return boundedClassPathEntries(classPath, maxEntries, "", tracker);
+    }
+
+    private static List<String> boundedClassPathEntries(String classPath, int maxEntries,
+                                                         String packagePrefix) {
+        return boundedClassPathEntries(classPath, maxEntries, packagePrefix,
+                InputBudget.defaults().tracker());
+    }
+
+    private static List<String> boundedClassPathEntries(String classPath, int maxEntries,
+                                                         String packagePrefix,
+                                                         InputBudget.Tracker tracker) {
+        if (classPath == null || classPath.isBlank() || maxEntries <= 0) {
+            return List.of();
+        }
+        int limit = Math.min(maxEntries, MAX_DISCOVERY_ENTRIES);
+        String packagePath = normalizedPackagePath(packagePrefix);
+        InputBudget.Tracker accounting = tracker == null
+                ? InputBudget.defaults().tracker() : tracker;
+        InputBudget policy = accounting.budget();
+        java.util.TreeSet<String> names = new java.util.TreeSet<>();
+        long deadline = System.nanoTime() + MAX_DISCOVERY_MILLIS * 1_000_000L;
+        int seen = 0;
         for (String entry : classPath.split(java.util.regex.Pattern.quote(
-                java.io.File.pathSeparator))) {
-            if (entry.isBlank()) {
+                java.io.File.pathSeparator), -1)) {
+            if (entry == null || entry.isBlank() || names.size() >= limit
+                    || seen >= MAX_DISCOVERY_ENTRIES || System.nanoTime() >= deadline) {
+                break;
+            }
+            Path path;
+            try {
+                path = Path.of(entry).toAbsolutePath().normalize();
+                try {
+                    ArchiveLimits.checkPathAncestors(path, policy);
+                } catch (IOException unsafePath) {
+                    continue;
+                }
+                if (io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(path)) {
+                    continue;
+                }
+            } catch (RuntimeException invalidPath) {
                 continue;
             }
-            Path path = Path.of(entry);
             try {
-                if (Files.isDirectory(path)) {
-                    try (java.util.stream.Stream<Path> files = Files.walk(path)) {
-                        files.filter(Files::isRegularFile)
-                                .map(path::relativize)
-                                .map(Path::toString)
-                                .filter(name -> name.endsWith(".class"))
-                                .forEach(name -> addHandlerCandidate(names, name));
+                if (Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+                    Path scanRoot = packagePath.isBlank() ? path
+                            : path.resolve(packagePath.replace('/', java.io.File.separatorChar))
+                            .normalize();
+                    if (!scanRoot.startsWith(path)
+                            || !Files.isDirectory(scanRoot, LinkOption.NOFOLLOW_LINKS)
+                            || io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(scanRoot)) {
+                        continue;
                     }
-                } else if (Files.isRegularFile(path) && entry.endsWith(".jar")) {
-                    try (JarFile jar = new JarFile(path.toFile())) {
-                        java.util.Enumeration<JarEntry> entries = jar.entries();
-                        while (entries.hasMoreElements()) {
-                            JarEntry jarEntry = entries.nextElement();
-                            if (!jarEntry.isDirectory()) {
-                                addHandlerCandidate(names, jarEntry.getName());
+                    try (java.util.stream.Stream<Path> files = Files.walk(scanRoot)) {
+                        var iterator = files.iterator();
+                        while (iterator.hasNext() && names.size() < limit
+                                && seen < MAX_DISCOVERY_ENTRIES
+                                && System.nanoTime() < deadline) {
+                            Path file = iterator.next();
+                            seen++;
+                            accounting.observeFilesystemEntry();
+                            if (io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(file)
+                                    || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+                                continue;
                             }
+                            Path relative = path.relativize(file);
+                            if (relative.getNameCount() > MAX_DISCOVERY_PATH_DEPTH) {
+                                continue;
+                            }
+                            addBoundedClassEntry(names, relative.toString(), packagePath, limit);
+                        }
+                    }
+                } else if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+                        && entry.toLowerCase(java.util.Locale.ROOT).endsWith(".jar")) {
+                    ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                            path, policy, "VERIFY_DISCOVERY_ARCHIVE");
+                    try (ArchiveLimits.ZipFileHandle handle = ArchiveLimits.openZipFile(
+                            snapshot, "VERIFY_DISCOVERY_ARCHIVE")) {
+                        java.util.zip.ZipFile jar = handle.zip();
+                        java.util.Enumeration<? extends ZipEntry> entries = jar.entries();
+                        while (entries.hasMoreElements() && names.size() < limit
+                                && seen < MAX_DISCOVERY_ENTRIES
+                                && System.nanoTime() < deadline) {
+                            ZipEntry jarEntry = entries.nextElement();
+                            seen++;
+                            accounting.observe(jarEntry);
+                            if (jarEntry.isDirectory()) {
+                                continue;
+                            }
+                            addBoundedClassEntry(names, jarEntry.getName(), packagePath, limit);
                         }
                     }
                 }
-            } catch (IOException | SecurityException ignored) {
-                // Keep verification bounded when an optional classpath entry is unreadable.
+            } catch (IOException | RuntimeException ignored) {
+                // An optional classpath root can be corrupt or disappear during discovery. Keep
+                // the bounded candidates from other roots and let the caller report a partial
+                // callback hypothesis instead of widening access or aborting the child.
             }
-            if (names.size() >= MAX_PROXY_INTERFACES * 4) {
-                break;
-            }
+        }
+        return List.copyOf(names);
+    }
+
+    private static void addBoundedClassEntry(Set<String> names, String value,
+                                             String packagePath, int limit) {
+        if (names.size() >= limit || value == null || !value.endsWith(".class")
+                || value.contains("\\") || value.startsWith("/")
+                || !io.just.sast.util.ArchiveLimits.safeEntryName(value)) {
+            return;
+        }
+        String normalized = value.replace('\\', '/');
+        if (!packagePath.isBlank() && !(normalized.equals(packagePath)
+                || normalized.startsWith(packagePath + "/"))) {
+            return;
+        }
+        String binary = normalized.substring(0, normalized.length() - ".class".length())
+                .replace('/', '.');
+        if (binary.startsWith("java.") || binary.startsWith("javax.")
+                || binary.startsWith("jdk.") || binary.startsWith("sun.")
+                || binary.startsWith("com.sun.") || binary.startsWith("io.just.sast.")) {
+            return;
+        }
+        names.add(normalized);
+    }
+
+    private static String normalizedPackagePath(String packagePrefix) {
+        if (packagePrefix == null || packagePrefix.isBlank()
+                || !packagePrefix.matches("[A-Za-z0-9_$]*(\\.[A-Za-z0-9_$]+)*")) {
+            return "";
+        }
+        return packagePrefix.replace('.', '/');
+    }
+
+    private static List<Class<?>> discoverApplicationHandlers(ClassLoader loader) {
+        TreeSet<String> names = new TreeSet<>();
+        String classPath = targetClassPath();
+        for (String name : boundedClassPathEntries(classPath, MAX_PROXY_INTERFACES * 4)) {
+            addHandlerCandidate(names, name);
         }
         List<Class<?>> result = new ArrayList<>();
         for (String name : names) {
@@ -1557,39 +1508,8 @@ public final class ChainVerifyProbe {
     private static List<Class<?>> discoverApplicationInterfaces(ClassLoader loader) {
         TreeSet<String> names = new TreeSet<>();
         String classPath = targetClassPath();
-        for (String entry : classPath.split(java.util.regex.Pattern.quote(
-                java.io.File.pathSeparator))) {
-            if (entry.isBlank()) {
-                continue;
-            }
-            Path path = Path.of(entry);
-            try {
-                if (Files.isDirectory(path)) {
-                    try (java.util.stream.Stream<Path> files = Files.walk(path)) {
-                        files.filter(Files::isRegularFile)
-                                .map(path::relativize)
-                                .map(Path::toString)
-                                .filter(name -> name.endsWith(".class"))
-                                .forEach(name -> addInterfaceCandidate(names, name));
-                    }
-                } else if (Files.isRegularFile(path) && entry.endsWith(".jar")) {
-                    try (JarFile jar = new JarFile(path.toFile())) {
-                        java.util.Enumeration<JarEntry> entries = jar.entries();
-                        while (entries.hasMoreElements()) {
-                            JarEntry jarEntry = entries.nextElement();
-                            if (!jarEntry.isDirectory()) {
-                                addInterfaceCandidate(names, jarEntry.getName());
-                            }
-                        }
-                    }
-                }
-            } catch (IOException | SecurityException ignored) {
-                // Missing optional nested dependency: leave dynamic verification partial for
-                // that candidate instead of widening access or aborting the child.
-            }
-            if (names.size() >= MAX_PROXY_INTERFACES * 4) {
-                break;
-            }
+        for (String name : boundedClassPathEntries(classPath, MAX_PROXY_INTERFACES * 4)) {
+            addInterfaceCandidate(names, name);
         }
         List<Class<?>> result = new ArrayList<>();
         for (String name : names) {
@@ -1803,13 +1723,17 @@ public final class ChainVerifyProbe {
 
     /** Emit only a probe-owned, per-attempt result marker; target output remains diagnostic. */
     private static void emit(String status) {
-        emit(protocolToken, status);
+        emit(protocolToken, ProbeEvent.fromWire(status));
     }
 
     private static void emit(String token, String status) {
-        String safeStatus = status == null ? "UNTESTABLE: null-status"
-                : status.replace('\r', ' ').replace('\n', ' ');
-        if (safeStatus.startsWith("SANDBOX_READY")) {
+        emit(token, ProbeEvent.fromWire(status));
+    }
+
+    private static void emit(String token, ProbeEvent event) {
+        String safeStatus = event == null ? ProbeEvent.fromWire(null).wireStatus()
+                : event.wireStatus();
+        if (event != null && event.kind() == ProbeEvent.Kind.ISOLATION_READY) {
             safeStatus += "|policy=" + safeIsolationPolicyDigest;
         }
         if (safeStatus.length() > 4096) {
@@ -1900,19 +1824,141 @@ public final class ChainVerifyProbe {
     }
 
     private static String resultMac(String frame) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(resultChannelSecret.getBytes(StandardCharsets.US_ASCII),
-                    "HmacSHA256"));
-            byte[] digest = mac.doFinal(frame.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(digest.length * 2);
-            for (byte value : digest) {
-                hex.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
-            }
-            return hex.toString();
-        } catch (GeneralSecurityException impossible) {
+        // Do not resolve a mutable JCA provider after target classes have been loaded.  A target
+        // can register/remove providers or install a restrictive policy, which previously made
+        // Mac.getInstance("HmacSHA256") return an empty marker and left the parent with an
+        // indistinguishable empty result file.  SHA-256 itself is the only required primitive;
+        // this bounded implementation keeps the child channel deterministic and the parent
+        // still authenticates the exact bytes with its independent HMAC implementation.
+        return resultMacForSecret(resultChannelSecret, frame);
+    }
+
+    /** Package-local cross-runtime contract seam; it never mutates the live channel secret. */
+    static String resultMacForContract(String secret, String frame) {
+        return resultMacForSecret(secret, frame);
+    }
+
+    private static String resultMacForSecret(String secret, String frame) {
+        if (!validResultSecret(secret) || frame == null) {
             return "";
         }
+        byte[] key = secret.getBytes(StandardCharsets.US_ASCII);
+        byte[] message = frame.getBytes(StandardCharsets.UTF_8);
+        if (key.length > 64) {
+            key = sha256Bytes(key);
+        }
+        byte[] innerPad = new byte[64];
+        byte[] outerPad = new byte[64];
+        for (int i = 0; i < 64; i++) {
+            byte value = i < key.length ? key[i] : 0;
+            innerPad[i] = (byte) (value ^ 0x36);
+            outerPad[i] = (byte) (value ^ 0x5c);
+        }
+        byte[] innerInput = new byte[innerPad.length + message.length];
+        System.arraycopy(innerPad, 0, innerInput, 0, innerPad.length);
+        System.arraycopy(message, 0, innerInput, innerPad.length, message.length);
+        byte[] inner = sha256Bytes(innerInput);
+        byte[] outerInput = new byte[outerPad.length + inner.length];
+        System.arraycopy(outerPad, 0, outerInput, 0, outerPad.length);
+        System.arraycopy(inner, 0, outerInput, outerPad.length, inner.length);
+        byte[] mac = sha256Bytes(outerInput);
+        return hexBytes(mac);
+    }
+
+    private static String hexBytes(byte[] bytes) {
+        if (bytes == null) {
+            return "";
+        }
+        char[] result = new char[bytes.length * 2];
+        final char[] digits = "0123456789abcdef".toCharArray();
+        for (int i = 0; i < bytes.length; i++) {
+            int value = bytes[i] & 0xff;
+            result[i * 2] = digits[value >>> 4];
+            result[i * 2 + 1] = digits[value & 0x0f];
+        }
+        return new String(result);
+    }
+
+    private static byte[] sha256Bytes(byte[] input) {
+        byte[] source = input == null ? new byte[0] : input;
+        long bitLength = ((long) source.length) * 8L;
+        int paddedLength = ((source.length + 9 + 63) / 64) * 64;
+        byte[] padded = new byte[paddedLength];
+        System.arraycopy(source, 0, padded, 0, source.length);
+        padded[source.length] = (byte) 0x80;
+        for (int i = 0; i < 8; i++) {
+            padded[padded.length - 1 - i] = (byte) (bitLength >>> (i * 8));
+        }
+        int h0 = 0x6a09e667;
+        int h1 = 0xbb67ae85;
+        int h2 = 0x3c6ef372;
+        int h3 = 0xa54ff53a;
+        int h4 = 0x510e527f;
+        int h5 = 0x9b05688c;
+        int h6 = 0x1f83d9ab;
+        int h7 = 0x5be0cd19;
+        int[] w = new int[64];
+        for (int offset = 0; offset < padded.length; offset += 64) {
+            for (int i = 0; i < 16; i++) {
+                int base = offset + (i * 4);
+                w[i] = ((padded[base] & 0xff) << 24)
+                        | ((padded[base + 1] & 0xff) << 16)
+                        | ((padded[base + 2] & 0xff) << 8)
+                        | (padded[base + 3] & 0xff);
+            }
+            for (int i = 16; i < 64; i++) {
+                int s0 = Integer.rotateRight(w[i - 15], 7)
+                        ^ Integer.rotateRight(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+                int s1 = Integer.rotateRight(w[i - 2], 17)
+                        ^ Integer.rotateRight(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+                w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+            }
+            int a = h0;
+            int b = h1;
+            int c = h2;
+            int d = h3;
+            int e = h4;
+            int f = h5;
+            int g = h6;
+            int h = h7;
+            for (int i = 0; i < 64; i++) {
+                int s1 = Integer.rotateRight(e, 6) ^ Integer.rotateRight(e, 11)
+                        ^ Integer.rotateRight(e, 25);
+                int ch = (e & f) ^ (~e & g);
+                int t1 = h + s1 + ch + SHA256_K[i] + w[i];
+                int s0 = Integer.rotateRight(a, 2) ^ Integer.rotateRight(a, 13)
+                        ^ Integer.rotateRight(a, 22);
+                int maj = (a & b) ^ (a & c) ^ (b & c);
+                int t2 = s0 + maj;
+                h = g;
+                g = f;
+                f = e;
+                e = d + t1;
+                d = c;
+                c = b;
+                b = a;
+                a = t1 + t2;
+            }
+            h0 += a;
+            h1 += b;
+            h2 += c;
+            h3 += d;
+            h4 += e;
+            h5 += f;
+            h6 += g;
+            h7 += h;
+        }
+        int[] words = {h0, h1, h2, h3, h4, h5, h6, h7};
+        byte[] digest = new byte[32];
+        for (int i = 0; i < words.length; i++) {
+            int word = words[i];
+            int base = i * 4;
+            digest[base] = (byte) (word >>> 24);
+            digest[base + 1] = (byte) (word >>> 16);
+            digest[base + 2] = (byte) (word >>> 8);
+            digest[base + 3] = (byte) word;
+        }
+        return digest;
     }
 
     private static void closeResultChannel() {
@@ -2399,17 +2445,12 @@ public final class ChainVerifyProbe {
         } catch (RuntimeException invalidPath) {
             return false;
         }
+        InputBudget policy = InputBudget.defaults();
+        InputBudget.Tracker tracker = policy.tracker();
         long deadline = System.nanoTime() + 5L * 1_000_000_000L;
         while (System.nanoTime() < deadline) {
-            try {
-                if (Files.isRegularFile(markerPath) && Files.size(markerPath) <= 256L) {
-                    String actual = Files.readString(markerPath).strip();
-                    if (expected.equals(actual)) {
-                        return true;
-                    }
-                }
-            } catch (IOException | RuntimeException ignored) {
-                // The parent may still be creating/renaming the marker.
+            if (readIsolationMarker(markerPath, expected, policy, tracker)) {
+                return true;
             }
             try {
                 Thread.sleep(10L);
@@ -2419,6 +2460,60 @@ public final class ChainVerifyProbe {
             }
         }
         return false;
+    }
+
+    /**
+     * Read the parent-owned isolation marker as an untrusted input channel.
+     *
+     * <p>The marker is deliberately tiny, but a tiny declared size alone is not a sufficient
+     * contract: a link/reparse point can redirect the read and a replace-after-check race can
+     * make the nonce belong to a different file.  The read therefore uses NOFOLLOW metadata,
+     * one caller-owned {@link InputBudget.Tracker}, and a before/after identity snapshot.  Any
+     * uncertainty is a normal "not ready" result; it never widens the dynamic gate.</p>
+     */
+    static boolean readIsolationMarker(Path markerPath, String expected, InputBudget budget) {
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        return readIsolationMarker(markerPath, expected, policy, policy.tracker());
+    }
+
+    private static boolean readIsolationMarker(Path markerPath, String expected,
+                                               InputBudget budget,
+                                               InputBudget.Tracker tracker) {
+        if (markerPath == null || expected == null || expected.isBlank()
+                || expected.length() > 128 || tracker == null) {
+            return false;
+        }
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        try {
+            Path normalized = markerPath.toAbsolutePath().normalize();
+            String text = normalized.toString();
+            ArchiveLimits.checkPathAncestors(normalized, policy);
+            if (text.codePointCount(0, text.length()) > policy.maxPathChars()
+                    || normalized.getNameCount() > policy.maxPathDepth()
+                    || ArchiveLimits.isLinkOrReparsePoint(normalized)
+                    || !Files.isRegularFile(normalized, LinkOption.NOFOLLOW_LINKS)) {
+                return false;
+            }
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    normalized, policy, "VERIFY_MARKER");
+            BasicFileAttributes before = snapshot.fileAttributes();
+            if (!before.isRegularFile() || before.size() > 256L
+                    || ArchiveLimits.isLinkOrReparsePoint(normalized)) {
+                return false;
+            }
+            byte[] bytes;
+            try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(normalized, "VERIFY_MARKER");
+                 InputStream input = opened.stream()) {
+                bytes = IoUtil.readAll(input,
+                        Math.min(256L, Math.min(policy.maxEntryBytes(),
+                                tracker.remainingReadBytes())), tracker);
+            }
+            ArchiveLimits.verifyRegularFileUnchanged(snapshot, "VERIFY_MARKER");
+            return expected.equals(new String(bytes, StandardCharsets.UTF_8).strip());
+        } catch (IOException | RuntimeException ignored) {
+            // A marker that is missing, replaced, linked, or over budget is simply not ready.
+            return false;
+        }
     }
 
     /** Verify the only supported Windows runner before any target class is loaded. */
@@ -2524,9 +2619,13 @@ public final class ChainVerifyProbe {
             if (!expectedDigest.equalsIgnoreCase(hex(resourceDigest.digest()))) {
                 return nativeFixtureFailure("fixture-resource-digest-mismatch");
             }
+            ArchiveLimits.FileReadSnapshot outputSnapshot = ArchiveLimits.snapshotRegularFile(
+                    output, InputBudget.defaults(), "VERIFY_NATIVE_FIXTURE");
             MessageDigest outputDigest = MessageDigest.getInstance("SHA-256");
             long outputBytes = 0L;
-            try (InputStream input = Files.newInputStream(output)) {
+            try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(output,
+                    "VERIFY_NATIVE_FIXTURE");
+                 InputStream input = opened.stream()) {
                 byte[] buffer = new byte[32 * 1024];
                 for (int read; (read = input.read(buffer)) >= 0; ) {
                     if (read == 0) continue;
@@ -2537,6 +2636,7 @@ public final class ChainVerifyProbe {
                     outputDigest.update(buffer, 0, read);
                 }
             }
+            ArchiveLimits.verifyRegularFileUnchanged(outputSnapshot, "VERIFY_NATIVE_FIXTURE");
             String fileHex = hex(outputDigest.digest());
             if (outputBytes == 0L || !expectedDigest.equalsIgnoreCase(fileHex)
                     || !nativeCompatible(output)) {
@@ -2590,7 +2690,11 @@ public final class ChainVerifyProbe {
         try {
             byte[] header = new byte[4096];
             int length = 0;
-            try (InputStream input = Files.newInputStream(path, StandardOpenOption.READ)) {
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    path, InputBudget.defaults(), "VERIFY_NATIVE_FIXTURE");
+            try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(path,
+                    "VERIFY_NATIVE_FIXTURE");
+                 InputStream input = opened.stream()) {
                 while (length < header.length) {
                     int read = input.read(header, length, header.length - length);
                     if (read < 0) break;
@@ -2598,6 +2702,7 @@ public final class ChainVerifyProbe {
                     length += read;
                 }
             }
+            ArchiveLimits.verifyRegularFileUnchanged(snapshot, "VERIFY_NATIVE_FIXTURE");
             String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
             String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
             int archCode = normalizedArch(arch);
@@ -3069,45 +3174,11 @@ public final class ChainVerifyProbe {
     private static List<String> discoverApplicationClassNames(String packagePrefix) {
         TreeSet<String> names = new TreeSet<>();
         String classPath = targetClassPath();
-        for (String entry : classPath.split(java.util.regex.Pattern.quote(
-                java.io.File.pathSeparator))) {
-            if (entry.isBlank() || names.size() >= MAX_CALLBACK_SUBTYPES) {
+        for (String name : boundedClassPathEntries(classPath, MAX_CALLBACK_SUBTYPES,
+                packagePrefix)) {
+            addApplicationClassCandidate(names, name, packagePrefix);
+            if (names.size() >= MAX_CALLBACK_SUBTYPES) {
                 break;
-            }
-            Path path = Path.of(entry);
-            try {
-                if (Files.isDirectory(path)) {
-                    Path scanRoot = packagePrefix == null || packagePrefix.isBlank()
-                            ? path : path.resolve(packagePrefix.replace('.', java.io.File.separatorChar));
-                    if (!Files.isDirectory(scanRoot)) {
-                        continue;
-                    }
-                    try (java.util.stream.Stream<Path> files = Files.walk(scanRoot)) {
-                        files.filter(Files::isRegularFile)
-                                .map(path::relativize)
-                                .map(Path::toString)
-                                .filter(name -> name.endsWith(".class"))
-                                .forEach(name -> addApplicationClassCandidate(names, name,
-                                        packagePrefix));
-                    }
-                } else if (Files.isRegularFile(path) && entry.endsWith(".jar")) {
-                    try (JarFile jar = new JarFile(path.toFile())) {
-                        java.util.Enumeration<JarEntry> entries = jar.entries();
-                        String packagePath = packagePrefix == null ? ""
-                                : packagePrefix.replace('.', '/');
-                        while (entries.hasMoreElements() && names.size() < MAX_CALLBACK_SUBTYPES) {
-                            JarEntry jarEntry = entries.nextElement();
-                            if (!jarEntry.isDirectory()
-                                    && (packagePath.isBlank()
-                                    || jarEntry.getName().startsWith(packagePath))) {
-                                addApplicationClassCandidate(names, jarEntry.getName(),
-                                        packagePrefix);
-                            }
-                        }
-                    }
-                }
-            } catch (IOException | SecurityException ignored) {
-                // Optional classpath roots remain an honest partial boundary.
             }
         }
         return List.copyOf(names);
@@ -3564,8 +3635,11 @@ public final class ChainVerifyProbe {
                 new java.io.ByteArrayInputStream(new byte[0]))) {
             // The empty stream is intentional: construction initializes the JDK machinery,
             // then EOF is ignored without reading target-controlled bytes.
-        } catch (IOException ignored) {
-            // EOF is the expected result for the bounded bootstrap stream.
+        } catch (Throwable ignored) {
+            // EOF is the expected result for the bounded bootstrap stream.  Newer JDKs may
+            // initialize their security-properties loader during this warmup; if the selected
+            // JDK image cannot resolve that file in the host environment, keep the dynamic
+            // attempt alive and let the actual target boundary report a typed partial result.
         }
     }
 
@@ -3591,7 +3665,7 @@ public final class ChainVerifyProbe {
                 // internal property-reader lambdas; reflective access to com.sun.* is
                 // intentionally not required (and is denied by strong modules).
                 new javax.naming.InitialContext().close();
-            } catch (javax.naming.NamingException | RuntimeException ignored) {
+        } catch (Throwable ignored) {
                 // No provider is expected in the isolated probe. Initialization itself is
                 // the warmup; provider lookup must never be retried with relaxed access.
             }
@@ -3624,7 +3698,7 @@ public final class ChainVerifyProbe {
             new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX",
                     java.util.Locale.US).setTimeZone(utc);
             new java.util.GregorianCalendar(utc, java.util.Locale.US).getTimeInMillis();
-        } catch (RuntimeException ignored) {
+        } catch (Throwable ignored) {
             // Runtime-specific locale providers are optional; failure remains a normal
             // partial-path result rather than widening the sandbox.
         }
@@ -3646,7 +3720,7 @@ public final class ChainVerifyProbe {
             Method classGetMethod = Class.class.getMethod("getMethod", String.class,
                     Class[].class);
             classGetMethod.invoke(Object.class, "toString", new Class<?>[0]);
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        } catch (Throwable ignored) {
             // A runtime-specific accessor implementation may already be unavailable. Keep
             // the normal bounded PARTIAL_PATH result instead of widening permissions.
         }
@@ -3655,7 +3729,7 @@ public final class ChainVerifyProbe {
     private static void warmClass(String name) {
         try {
             Class.forName(name, true, null);
-        } catch (ClassNotFoundException | LinkageError | RuntimeException ignored) {
+        } catch (Throwable ignored) {
             // Optional JDK implementation detail; a failed warmup must remain a normal
             // partial verification result rather than widening the sandbox.
         }

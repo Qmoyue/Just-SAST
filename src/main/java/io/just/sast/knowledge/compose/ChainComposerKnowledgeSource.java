@@ -8,21 +8,34 @@ import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
+import io.just.sast.blackboard.RunProduct;
+import io.just.sast.analysis.entry.ApplicationEntryIndex;
+import io.just.sast.config.Rule;
+import io.just.sast.config.RuleSchemaV2;
+import io.just.sast.run.InputBudget;
+import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.ChainMaterializer;
 import io.just.sast.util.JustLogger;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Enumeration;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
-import java.util.jar.JarEntry;
-import java.util.jar.JarFile;
+import java.util.TreeSet;
+import java.util.function.Supplier;
+import java.util.zip.ZipFile;
 
 /**
  * 语义链组装（COMPOSITION 阶段）。
@@ -42,7 +55,23 @@ import java.util.jar.JarFile;
 public final class ChainComposerKnowledgeSource implements KnowledgeSource {
 
     private static final int MAX_COMPOSED = 400;
-    private static final int MAX_HOPS = 16;
+    /**
+     * Reserve a small, deterministic frontier for application-rooted multi-segment
+     * composition before the broad compatibility pass.  A single raw sink can otherwise
+     * consume the entire global cap and leave a second-deserialization bridge invisible.
+     */
+    private static final int MAX_APPLICATION_PRIORITY_COMPOSED = 256;
+    private static final int MAX_APPLICATION_PRIORITY_OVERLAP = 128;
+    private static final int MAX_APPLICATION_PRIORITY_FRONTS = 64;
+    private static final int MAX_APPLICATION_PRIORITY_BACKS = 32;
+    private static final int MAX_APPLICATION_COMPOSITION_DEPTH = 3;
+    /**
+     * A composed path contains both semantic bridge hops and the concrete front/back traces.
+     * The old bound of 16 discarded otherwise bounded application chains as soon as a
+     * deserializer prefix was joined to a normal 8–12-hop gadget.  Keep the path finite, but
+     * leave room for the full typed prefix/suffix rather than silently dropping the terminal.
+     */
+    private static final int MAX_HOPS = 64;
     private static final int MAX_SOURCE_HOSTS = 1000;
 
     /**
@@ -60,22 +89,31 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             "java/util/HashMap", "java/util/HashSet", "java/util/Hashtable",
             "java/util/LinkedHashMap", "java/util/LinkedHashSet",
             "java/util/TreeMap", "java/util/TreeSet", "java/util/concurrent/PriorityQueue");
+    private static final List<String> PUBLIC_ENTRY_KINDS = List.of(
+            "readObject", "readResolve", "readObjectNoData", "readExternal",
+            "hashCode", "equals", "compareTo", "compare", "toString",
+            "proxyInvoke", "validateObject");
+    private static final List<String> TRIGGER_ENTRY_KINDS = List.of(
+            "hashCode", "equals", "compareTo", "compare", "toString");
 
     /** 桥接类型。 */
-    enum Bridge { INVOKE, TRIGGER, TEMPLATE, DESER }
-
-    private Blackboard bb;
-    /** 反序列化源宿主：带描述符的宿主方法键 → 源框架入口。 */
-    private Map<String, DeserHost> deserHosts;
-    /** primary artifact provenance used only to make bounded source-host coverage fair. */
-    private Set<String> primaryArtifactClasses;
+    enum Bridge { INVOKE, TRIGGER, TEMPLATE, DESER, JNDI_RMI }
 
     private record DeserHost(String owner, String method, String descriptor,
                              String frameOwner, String frameMethod, String frameDescriptor) {
     }
 
+    /** Build-local key for the immutable terminal-admission cache. */
+    private record TerminalAdmissionKey(String owner, String name, String descriptor) {
+    }
+
+    /** Build-local key for typed continuation rule/endpoint lookup. */
+    private record ContinuationAdmissionKey(String ruleId, String owner, String name,
+                                            String descriptor) {
+    }
+
     private record FrontFeatures(boolean invoke, String triggerContainer,
-                                 boolean template, boolean deserialize) {
+                                 boolean template, boolean deserialize, boolean jndiRmi) {
     }
 
     @Override
@@ -99,8 +137,61 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     }
 
     @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.ANALYSIS_CHAINS, RunProduct.COMPOSED_CHAINS);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.COMPOSED_CHAINS);
+    }
+
+    @Override
     public void init(Blackboard blackboard) {
-        this.bb = blackboard;
+        // Composition is event-owned; all semantic reads use the Blackboard supplied to
+        // onEvent so one source instance cannot retain scope/rules from another run.
+    }
+
+    private int applicationFrontPriority(Blackboard target, Chain chain) {
+        if (target == null || chain == null || target.applicationEntryIndex() == null) {
+            return 0;
+        }
+        String descriptor = entryDescriptor(chain);
+        String key = chain.entryClass() + "#" + chain.entryMethod() + descriptor;
+        var index = target.applicationEntryIndex();
+        int score = index.isApplicationEntryMethod(key) ? 1_000 : 0;
+        if (index.isApplicationOwner(chain.entryClass())) {
+            score += 64;
+        }
+        if ("source".equals(chain.entryKind()) || "deserialize".equals(chain.entryKind())) {
+            score += 16;
+        }
+        if (chain.unresolvedHops() == 0) {
+            score += 4;
+        }
+        return score;
+    }
+
+    private static int terminalBackPriority(Chain chain) {
+        if (chain == null) {
+            return 0;
+        }
+        int score = chain.terminalSink() ? 1_000 : 0;
+        if ("TERMINAL".equalsIgnoreCase(chain.sinkRole())) {
+            score += 256;
+        }
+        if (chain.unresolvedHops() == 0) {
+            score += 32;
+        }
+        score += switch (chain.severity() == null ? "" : chain.severity()) {
+            case "CRITICAL" -> 16;
+            case "HIGH" -> 8;
+            case "MEDIUM" -> 2;
+            default -> 0;
+        };
+        // Shorter terminal suffixes are easier to join within the finite hop budget.  The
+        // stable key tie-break below still preserves deterministic ordering among equals.
+        return score - Math.min(128, chain.hops().size());
     }
 
     @Override
@@ -108,44 +199,88 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (event.type() != EventType.SCAN_ANALYZED) {
             return;
         }
-        List<Chain> chains = new ArrayList<>(bb.chains());
-        chains.sort(java.util.Comparator.comparing(Chain::key));
-        if (chains.size() < 2) {
+        boolean applicationScoped = defaultApplicationCompositionScope(bb);
+        Blackboard.CompositionInputs initialInputs = bb.compositionInputsLazy();
+        Map<TerminalAdmissionKey, ApplicationEntryIndex.TerminalDecision> terminalAdmissionCache =
+                new HashMap<>();
+        Map<ContinuationAdmissionKey, Boolean> continuationAdmissionCache = new HashMap<>();
+        Map<String, FrontFeatures> frontFeaturesCache = new HashMap<>();
+        // A known application scope has typed frontiers for every demand-driven pass; only
+        // the legacy/unknown-scope path needs the broad compatibility union.  Avoid building
+        // that union merely to derive the finite-input guard below.
+        List<Chain> compatibilityInputs = applicationScoped ? List.of()
+                : initialInputs.compatibilityAll();
+        List<Chain> chains = new ArrayList<>(applicationScoped
+                ? initialInputs.applicationChains() : compatibilityInputs);
+        // The composition budget is a semantic safety bound, not a product top-k.  Spend its
+        // first slots on chains that already have an application execution root so a dependency
+        // gadget cannot exhaust the frontier before the application prefix is joined.  The
+        // score is derived solely from the typed application index and chain shape; it never
+        // inspects benchmark names, fixture classes or expected answers.
+        chains.sort(java.util.Comparator
+                .comparingInt((Chain chain) -> applicationFrontPriority(bb, chain)).reversed()
+                .thenComparing(Chain::key));
+        int initialCompositionCount = applicationScoped
+                ? distinctCompositionInputCount(initialInputs) : compatibilityInputs.size();
+        if (initialCompositionCount < 2) {
             return;
         }
-        List<Chain> publicEntries = chains.stream()
+        // In a known application scope, the default product is demand-driven at the
+        // composition boundary itself: only an application-owned execution prefix may spend
+        // the front budget, and only a public dependency suffix with a typed indexed terminal
+        // may spend the back budget.  The raw chain store remains available to the explicit
+        // gadget-kernel/compatibility path and to the application-hosted bridge pass below;
+        // default composition must not materialize dependency-only fronts and then hope the
+        // report boundary removes them later.
+        List<Chain> defaultFronts = applicationScoped
+                ? chains.stream().filter(chain -> isApplicationFront(bb, chain)).toList() : chains;
+        boolean initialBackDemand = !applicationScoped
+                || hasApplicationBackDemand(bb, defaultFronts, frontFeaturesCache);
+        List<Chain> defaultBackCandidates = applicationScoped
+                ? defaultSuffixCandidates(bb, initialInputs, terminalAdmissionCache,
+                        continuationAdmissionCache, initialBackDemand)
+                : chains;
+        List<Chain> publicEntries = defaultBackCandidates.stream()
                 .filter(ChainComposerKnowledgeSource::isPublicEntry)
+                .sorted(java.util.Comparator
+                        .comparingInt((Chain chain) -> terminalBackPriority(chain)).reversed()
+                        .thenComparing(Chain::key))
                 .toList();
-        List<Chain> triggerEntries = chains.stream()
+        List<Chain> triggerEntries = defaultBackCandidates.stream()
                 .filter(chain -> isTriggerEntry(chain.entryKind()))
                 .toList();
-        List<Chain> templateEntries = chains.stream()
+        List<Chain> templateEntries = defaultBackCandidates.stream()
                 .filter(chain -> isTemplateTrigger(chain.entryMethod()))
                 .toList();
-        JustLogger.info("链组装候选：链 {}，公共入口 {}，触发入口 {}，模板入口 {}",
-                chains.size(), publicEntries.size(), triggerEntries.size(), templateEntries.size());
+        List<Chain> fragmentEntries = defaultBackCandidates.stream()
+                .filter(ChainComposerKnowledgeSource::isDeclaredFragment)
+                .toList();
+        JustLogger.info("链组装候选：原始 {}，默认前缀 {}，terminal 后缀 {}，公共入口 {}，触发入口 {}，模板入口 {}",
+                chains.size(), defaultFronts.size(), defaultBackCandidates.size(),
+                publicEntries.size(), triggerEntries.size(), templateEntries.size());
 
-        int composed = 0;
-        for (Chain front : chains) {
+        int composed = composeApplicationPriority(bb, defaultFronts, publicEntries,
+                frontFeaturesCache);
+        for (Chain front : defaultFronts) {
             if (composed >= MAX_COMPOSED) {
                 bb.markIncomplete("COMPOSITION_CHAIN_CAP:" + MAX_COMPOSED);
                 break;
             }
-            FrontFeatures features = frontFeatures(front);
+            FrontFeatures features = frontFeaturesCached(bb, front, frontFeaturesCache);
             if (!features.invoke() && features.triggerContainer() == null
-                    && !features.template() && !features.deserialize()) {
+                    && !features.template() && !features.deserialize() && !features.jndiRmi()) {
                 continue;
             }
             // Only inspect chains that can satisfy at least one bridge precondition.  This
             // preserves the old semanticBridge checks while avoiding the full chain×chain
             // product for ordinary, non-bridgeable candidates.
             List<Chain> candidates = candidateBacks(features, publicEntries,
-                    triggerEntries, templateEntries);
+                    triggerEntries, templateEntries, fragmentEntries);
             for (Chain back : candidates) {
                 if (composed >= MAX_COMPOSED || front == back) {
                     continue;
                 }
-                Bridge bridge = semanticBridge(features, front, back);
+                Bridge bridge = semanticBridge(bb, features, front, back);
                 if (bridge == null) {
                     continue;
                 }
@@ -153,18 +288,643 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 if (onPath(front, back.entryClass())) {
                     continue;
                 }
-                Chain merged = compose(front, back, bridge);
-                if (merged != null && bb.addChain(merged)) {
+                Chain merged = admitComposed(bb, composedProducer(front, back, bridge));
+                if (merged != null) {
                     composed++;
                 }
             }
         }
-        JustLogger.info("链组装语义阶段完成：产链 {}，当前链 {}", composed, bb.chains().size());
+        Blackboard.CompositionInputs sourceInputs = bb.compositionInputsLazy();
+        int sourceCompositionCount = distinctCompositionInputCount(sourceInputs);
+        JustLogger.info("链组装语义阶段完成：产链 {}，默认链 {}，组合输入 {}", composed,
+                bb.chains().size(), sourceCompositionCount);
         // 源宿主桥使用含本轮 INVOKE/DESER 合成链的新快照——完整链（多段桥接产物）也能再挂源宿主；
         // 图不可用（最小夹具）时宿主扫描无从进行，跳过该桥
-        int sourceComposed = this.bb != null && this.bb.graph() != null
-                ? composeSourceHosted(List.copyOf(this.bb.chains())) : 0;
-        JustLogger.info("链组装：语义桥接产链 {} 条（源宿主容器触发 {} 条）", composed, sourceComposed);
+        int sourceComposed = bb.graph() != null
+                ? composeSourceHosted(bb, sourceInputs) : 0;
+        // Source-hosted chains are discovered by the same composition phase and therefore
+        // were not present in the first application-priority snapshot.  Re-admit the fresh
+        // snapshot once so an application-owned OIS/framework host can continue through the
+        // exact callback overlap to a secondary deserializer and its terminal suffix.  The
+        // pass has the same finite frontier and deterministic root grouping; it is not an
+        // unbounded fixed-point loop.
+        int postSourceApplication = 0;
+        if (bb.graph() != null && sourceComposed > 0) {
+            Blackboard.CompositionInputs refreshedInputs = bb.compositionInputsLazy();
+            List<Chain> refreshed = applicationScoped
+                    ? refreshedInputs.applicationChains() : refreshedInputs.compatibilityAll();
+            // Keep the same direct-add compatibility boundary as the initial pass.  Solver
+            // suffixes normally live in the typed continuation stores, while older callers may
+            // still publish a dependency suffix through addChain before this follow-up round.
+            List<Chain> refreshedBacks = applicationScoped
+                    ? defaultSuffixCandidates(bb, refreshedInputs, terminalAdmissionCache,
+                            continuationAdmissionCache,
+                            hasApplicationBackDemand(bb, refreshed, frontFeaturesCache)) : refreshed;
+            List<Chain> refreshedPublicEntries = refreshedBacks.stream()
+                    .filter(ChainComposerKnowledgeSource::isPublicEntry)
+                    .sorted(java.util.Comparator
+                            .comparingInt((Chain chain) -> terminalBackPriority(chain)).reversed()
+                            .thenComparing(Chain::key))
+                    .toList();
+            postSourceApplication = composeApplicationPriority(bb, refreshed, refreshedPublicEntries,
+                    frontFeaturesCache);
+        }
+        JustLogger.info("链组装：语义桥接产链 {} 条（源宿主容器触发 {} 条，源宿主后应用续接 {} 条）",
+                composed, sourceComposed, postSourceApplication);
+    }
+
+    private boolean defaultApplicationCompositionScope(Blackboard target) {
+        return target != null && target.applicationEntryIndex() != null
+                && target.applicationEntryIndex().applicationScopeKnown();
+    }
+
+    /** Avoid materializing any deferred suffix when the current application frontier has no
+     * typed bridge capability that could consume a back.  Source-host trigger demand is handled
+     * separately after this pass and may still request trigger endpoints. */
+    private boolean hasApplicationBackDemand(Blackboard target, List<Chain> fronts,
+                                             Map<String, FrontFeatures> frontFeaturesCache) {
+        if (target == null || fronts == null || fronts.isEmpty()) {
+            return false;
+        }
+        for (Chain front : fronts) {
+            FrontFeatures features = frontFeaturesCached(target, front, frontFeaturesCache);
+            if (features.invoke() || features.deserialize() || features.triggerContainer() != null
+                    || features.template() || features.jndiRmi()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Application-first composition pass.  This is deliberately a semantic frontier rather
+     * than a benchmark fixture: application execution roots are selected from the typed
+     * application index, terminal backs are ordered by rule role/category, and each root gets
+     * a bounded number of independent suffix families.  Newly composed DESER chains are fed
+     * through one more bounded round so a Method.invoke → ObjectUtil.deserialize prefix can
+     * continue to the actual terminal (for example TemplatesImpl) instead of stopping at the
+     * first capability/bridge.  The broad pass below still runs for compatibility and kernel
+     * callers; this pass only reserves coverage for roots that would otherwise be starved by
+     * the global composition cap.
+     */
+    private int composeApplicationPriority(Blackboard target, List<Chain> chains,
+                                           List<Chain> publicEntries,
+                                           Map<String, FrontFeatures> frontFeaturesCache) {
+        if (chains == null || chains.isEmpty() || publicEntries == null || publicEntries.isEmpty()) {
+            return 0;
+        }
+        List<Chain> eligibleFronts = chains.stream()
+                .filter(chain -> isApplicationFront(target, chain))
+                .filter(chain -> {
+                    FrontFeatures features = frontFeaturesCached(target, chain, frontFeaturesCache);
+                    return features.invoke() || features.deserialize()
+                            || features.triggerContainer() != null
+                            || features.template() || features.jndiRmi();
+                })
+                .sorted(java.util.Comparator
+                        .comparingInt((Chain chain) -> applicationFrontPriority(target, chain)).reversed()
+                        .thenComparing(Chain::key))
+                .toList();
+        List<Chain> fronts = selectApplicationFronts(eligibleFronts);
+        if (fronts.isEmpty()) {
+            return 0;
+        }
+        List<Chain> backs = publicEntries.stream()
+                .sorted(java.util.Comparator
+                        .comparingInt((Chain chain) -> applicationBackPriority(chain)).reversed()
+                        .thenComparing(Chain::key))
+                .limit(MAX_APPLICATION_PRIORITY_BACKS)
+                .toList();
+        List<Chain> overlapBacks = backs.stream()
+                .filter(chain -> isSecondaryDeserializationBack(target, chain))
+                .toList();
+        int composed = 0;
+        Set<String> seenFrontDepth = new HashSet<>();
+        List<ComposedDepth> frontier = new ArrayList<>();
+        // A reflective capability can be the last observable sink of an application prefix
+        // even though the same callback method is the entry of a dependency deserializer
+        // suffix.  This is a typed overlap, not an arbitrary class-name join: both sides must
+        // share the exact callback method, and the back side must be a public terminal
+        // DESERIALIZE chain.  Schedule it before the ordinary INVOKE product so a noisy
+        // capability frontier cannot starve the secondary-deserialization continuation.
+        int overlapAdded = 0;
+        for (int round = 0; round < overlapBacks.size()
+                && composed < MAX_APPLICATION_PRIORITY_COMPOSED
+                && overlapAdded < MAX_APPLICATION_PRIORITY_OVERLAP; round++) {
+            for (int frontIndex = 0; frontIndex < fronts.size()
+                    && composed < MAX_APPLICATION_PRIORITY_COMPOSED
+                    && overlapAdded < MAX_APPLICATION_PRIORITY_OVERLAP; frontIndex++) {
+                Chain front = fronts.get(frontIndex);
+                Chain back = overlapBacks.get(Math.floorMod(round + frontIndex,
+                        overlapBacks.size()));
+                Chain merged = admitComposed(target,
+                        composeIfOverlapping(target, front, back, seenFrontDepth));
+                if (merged == null) {
+                    continue;
+                }
+                composed++;
+                overlapAdded++;
+                frontier.add(new ComposedDepth(merged, 1));
+            }
+        }
+        // Continue the overlap frontier before spending the remaining reserved slots on
+        // unrelated one-step capability products.  Otherwise a large Method.invoke family
+        // can fill the finite cap and prevent ObjectUtil/SignedObject-style suffixes from
+        // reaching their actual terminal sink.
+        for (int depth = 1; depth < MAX_APPLICATION_COMPOSITION_DEPTH
+                && !frontier.isEmpty() && composed < MAX_APPLICATION_PRIORITY_COMPOSED; depth++) {
+            List<ComposedDepth> next = new ArrayList<>();
+            for (ComposedDepth item : frontier) {
+                if (item.depth() != depth || composed >= MAX_APPLICATION_PRIORITY_COMPOSED) {
+                    continue;
+                }
+                FrontFeatures features = frontFeaturesCached(target, item.chain(),
+                        frontFeaturesCache);
+                if (!features.deserialize() && !features.invoke() && !features.jndiRmi()) {
+                    continue;
+                }
+                for (Chain back : backs) {
+                    if (composed >= MAX_APPLICATION_PRIORITY_COMPOSED) {
+                        break;
+                    }
+                    Chain merged = admitComposed(target,
+                            composeIfBridgeable(target, item.chain(), back, seenFrontDepth,
+                                    frontFeaturesCache));
+                    if (merged == null) {
+                        continue;
+                    }
+                    composed++;
+                    next.add(new ComposedDepth(merged, depth + 1));
+                }
+            }
+            frontier = next;
+        }
+        // Round-robin roots, not back-first: one noisy root cannot exhaust the reserved
+        // frontier before every application entry has a chance to acquire a suffix.
+        for (int round = 0; round < backs.size() && composed < MAX_APPLICATION_PRIORITY_COMPOSED;
+             round++) {
+            for (int frontIndex = 0; frontIndex < fronts.size()
+                    && composed < MAX_APPLICATION_PRIORITY_COMPOSED; frontIndex++) {
+                Chain front = fronts.get(frontIndex);
+                Chain back = backs.get(Math.floorMod(round + frontIndex, backs.size()));
+                Chain merged = admitComposed(target,
+                        composeIfBridgeable(target, front, back, seenFrontDepth,
+                                frontFeaturesCache));
+                if (merged == null) {
+                    continue;
+                }
+                composed++;
+                frontier.add(new ComposedDepth(merged, 1));
+            }
+        }
+        return composed;
+    }
+
+    /**
+     * Select at most the bounded number of application prefixes while giving every distinct
+     * execution root one representative before filling remaining slots with higher-quality
+     * variants.  A chain count cap alone lets one controller or source host crowd out another
+     * root, which is precisely how a generated source-hosted prefix can disappear from the
+     * continuation pass.
+     */
+    private List<Chain> selectApplicationFronts(List<Chain> eligible) {
+        if (eligible == null || eligible.isEmpty()) {
+            return List.of();
+        }
+        List<Chain> selected = new ArrayList<>(Math.min(MAX_APPLICATION_PRIORITY_FRONTS,
+                eligible.size()));
+        Set<String> roots = new LinkedHashSet<>();
+        for (Chain chain : eligible) {
+            if (selected.size() >= MAX_APPLICATION_PRIORITY_FRONTS) {
+                break;
+            }
+            if (roots.add(applicationRootKey(chain))) {
+                selected.add(chain);
+            }
+        }
+        if (selected.size() < MAX_APPLICATION_PRIORITY_FRONTS) {
+            for (Chain chain : eligible) {
+                if (selected.size() >= MAX_APPLICATION_PRIORITY_FRONTS
+                        || selected.contains(chain)) {
+                    continue;
+                }
+                selected.add(chain);
+            }
+        }
+        return List.copyOf(selected);
+    }
+
+    private static String applicationRootKey(Chain chain) {
+        if (chain == null) {
+            return "<null>";
+        }
+        return chain.entryClass() + "#" + chain.entryMethod() + entryDescriptor(chain);
+    }
+
+    private record ComposedDepth(Chain chain, int depth) {
+    }
+
+    private boolean isApplicationFront(Blackboard target, Chain chain) {
+        if (target == null || chain == null) {
+            return false;
+        }
+        if (target.applicationEntryIndex() == null
+                || !target.applicationEntryIndex().applicationScopeKnown()) {
+            return applicationFrontPriority(target, chain) > 0;
+        }
+        String descriptor = entryDescriptor(chain);
+        String key = chain.entryClass() + "#" + chain.entryMethod() + descriptor;
+        var index = target.applicationEntryIndex();
+        if (!index.isApplicationOwner(chain.entryClass())) {
+            return false;
+        }
+        // A reverse chain may start at an application-owned helper rather than at the
+        // externally reachable root.  The immutable entry-forward slice is the typed
+        // admission for that prefix; it is deliberately narrower than owner/classpath
+        // membership and therefore cannot admit a dependency-only front.
+        return index.isApplicationEntryMethod(key) || index.isEntryForwardReachable(key)
+                || index.isApplicationBindingCallback(chain.entryClass(), chain.entryMethod(),
+                descriptor);
+    }
+
+    /**
+     * A default composition back must be either a dependency/JDK suffix whose actual sink is
+     * already present in the immutable terminal-impact index and sink-reverse slice, or an
+     * explicitly typed bridge/continuation whose eventual terminal is expected in a later
+     * bounded composition round.  The latter keeps lookup/JDBC/reflection/second-deserialize
+     * continuation alive without allowing the intermediate node to become a terminal finding.
+     */
+    private boolean isDefaultSuffixCandidate(Blackboard target, Chain chain,
+                                             Map<TerminalAdmissionKey,
+                                                     ApplicationEntryIndex.TerminalDecision>
+                                                     terminalAdmissionCache,
+                                             Map<ContinuationAdmissionKey, Boolean>
+                                                     continuationAdmissionCache) {
+        if (chain == null || !isPublicEntry(chain)
+                || target == null || target.applicationEntryIndex() == null) {
+            return false;
+        }
+        var index = target.applicationEntryIndex();
+        if (!index.applicationScopeKnown() || index.isApplicationOwner(chain.entryClass())) {
+            return false;
+        }
+        var decision = terminalAdmission(index, chain, terminalAdmissionCache);
+        if (decision.admitted()) {
+            return index.isSinkReverseReachable(decision.hostMethodKey());
+        }
+        return decision.status() == ApplicationEntryIndex.TerminalStatus.INTERMEDIATE_ONLY
+                && typedContinuationSink(target, chain, continuationAdmissionCache);
+    }
+
+    private boolean isDefaultSuffixCandidate(
+            Blackboard target, Blackboard.DeferredDependencySuffix deferred,
+            Map<TerminalAdmissionKey, ApplicationEntryIndex.TerminalDecision>
+                    terminalAdmissionCache) {
+        if (target == null || deferred == null || target.applicationEntryIndex() == null) {
+            return false;
+        }
+        ApplicationEntryIndex index = target.applicationEntryIndex();
+        ApplicationEntryIndex.ProducerCandidate candidate = deferred.candidate();
+        if (!index.applicationScopeKnown() || index.isApplicationOwner(candidate.entryOwner())
+                || !isPublicEntry(candidate.entryKind())) {
+            return false;
+        }
+        ApplicationEntryIndex.TerminalDecision decision = terminalAdmission(index,
+                candidate.terminalOwner(), candidate.terminalName(),
+                candidate.terminalDescriptor(), terminalAdmissionCache);
+        return decision.admitted() && index.isSinkReverseReachable(decision.hostMethodKey());
+    }
+
+    /**
+     * Filter the typed composition owners before constructing a compatibility union.  The
+     * application scope already has an indexed terminal/backward boundary, so application
+     * chains that cannot serve as dependency/bridge backs must not be copied into a global
+     * list only to be discarded by the predicate afterwards.  Inserting stores in the same
+     * order as CompositionInputs.compatibilityAll() preserves direct addChain compatibility and duplicate
+     * key precedence for the remaining candidates.
+     */
+    private List<Chain> defaultSuffixCandidates(Blackboard target,
+                                                 Blackboard.CompositionInputs inputs,
+                                                 Map<TerminalAdmissionKey,
+                                                         ApplicationEntryIndex.TerminalDecision>
+                                                         terminalAdmissionCache,
+                                                 Map<ContinuationAdmissionKey, Boolean>
+                                                         continuationAdmissionCache,
+                                                 boolean allowDeferredMaterialization) {
+        if (target == null || inputs == null) {
+            return List.of();
+        }
+        Map<String, Chain> unique = new java.util.TreeMap<>();
+        addDefaultSuffixCandidates(unique, target, inputs.applicationChains(),
+                terminalAdmissionCache, continuationAdmissionCache);
+        addDefaultSuffixCandidates(unique, target, inputs.bridgeContinuations(),
+                terminalAdmissionCache, continuationAdmissionCache);
+        addDefaultSuffixCandidates(unique, target, inputs.dependencySuffixes(),
+                terminalAdmissionCache, continuationAdmissionCache);
+        if (allowDeferredMaterialization) {
+            addDeferredDefaultSuffixCandidates(unique, target, inputs, terminalAdmissionCache);
+        }
+        return List.copyOf(unique.values());
+    }
+
+    /** Resolve deferred suffix endpoints only after the typed composition filter accepts them. */
+    private void addDeferredDefaultSuffixCandidates(
+            Map<String, Chain> unique, Blackboard target,
+            List<Blackboard.DeferredDependencySuffix> candidates,
+            Map<TerminalAdmissionKey, ApplicationEntryIndex.TerminalDecision>
+                    terminalAdmissionCache) {
+        if (target == null || candidates == null) {
+            return;
+        }
+        for (Blackboard.DeferredDependencySuffix deferred : candidates) {
+            if (!isDefaultSuffixCandidate(target, deferred, terminalAdmissionCache)) {
+                continue;
+            }
+            ApplicationEntryIndex.ProducerAdmissionDecision demandDecision =
+                    target.applicationEntryIndex().producerAdmission(deferred.candidate());
+            Blackboard.SolverAdmissionResult result =
+                    target.materializeDeferredDependencySuffix(deferred, demandDecision);
+            if (result.accepted()) {
+                unique.putIfAbsent(result.chain().key(), result.chain());
+            }
+        }
+    }
+
+    private void addDeferredDefaultSuffixCandidates(
+            Map<String, Chain> unique, Blackboard target,
+            Blackboard.CompositionInputs inputs,
+            Map<TerminalAdmissionKey, ApplicationEntryIndex.TerminalDecision>
+                    terminalAdmissionCache) {
+        if (target == null || inputs == null || target.applicationEntryIndex() == null) {
+            return;
+        }
+        ApplicationEntryIndex index = target.applicationEntryIndex();
+        List<Blackboard.DeferredDependencySuffix> demanded = new ArrayList<>();
+        Set<Blackboard.DeferredDependencySuffix> seen =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        // Walk the immutable terminal-demand owner first, then use the deferred terminal
+        // index to retrieve only endpoint candidates whose exact terminal is both indexed and
+        // reverse-reachable.  Identity tracking deliberately preserves distinct suppliers
+        // that share the same cheap ProducerCandidate endpoint.
+        for (ApplicationEntryIndex.TerminalImpact impact : index.terminalDemandImpacts()) {
+            for (Blackboard.DeferredDependencySuffix deferred :
+                    inputs.deferredDependencySuffixesForTerminal(impact.owner(), impact.name(),
+                            impact.descriptor())) {
+                if (seen.add(deferred)) {
+                    demanded.add(deferred);
+                }
+            }
+        }
+        // A descriptor-free endpoint is admitted by the index's name lookup.  It has no exact
+        // terminal-map key, so retain that small compatibility subset from the entry-kind
+        // buckets without reopening a full list scan for normal descriptor-bearing candidates.
+        for (String entryKind : PUBLIC_ENTRY_KINDS) {
+            for (Blackboard.DeferredDependencySuffix deferred :
+                    inputs.deferredDependencySuffixesForEntryKind(entryKind)) {
+                if (deferred.candidate().terminalDescriptor().isBlank() && seen.add(deferred)) {
+                    demanded.add(deferred);
+                }
+            }
+        }
+        addDeferredDefaultSuffixCandidates(unique, target, demanded, terminalAdmissionCache);
+    }
+
+    private void addDefaultSuffixCandidates(Map<String, Chain> unique, Blackboard target,
+                                            List<Chain> candidates,
+                                            Map<TerminalAdmissionKey,
+                                                    ApplicationEntryIndex.TerminalDecision>
+                                                    terminalAdmissionCache,
+                                            Map<ContinuationAdmissionKey, Boolean>
+                                                    continuationAdmissionCache) {
+        if (candidates == null) {
+            return;
+        }
+        for (Chain chain : candidates) {
+            if (isDefaultSuffixCandidate(target, chain, terminalAdmissionCache,
+                    continuationAdmissionCache)) {
+                unique.putIfAbsent(chain.key(), chain);
+            }
+        }
+    }
+
+    /** Resolve one immutable terminal decision at most once per composition build. */
+    private static ApplicationEntryIndex.TerminalDecision terminalAdmission(
+            ApplicationEntryIndex index, Chain chain,
+            Map<TerminalAdmissionKey, ApplicationEntryIndex.TerminalDecision> cache) {
+        return terminalAdmission(index, chain.sinkClass(), chain.sinkMethod(),
+                chain.sinkDescriptor(), cache);
+    }
+
+    private static ApplicationEntryIndex.TerminalDecision terminalAdmission(
+            ApplicationEntryIndex index, String owner, String name, String descriptor,
+            Map<TerminalAdmissionKey, ApplicationEntryIndex.TerminalDecision> cache) {
+        TerminalAdmissionKey key = new TerminalAdmissionKey(
+                owner == null ? "" : owner,
+                name == null ? "" : name,
+                descriptor == null ? "" : descriptor);
+        if (cache != null) {
+            ApplicationEntryIndex.TerminalDecision cached = cache.get(key);
+            if (cached != null) {
+                return cached;
+            }
+        }
+        ApplicationEntryIndex.TerminalDecision decision = index.terminalAdmission(
+                key.owner(), key.name(), key.descriptor());
+        if (cache != null) {
+            cache.put(key, decision);
+        }
+        return decision;
+    }
+
+    private boolean typedContinuationSink(Blackboard target, Chain chain,
+                                         Map<ContinuationAdmissionKey, Boolean> cache) {
+        if (chain == null || target == null) {
+            return false;
+        }
+        ContinuationAdmissionKey key = new ContinuationAdmissionKey(
+                chain.ruleId() == null ? "" : chain.ruleId(),
+                chain.sinkClass() == null ? "" : chain.sinkClass(),
+                chain.sinkMethod() == null ? "" : chain.sinkMethod(),
+                chain.sinkDescriptor() == null ? "" : chain.sinkDescriptor());
+        if (cache != null) {
+            Boolean cached = cache.get(key);
+            if (cached != null) {
+                return cached;
+            }
+        }
+        Rule.SinkRule sink = target.rules().sinks().stream()
+                .filter(rule -> rule != null && rule.id().equals(key.ruleId()))
+                .findFirst()
+                .orElseGet(() -> target.ruleEngine()
+                        .matchingSink(key.owner(), key.name(), key.descriptor())
+                        .orElse(null));
+        boolean result = sink != null && !RuleSchemaV2.isTerminalSink(sink)
+                && !RuleSchemaV2.bridgesFor(sink).isEmpty();
+        if (cache != null) {
+            cache.put(key, result);
+        }
+        return result;
+    }
+
+    private int applicationBackPriority(Chain chain) {
+        int score = terminalBackPriority(chain);
+        if (chain == null) {
+            return score;
+        }
+        // A terminal deserialization is a typed continuation point, not merely an effect;
+        // reserve it ahead of unrelated file/reflective terminals so nested input can be
+        // composed in the next round.  Rule category/role is data-driven and applies equally
+        // to any framework's secondary input API.
+        if ("DESERIALIZE".equalsIgnoreCase(chain.category())) {
+            score += 320;
+        }
+        if ("CODE_EXEC".equalsIgnoreCase(chain.category())) {
+            score += 160;
+        }
+        if ("JNDI".equalsIgnoreCase(chain.category()) || "JDBC".equalsIgnoreCase(chain.category())) {
+            score += 120;
+        }
+        return score;
+    }
+
+    private ComposedProducer composeIfBridgeable(Blackboard target, Chain front, Chain back,
+                                                 Set<String> seenFrontDepth,
+                                                 Map<String, FrontFeatures> frontFeaturesCache) {
+        if (front == null || back == null || front == back || onPath(front, back.entryClass())) {
+            return null;
+        }
+        FrontFeatures features = frontFeaturesCached(target, front, frontFeaturesCache);
+        Bridge bridge = semanticBridge(target, features, front, back);
+        if (bridge == null) {
+            return null;
+        }
+        String dedupe = front.key() + "|" + back.key() + "|" + bridge.name();
+        if (!seenFrontDepth.add(dedupe)) {
+            return null;
+        }
+        return composedProducer(front, back, bridge);
+    }
+
+    /**
+     * Join an application prefix to a secondary-deserialization suffix at an exact callback
+     * method already present in the prefix.  Reflection is often modeled as a capability sink
+     * before the more precise converter/deserializer path is discovered; requiring an exact
+     * callback overlap preserves that value/object identity without allowing unrelated gadget
+     * roots to enter the default application result.
+     */
+    private ComposedProducer composeIfOverlapping(Blackboard target, Chain front, Chain back,
+                                                  Set<String> seenFrontDepth) {
+        if (front == null || back == null || front == back
+                || !isSecondaryDeserializationBack(target, back)) {
+            return null;
+        }
+        int suffixStart = overlapSuffixStart(front, back);
+        if (suffixStart < 0) {
+            return null;
+        }
+        String dedupe = "overlap|" + front.key() + "|" + back.key();
+        if (!seenFrontDepth.add(dedupe)) {
+            return null;
+        }
+        return composedProducer(front, back, () -> composeOverlap(front, back, suffixStart));
+    }
+
+    private boolean isSecondaryDeserializationBack(Blackboard target, Chain chain) {
+        if (chain == null || !chain.terminalSink()
+                || !"DESERIALIZE".equalsIgnoreCase(chain.category())
+                || !isPublicEntry(chain)) {
+            return false;
+        }
+        if (target == null || target.applicationEntryIndex() == null
+                || !target.applicationEntryIndex().applicationScopeKnown()) {
+            return true;
+        }
+        // A suffix that is already rooted in another application entry is a separate product
+        // candidate, not a dependency continuation of this application prefix.
+        return !target.applicationEntryIndex().isApplicationOwner(chain.entryClass());
+    }
+
+    /** Return the first hop after the shared callback in sink-to-entry hop order. */
+    private static int overlapSuffixStart(Chain front, Chain back) {
+        if (front == null || back == null || front.hops().isEmpty()) {
+            return -1;
+        }
+        String owner = back.entryClass();
+        String name = back.entryMethod();
+        String descriptor = entryDescriptor(back);
+        // A callback method appears as the from-side of its outgoing trace hop.  Prefer that
+        // exact boundary and choose the occurrence nearest the application ENTRY so recursive
+        // wildcard paths do not make an earlier loop the splice point.
+        for (int i = front.hops().size() - 1; i >= 0; i--) {
+            ChainHop hop = front.hops().get(i);
+            if (sameMethod(hop.fromOwner(), hop.fromName(), owner, name)
+                    && descriptorCompatible(descriptor, hop.desc())) {
+                int suffix = i + 1;
+                return containsEntryFrom(front, suffix) ? suffix : -1;
+            }
+        }
+        // Some field/dispatch traces expose the callback only as the to-side endpoint.  Keep
+        // that hop so the displayed path still contains the caller→callback boundary.
+        for (int i = front.hops().size() - 1; i >= 0; i--) {
+            ChainHop hop = front.hops().get(i);
+            if (sameMethod(hop.toOwner(), hop.toName(), owner, name)
+                    && descriptorCompatible(descriptor, hop.desc())) {
+                return containsEntryFrom(front, i) ? i : -1;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean containsEntryFrom(Chain chain, int start) {
+        if (chain == null || start < 0 || start > chain.hops().size()) {
+            return false;
+        }
+        for (int i = start; i < chain.hops().size(); i++) {
+            if (chain.hops().get(i).kind() == HopKind.ENTRY) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean descriptorCompatible(String expected, String actual) {
+        return expected == null || expected.isBlank() || actual == null || actual.isBlank()
+                || expected.equals(actual);
+    }
+
+    private static boolean sameMethod(String owner, String name, String expectedOwner,
+                                      String expectedName) {
+        return expectedOwner != null && expectedOwner.equals(owner)
+                && expectedName != null && expectedName.equals(name);
+    }
+
+    private static Chain composeOverlap(Chain front, Chain back, int suffixStart) {
+        int backEntry = -1;
+        for (int i = back.hops().size() - 1; i >= 0; i--) {
+            if (back.hops().get(i).kind() == HopKind.ENTRY) {
+                backEntry = i;
+                break;
+            }
+        }
+        int backEnd = backEntry < 0 ? back.hops().size() : backEntry;
+        List<ChainHop> hops = new ArrayList<>(backEnd
+                + 1 + Math.max(0, front.hops().size() - suffixStart));
+        hops.addAll(back.hops().subList(0, backEnd));
+        // The shared callback is the typed bridge boundary.  A self-dispatch hop is used so
+        // reports/evidence can distinguish this continuation from an ordinary call-graph edge
+        // without inventing a target method or dropping the exact overlap identity.
+        hops.add(new ChainHop(back.entryClass(), back.entryMethod(),
+                back.entryClass(), back.entryMethod(), HopKind.VIRTUAL_DISPATCH, null,
+                "bridge-second-deserialization-overlap", entryDescriptor(back), null));
+        hops.addAll(front.hops().subList(suffixStart, front.hops().size()));
+        if (hops.size() > MAX_HOPS) {
+            return null;
+        }
+        return new Chain(back.ruleId(), back.category(), back.severity(),
+                front.entryClass(), front.entryMethod(), front.entryKind(),
+                back.sinkClass(), back.sinkMethod(), hops,
+                front.unresolvedHops() + back.unresolvedHops(), back.sinkDescriptor(),
+                back.sinkRole(), constructionPlanOf(back, front), back.sinkRisk());
     }
 
     /**
@@ -173,33 +933,45 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
      * 元素 hashCode/equals/compareTo（如 HashSet.readObject → HashMap.hash → 元素 hashCode）。
      * 此类方法直接作为触发容器桥的前段宿主，与 trigger-entry 后段链组装成完整攻击路径。
      */
-    private int composeSourceHosted(List<Chain> chains) {
-        if (deserHosts == null) {
-            scanHosts();
+    private int composeSourceHosted(Blackboard target, Blackboard.CompositionInputs inputs) {
+        if (target == null || inputs == null) {
+            return 0;
         }
+        Map<String, DeserHost> discoveredHosts = scanHosts(target);
+        Set<String> primaryClasses = primaryArtifactClasses(target);
         int composed = 0;
-        // 公开 gadget 片段链（已知触发语义）优先消耗预算，其余按黑板顺序
-        List<Chain> ordered = new ArrayList<>();
-        List<Chain> rest = new ArrayList<>();
-        for (Chain back : chains) {
-            boolean fragment = back.hops().stream()
-                    .anyMatch(h -> "fragment".equals(h.reason()));
-            (fragment ? ordered : rest).add(back);
+        List<Map.Entry<String, DeserHost>> hosts = new ArrayList<>(discoveredHosts.entrySet());
+        // A dependency/JDK trigger is only a product candidate after it is attached to a
+        // deserialization host owned by the target application.  The application index is
+        // the typed admission boundary: it proves that the host is reachable from an
+        // application execution root in the bounded forward slice.  Kernel/compatibility
+        // callers without a known scope retain the historical bounded composition path.
+        if (target.applicationEntryIndex().applicationScopeKnown()) {
+            var index = target.applicationEntryIndex();
+            boolean hasApplicationRootInForwardSlice = index.applicationEntries().stream()
+                    .anyMatch(entry -> index.isEntryForwardReachable(entry.methodKey()));
+            hosts.removeIf(entry -> !applicationAnchoredHost(target, entry.getValue(),
+                    hasApplicationRootInForwardSlice));
+            if (hosts.isEmpty()) {
+                target.markIncomplete("SOURCE_HOST_NO_APPLICATION_ANCHOR");
+            }
         }
-        ordered.sort(java.util.Comparator.comparing(Chain::key));
-        rest.sort(java.util.Comparator.comparing(Chain::key));
-        ordered.addAll(rest);
-        List<Chain> triggerChains = ordered.stream()
-                .filter(chain -> isTriggerEntry(chain.entryKind()))
+        // Deferred trigger payloads are a demand frontier, not a compatibility snapshot.
+        // Do not materialize them until at least one concrete source host survived the typed
+        // application-anchor filter; a graph-less/minimal or unanchored scan has no consumer.
+        List<Chain> chains = hosts.isEmpty() ? List.of()
+                : sourceHostedTriggerInputs(target, inputs);
+        // The caller now supplies a typed, deduplicated trigger frontier only after at least
+        // one host demand survives. Retain the complete capability/risk/key ordering here,
+        // but do not copy every non-trigger chain into an ordered/rest pair before filtering.
+        List<Chain> triggerChains = chains.stream()
                 .sorted(java.util.Comparator
-                        .comparingInt((Chain chain) -> triggerPriority(chain,
-                                primaryArtifactClasses())).reversed()
+                                 .comparingInt((Chain chain) -> triggerPriority(chain,
+                                 primaryClasses)).reversed()
                         .thenComparingInt(Chain::unresolvedHops)
-                .thenComparingInt(chain -> chain.hops().size())
-                .thenComparing(Chain::key))
+                        .thenComparingInt(chain -> chain.hops().size())
+                        .thenComparing(Chain::key))
                 .toList();
-        List<Map.Entry<String, DeserHost>> hosts = new ArrayList<>(deserHosts.entrySet());
-        Set<String> primaryClasses = primaryArtifactClasses();
         // The source-host product is bounded by design. A lexical host order lets a large
         // dependency surface consume the whole first round before an application-defined
         // deserialization boundary gets a chance to attach a fragment. Put primary-artifact
@@ -233,33 +1005,23 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 if (back.entryClass().equals(hostClass)) {
                     continue;
                 }
-                List<ChainHop> hops = new ArrayList<>();
-                for (int i = 0; i < back.hops().size() - 1; i++) {
-                    hops.add(back.hops().get(i));
-                }
-                // 机制桥接跳：反序列化框架的容器/bean 机制以攻击者数据回调后段入口
-                // （OIS: HashSet.readObject→HashMap.hash；Kryo: MapSerializer.read→put；
-                //   fastjson: JavaBeanDeserializer→setter——框架管线语义，非调用图相邻）
-                hops.add(new ChainHop(hostRef.frameOwner(), hostRef.frameMethod(),
-                        back.entryClass(), back.entryMethod(),
-                        HopKind.VIRTUAL_DISPATCH, null, "bridge-trigger-src",
-                        entryDescriptor(back), null));
-                hops.add(new ChainHop(hostClass, hostMethod, hostRef.frameOwner(), hostRef.frameMethod(),
-                        HopKind.DIRECT_CALL, null, "bridge-source-deserialize",
-                        hostRef.frameDescriptor(), null));
-                hops.add(new ChainHop(hostClass, hostMethod, hostClass, hostMethod,
-                        HopKind.ENTRY, null, "source",
-                        hostRef.descriptor(), null));
-                if (hops.size() > MAX_HOPS) {
+                int sourceHopCount = sourceHostedHopCount(back);
+                if (sourceHopCount > MAX_HOPS) {
                     continue;
                 }
-                Chain merged = new Chain(back.ruleId(), back.category(), back.severity(),
-                        hostClass, hostMethod, "source",
-                        back.sinkClass(), back.sinkMethod(), hops, back.unresolvedHops(),
-                        back.sinkDescriptor(), back.sinkRole(), constructionPlanOf(back, null),
-                        back.sinkRisk());
-                if (bb.addChain(merged)) {
-                    bb.chainNote(merged.key(), "pattern:src-container-trigger");
+                SourceHostedProducer producer = sourceHostedProducer(back, hostClass, hostMethod,
+                        "source", hostRef.descriptor(), sourceHopCount, true,
+                        () -> sourceHostedHops(back, hostRef, hostClass, hostMethod));
+                if (producer == null) {
+                    continue;
+                }
+                Chain merged = admitSourceHostedChain(target, producer);
+                if (merged != null) {
+                    // The typed admission owner has already routed the product.  Notes are
+                    // owned by the default/calibration stores; calling this unconditionally
+                    // is equivalent for bridge/suffix/kernel routes and avoids a full snapshot
+                    // scan of target.chains() for every accepted source-host candidate.
+                    target.chainNote(merged.key(), "pattern:src-container-trigger");
                     composed++;
                     emittedInRound = true;
                 }
@@ -273,12 +1035,223 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 && !hosts.isEmpty() && roundLimitReached) {
             // If the bounded frontier was exhausted before the normal composition cap,
             // expose the bound in completeness metadata instead of silently dropping pairs.
-            bb.markIncomplete("SOURCE_HOST_SCHEDULING_CAP:" + MAX_SOURCE_ROUNDS);
+            target.markIncomplete("SOURCE_HOST_SCHEDULING_CAP:" + MAX_SOURCE_ROUNDS);
         }
         if (composed >= MAX_COMPOSED) {
-            bb.markIncomplete("COMPOSITION_SOURCE_CHAIN_CAP:" + MAX_COMPOSED);
+            target.markIncomplete("COMPOSITION_SOURCE_CHAIN_CAP:" + MAX_COMPOSED);
         }
         return composed;
+    }
+
+    /**
+     * Source-host composition only consumes trigger-entry chains.  Build that frontier from
+     * the typed stores directly so ordinary application products are not first copied into a
+     * compatibility union and discarded by the final entry-kind predicate.  Store insertion
+     * order mirrors CompositionInputs.compatibilityAll(), retaining direct addChain compatibility and
+     * deterministic duplicate-key precedence.
+     */
+    private List<Chain> sourceHostedTriggerInputs(Blackboard target,
+                                                  Blackboard.CompositionInputs inputs) {
+        if (inputs == null) {
+            return List.of();
+        }
+        Map<String, Chain> unique = new java.util.TreeMap<>();
+        addTriggerInputs(unique, inputs.applicationChains());
+        addTriggerInputs(unique, inputs.bridgeContinuations());
+        addTriggerInputs(unique, inputs.dependencySuffixes());
+        if (target != null) {
+            for (String entryKind : TRIGGER_ENTRY_KINDS) {
+                for (Blackboard.DeferredDependencySuffix deferred :
+                        inputs.deferredDependencySuffixesForEntryKind(entryKind)) {
+                    ApplicationEntryIndex.ProducerAdmissionDecision demandDecision =
+                            target.applicationEntryIndex().producerAdmission(deferred.candidate());
+                    Blackboard.SolverAdmissionResult result =
+                            target.materializeDeferredDependencySuffix(deferred, demandDecision);
+                    if (result.accepted() && isTriggerEntry(result.chain().entryKind())) {
+                        unique.putIfAbsent(result.chain().key(), result.chain());
+                    }
+                }
+            }
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private void addTriggerInputs(Map<String, Chain> unique, List<Chain> candidates) {
+        if (candidates == null) {
+            return;
+        }
+        for (Chain chain : candidates) {
+            if (isTriggerEntry(chain.entryKind())) {
+                unique.putIfAbsent(chain.key(), chain);
+            }
+        }
+    }
+
+    private int distinctCompositionInputCount(Blackboard.CompositionInputs inputs) {
+        if (inputs == null) {
+            return 0;
+        }
+        Set<String> keys = new HashSet<>();
+        addCompositionKeys(keys, inputs.applicationChains());
+        addCompositionKeys(keys, inputs.bridgeContinuations());
+        addCompositionKeys(keys, inputs.dependencySuffixes());
+        if (inputs.deferredDependencySuffixes() != null) {
+            for (Blackboard.DeferredDependencySuffix deferred :
+                    inputs.deferredDependencySuffixes()) {
+                ApplicationEntryIndex.ProducerCandidate candidate = deferred.candidate();
+                keys.add("<deferred>|" + candidate.entryMethodKey() + "|"
+                        + candidate.terminalOwner() + "#" + candidate.terminalName()
+                        + candidate.terminalDescriptor());
+            }
+        }
+        return keys.size();
+    }
+
+    private void addCompositionKeys(Set<String> keys, List<Chain> candidates) {
+        if (candidates == null) {
+            return;
+        }
+        for (Chain chain : candidates) {
+            if (chain != null) {
+                keys.add(chain.key());
+            }
+        }
+    }
+
+    /**
+     * Publish a source-hosted endpoint through the event-owned typed admission boundary.
+     * Keeping the target explicit prevents a stale source field from silently routing a
+     * candidate to another Blackboard when a source is exercised in isolation or replayed.
+     */
+    boolean admitSourceHosted(Blackboard target, SourceHostedProducer producer,
+                              Supplier<Chain> materializer) {
+        return admitSourceHostedChain(target, producer, materializer) != null;
+    }
+
+    private Chain admitSourceHostedChain(Blackboard target, SourceHostedProducer producer) {
+        if (producer == null) {
+            return null;
+        }
+        return admitSourceHostedChain(target, producer, producer.materializer());
+    }
+
+    private Chain admitSourceHostedChain(Blackboard target, SourceHostedProducer producer,
+                                         Supplier<Chain> materializer) {
+        if (target == null || producer == null || materializer == null) {
+            return null;
+        }
+        return admitEagerCompositionCandidate(target, producer.candidate(), materializer);
+    }
+
+    /**
+     * Shared eager-composition boundary for source-hosted and composed products.  Both callers
+     * need a concrete chain in the current round; a deferred suffix must remain in the typed
+     * frontier until an application-backed consumer requests it.
+     */
+    private Chain admitEagerCompositionCandidate(
+            Blackboard target, ApplicationEntryIndex.ProducerCandidate candidate,
+            Supplier<Chain> materializer) {
+        if (target == null || candidate == null || materializer == null
+                || target.applicationEntryIndex() == null) {
+            return null;
+        }
+        ApplicationEntryIndex.ProducerAdmissionDecision decision =
+                target.applicationEntryIndex().producerAdmission(candidate);
+        if (!decision.materializationPolicy().materializesImmediately()) {
+            return null;
+        }
+        Blackboard.SolverAdmissionResult result =
+                target.admitSolverCandidate(candidate, materializer);
+        return result.accepted() ? result.chain() : null;
+    }
+
+    /**
+     * Build only the source-host endpoint; the concrete bridge hops remain behind the supplier
+     * until the central application-demand owner accepts the candidate.
+     */
+    static SourceHostedProducer sourceHostedProducer(Chain back, String hostOwner,
+                                                      String hostMethod, String hostEntryKind,
+                                                      String hostDescriptor, int hopCount,
+                                                      boolean continuationEvidence,
+                                                      Supplier<List<ChainHop>> hopMaterializer) {
+        if (back == null || hostOwner == null || hostOwner.isBlank()
+                || hostMethod == null || hostMethod.isBlank()) {
+            return null;
+        }
+        if (hopCount < 0 || hopCount > MAX_HOPS || hopMaterializer == null) {
+            return null;
+        }
+        ApplicationEntryIndex.ProducerCandidate candidate =
+                new ApplicationEntryIndex.ProducerCandidate(back.ruleId(), back.category(),
+                        back.severity(), hostOwner, hostMethod, hostDescriptor, hostEntryKind,
+                        back.sinkClass(), back.sinkMethod(), back.sinkDescriptor(),
+                        back.sinkRole(), back.sinkRisk(),
+                        continuationEvidence);
+        Supplier<Chain> materializer = () -> {
+            List<ChainHop> hops = hopMaterializer.get();
+            if (hops == null || hops.size() != hopCount || hops.size() > MAX_HOPS) {
+                return null;
+            }
+            List<ChainHop> immutableHops = List.copyOf(hops);
+            return new Chain(candidate.ruleId(), candidate.category(), candidate.severity(),
+                    candidate.entryOwner(), candidate.entryName(), candidate.entryKind(),
+                    candidate.terminalOwner(), candidate.terminalName(), immutableHops,
+                    back.unresolvedHops(), candidate.terminalDescriptor(), candidate.terminalRole(),
+                    constructionPlanOf(back, null), candidate.sinkRisk());
+        };
+        return new SourceHostedProducer(candidate, materializer);
+    }
+
+    private static int sourceHostedHopCount(Chain back) {
+        if (back == null || back.hops() == null) {
+            return -1;
+        }
+        return Math.max(0, back.hops().size() - 1) + 3;
+    }
+
+    private static List<ChainHop> sourceHostedHops(Chain back, DeserHost hostRef,
+                                                   String hostClass, String hostMethod) {
+        List<ChainHop> hops = new ArrayList<>(sourceHostedHopCount(back));
+        for (int i = 0; i < back.hops().size() - 1; i++) {
+            hops.add(back.hops().get(i));
+        }
+        // 机制桥接跳：反序列化框架的容器/bean 机制以攻击者数据回调后段入口
+        // （OIS: HashSet.readObject→HashMap.hash；Kryo: MapSerializer.read→put；
+        //   fastjson: JavaBeanDeserializer→setter——框架管线语义，非调用图相邻）
+        hops.add(new ChainHop(hostRef.frameOwner(), hostRef.frameMethod(),
+                back.entryClass(), back.entryMethod(),
+                HopKind.VIRTUAL_DISPATCH, null, "bridge-trigger-src",
+                entryDescriptor(back), null));
+        hops.add(new ChainHop(hostClass, hostMethod, hostRef.frameOwner(), hostRef.frameMethod(),
+                HopKind.DIRECT_CALL, null, "bridge-source-deserialize",
+                hostRef.frameDescriptor(), null));
+        hops.add(new ChainHop(hostClass, hostMethod, hostClass, hostMethod,
+                HopKind.ENTRY, null, "source", hostRef.descriptor(), null));
+        return hops;
+    }
+
+    /** Typed source-host endpoint plus deferred composition payload. */
+    record SourceHostedProducer(ApplicationEntryIndex.ProducerCandidate candidate,
+                                Supplier<Chain> materializer) {
+        SourceHostedProducer {
+            candidate = Objects.requireNonNull(candidate, "candidate");
+            materializer = ChainMaterializer.memoize(Objects.requireNonNull(materializer, "materializer"));
+        }
+    }
+
+    private boolean applicationAnchoredHost(Blackboard target, DeserHost host,
+                                           boolean hasApplicationRootInForwardSlice) {
+        if (target == null || host == null || target.applicationEntryIndex() == null) {
+            return false;
+        }
+        var index = target.applicationEntryIndex();
+        if (!index.applicationScopeKnown() || !index.allowsDependencyExpansion()) {
+            return false;
+        }
+        String key = host.owner() + "#" + host.method() + host.descriptor();
+        return index.isApplicationOwner(host.owner())
+                && index.isEntryForwardReachable(key)
+                && hasApplicationRootInForwardSlice;
     }
 
     /**
@@ -347,44 +1320,207 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     }
 
     /** Read only primary-artifact class names; nested dependency jars are intentionally excluded. */
-    private Set<String> primaryArtifactClasses() {
-        if (primaryArtifactClasses != null) {
-            return primaryArtifactClasses;
+    private Set<String> primaryArtifactClasses(Blackboard target) {
+        if (target == null || target.scanInputs() == null) {
+            return Set.of();
+        }
+        // The frontend already observed the target artifact while building the immutable
+        // program model.  Reuse that ownership set when available instead of opening the
+        // target a second time merely to prioritize source-host pairs.  Compatibility
+        // blackboards without scope metadata retain the bounded legacy discovery below.
+        if (target.scanInputs().applicationScopeKnown()) {
+            return Set.copyOf(target.scanInputs().applicationClassNames());
         }
         Set<String> result = new LinkedHashSet<>();
-        Path target = bb.scanInputs().target();
+        Path artifact = target.scanInputs().target();
         try {
-            if (Files.isDirectory(target)) {
-                try (var stream = Files.walk(target)) {
-                    stream.filter(Files::isRegularFile)
-                            .map(target::relativize)
-                            .map(Path::toString)
-                            .map(value -> value.replace(File.separatorChar, '/'))
-                            .map(ChainComposerKnowledgeSource::primaryClassName)
-                            .filter(java.util.Objects::nonNull)
-                            .forEach(result::add);
+            InputBudget.Tracker tracker = target.scanInputs().inputTracker();
+            InputBudget policy = tracker == null ? InputBudget.defaults() : tracker.budget();
+            result.addAll(boundedPrimaryArtifactClasses(artifact, policy, tracker));
+        } catch (IOException e) {
+            JustLogger.debug("读取主工件类归属失败，源宿主调度退回稳定排序: {}", e.getMessage());
+        }
+        return Set.copyOf(result);
+    }
+
+    /**
+     * Bounded primary-artifact class-name discovery used only for deterministic source-host
+     * prioritisation.  It deliberately excludes nested dependency jars and never affects chain
+     * truth.  The helper is package-visible so the hostile-input contract can exercise the same
+     * boundary without constructing a complete Blackboard.
+     */
+    static Set<String> boundedPrimaryArtifactClasses(Path target, InputBudget budget)
+            throws IOException {
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        return boundedPrimaryArtifactClasses(target, policy, policy.tracker());
+    }
+
+    /**
+     * Discover primary-artifact classes while charging a caller-owned tracker.  Composition is
+     * an optional priority hint, but it still reads attacker-controlled paths; accepting a
+     * tracker from the scan boundary prevents this helper from resetting the aggregate entry,
+     * byte and time budget after identity/frontend work.  The tracker policy is authoritative so
+     * a mismatched convenience policy cannot widen the caller's limits.
+     */
+    static Set<String> boundedPrimaryArtifactClasses(Path target, InputBudget budget,
+                                                      InputBudget.Tracker tracker)
+            throws IOException {
+        if (target == null) {
+            throw new IOException("primary artifact is null");
+        }
+        InputBudget requested = budget == null ? InputBudget.defaults() : budget;
+        InputBudget.Tracker accounting = tracker == null ? requested.tracker() : tracker;
+        InputBudget policy = accounting.budget();
+        Path root = target.toAbsolutePath().normalize();
+        if (ArchiveLimits.isLinkOrReparsePoint(root)) {
+            throw new IOException("primary artifact is a link or reparse point");
+        }
+        Set<String> result = new TreeSet<>();
+        if (Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+            ArchiveLimits.DirectoryReadSnapshot snapshot = ArchiveLimits.snapshotDirectory(
+                    root, policy, "PRIMARY_ARTIFACT");
+            IOException failure = null;
+            try (var stream = Files.walk(root)) {
+                var iterator = stream.iterator();
+                while (iterator.hasNext()) {
+                    accounting.checkTime();
+                    Path path = iterator.next();
+                    Path normalized = path.toAbsolutePath().normalize();
+                    if (!normalized.startsWith(root)
+                            || ArchiveLimits.isLinkOrReparsePoint(path)) {
+                        throw new IOException("primary artifact tree contains link or escapes root");
+                    }
+                    Path relativePath = root.relativize(normalized);
+                    String relative = relativePath.toString().replace(File.separatorChar, '/');
+                    BasicFileAttributes attributes = Files.readAttributes(path,
+                            BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    if (relativePath.getNameCount() > policy.maxPathDepth()) {
+                        throw new IOException("primary artifact path depth exceeds limit: "
+                                + policy.maxPathDepth());
+                    }
+                    String accountingName = relative.isBlank() ? "<root>" : relative;
+                    accounting.observeFile(accountingName,
+                            attributes.isRegularFile() ? attributes.size() : 0L);
+                    verifyPrimaryArtifactEntry(path, attributes);
+                    if (attributes.isRegularFile()) {
+                        String className = primaryClassName(relative);
+                        if (className != null && result.size() < policy.maxClassEntries()) {
+                            result.add(className);
+                        } else if (className != null) {
+                            throw new IOException("primary artifact class count exceeds limit: "
+                                    + policy.maxClassEntries());
+                        }
+                    }
                 }
-            } else if (Files.isRegularFile(target)) {
-                String name = target.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
-                if (name.endsWith(".class")) {
-                    result.add(target.getFileName().toString().replaceFirst("\\.class$", ""));
+            } catch (IOException readFailure) {
+                failure = readFailure;
+            }
+            try {
+                ArchiveLimits.verifyDirectoryUnchanged(snapshot, "PRIMARY_ARTIFACT");
+            } catch (IOException identityFailure) {
+                if (failure == null) {
+                    failure = identityFailure;
                 } else {
-                    try (JarFile jar = new JarFile(target.toFile())) {
-                        Enumeration<JarEntry> entries = jar.entries();
+                    failure.addSuppressed(identityFailure);
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        } else if (Files.isRegularFile(root, LinkOption.NOFOLLOW_LINKS)) {
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    root, policy, "PRIMARY_ARTIFACT");
+            IOException failure = null;
+            try {
+                ArchiveLimits.checkContainerSize(root, policy);
+                String name = root.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
+                if (name.endsWith(".class")) {
+                    accounting.observeFile(root.getFileName().toString(),
+                            snapshot.fileAttributes().size());
+                    result.add(root.getFileName().toString().replaceFirst("\\.class$", ""));
+                } else {
+                    try (ArchiveLimits.ZipFileHandle handle = ArchiveLimits.openZipFile(snapshot,
+                            "PRIMARY_ARTIFACT")) {
+                        ZipFile jar = handle.zip();
+                        Enumeration<? extends java.util.zip.ZipEntry> entries = jar.entries();
+                        Set<String> seen = new HashSet<>();
                         while (entries.hasMoreElements()) {
-                            String className = primaryClassName(entries.nextElement().getName());
-                            if (className != null) {
+                            accounting.checkTime();
+                            java.util.zip.ZipEntry entry = entries.nextElement();
+                            if (entry == null || !seen.add(entry.getName())
+                                    || !ArchiveLimits.safeEntryName(entry.getName(), policy)) {
+                                throw new IOException("invalid or duplicate primary archive entry");
+                            }
+                            accounting.observe(entry);
+                            String className = primaryClassName(entry.getName());
+                            if (className != null && result.size() < policy.maxClassEntries()) {
                                 result.add(className);
+                            } else if (className != null) {
+                                throw new IOException("primary artifact class count exceeds limit: "
+                                        + policy.maxClassEntries());
                             }
                         }
                     }
                 }
+            } catch (IOException readFailure) {
+                failure = readFailure;
             }
-        } catch (IOException e) {
-            JustLogger.debug("读取主工件类归属失败，源宿主调度退回稳定排序: {}", e.getMessage());
+            if (failure != null) {
+                throw failure;
+            }
+        } else {
+            throw new IOException("primary artifact is not a regular file or directory");
         }
-        primaryArtifactClasses = Set.copyOf(result);
-        return primaryArtifactClasses;
+        return Collections.unmodifiableSet(result);
+    }
+
+    /** Re-read one discovered entry so a replacement cannot silently influence prioritisation. */
+    private static void verifyPrimaryArtifactEntry(Path path,
+                                                   BasicFileAttributes before) throws IOException {
+        if (path == null || before == null || ArchiveLimits.isLinkOrReparsePoint(path)) {
+            throw new IOException("PRIMARY_ARTIFACT_CHANGED_DURING_READ");
+        }
+        BasicFileAttributes after = Files.readAttributes(path,
+                BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        boolean same = before.isDirectory()
+                ? ArchiveLimits.sameDirectoryIdentity(before, after)
+                : ArchiveLimits.sameRegularFileIdentity(before, after);
+        if (!same || ArchiveLimits.isLinkOrReparsePoint(path)) {
+            throw new IOException("PRIMARY_ARTIFACT_CHANGED_DURING_READ");
+        }
+    }
+
+    /** Package-local hostile contract seam; production discovery uses the same directory guard. */
+    static ArchiveLimits.DirectoryReadSnapshot snapshotPrimaryArtifactForContract(Path target,
+                                                                                    InputBudget budget)
+            throws IOException {
+        return ArchiveLimits.snapshotDirectory(target, budget, "PRIMARY_ARTIFACT");
+    }
+
+    /** Package-local hostile contract seam; production discovery uses the same directory guard. */
+    static void verifyPrimaryArtifactDirectoryForContract(
+            ArchiveLimits.DirectoryReadSnapshot snapshot) throws IOException {
+        ArchiveLimits.verifyDirectoryUnchanged(snapshot, "PRIMARY_ARTIFACT");
+    }
+
+    /** Package-local hostile contract seam; production discovery uses the same entry guard. */
+    static void verifyPrimaryArtifactEntryForContract(Path path,
+                                                       BasicFileAttributes before)
+            throws IOException {
+        verifyPrimaryArtifactEntry(path, before);
+    }
+
+    /** Package-local hostile contract seam; production archive reads use the same file guard. */
+    static ArchiveLimits.FileReadSnapshot snapshotPrimaryArtifactFileForContract(Path target,
+                                                                                   InputBudget budget)
+            throws IOException {
+        return ArchiveLimits.snapshotRegularFile(target, budget, "PRIMARY_ARTIFACT");
+    }
+
+    /** Package-local hostile contract seam; production archive reads use the same file guard. */
+    static void verifyPrimaryArtifactFileForContract(ArchiveLimits.FileReadSnapshot snapshot)
+            throws IOException {
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "PRIMARY_ARTIFACT");
     }
 
     private static String primaryClassName(String entry) {
@@ -402,72 +1538,34 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         return entry.substring(0, entry.length() - 6);
     }
 
-    /** 全图单遍扫描：反序列化源宿主（体内含 OIS 读取或 bridge:deserialize 源调用，
-     *  排除 JDK 运行时包——其 readObject 体是容器触发机制本身，以机制桥接跳建模）。 */
-    private void scanHosts() {
-        Map<String, DeserHost> hosts = new java.util.TreeMap<>();
-        for (var call : bb.graph().nodesOfType(io.just.sast.cpg.graph.NodeType.CALL)) {
-            String callOwner = call.strProp("owner");
-            String callName = call.strProp("name");
-            String hostOwner = call.strProp("methodOwner");
-            String hostName = call.strProp("methodName");
-            if (hostOwner == null || hostName == null || isJdkInternal(hostOwner)) {
-                continue;
-            }
-            String frameOwner = null;
-            String frameMethod = null;
-            if (isObjectInputRead(callOwner, callName)) {
-                frameOwner = callOwner;
-                frameMethod = callName;
-            } else if (callName != null) {
-                var rule = bb.ruleEngine().matchingSource(callOwner, callName, call.strProp("desc"))
-                        .filter(r -> "deserialize".equals(r.bridge())).orElse(null);
-                if (rule != null) {
-                    frameOwner = callOwner;
-                    frameMethod = callName;
-                }
-            }
-            if (frameOwner == null || hosts.size() >= MAX_SOURCE_HOSTS) {
-                if (hosts.size() >= MAX_SOURCE_HOSTS) {
-                    bb.markIncomplete("SOURCE_HOST_CAP:" + MAX_SOURCE_HOSTS);
-                }
-                continue;
-            }
-            // 框架自身管线内的同名调用（Kryo 序列化器内部再调 readObject 等）是机制 plumbing，
-            // 不是攻击面宿主——排除与源框架同包的宿主
-            int slash = frameOwner.lastIndexOf('/');
-            String framePkg = slash > 0 ? frameOwner.substring(0, slash + 1) : frameOwner;
-            if (!hostOwner.startsWith(framePkg)) {
-                String hostDescriptor = call.strProp("methodDesc");
-                String hostKey = hostOwner + ".#" + hostName + hostDescriptor;
-                hosts.putIfAbsent(hostKey, new DeserHost(hostOwner, hostName, hostDescriptor,
-                        frameOwner, frameMethod, call.strProp("desc")));
-            }
-        }
-        deserHosts = hosts;
-    }
-
-    /** JDK 运行时包前缀（这些包里的反序列化源宿主是机制本身，不是攻击面宿主）。 */
-    private static boolean isJdkInternal(String owner) {
-        return owner.startsWith("java/") || owner.startsWith("javax/")
-                || owner.startsWith("sun/") || owner.startsWith("com/sun/")
-                || owner.startsWith("jdk/") || owner.startsWith("org/w3c/")
-                || owner.startsWith("org/xml/") || owner.startsWith("org/omg/");
-    }
-
     /**
-     * ObjectInputStream source calls include inherited reads through a custom stream
-     * subclass.  The call owner is the bytecode-declared receiver type, so checking only
-     * the JDK base class loses application-defined stream boundaries before composition.
+     * Read the immutable source-host projection built by {@link ApplicationEntryIndex}.
+     * Source/rule matching and subtype-aware ObjectInputStream recognition belong to that
+     * index owner; composition must not rescan raw CPG calls and reconstruct a second site
+     * model for every event.  The finite host cap remains local to this composition consumer.
      */
-    private boolean isObjectInputRead(String owner, String name) {
-        if (owner == null || name == null
-                || !("readObject".equals(name) || "readUnshared".equals(name)
-                || "readFields".equals(name))) {
-            return false;
+    private Map<String, DeserHost> scanHosts(Blackboard target) {
+        if (target == null || target.applicationEntryIndex() == null) {
+            return Map.of();
         }
-        return "java/io/ObjectInputStream".equals(owner)
-                || bb.hierarchy().isSubtypeOf(owner, "java/io/ObjectInputStream");
+        Map<String, DeserHost> hosts = new java.util.TreeMap<>();
+        for (ApplicationEntryIndex.DeserializeHost sourceHost
+                : target.applicationEntryIndex().deserializeHosts()) {
+            if (sourceHost == null) {
+                continue;
+            }
+            if (hosts.size() >= MAX_SOURCE_HOSTS) {
+                target.markIncomplete("SOURCE_HOST_CAP:" + MAX_SOURCE_HOSTS);
+                continue;
+            }
+            // ApplicationEntryIndex already owns the JDK/plumbing and same-package filters;
+            // this consumer only applies its local cap and converts the immutable projection.
+            hosts.putIfAbsent(sourceHost.hostMethodKey(),
+                    new DeserHost(sourceHost.hostOwner(), sourceHost.hostName(),
+                            sourceHost.hostDescriptor(), sourceHost.frameOwner(),
+                            sourceHost.frameMethod(), sourceHost.frameDescriptor()));
+        }
+        return Map.copyOf(hosts);
     }
 
     private static boolean isPublicEntry(Chain chain) {
@@ -477,17 +1575,65 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 && "framework-bean-input".equals(hop.reason())));
     }
 
-    private FrontFeatures frontFeatures(Chain front) {
+    private FrontFeatures frontFeatures(Blackboard target, Chain front) {
         String frontSink = front.sinkClass() + "." + front.sinkMethod();
         return new FrontFeatures(
                 "java/lang/reflect/Method.invoke".equals(frontSink),
                 triggerContainerOnPath(front),
                 onPath(front, "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"),
-                "DESERIALIZE".equals(front.category()));
+                "DESERIALIZE".equals(front.category()),
+                isJndiRmiBridge(target, front));
+    }
+
+    /**
+     * Reuse one front capability projection for the bounded application-priority pass.
+     *
+     * <p>The projection is event-local: a reused source instance must observe a new
+     * Blackboard/ruleset on the next event, while repeated consumers in one pass avoid
+     * rescanning the same chain hops and rule bridge metadata.</p>
+     */
+    private FrontFeatures frontFeaturesCached(Blackboard target, Chain front,
+                                              Map<String, FrontFeatures> cache) {
+        if (front == null) {
+            return new FrontFeatures(false, null, false, false, false);
+        }
+        if (cache == null || front.key() == null || front.key().isBlank()) {
+            return frontFeatures(target, front);
+        }
+        FrontFeatures cached = cache.get(front.key());
+        if (cached != null) {
+            return cached;
+        }
+        FrontFeatures computed = frontFeatures(target, front);
+        cache.put(front.key(), computed);
+        return computed;
+    }
+
+    /** Resolve the rule's typed bridge axis; a legacy JNDI terminal bit alone is insufficient. */
+    private boolean isJndiRmiBridge(Blackboard target, Chain front) {
+        if (front == null || target == null) {
+            return false;
+        }
+        Rule.SinkRule sink = target.rules().sinks().stream()
+                .filter(rule -> rule.id().equals(front.ruleId()))
+                .findFirst().orElseGet(() -> target.ruleEngine()
+                        .matchingSink(front.sinkClass(), front.sinkMethod(), front.sinkDescriptor())
+                        .orElse(null));
+        boolean result = sink != null && RuleSchemaV2.bridgesFor(sink)
+                .contains(RuleSchemaV2.Bridge.JNDI_RMI)
+                && !RuleSchemaV2.isTerminalSink(sink);
+        return result;
+    }
+
+    private static boolean isDeclaredFragment(Chain chain) {
+        return chain != null && chain.constructionPlan() != null
+                && !chain.constructionPlan().isEmpty()
+                && chain.hops().stream().anyMatch(hop -> "fragment".equals(hop.reason()));
     }
 
     private List<Chain> candidateBacks(FrontFeatures features, List<Chain> publicEntries,
-                                       List<Chain> triggerEntries, List<Chain> templateEntries) {
+                                       List<Chain> triggerEntries, List<Chain> templateEntries,
+                                       List<Chain> fragmentEntries) {
         if ((features.invoke() || features.deserialize()) && features.triggerContainer() == null
                 && !features.template()) {
             return publicEntries;
@@ -502,11 +1648,15 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (features.template()) {
             candidates.addAll(templateEntries);
         }
+        if (features.jndiRmi()) {
+            candidates.addAll(fragmentEntries);
+        }
         return candidates.isEmpty() ? List.of() : List.copyOf(candidates);
     }
 
     /** 判断前段链的 sink 能否语义上触发后段链的 entry。 */
-    private Bridge semanticBridge(FrontFeatures features, Chain front, Chain back) {
+    private Bridge semanticBridge(Blackboard target, FrontFeatures features, Chain front,
+                                  Chain back) {
         String backKind = back.entryKind();
         String backEntry = back.entryClass() + "." + back.entryMethod();
 
@@ -520,7 +1670,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         // （有序容器 TreeMap/PriorityQueue 的槽位要求 Comparable——不可比较的入口类放不进去，
         //   桥不成立；HashMap/HashSet/Hashtable 的 key 槽为 Object 不限）
         if (features.triggerContainer() != null && isTriggerEntry(backKind)
-                && keySlotAccepts(features.triggerContainer(), back.entryClass())) {
+                && keySlotAccepts(target, features.triggerContainer(), back.entryClass())) {
             return Bridge.TRIGGER;
         }
 
@@ -535,17 +1685,24 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             return Bridge.DESER;
         }
 
+        // JNDI lookup returns a remote reference/object; the RMI response can re-enter an
+        // object graph and invoke a declared callback fragment.  Require a versioned fragment
+        // construction plan and a callback-shaped entry so an arbitrary lookup chain cannot
+        // be paired with an unrelated sink by class-name coincidence.
+        if (features.jndiRmi() && isDeclaredFragment(back)
+                && isPublicEntry(back) && back.unresolvedHops() == 0) {
+            return Bridge.JNDI_RMI;
+        }
+
         return null;
     }
 
     private static boolean isPublicEntry(String entryKind) {
-        return Set.of("readObject", "readResolve", "readObjectNoData", "readExternal",
-                "hashCode", "equals", "compareTo", "compare", "toString",
-                "proxyInvoke", "validateObject").contains(entryKind);
+        return PUBLIC_ENTRY_KINDS.contains(entryKind);
     }
 
     private static boolean isTriggerEntry(String entryKind) {
-        return Set.of("hashCode", "equals", "compareTo", "compare", "toString").contains(entryKind);
+        return TRIGGER_ENTRY_KINDS.contains(entryKind);
     }
 
     private static boolean isTemplateTrigger(String entryMethod) {
@@ -576,10 +1733,10 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     }
 
     /** 后段入口类能否放入容器的 key/元素槽：有序容器要求 Comparable。 */
-    private boolean keySlotAccepts(String container, String entryClass) {
+    private boolean keySlotAccepts(Blackboard target, String container, String entryClass) {
         if (container.startsWith("java/util/TreeMap") || container.startsWith("java/util/TreeSet")
                 || container.startsWith("java/util/concurrent/PriorityQueue")) {
-            return bb.hierarchy().isSubtypeOf(entryClass, "java/lang/Comparable");
+            return target != null && target.hierarchy().isSubtypeOf(entryClass, "java/lang/Comparable");
         }
         return true;
     }
@@ -617,6 +1774,56 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 back.sinkClass(), back.sinkMethod(), hops,
                 front.unresolvedHops() + back.unresolvedHops(), back.sinkDescriptor(), back.sinkRole(),
                 constructionPlanOf(back, front), back.sinkRisk());
+    }
+
+    /**
+     * Admit a composed candidate through the typed owner before exposing its path payload.
+     * Compatibility callers without a known application scope retain the historical
+     * composition store; production scans use the lazy candidate route and therefore never
+     * construct a rejected dependency-only composition.
+     */
+    Chain admitComposed(Blackboard target, ComposedProducer producer) {
+        if (producer == null || target == null) {
+            return null;
+        }
+        if (!target.applicationEntryIndex().applicationScopeKnown()) {
+            Blackboard.SolverAdmissionResult result = target.admitCompatibilityCandidate(
+                    producer.candidate(), producer.materializer());
+            return result.accepted() ? result.chain() : null;
+        }
+        return admitEagerCompositionCandidate(target, producer.candidate(),
+                producer.materializer());
+    }
+
+    /** Build only the typed endpoints; the bridge path remains behind the supplier. */
+    ComposedProducer composedProducer(Chain front, Chain back, Bridge bridge) {
+        if (bridge == null) {
+            return null;
+        }
+        return composedProducer(front, back, () -> compose(front, back, bridge));
+    }
+
+    private ComposedProducer composedProducer(Chain front, Chain back,
+                                              Supplier<Chain> materializer) {
+        if (front == null || back == null || materializer == null) {
+            return null;
+        }
+        ApplicationEntryIndex.ProducerCandidate candidate =
+                new ApplicationEntryIndex.ProducerCandidate(back.ruleId(), back.category(),
+                        back.severity(), front.entryClass(), front.entryMethod(),
+                        entryDescriptor(front), front.entryKind(), back.sinkClass(),
+                        back.sinkMethod(), back.sinkDescriptor(), back.sinkRole(),
+                        back.sinkRisk(), true);
+        return new ComposedProducer(candidate, materializer);
+    }
+
+    /** Typed composition endpoint plus deferred bridge payload. */
+    record ComposedProducer(ApplicationEntryIndex.ProducerCandidate candidate,
+                            Supplier<Chain> materializer) {
+        ComposedProducer {
+            candidate = Objects.requireNonNull(candidate, "candidate");
+            materializer = ChainMaterializer.memoize(Objects.requireNonNull(materializer, "materializer"));
+        }
     }
 
     /** Preserve the declarative gadget plan while composing a source prefix with a fragment.

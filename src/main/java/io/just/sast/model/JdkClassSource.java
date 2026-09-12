@@ -17,6 +17,15 @@ public interface JdkClassSource extends AutoCloseable {
     }
 
     /**
+     * Path-free runtime-delegation evidence.  Third-party sources which predate this contract
+     * remain source-compatible but are explicitly UNKNOWN rather than being treated as target
+     * accurate or as the current runtime image.
+     */
+    default JdkSourceInfo sourceInfo() {
+        return new JdkSourceInfo(JdkSourceInfo.ImageKind.UNKNOWN, 0);
+    }
+
+    /**
      * Release resources owned by a target-JDK source.  Runtime-backed sources do not own the
      * process JRT filesystem, so their default implementation is intentionally a no-op.  A
      * default keeps the frontend extension contract source-compatible for third-party sources.

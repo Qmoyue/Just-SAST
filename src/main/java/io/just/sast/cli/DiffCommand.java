@@ -1,13 +1,21 @@
 package io.just.sast.cli;
 
+import io.just.sast.run.RunOutcome;
+import io.just.sast.run.InputBudget;
+import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.IoUtil;
 import java.util.concurrent.Callable;
+import java.io.IOException;
 
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Parameters;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,7 +44,18 @@ public final class DiffCommand implements Callable<Integer> {
     private static final String[] OPTIONAL_SEMANTIC_COLUMNS = {"sink_role", "construction_status",
             "construction_type", "construction_fields", "construction_trigger",
             "construction_sink_control", "construction_reasons", "verification_status",
-            "sink_distorted", "sandbox_ready"};
+            "sink_distorted", "resource_containment_ready"};
+
+    private final InputBudget inputBudget;
+
+    public DiffCommand() {
+        this(InputBudget.defaults());
+    }
+
+    /** Package contract seam: production CLI uses defaults; tests may prove aggregate limits. */
+    DiffCommand(InputBudget inputBudget) {
+        this.inputBudget = inputBudget == null ? InputBudget.defaults() : inputBudget;
+    }
 
     @Parameters(index = "0", paramLabel = "<old-dir>", description = "旧扫描输出目录")
     Path oldDir;
@@ -48,15 +67,25 @@ public final class DiffCommand implements Callable<Integer> {
     public Integer call() {
         Map<String, String> oldChains;
         Map<String, String> newChains;
+        InputBudget policy = inputBudget;
+        InputBudget.Tracker tracker = policy.tracker();
         try {
-            oldChains = readChains(findingsCsv(oldDir), oldDir);
-            newChains = readChains(findingsCsv(newDir), newDir);
+            oldChains = readChains(findingsCsv(oldDir), oldDir, policy, tracker);
+            newChains = readChains(findingsCsv(newDir), newDir, policy, tracker);
         } catch (IllegalArgumentException e) {
             System.err.println("[just:error] " + e.getMessage());
-            return ExitCode.USAGE.code();
+            return RunOutcome.usage("DIFF_INPUT_INVALID", e.getMessage()).exitCode();
+        } catch (IOException e) {
+            String message = e.getMessage() == null ? "DIFF_READ_FAILURE" : e.getMessage();
+            if (message.startsWith("DIFF_INPUT_LIMIT")) {
+                System.err.println("[just:error] " + message);
+                return RunOutcome.usage("DIFF_INPUT_LIMIT", "diff input exceeds shared budget").exitCode();
+            }
+            System.err.println("[just:error] 读取扫描结果失败: " + e.getClass().getSimpleName());
+            return RunOutcome.failed("DIFF_READ_FAILURE", e.getClass().getSimpleName()).exitCode();
         } catch (Exception e) {
             System.err.println("[just:error] 读取扫描结果失败: " + e);
-            return ExitCode.INTERNAL.code();
+            return RunOutcome.failed("DIFF_READ_FAILURE", e.getClass().getSimpleName()).exitCode();
         }
 
         Set<String> added = new TreeSet<>(newChains.keySet());
@@ -84,21 +113,25 @@ public final class DiffCommand implements Callable<Integer> {
             System.out.println("  ~ " + c);
         }
         System.out.println("不变链: " + (newChains.size() - added.size() - changed.size()));
-        return ExitCode.OK.code();
+        return RunOutcome.success().exitCode();
     }
 
     /** 读取分类布局中的 findings/findings.csv；同时兼容旧版根目录 findings.csv。 */
     private static Path findingsCsv(Path dir) {
         Path classified = dir.resolve("findings").resolve("findings.csv");
-        return Files.exists(classified) ? classified : dir.resolve("findings.csv");
+        return Files.exists(classified, LinkOption.NOFOLLOW_LINKS) ? classified
+                : dir.resolve("findings.csv");
     }
 
     /** 读 findings.csv 为 身份键 → 语义指纹。目录缺 findings.csv 是用法错误（显式报错，不当空集）。 */
-    private Map<String, String> readChains(Path csv, Path dir) throws Exception {
-        if (!Files.exists(csv)) {
+    private Map<String, String> readChains(Path csv, Path dir, InputBudget policy,
+                                           InputBudget.Tracker tracker) throws Exception {
+        ArchiveLimits.checkPathAncestors(csv, policy);
+        if (!Files.isRegularFile(csv, LinkOption.NOFOLLOW_LINKS)
+                || ArchiveLimits.isLinkOrReparsePoint(csv)) {
             throw new IllegalArgumentException("目录缺少 findings.csv（不是扫描输出目录）: " + dir.toAbsolutePath());
         }
-        List<String> lines = Files.readAllLines(csv, StandardCharsets.UTF_8);
+        List<String> lines = readBoundedLines(csv, policy, tracker);
         Map<String, String> map = new LinkedHashMap<>();
         int[] identityIdx = null;
         int[] semanticIdx = null;
@@ -139,6 +172,25 @@ public final class DiffCommand implements Callable<Integer> {
             }
         }
         return map;
+    }
+
+    /** Read a report CSV with caller-total bytes/time limits and a NOFOLLOW source snapshot. */
+    private static List<String> readBoundedLines(Path csv, InputBudget policy,
+                                                 InputBudget.Tracker tracker) throws IOException {
+        ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                csv, policy, "DIFF_INPUT");
+        BasicFileAttributes before = snapshot.fileAttributes();
+        long limit = Math.min(policy.maxEntryBytes(), tracker.remainingReadBytes());
+        if (before.size() > policy.maxEntryBytes() || before.size() > limit) {
+            throw new IOException("DIFF_INPUT_LIMIT:" + policy.maxEntryBytes());
+        }
+        byte[] bytes;
+        try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(csv, "DIFF_INPUT");
+             InputStream input = opened.stream()) {
+            bytes = IoUtil.readAll(input, limit, tracker);
+        }
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "DIFF_INPUT");
+        return List.of(new String(bytes, StandardCharsets.UTF_8).split("\\R", -1));
     }
 
     /** 按表头名定位列下标；任一列缺失返回 null（调用方按畸形行跳过/报错）。 */

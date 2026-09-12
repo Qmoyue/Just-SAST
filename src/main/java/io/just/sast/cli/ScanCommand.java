@@ -4,6 +4,8 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import io.just.sast.report.ScanCache;
+import io.just.sast.run.RunOutcome;
+import io.just.sast.verify.VerificationDefaults;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -25,6 +27,10 @@ public final class ScanCommand implements Callable<Integer> {
             description = "CSV 输出目录（默认 just-out）")
     Path output;
 
+    @Option(names = "--overwrite",
+            description = "显式替换既有报告目录；新报告先在唯一 staging 中完成并原子交换")
+    boolean overwrite;
+
     @Option(names = "--rules", paramLabel = "<file>",
             description = "自定义规则 YAML（默认内置）")
     Path rules;
@@ -40,19 +46,22 @@ public final class ScanCommand implements Callable<Integer> {
     boolean stats;
 
     @Option(names = "--no-verify",
-            description = "关闭子进程链级动态验证（CI/不可执行环境；默认验证会在子 JVM 中真实执行入口方法）")
+            description = "关闭动态验证，仅执行静态分析；适用于来源不明或不可信制品（targetCodeExecutionPossible=false）")
     boolean noVerify;
 
     @Option(names = "--safe-exec",
-            description = "显式使用仅 canary 的兼容 adapter；默认动态验证走 LIGHT_SAFE_CALL")
+            hidden = true,
+            description = "已弃用的兼容调试选项；不改变目标信任模型")
     boolean safeExec;
 
     @Option(names = "--safe-real-sink",
-            description = "显式声明 SAFE_REAL（默认动态验证已启用）；参数按签名替换为固定安全值，不执行危险命令/RCE")
+            hidden = true,
+            description = "已弃用的兼容调试选项；固定参数调用不等于 OS 访问控制边界或真实利用")
     boolean safeRealSink;
 
     @Option(names = "--require-os-isolation",
-            description = "动态验证要求 Job Object；不可用时返回 UNTESTABLE，不启动无隔离真实终点")
+            hidden = true,
+            description = "已弃用的兼容选项；动态验证始终 fail-closed，不会在无 Job Object 时启动目标")
     boolean requireOsIsolation;
 
     @Option(names = "--baseline", paramLabel = "<scan-dir>",
@@ -67,17 +76,19 @@ public final class ScanCommand implements Callable<Integer> {
             description = "显式启用完整报告增量缓存；只缓存 COMPLETE 且无失败动态终态的扫描")
     Path cache;
 
-    @Option(names = "--verify-budget", paramLabel = "<N>", defaultValue = "20",
-            description = "子进程动态验证的链数预算（默认 20；按证据分值选取，同一入口类最多 2 条）")
+    @Option(names = "--verify-budget", paramLabel = "<N>",
+            defaultValue = VerificationDefaults.VERIFY_BUDGET_TEXT,
+            description = "子进程动态验证的规范化 finding 组预算（默认 32；按证据分值选取）")
     int verifyBudget;
 
 
     @Override
     public Integer call() {
         try {
-            // SAFE_REAL is the product default for enabled dynamic verification. Windows uses
-            // the same lightweight Job Object runner whether or not the explicit requirement
-            // bit is set; the bit only changes the cache/report identity and failure policy.
+            printVerificationDisclosure(noVerify);
+            // The default enabled mode is AUTO: static analysis completes first, then the
+            // bounded verifier may load trusted target code behind a Job Object resource
+            // boundary. Legacy adapter flags only select compatibility probes.
             boolean useSafeReal = !noVerify && (safeRealSink || !safeExec);
             boolean useOsIsolation = requireOsIsolation;
             boolean useCache = cache != null && baseline == null && suppressions == null;
@@ -93,7 +104,7 @@ public final class ScanCommand implements Callable<Integer> {
                             useOsIsolation);
                     if (ScanCache.restore(cache, preflight.cacheKey(), output)) {
                         System.err.println("[just:info] 增量缓存命中（报告身份已校验）");
-                        return ExitCode.OK.code();
+                        return RunOutcome.success().exitCode();
                     }
                 } catch (java.io.IOException | RuntimeException cacheFailure) {
                     System.err.println("[just:warn] 增量缓存不可用，继续完整扫描: "
@@ -103,7 +114,8 @@ public final class ScanCommand implements Callable<Integer> {
             ScanPipeline.ScanResult result = ScanPipeline.run(target, deps, output, rules, stats,
                     fast, jdkHome, !noVerify, verifyBudget, safeExec, useSafeReal,
                     useOsIsolation,
-                    baseline, suppressions);
+                    baseline, suppressions, overwrite,
+                    ScanPipeline.ExportPolicy.STRICT_PRODUCT);
             if (useCache && preflight != null) {
                 try {
                     boolean stored = ScanCache.store(cache, preflight.cacheKey(), output,
@@ -117,10 +129,25 @@ public final class ScanCommand implements Callable<Integer> {
             return result.exitCode();
         } catch (ScanPipeline.UsageException e) {
             System.err.println("[just:error] " + e.getMessage());
-            return ExitCode.USAGE.code();
+            return RunOutcome.usage("USAGE_ERROR", e.getMessage()).exitCode();
         } catch (Exception e) {
             System.err.println("[just:error] 扫描失败: " + e);
-            return ExitCode.INTERNAL.code();
+            return RunOutcome.failed("SCAN_FAILURE", e.getClass().getSimpleName()).exitCode();
         }
+    }
+
+    private static void printVerificationDisclosure(boolean noVerify) {
+        if (noVerify) {
+            System.err.println("[just:info] verificationMode=STATIC_ONLY; "
+                    + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
+                    + "recommendedForUntrustedArtifacts=true");
+            return;
+        }
+        System.err.println("[just:warning] verificationMode=AUTO; "
+                + "targetCodeExecutionPossible=true; targetCodeExecuted=UNKNOWN; "
+                + "targetTrust=TRUSTED_LOCAL_TARGET_REQUIRED; "
+                + "resourceContainmentOnly=true; filesystemIsolation=false; "
+                + "networkIsolation=false; recommendedForUntrustedArtifacts=false; "
+                + "isolationFailure=FAIL_CLOSED; use --no-verify for untrusted artifacts");
     }
 }

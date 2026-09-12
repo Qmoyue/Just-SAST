@@ -6,6 +6,7 @@ import io.just.sast.blackboard.ConstructionSummary;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.blackboard.VerificationSummary;
+import io.just.sast.blackboard.VerificationOutcome;
 import io.just.sast.chain.ChainRanking;
 import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ConfidenceScorer;
@@ -426,13 +427,13 @@ public final class PayloadPlanWriter {
         if (verification == null) {
             return "SINK BOUNDARY NOT EXECUTED BY THIS PLAN";
         }
-        return switch (verification.status()) {
-            case "SINK_BLOCKED" -> "SINK BLOCKED BEFORE BODY";
-            case "SINK_EXECUTED_SAFE" -> "REAL SINK BODY/CALL OBSERVED WITH FIXED SAFE ARGUMENTS";
-            case "JNI_EXECUTED_SAFE" -> "JNI FIXTURE LOAD/CALLBACK OBSERVED WITH FIXED SAFE ARGUMENTS";
-            case "SAFE_EFFECT_OBSERVED" -> "SAFE EFFECT OBSERVED; REAL SINK NOT ENTERED";
-            case "CONCRETE_REACHED" -> "CONCRETE TRIGGER; SINK NOT PROVEN";
-            case "EXECUTED" -> "ENTRY RETURNED; SINK NOT PROVEN";
+        return switch (verification.outcomeStatus()) {
+            case SINK_BLOCKED -> "SINK BLOCKED BEFORE BODY";
+            case SINK_EXECUTED_SAFE -> "REAL SINK BODY/CALL OBSERVED WITH FIXED JUST-OWNED ARGUMENTS (DISTORTED)";
+            case JNI_EXECUTED_SAFE -> "JNI FIXTURE LOAD/CALLBACK OBSERVED WITH FIXED JUST-OWNED ARGUMENTS (DISTORTED)";
+            case SAFE_EFFECT_OBSERVED -> "SAFE EFFECT OBSERVED; REAL SINK NOT ENTERED";
+            case CONCRETE_REACHED -> "CONCRETE TRIGGER; SINK NOT PROVEN";
+            case EXECUTED -> "ENTRY RETURNED; SINK NOT PROVEN";
             default -> "SINK BOUNDARY NOT PROVEN";
         };
     }
@@ -446,13 +447,13 @@ public final class PayloadPlanWriter {
         if (verification == null) {
             return "NOT_SELECTED";
         }
-        return switch (verification.status()) {
-            case "SINK_BLOCKED" -> "SINK_BLOCKED_BEFORE_BODY";
-            case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE_ARGUMENTS_WITH_DISTORTION";
-            case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE_WITH_DISTORTION";
-            case "SAFE_EFFECT_OBSERVED" -> "SAFE_EFFECT_OBSERVED_WITH_DISTORTION";
-            case "CONCRETE_REACHED" -> "CONCRETE_TRIGGER_WITHOUT_EXACT_CANARY";
-            case "EXECUTED" -> "ENTRY_RETURNED_WITHOUT_SINK_PROOF";
+        return switch (verification.outcomeStatus()) {
+            case SINK_BLOCKED -> "SINK_BLOCKED_BEFORE_BODY";
+            case SINK_EXECUTED_SAFE -> "REAL_SINK_FIXED_ARGUMENTS_WITH_DISTORTION";
+            case JNI_EXECUTED_SAFE -> "JNI_FIXTURE_FIXED_ARGUMENTS_WITH_DISTORTION";
+            case SAFE_EFFECT_OBSERVED -> "SAFE_EFFECT_OBSERVED_WITH_DISTORTION";
+            case CONCRETE_REACHED -> "CONCRETE_TRIGGER_WITHOUT_EXACT_CANARY";
+            case EXECUTED -> "ENTRY_RETURNED_WITHOUT_SINK_PROOF";
             default -> "NOT_PROVEN";
         };
     }
@@ -491,22 +492,24 @@ public final class PayloadPlanWriter {
 
     private static String safetyText(Chain chain, VerificationSummary.ChainResult verification) {
         String sink = escMarkdown(dotted(chain.sinkClass(), chain.sinkMethod()));
-        if (verification != null && "SINK_BLOCKED".equals(verification.status())) {
+        VerificationOutcome.Status status = verification == null
+                ? VerificationOutcome.Status.UNKNOWN : verification.outcomeStatus();
+        if (status == VerificationOutcome.Status.SINK_BLOCKED) {
             return "`SINK_CANARY_ONLY`: the real prefix reached the canary and stopped before `"
                     + sink + "` executed. No command, network, native load, or serialized attack bytes are emitted.\n\n";
         }
-        if (verification != null && "PRE_SINK_CONFIRMED".equals(verification.status())) {
+        if (status == VerificationOutcome.Status.PRE_SINK_CONFIRMED) {
             return "`PREFIX_ONLY`: the complete observed prefix reached the high-risk sink boundary and "
                     + "stopped before `" + sink + "` executed. `terminal_executed=false`; no native load, "
                     + "lookup, network, evaluator, command, or attack serialization is performed.\n\n";
         }
-        if (verification != null && "SINK_EXECUTED_SAFE".equals(verification.status())) {
-            return "`SINK_EXECUTED_SAFE`: the exact target sink body/call was observed with Just-fixed, type-correct safe arguments under the attested OS runner. The result is intentionally distorted and does not prove malicious controllability or RCE; no dangerous command, network target, native path, or attack bytes are released.\n\n";
+        if (status == VerificationOutcome.Status.SINK_EXECUTED_SAFE) {
+            return "`SINK_EXECUTED_SAFE`: the exact target sink body/call was observed with Just-fixed, type-correct arguments under the attested Job Object process/resource boundary. The result is intentionally distorted, does not prove malicious controllability or RCE, and does not claim filesystem/network/syscall isolation; no dangerous command, network target, native path, or attack bytes are released.\n\n";
         }
-        if (verification != null && "JNI_EXECUTED_SAFE".equals(verification.status())) {
-            return "`JNI_EXECUTED_SAFE`: the approved, digest-bound native fixture loaded and its callback reached the exact sink under the attested OS runner. The result is intentionally distorted and does not prove arbitrary native execution or RCE.\n\n";
+        if (status == VerificationOutcome.Status.JNI_EXECUTED_SAFE) {
+            return "`JNI_EXECUTED_SAFE`: the approved, digest-bound native fixture loaded and its callback reached the exact sink under the attested Job Object process/resource boundary. The result is intentionally distorted and does not prove arbitrary native execution, filesystem/network isolation, or RCE.\n\n";
         }
-        if (verification != null && "SAFE_EFFECT_OBSERVED".equals(verification.status())) {
+        if (status == VerificationOutcome.Status.SAFE_EFFECT_OBSERVED) {
             return "`SAFE_EFFECT_OBSERVED`: a fixed inert/mock effect was observed under the declared policy; the real sink `"
                     + sink + "` was not entered. This result is intentionally distorted and does not prove RCE, network access, native loading, or exploitability.\n\n";
         }

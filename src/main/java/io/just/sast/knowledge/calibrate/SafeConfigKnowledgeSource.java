@@ -6,6 +6,7 @@ import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
+import io.just.sast.blackboard.RunProduct;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.InsnFact;
@@ -50,6 +51,16 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
     @Override
     public int priority() {
         return 300;
+    }
+
+    @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.COMPOSED_CHAINS, RunProduct.CALIBRATED_CHAINS);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.CALIBRATED_CHAINS);
     }
 
     @Override

@@ -113,11 +113,13 @@ public final class ChainRanking {
         }
         VerificationSummary.ChainResult result = verification == null ? null
                 : verification.get(chain.key());
-        String status = result == null ? "" : result.status();
+        String status = result == null ? "" : result.outcomeStatus().name();
         if (status.isBlank()) {
             status = ConfidenceScorer.statusFromNotes(chainNotes);
         }
-        int dynamic = ConfidenceScorer.dynamicRank(status, chainNotes);
+        ConfidenceScorer.RankFeatures rankFeatures =
+                ConfidenceScorer.rankFeatures(chain, chainNotes);
+        int dynamic = rankFeatures.dynamicRank();
         // A terminal-looking frame without the authenticated readiness bit is not dynamic
         // evidence. Keep the candidate visible, but place it with untestable results.
         if (result != null && !result.sandboxReady()) {
@@ -168,7 +170,7 @@ public final class ChainRanking {
                 + ";precision=" + precision.compact();
         return new Evidence(dynamic, sinkRole, construction, sinkPrecision, entry,
                 chain.unresolvedHops(), incomplete, chain.hops().size(),
-                ConfidenceScorer.evidenceScore(chain, chainNotes), precision.rank(), explanation);
+                rankFeatures.totalScore(), precision.rank(), explanation);
     }
 
     private static String safeKey(Chain chain) {

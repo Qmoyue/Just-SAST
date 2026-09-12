@@ -5,6 +5,7 @@ import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.KnowledgeSource;
+import io.just.sast.blackboard.RunProduct;
 
 import java.util.Set;
 
@@ -22,7 +23,15 @@ public final class ForwardTaintKnowledgeSource implements KnowledgeSource {
      * method summaries twice; small inputs keep the two-pass schedule for its cheap staged
      * precision behavior.
      */
-    private static final int SINGLE_REFINED_PASS_THRESHOLD = 50_000;
+    /**
+     * A medium dependency closure can still be dominated by the coarse pass.  The refined
+     * transfer already includes the coarse facts, so paying for two full interpretations is
+     * only worthwhile for genuinely small closures where the staged precision is cheap.  Use
+     * a graph-independent, power-of-two boundary so the policy is stable across artifacts and
+     * cannot become a benchmark-specific branch.  The actual closure is still bounded by the
+     * application-anchored demand slice before this decision is made.
+     */
+    private static final int SINGLE_REFINED_PASS_THRESHOLD = 4_096;
 
     @Override
     public String id() {
@@ -40,6 +49,16 @@ public final class ForwardTaintKnowledgeSource implements KnowledgeSource {
     }
 
     @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.PROGRAM_MODEL);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.ANALYSIS_CHAINS);
+    }
+
+    @Override
     public void init(Blackboard blackboard) {
         // 引擎按需创建
     }
@@ -50,37 +69,46 @@ public final class ForwardTaintKnowledgeSource implements KnowledgeSource {
             return;
         }
         ForwardEngine engine = new ForwardEngine(bb);
-        int closureSize = bb.originSupport().entryDownstream(bb.graph()).size();
-        if (closureSize > SINGLE_REFINED_PASS_THRESHOLD) {
-            io.just.sast.util.JustLogger.info(
-                    "前向污点：大闭包 {} 个方法，采用单次精扫（阈值 {}）",
-                    closureSize, SINGLE_REFINED_PASS_THRESHOLD);
+        ForwardRunMetrics.Pass completedPass = ForwardRunMetrics.Pass.UNKNOWN;
+        try {
+            int closureSize = bb.originSupport().entryDownstream(bb.graph()).size();
+            if (closureSize > SINGLE_REFINED_PASS_THRESHOLD) {
+                io.just.sast.util.JustLogger.info(
+                        "前向污点：大闭包 {} 个方法，采用单次精扫（阈值 {}）",
+                        closureSize, SINGLE_REFINED_PASS_THRESHOLD);
+                long refinedStartedAt = System.nanoTime();
+                engine.run(ForwardEngine.Options.refined());
+                completedPass = ForwardRunMetrics.Pass.REFINED;
+                io.just.sast.util.JustLogger.info("前向污点精扫阶段耗时 {} ms",
+                        (System.nanoTime() - refinedStartedAt) / 1_000_000L);
+                if (bb.originSupport().constantProofBudgetExceeded()) {
+                    bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
+                }
+                return;
+            }
+            long coarseStartedAt = System.nanoTime();
+            engine.run(ForwardEngine.Options.coarse());
+            completedPass = ForwardRunMetrics.Pass.COARSE;
+            io.just.sast.util.JustLogger.info("前向污点粗扫阶段耗时 {} ms",
+                    (System.nanoTime() - coarseStartedAt) / 1_000_000L);
+            // A phase timeout cancels the worker with its interrupt flag.  Do not start the
+            // refinement pass after cancellation: doing so used to make a timed-out coarse
+            // pass continue for another large-jar traversal and delayed executor shutdown.
+            if (Thread.currentThread().isInterrupted()) {
+                bb.markIncomplete("FORWARD_INTERRUPTED");
+                return;
+            }
             long refinedStartedAt = System.nanoTime();
             engine.run(ForwardEngine.Options.refined());
+            completedPass = ForwardRunMetrics.Pass.REFINED;
             io.just.sast.util.JustLogger.info("前向污点精扫阶段耗时 {} ms",
                     (System.nanoTime() - refinedStartedAt) / 1_000_000L);
             if (bb.originSupport().constantProofBudgetExceeded()) {
                 bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
             }
-            return;
-        }
-        long coarseStartedAt = System.nanoTime();
-        engine.run(ForwardEngine.Options.coarse());
-        io.just.sast.util.JustLogger.info("前向污点粗扫阶段耗时 {} ms",
-                (System.nanoTime() - coarseStartedAt) / 1_000_000L);
-        // A phase timeout cancels the worker with its interrupt flag.  Do not start the
-        // refinement pass after cancellation: doing so used to make a timed-out coarse
-        // pass continue for another large-jar traversal and delayed executor shutdown.
-        if (Thread.currentThread().isInterrupted()) {
-            bb.markIncomplete("FORWARD_INTERRUPTED");
-            return;
-        }
-        long refinedStartedAt = System.nanoTime();
-        engine.run(ForwardEngine.Options.refined());
-        io.just.sast.util.JustLogger.info("前向污点精扫阶段耗时 {} ms",
-                (System.nanoTime() - refinedStartedAt) / 1_000_000L);
-        if (bb.originSupport().constantProofBudgetExceeded()) {
-            bb.markIncomplete("CONSTANT_PROOF_CAP:" + OriginSupport.CONSTANT_PROOF_BUDGET);
+        } finally {
+            bb.publishFact(ForwardRunMetrics.from(engine.stateSnapshot(), completedPass,
+                    Thread.currentThread().isInterrupted()));
         }
     }
 }

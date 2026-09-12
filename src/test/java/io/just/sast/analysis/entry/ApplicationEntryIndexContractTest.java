@@ -1,0 +1,471 @@
+package io.just.sast.analysis.entry;
+
+import io.just.sast.config.Match;
+import io.just.sast.config.Rule;
+import io.just.sast.config.RuleEngine;
+import io.just.sast.config.RuleSet;
+import io.just.sast.analysis.taint.OriginSupport;
+import io.just.sast.cpg.build.CpgIndex;
+import io.just.sast.cpg.graph.EdgeType;
+import io.just.sast.cpg.graph.Graph;
+import io.just.sast.cpg.graph.Node;
+import io.just.sast.analysis.hierarchy.ClassHierarchy;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.lang.reflect.Modifier;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/** Contract coverage for the P3.1 entry/site/terminal index and its fail-closed scope gate. */
+class ApplicationEntryIndexContractTest {
+
+    private static final String APP = "fixture/app/Ingress";
+    private static final String GADGET = "fixture/lib/Gadget";
+    private static final String RUNTIME = "java/lang/Runtime";
+    private static final String SINK_DESC = "(Ljava/lang/String;)Ljava/lang/Process;";
+    private static final String APP_METHOD = APP + "#handle()V";
+    private static final String GADGET_METHOD = GADGET + "#trigger()V";
+
+    @Test
+    void applicationScopeJoinsEntryForwardAndTerminalReverseSlices() {
+        Graph graph = fixture();
+        RuleSet rules = rules();
+        RuleEngine engine = new RuleEngine(rules, new ClassHierarchy(Map.of(), null));
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(APP), true);
+
+        assertTrue(index.applicationScopeKnown());
+        assertEquals(2, index.applicationEntries().size(),
+                "magic entry and unconditional OIS source are distinct evidence roots");
+        assertEquals(1, index.deserializeSites().size());
+        assertTrue(index.hasDeserializeRoot(),
+                "the entry index must own the typed deserialize-root fact");
+        assertTrue(index.deserializeSites().get(0).applicationOwned());
+        assertEquals(index.deserializeSites(), index.applicationInputSites());
+        assertEquals(index.deserializeSites(), index.typedBindingSites());
+        assertEquals(index.applicationInputSites(),
+                index.applicationInputSitesForMember(APP, "handle"));
+        assertTrue(index.applicationInputSitesForMember(APP, "missing").isEmpty());
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.applicationInputSitesForMember(APP, "handle").clear());
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.applicationInputSites().clear());
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.typedBindingSites().add(index.deserializeSites().get(0)));
+        assertEquals(1, index.terminalImpacts().size());
+        assertEquals(index.terminalImpacts(), index.terminalDemandImpacts(),
+                "the index-owned demand projection must retain only terminal impacts that can "
+                        + "participate in the entry-forward/terminal-reverse join");
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.terminalDemandImpacts().clear());
+        assertTrue(index.entryForwardSlice().contains(APP_METHOD));
+        assertTrue(index.entryForwardSlice().contains(GADGET_METHOD));
+        assertTrue(index.sinkReverseSlice().contains(APP_METHOD));
+        assertTrue(index.sinkReverseSlice().contains(GADGET_METHOD));
+        assertTrue(index.entryTerminalIntersection().contains(APP_METHOD));
+        assertTrue(index.entryTerminalIntersection().contains(GADGET_METHOD));
+        assertTrue(index.isEntryForwardReachable(APP_METHOD));
+        assertTrue(index.isSinkReverseReachable(GADGET_METHOD));
+        assertTrue(index.isEntryTerminalDemand(APP_METHOD));
+        assertFalse(index.isEntryTerminalDemand("fixture/other/Root#run()V"));
+        assertTrue(index.dependencyCandidates().contains(GADGET_METHOD),
+                "dependency suffix is retained only after entry/terminal intersection");
+        assertTrue(index.allowsDependencyExpansion());
+        assertTrue(index.semanticDigest().matches("[0-9a-f]{64}"));
+
+        ApplicationEntryIndex second = ApplicationEntryIndex.build(fixture(), engine,
+                Set.of(APP), true);
+        assertEquals(index.semanticDigest(), second.semanticDigest(),
+                "index identity must not depend on graph traversal insertion order");
+    }
+
+    @Test
+    void exposesStableImmutableHotReadSetsWithoutRebuildingSlices() {
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(fixture(),
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of(APP), true);
+
+        assertEquals(Set.copyOf(index.entryForwardSlice()), index.entryForwardMethodKeys());
+        assertEquals(Set.copyOf(index.sinkReverseSlice()), index.sinkReverseMethodKeys());
+        assertTrue(index.applicationEntryMethods(APP, "handle").contains(APP_METHOD));
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.applicationEntryMethods(APP, "handle").add(APP_METHOD));
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.entryForwardMethodKeys().add("fixture/other/Root#run()V"));
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.sinkReverseMethodKeys().clear());
+    }
+
+    @Test
+    void indexesTypedDeserializeHostsForCompositionWithoutRescanningGraph() {
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(fixture(),
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of(APP), true);
+
+        assertEquals(1, index.deserializeHosts().size());
+        ApplicationEntryIndex.DeserializeHost host = index.deserializeHosts().get(0);
+        assertEquals(APP_METHOD, host.hostMethodKey());
+        assertEquals(APP, host.hostOwner());
+        assertEquals("handle", host.hostName());
+        assertEquals("()V", host.hostDescriptor());
+        assertEquals("java/io/ObjectInputStream", host.frameOwner());
+        assertEquals("readObject", host.frameMethod());
+        assertEquals("()Ljava/lang/Object;", host.frameDescriptor());
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.deserializeHosts().clear());
+    }
+
+    @Test
+    void indexesMechanismEntriesByOwnerForObjectGraphLookup() {
+        Graph graph = new Graph();
+        graph.methodNode(GADGET, "readObject", "()V", false);
+        Rule.MagicEntryRule callback = new Rule.MagicEntryRule("gadget-read-object",
+                "readObject", new Rule.MethodMatcher(Match.of("readObject"),
+                Match.of("()V"), false), null, "deserialize");
+        RuleSet callbackRules = new RuleSet(List.of(), List.of(callback), List.of(),
+                List.of(), List.of());
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(callbackRules, new ClassHierarchy(Map.of(), null)),
+                Set.of(APP), true);
+
+        List<ApplicationEntryIndex.ExecutionEntry> entries =
+                index.mechanismEntriesForOwner(GADGET);
+        assertEquals(1, entries.size());
+        assertEquals(GADGET_METHOD.replace("trigger()V", "readObject()V"),
+                entries.get(0).methodKey());
+        assertEquals("readObject", entries.get(0).entryKind());
+        assertFalse(entries.get(0).applicationOwned(),
+                "dependency callbacks remain lookup facts, not application roots");
+        assertTrue(index.mechanismEntriesForOwner("fixture/missing/Nope").isEmpty());
+        assertThrows(UnsupportedOperationException.class, entries::clear);
+    }
+
+    @Test
+    void unknownApplicationScopeCannotCreateDefaultRoots() {
+        Graph graph = fixture();
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine, Set.of(), false);
+
+        assertTrue(index.deserializeSites().stream().noneMatch(
+                ApplicationEntryIndex.DeserializeSite::applicationOwned));
+        assertTrue(index.applicationInputSites().isEmpty());
+        assertTrue(index.typedBindingSites().isEmpty());
+        assertTrue(index.applicationInputSitesForMember(APP, "handle").isEmpty());
+        assertTrue(index.applicationEntries().isEmpty());
+        assertTrue(index.hasDeserializeRoot(),
+                "the raw deserialize boundary remains observable even when application scope is unknown");
+        assertTrue(index.entryForwardSlice().isEmpty());
+        assertFalse(index.allowsDependencyExpansion());
+        assertTrue(index.completenessReasons().contains("APPLICATION_SCOPE_UNKNOWN"));
+        assertTrue(index.completenessReasons().contains("NO_APPLICATION_ENTRY"));
+    }
+
+    @Test
+    void knownScopeExcludesDependencyOnlyDeserializeRootFromLegacyClosure() {
+        Graph graph = new Graph();
+        Node dependencyEntry = graph.methodNode(GADGET, "readObject", "()V", false);
+        Node runtime = graph.methodNode("java/lang/Runtime", "exec",
+                "(Ljava/lang/String;)Ljava/lang/Process;", true);
+        Node exec = graph.addCallNode("java/lang/Runtime", "exec",
+                "(Ljava/lang/String;)Ljava/lang/Process;", "VIRTUAL", null, 0,
+                GADGET, "readObject", "()V");
+        graph.addEdge(exec, runtime, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        Rule.SinkRule sink = rules().sinks().get(0);
+        Rule.MagicEntryRule readObject = new Rule.MagicEntryRule("dependency-read-object",
+                "readObject", new Rule.MethodMatcher(Match.of("readObject"), Match.of("()V"),
+                false), null, "deserialize");
+        RuleSet rules = new RuleSet(List.of(sink), List.of(readObject), List.of(), List.of(),
+                List.of());
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(), null);
+        OriginSupport support = new OriginSupport(graph, hierarchy,
+                new RuleEngine(rules, hierarchy), false, CpgIndex.empty(),
+                Set.of(APP), true);
+
+        assertFalse(support.entryDownstream(graph).contains(dependencyEntry.owner() + "#readObject()V"),
+                "a dependency callback must not become an application root when scope is known");
+    }
+
+    @Test
+    void demandAdmissionRejectsReverseReachableNonTerminalHost() {
+        Graph graph = fixture();
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(APP), true);
+
+        ApplicationEntryIndex.DemandDecision decision = index.demandAdmission(
+                APP_METHOD, APP_METHOD, false);
+
+        assertFalse(decision.admitted(), decision.toString());
+        assertEquals(ApplicationEntryIndex.DemandStatus.TERMINAL_NOT_INDEXED,
+                decision.status(),
+                "reverse reachability alone must not turn an application caller into a sink host");
+    }
+
+    @Test
+    void terminalAdmissionResolvesOnlyIndexedTerminalImpact() {
+        Graph graph = fixture();
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(APP), true);
+
+        ApplicationEntryIndex.TerminalDecision indexed = index.terminalAdmission(
+                RUNTIME, "exec", SINK_DESC);
+        assertTrue(indexed.admitted(), indexed.toString());
+        assertEquals(GADGET_METHOD, indexed.hostMethodKey());
+        assertEquals(ApplicationEntryIndex.TerminalStatus.INDEXED, indexed.status());
+        assertEquals(1, index.terminalImpactsFor(RUNTIME, "exec", SINK_DESC).size());
+        assertEquals(1, index.terminalImpactsFor(RUNTIME, "exec", "").size());
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.terminalImpactsFor(RUNTIME, "exec", SINK_DESC).clear());
+
+        ApplicationEntryIndex.TerminalDecision byName = index.terminalAdmission(
+                RUNTIME, "exec", "");
+        assertTrue(byName.admitted(), byName.toString());
+        assertEquals(GADGET_METHOD, byName.hostMethodKey(),
+                "descriptor-free terminal lookup must use the deterministic terminal index");
+
+        ApplicationEntryIndex.TerminalDecision missing = index.terminalAdmission(
+                APP, "handle", "()V");
+        assertFalse(missing.admitted(), missing.toString());
+        assertEquals(ApplicationEntryIndex.TerminalStatus.NOT_INDEXED, missing.status());
+        assertEquals("TERMINAL_IMPACT_NOT_INDEXED", missing.reasonCode());
+        assertTrue(index.terminalImpactsFor(APP, "handle", "()V").isEmpty());
+    }
+
+    @Test
+    void producerAdmissionRejectsSeparateForwardAndReverseSlicesBeforeMaterialization() {
+        Graph graph = new Graph();
+        graph.methodNode(APP, "handle", "()V", false);
+        Node gadget = graph.methodNode(GADGET, "trigger", "()V", false);
+        Node runtime = graph.methodNode(RUNTIME, "exec", SINK_DESC, true);
+        Node terminal = graph.addCallNode(RUNTIME, "exec", SINK_DESC, "VIRTUAL", null,
+                0, GADGET, "trigger", "()V");
+        graph.addEdge(terminal, runtime, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(APP), true);
+        ApplicationEntryIndex.ProducerCandidate candidate =
+                new ApplicationEntryIndex.ProducerCandidate("runtime-exec", "COMMAND", "CRITICAL",
+                        APP, "handle", "()V", "lifecycle", RUNTIME, "exec", SINK_DESC,
+                        "TERMINAL", io.just.sast.blackboard.SinkRisk.CONTROLLED_EFFECT, false);
+
+        ApplicationEntryIndex.ProducerAdmissionDecision decision =
+                index.producerAdmission(candidate);
+
+        assertEquals(ApplicationEntryIndex.ProducerAdmissionStatus.REJECTED, decision.status());
+        assertEquals(ApplicationEntryIndex.CandidateAdmissionStatus.ENTRY_NOT_IN_TERMINAL_DEMAND,
+                decision.candidate().status());
+        assertTrue(index.entryForwardSlice().contains(APP_METHOD));
+        assertTrue(index.sinkReverseSlice().contains(GADGET + "#trigger()V"));
+        assertTrue(index.entryTerminalIntersection().isEmpty(),
+                "independent slices must not be treated as a demand intersection");
+    }
+
+    @Test
+    void producerDecisionExposesDeferredMaterializationPolicy() {
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(fixture(),
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of(APP), true);
+        ApplicationEntryIndex.ProducerCandidate candidate =
+                new ApplicationEntryIndex.ProducerCandidate("runtime-exec", "COMMAND", "CRITICAL",
+                        GADGET, "trigger", "()V", "readObject", RUNTIME, "exec", SINK_DESC,
+                        "TERMINAL", io.just.sast.blackboard.SinkRisk.HIGH_RISK_TERMINAL, false);
+
+        ApplicationEntryIndex.ProducerAdmissionDecision decision =
+                index.producerAdmission(candidate);
+
+        assertEquals(ApplicationEntryIndex.ProducerAdmissionStatus.DEPENDENCY_SUFFIX,
+                decision.status());
+        assertEquals(ApplicationEntryIndex.MaterializationPolicy.DEFERRED_SUFFIX,
+                decision.materializationPolicy());
+        assertTrue(decision.retainForComposition());
+        assertFalse(decision.materializeApplicationChain());
+    }
+
+    @Test
+    void producerMaterializationPolicyMatrixKeepsRoutingAxesClosed() {
+        ApplicationEntryIndex.ProducerCandidate candidate =
+                new ApplicationEntryIndex.ProducerCandidate("rule", "category", "HIGH",
+                        APP, "handle", "()V", "http", RUNTIME, "exec", SINK_DESC,
+                        "TERMINAL", io.just.sast.blackboard.SinkRisk.CONTROLLED_EFFECT, false);
+        ApplicationEntryIndex.TerminalDecision terminal =
+                new ApplicationEntryIndex.TerminalDecision(
+                        ApplicationEntryIndex.TerminalStatus.NOT_INDEXED, "", "", "", -1, "");
+        ApplicationEntryIndex.CandidateAdmissionDecision admission =
+                new ApplicationEntryIndex.CandidateAdmissionDecision(
+                        ApplicationEntryIndex.CandidateAdmissionStatus.ADMITTED, APP_METHOD,
+                        RUNTIME, "exec", SINK_DESC, true, true, false);
+        Map<ApplicationEntryIndex.ProducerAdmissionStatus,
+                ApplicationEntryIndex.MaterializationPolicy> expected = Map.of(
+                ApplicationEntryIndex.ProducerAdmissionStatus.APPLICATION_CHAIN,
+                ApplicationEntryIndex.MaterializationPolicy.EAGER_APPLICATION,
+                ApplicationEntryIndex.ProducerAdmissionStatus.BRIDGE_CONTINUATION,
+                ApplicationEntryIndex.MaterializationPolicy.EAGER_BRIDGE,
+                ApplicationEntryIndex.ProducerAdmissionStatus.DEPENDENCY_SUFFIX,
+                ApplicationEntryIndex.MaterializationPolicy.DEFERRED_SUFFIX,
+                ApplicationEntryIndex.ProducerAdmissionStatus.KERNEL_ONLY,
+                ApplicationEntryIndex.MaterializationPolicy.EAGER_KERNEL,
+                ApplicationEntryIndex.ProducerAdmissionStatus.REJECTED,
+                ApplicationEntryIndex.MaterializationPolicy.REJECTED);
+
+        for (ApplicationEntryIndex.ProducerAdmissionStatus status
+                : ApplicationEntryIndex.ProducerAdmissionStatus.values()) {
+            ApplicationEntryIndex.ProducerAdmissionDecision decision =
+                    new ApplicationEntryIndex.ProducerAdmissionDecision(status, admission,
+                            terminal, status == ApplicationEntryIndex.ProducerAdmissionStatus
+                                    .BRIDGE_CONTINUATION);
+            ApplicationEntryIndex.MaterializationPolicy policy = expected.get(status);
+            assertEquals(policy, decision.materializationPolicy(), status.name());
+            assertEquals(status == ApplicationEntryIndex.ProducerAdmissionStatus.APPLICATION_CHAIN,
+                    decision.materializeApplicationChain(), status.name());
+            assertEquals(status == ApplicationEntryIndex.ProducerAdmissionStatus.BRIDGE_CONTINUATION
+                            || status == ApplicationEntryIndex.ProducerAdmissionStatus.DEPENDENCY_SUFFIX,
+                    decision.retainForComposition(), status.name());
+            assertEquals(policy == ApplicationEntryIndex.MaterializationPolicy.EAGER_APPLICATION
+                            || policy == ApplicationEntryIndex.MaterializationPolicy.EAGER_BRIDGE
+                            || policy == ApplicationEntryIndex.MaterializationPolicy.EAGER_KERNEL,
+                    policy.materializesImmediately(), status.name());
+            assertEquals(policy == ApplicationEntryIndex.MaterializationPolicy.EAGER_BRIDGE
+                            || policy == ApplicationEntryIndex.MaterializationPolicy.DEFERRED_SUFFIX,
+                    policy.retainsForComposition(), status.name());
+        }
+    }
+
+    @Test
+    void frameworkAnnotationAndBindingFactsCreateApplicationBoundary() {
+        Graph graph = new Graph();
+        Node method = graph.methodNode("fixture/app/Controller", "accept",
+                "(Ljava/lang/String;)V", false);
+        method.propsNote("methodAccess", Modifier.PUBLIC);
+        method.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        method.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PostMapping;"));
+        graph.freeze();
+
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/Controller"), true);
+
+        assertTrue(index.applicationEntries().stream().anyMatch(entry ->
+                entry.methodKey().equals("fixture/app/Controller#accept(Ljava/lang/String;)V")
+                        && entry.entryKind().equals("framework-http")));
+        assertEquals(1, index.deserializeSites().size());
+        assertEquals("framework-binding", index.deserializeSites().get(0).bridge());
+        assertTrue(index.deserializeSites().get(0).externalInput());
+        assertEquals(index.deserializeSites(), index.applicationInputSites());
+        assertEquals(index.deserializeSites(), index.typedBindingSites());
+    }
+
+    @Test
+    void indexesTypedBindingSitesByExactTargetOwner() {
+        Graph graph = new Graph();
+        Node method = graph.methodNode("fixture/app/Controller", "accept",
+                "(Lfixture/app/Model;)V", false);
+        method.propsNote("methodAccess", Modifier.PUBLIC);
+        method.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        method.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PostMapping;"));
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of("fixture/app/Controller", "fixture/app/Model"), true);
+
+        assertEquals(1, index.typedBindingSitesForTarget("fixture/app/Model").size());
+        assertEquals(index.typedBindingSites(),
+                index.typedBindingSitesForTarget("fixture/app/Model"));
+        assertTrue(index.typedBindingSitesForTarget("fixture/app/Unknown").isEmpty());
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.typedBindingSitesForTarget("fixture/app/Model").clear());
+    }
+
+    @Test
+    void protectedServletLifecycleAndInterfaceServiceAnnotationsAreApplicationEntries() {
+        Graph graph = new Graph();
+        Node servlet = graph.methodNode("fixture/app/Servlet", "doGet",
+                "(Ljavax/servlet/http/HttpServletRequest;Ljavax/servlet/http/HttpServletResponse;)V",
+                false);
+        servlet.propsNote("methodAccess", Modifier.PROTECTED);
+        servlet.propsNote("classSuperName", "javax/servlet/http/HttpServlet");
+        Node serviceContract = graph.methodNode("fixture/app/Service", "processTask",
+                "([B)Ljava/lang/String;", false);
+        serviceContract.propsNote("methodAccess", Modifier.PUBLIC);
+        serviceContract.propsNote("classAnnotationDescriptors", List.of(
+                "Ljavax/jws/WebService;"));
+        serviceContract.propsNote("methodAnnotationDescriptors", List.of(
+                "Ljavax/jws/WebMethod;"));
+        Node serviceImpl = graph.methodNode("fixture/app/ServiceImpl", "processTask",
+                "([B)Ljava/lang/String;", false);
+        serviceImpl.propsNote("methodAccess", Modifier.PUBLIC);
+        serviceImpl.propsNote("classInterfaces", List.of("fixture/app/Service"));
+        graph.freeze();
+
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/Servlet", "fixture/app/Service",
+                        "fixture/app/ServiceImpl"), true);
+
+        assertTrue(index.executionEntries().stream().anyMatch(entry ->
+                entry.methodKey().startsWith("fixture/app/Servlet#doGet")
+                        && entry.entryKind().equals("servlet-lifecycle")
+                        && entry.status() == io.just.sast.blackboard.FindingState.EntryStatus.EXTERNAL_ENTRY),
+                () -> "missing protected servlet entry: " + index.executionEntries());
+        assertTrue(index.executionEntries().stream().anyMatch(entry ->
+                entry.methodKey().startsWith("fixture/app/ServiceImpl#processTask")
+                        && entry.entryKind().equals("framework-service")
+                        && entry.externalControlProven()));
+        assertTrue(index.deserializeSites().stream().anyMatch(site ->
+                site.hostMethodKey().startsWith("fixture/app/ServiceImpl#processTask")
+                        && site.bridge().equals("framework-binding")));
+    }
+
+    private static RuleSet rules() {
+        Rule.SinkRule sink = new Rule.SinkRule("runtime-exec", "COMMAND", "CRITICAL",
+                new Rule.CallMatcher(Match.of("java/lang/Runtime"), Match.of("exec"),
+                        Match.of("(Ljava/lang/String;)Ljava/lang/Process;")),
+                List.of(new Rule.TaintedPos.Arg(0)), Rule.SinkRole.TERMINAL);
+        Rule.MagicEntryRule entry = new Rule.MagicEntryRule("app-handler", "http",
+                new Rule.MethodMatcher(Match.of("handle"), Match.of("()V"), false),
+                null, "lifecycle");
+        return new RuleSet(List.of(sink), List.of(entry), List.of(), List.of(), List.of());
+    }
+
+    private static Graph fixture() {
+        Graph graph = new Graph();
+        Node app = graph.methodNode(APP, "handle", "()V", false);
+        Node gadget = graph.methodNode(GADGET, "trigger", "()V", false);
+        graph.methodNode("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;", true);
+        graph.methodNode("java/lang/Runtime", "exec",
+                "(Ljava/lang/String;)Ljava/lang/Process;", true);
+
+        Node read = graph.addCallNode("java/io/ObjectInputStream", "readObject",
+                "()Ljava/lang/Object;", "VIRTUAL", null, 0, APP, "handle", "()V");
+        Node invokeGadget = graph.addCallNode(GADGET, "trigger", "()V", "STATIC", null,
+                1, APP, "handle", "()V");
+        Node exec = graph.addCallNode("java/lang/Runtime", "exec",
+                "(Ljava/lang/String;)Ljava/lang/Process;", "VIRTUAL", null, 0,
+                GADGET, "trigger", "()V");
+        graph.addEdge(read, graph.findMethodNode("java/io/ObjectInputStream", "readObject",
+                "()Ljava/lang/Object;"), EdgeType.INVOKES, "VIRTUAL");
+        graph.addEdge(invokeGadget, gadget, EdgeType.INVOKES, "STATIC");
+        graph.addEdge(exec, graph.findMethodNode("java/lang/Runtime", "exec",
+                "(Ljava/lang/String;)Ljava/lang/Process;"), EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+        return graph;
+    }
+}

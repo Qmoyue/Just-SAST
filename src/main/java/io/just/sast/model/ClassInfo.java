@@ -10,7 +10,20 @@ public record ClassInfo(
         List<String> interfaces,
         int access,
         List<MethodInfo> methods,
-        List<FieldInfo> fields) {
+        List<FieldInfo> fields,
+        List<String> annotationDescriptors) {
+
+    /** Compatibility constructor for model producers predating annotation retention. */
+    public ClassInfo(String internalName, String superName, List<String> interfaces, int access,
+                     List<MethodInfo> methods, List<FieldInfo> fields) {
+        this(internalName, superName, interfaces, access, methods, fields, List.of());
+    }
+
+    public ClassInfo {
+        annotationDescriptors = annotationDescriptors == null ? List.of()
+                : annotationDescriptors.stream().filter(value -> value != null && !value.isBlank())
+                .map(String::trim).distinct().sorted().toList();
+    }
 
     public boolean isInterface() {
         return Modifier.isInterface(access);

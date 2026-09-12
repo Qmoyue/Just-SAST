@@ -1,12 +1,16 @@
 package io.just.sast.perf;
 
 import io.just.sast.util.ArchiveLimits;
+import io.just.sast.run.InputBudget;
+import io.just.sast.util.IoUtil;
 
 import java.io.IOException;
 import java.io.Reader;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.Properties;
@@ -52,9 +56,33 @@ public final class PerformanceProfile {
 
     /** Read a UTF-8 Java-properties profile without following links or accepting unknown keys. */
     public static Limits read(Path file) throws IOException {
-        Path normalized = validateFile(file);
+        return read(file, InputBudget.defaults());
+    }
+
+    /** Read a profile under the same immutable input policy used by scan configuration. */
+    public static Limits read(Path file, InputBudget budget) throws IOException {
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        Path normalized = validateFile(file, policy);
+        ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                normalized, policy, "PERFORMANCE_PROFILE");
         Properties properties = new Properties();
-        try (Reader reader = Files.newBufferedReader(normalized, StandardCharsets.UTF_8)) {
+        InputBudget.Tracker tracker = policy.tracker();
+        byte[] source;
+        try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(normalized,
+                "PERFORMANCE_PROFILE");
+             java.io.InputStream input = opened.stream()) {
+            source = IoUtil.readAll(input, Math.min(MAX_BYTES, policy.maxEntryBytes()), tracker);
+        } catch (IOException failure) {
+            if (isInputLimitFailure(failure)) {
+                throw new IOException("PERFORMANCE_PROFILE_INPUT_LIMIT", failure);
+            }
+            if (failure instanceof NoSuchFileException) {
+                throw new IOException("PERFORMANCE_PROFILE_CHANGED_DURING_READ", failure);
+            }
+            throw new IOException("PERFORMANCE_PROFILE_READ_FAILED", failure);
+        }
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "PERFORMANCE_PROFILE");
+        try (Reader reader = new StringReader(new String(source, StandardCharsets.UTF_8))) {
             properties.load(reader);
         }
         Set<String> unknown = new LinkedHashSet<>();
@@ -78,16 +106,23 @@ public final class PerformanceProfile {
         return limits;
     }
 
-    private static Path validateFile(Path file) throws IOException {
+    private static Path validateFile(Path file, InputBudget budget) throws IOException {
         if (file == null) {
             throw new IOException("performance profile is missing");
         }
         Path normalized = file.toAbsolutePath().normalize();
+        ArchiveLimits.checkPathAncestors(normalized, budget);
+        if (normalized.toString().codePointCount(0, normalized.toString().length())
+                > budget.maxPathChars()) {
+            throw new IOException("performance profile path is too long");
+        }
         if (!Files.isRegularFile(normalized, LinkOption.NOFOLLOW_LINKS)
                 || ArchiveLimits.isLinkOrReparsePoint(normalized)) {
             throw new IOException("performance profile is not a regular non-link file");
         }
-        if (Files.size(normalized) > MAX_BYTES) {
+        long size = Files.size(normalized);
+        if (size > MAX_BYTES || size > budget.maxPhysicalBytes()
+                || size > budget.maxEntryBytes()) {
             throw new IOException("performance profile is too large");
         }
         return normalized;
@@ -104,6 +139,27 @@ public final class PerformanceProfile {
         } catch (NumberFormatException failure) {
             throw new IOException("invalid performance profile value for " + key, failure);
         }
+    }
+
+    private static boolean isInputLimitFailure(IOException failure) {
+        String message = failure.getMessage();
+        return message != null && (message.startsWith("条目超过单条目上限")
+                || message.startsWith("archive bytes read exceed limit")
+                || message.startsWith("archive container bytes read exceed limit")
+                || message.startsWith("INPUT_STREAM_NO_PROGRESS")
+                || message.startsWith("INPUT_PARSE_TIME_CAP"));
+    }
+
+    /** Package-local hostile contract seam; production reads use the same identity checks. */
+    static ArchiveLimits.FileReadSnapshot snapshotForContract(Path file) throws IOException {
+        return ArchiveLimits.snapshotRegularFile(file, InputBudget.defaults(),
+                "PERFORMANCE_PROFILE");
+    }
+
+    /** Package-local hostile contract seam; production reads use the same identity checks. */
+    static void verifySnapshotForContract(ArchiveLimits.FileReadSnapshot snapshot)
+            throws IOException {
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "PERFORMANCE_PROFILE");
     }
 
     private static long nonNegative(long value, String key) {

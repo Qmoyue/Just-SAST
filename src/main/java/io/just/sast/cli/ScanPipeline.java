@@ -1,10 +1,14 @@
 package io.just.sast.cli;
 
 import io.just.sast.analysis.callgraph.CallGraphBuilder;
+import io.just.sast.analysis.entry.ApplicationChainEvidence;
+import io.just.sast.analysis.entry.ApplicationChainJoiner;
+import io.just.sast.analysis.entry.DemandDrivenProgramSlice;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.Controller;
+import io.just.sast.blackboard.VerificationCoverage;
 import io.just.sast.config.RuleSet;
 import io.just.sast.config.Rule;
 import io.just.sast.config.YamlRuleLoader;
@@ -17,15 +21,23 @@ import io.just.sast.frontend.asm.ClassBytes;
 import io.just.sast.frontend.asm.JrtClassSource;
 import io.just.sast.frontend.asm.JdkClassSelector;
 import io.just.sast.frontend.asm.TargetJdkSource;
+import io.just.sast.knowledge.engine.ForwardRunMetrics;
+import io.just.sast.verify.VerificationPlan;
 import io.just.sast.model.JdkClassSource;
 import io.just.sast.model.LoadResult;
+import io.just.sast.model.ArtifactProvenance;
+import io.just.sast.model.ProgramUniverse;
 import io.just.sast.report.ConsoleSummary;
 import io.just.sast.report.CsvReporter;
 import io.just.sast.report.ReportIndexWriter;
 import io.just.sast.report.ReportLayout;
+import io.just.sast.report.ReportTransaction;
 import io.just.sast.report.ScanStatistics;
+import io.just.sast.run.RunOutcome;
+import io.just.sast.run.InputBudget;
 import io.just.sast.util.ArchiveLimits;
 import io.just.sast.util.ArtifactFingerprint;
+import io.just.sast.util.InputDigestVerification;
 import io.just.sast.util.JustLogger;
 
 import java.io.IOException;
@@ -45,14 +57,60 @@ public final class ScanPipeline {
 
     private ScanPipeline() {}
 
+    /**
+     * Controls which rows are exported by the report boundary.
+     *
+     * <p>The historical library entry points intentionally keep the audit snapshot
+     * available to callers that use {@link #run} as a characterization harness.
+     * The user-facing scan command must opt into {@link #STRICT_PRODUCT}; this
+     * makes the product boundary explicit without weakening the application-entry
+     * contract in the CLI.</p>
+     */
+    public enum ExportPolicy {
+        /** Keep all semantically produced rows in the compatibility/audit report. */
+        AUDIT_COMPATIBILITY,
+        /** Export only the default application-anchored product findings. */
+        STRICT_PRODUCT
+    }
+
     public static final class UsageException extends Exception {
         public UsageException(String message) {
             super(message);
         }
     }
 
-    /** 扫描结果。 */
-    public record ScanResult(int exitCode, List<Chain> chains, ScanStatistics stats) {}
+    /** 扫描结果；运行状态由闭集 RunOutcome 唯一拥有。 */
+    public record ScanResult(RunOutcome outcome, List<Chain> chains, ScanStatistics stats) {
+        public ScanResult {
+            outcome = outcome == null ? RunOutcome.notRun("MISSING_SCAN_OUTCOME", "") : outcome;
+            chains = chains == null ? List.of() : List.copyOf(chains);
+            if (stats == null) {
+                throw new IllegalArgumentException("scan statistics are required");
+            }
+        }
+
+        /** Compatibility constructor for library callers using the former integer result. */
+        public ScanResult(int exitCode, List<Chain> chains, ScanStatistics stats) {
+            this(compatibilityOutcome(exitCode, stats), chains, stats);
+        }
+
+        public int exitCode() {
+            return outcome.exitCode();
+        }
+
+        private static RunOutcome compatibilityOutcome(int exitCode, ScanStatistics stats) {
+            if (stats != null && exitCode == 0) {
+                return stats.runOutcome();
+            }
+            return switch (io.just.sast.run.ExitReason.fromCode(exitCode)) {
+                case OK -> RunOutcome.success();
+                case USAGE -> RunOutcome.usage("USAGE_ERROR", "legacy scan result");
+                case UNSUPPORTED_RUNTIME -> RunOutcome.unsupported("UNSUPPORTED_RUNTIME",
+                        "legacy scan result");
+                case INTERNAL -> RunOutcome.failed("SCAN_FAILURE", "legacy scan result");
+            };
+        }
+    }
 
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
@@ -91,10 +149,44 @@ public final class ScanPipeline {
                                  int verifyBudget, boolean safeExec, boolean safeReal,
                                  boolean requireOsIsolation, Path baseline,
                                  Path suppressions) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
+                safeExec, safeReal, requireOsIsolation, baseline, suppressions, false);
+    }
+
+    /** Full pipeline entry point with explicit overwrite authorization for run-level output. */
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec, boolean safeReal,
+                                 boolean requireOsIsolation, Path baseline,
+                                 Path suppressions, boolean overwrite) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
+                safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
+                ExportPolicy.AUDIT_COMPATIBILITY);
+    }
+
+    /**
+     * Full pipeline entry point with an explicit report export policy.
+     *
+     * <p>Callers that represent the product CLI must pass
+     * {@link ExportPolicy#STRICT_PRODUCT}.  The compatibility overload above is
+     * retained for library/fixture callers so that the audit snapshot remains
+     * testable without changing the user-visible default.</p>
+     */
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec, boolean safeReal,
+                                 boolean requireOsIsolation, Path baseline,
+                                 Path suppressions, boolean overwrite,
+                                 ExportPolicy exportPolicy) throws Exception {
+        if (exportPolicy == null) {
+            throw new IllegalArgumentException("export policy is required");
+        }
         long start = System.nanoTime();
         long parentCpuStarted = processCpuTimeMs();
         Map<String, Long> phaseMs = new java.util.LinkedHashMap<>();
         resetHeapPeaks();
+        GcSnapshot gcStarted = gcSnapshot();
+        InputBudget inputBudget = InputBudget.defaults();
 
         validatePath(target, "扫描目标", true);
         if (deps != null) {
@@ -114,6 +206,10 @@ public final class ScanPipeline {
         }
         if (Files.exists(output) && !Files.isDirectory(output)) {
             throw new UsageException("输出路径不是目录: " + output.toAbsolutePath());
+        }
+        if (Files.exists(output) && !overwrite) {
+            throw new UsageException("输出目录已存在；run-level 报告默认不覆盖，请显式使用 --overwrite: "
+                    + output.toAbsolutePath());
         }
         if (baseline != null) {
             validatePath(baseline, "baseline", true);
@@ -148,15 +244,17 @@ public final class ScanPipeline {
         // available to the cache layer before frontend parsing, reusing these values avoids a
         // second full read of a large target/dependency archive during report generation.
         List<Path> scanDeps = deps == null ? List.of() : List.copyOf(deps);
-        String targetArtifactHash = artifactHash(target);
-        List<String> dependencyHashes = io.just.sast.report.ScanCache.dependencyHashes(scanDeps);
+        InputBudget.Tracker inputTracker = inputBudget.tracker();
+        String targetArtifactHash = artifactHash(target, inputTracker);
+        List<String> dependencyHashes = io.just.sast.report.ScanCache
+                .dependencyHashes(scanDeps, inputTracker);
         String dependencyIdentity = io.just.sast.report.ScanCache
                 .dependencyIdentityFromHashes(dependencyHashes);
 
         // 规则
         RuleSet ruleSet;
         try {
-            ruleSet = loadRules(rules);
+            ruleSet = loadRules(rules, inputBudget, inputTracker);
         } catch (IOException e) {
             throw new UsageException("规则加载失败: " + e.getMessage());
         }
@@ -174,30 +272,50 @@ public final class ScanPipeline {
         if (jdkHome != null) {
             TargetJdkSource targetJdk;
             try {
-                targetJdk = new TargetJdkSource(jdkHome);
+                targetJdk = new TargetJdkSource(jdkHome, inputBudget, inputTracker);
             } catch (IOException e) {
                 throw new UsageException("--jdk-home 加载失败: " + e.getMessage());
             }
             jdkSource = targetJdk;
             JustLogger.info("使用目标 JDK：{}（--jdk-home={}）", targetJdk.description(), jdkHome);
         } else {
-            JrtClassSource jrt = JrtClassSource.runtime();
+            JrtClassSource jrt = JrtClassSource.runtime(inputBudget, inputTracker);
             jdkSource = jrt;
         }
         try {
-        BytecodeFrontend frontend = new BytecodeFrontend();
+        BytecodeFrontend frontend = new BytecodeFrontend(inputBudget);
         // 先解析 target/deps；完整模式随后只把应用引用、规则类型和 magic-entry 方法
         // 所需的 JDK 类体放进 CPG，避免对同一批应用字节重复读取/解析。
         // 把原始 ClassBytes 限制在独立 helper 的生命周期内。完整扫描需要的只是
         // ClassInfo；否则 JDK 切片规划期间 input 仍会把整批 fat-jar byte[] 挂住。
         int targetFeature = jdkFeature(jdkSource);
-        LoadResult applicationLoad = loadApplication(frontend, targets, targetFeature);
+            BytecodeFrontend.ScopedLoad scopedApplication = loadApplication(frontend, targets,
+                    targetFeature, inputTracker);
+            LoadResult applicationLoad = scopedApplication.load();
         LoadResult load;
         if (fast) {
             load = applicationLoad;
         } else {
-            load = loadWithJdkSlice(frontend, applicationLoad, jdkSource, ruleSet);
+            load = loadWithJdkSlice(frontend, applicationLoad, jdkSource, ruleSet,
+                    inputTracker);
         }
+        // The frontend has already parsed every bounded input entry.  Before CPG construction,
+        // retain only application-owned classes plus a generic, rule/reference-driven dependency
+        // closure.  This is the graph-facing demand boundary: it reduces unrelated dependency
+        // noise without pretending that an unread or malformed archive entry was absent, and it
+        // never changes the application-entry/join contract or benchmark truth.
+        long demandSliceStart = System.nanoTime();
+        DemandDrivenProgramSlice.Result demandSlice = DemandDrivenProgramSlice.select(
+                load, scopedApplication.applicationClassNames(), ruleSet);
+        load = demandSlice.load();
+        phaseMs.put("dependency_slice", elapsedMs(demandSliceStart));
+        JustLogger.info("依赖需求切片：{} -> {} 个类，依赖 {} -> {}，能力类 {}，规则锚点 {}，引用轮数 {}{}",
+                demandSlice.inputClasses(), demandSlice.selectedClasses(),
+                demandSlice.inputDependencies(), demandSlice.selectedDependencies(),
+                demandSlice.capabilityClasses(), demandSlice.ruleAnchorClasses(),
+                demandSlice.referenceRounds(), demandSlice.capped() ? "（触顶，结果 PARTIAL）" : "");
+        JustLogger.debug("应用范围：{} 个类；需求切片应用边界/终端门由前端模型计算，图级入口索引随后复核",
+                scopedApplication.applicationClassNames().size());
         JustLogger.info("解析完成：{} 个类（{} 个文件），诊断 {} 条",
                 load.classCount(), load.filesScanned(), load.diagnosticCount());
         if (load.targetMajorVersion() > 0) {
@@ -210,9 +328,15 @@ public final class ScanPipeline {
         }
         phaseMs.put("frontend", elapsedMs(frontendStart));
 
+        // Freeze the frontend product at the phase boundary.  Downstream owners consume only
+        // the immutable model; raw ASM/class bytes never cross into CPG or knowledge code.
+        ProgramUniverse universe = ProgramUniverse.of(load,
+                artifactProvenance(target, scanDeps, targetArtifactHash, dependencyHashes,
+                        jdkSource, targetFeature));
+
         long cpgStart = System.nanoTime();
-        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), jdkSource);
-        BuiltCpg cpg = new CpgBuilder().build(load);
+        ClassHierarchy hierarchy = new ClassHierarchy(universe.classes(), jdkSource);
+        BuiltCpg cpg = new CpgBuilder().build(universe);
         int callEdges = new CallGraphBuilder(hierarchy).build(cpg.graph());
         cpg.graph().freeze();
         JustLogger.info("CPG 构建完成：节点 {}，边 {}，调用边 {}，字段写入 {} 组",
@@ -225,12 +349,36 @@ public final class ScanPipeline {
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
                         verifyBudget, jdkHome, load.targetMajorVersion(), safeExec, safeReal,
-                        requireOsIsolation));
+                        requireOsIsolation, inputTracker, scopedApplication.applicationClassNames(),
+                        true));
         new Controller(blackboard, KnowledgeSources.discover()).run();
         for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
             phaseMs.put(timing.getKey(), timing.getValue());
         }
         phaseMs.put("analysis", elapsedMs(analysisStart));
+        // The verifier normally publishes this typed product before selecting a plan.  Keep a
+        // report-boundary fallback for callers that omit the calibration source (for example a
+        // custom controller or a future --no-verify execution path): absence must remain an
+        // explicit empty/unknown product, never a renderer-inferred application finding.
+        ApplicationChainEvidence applicationEvidence = latestApplicationChainEvidence(blackboard);
+        if (applicationEvidence == null) {
+            applicationEvidence = ApplicationChainJoiner.build(blackboard);
+            blackboard.publishFact(applicationEvidence);
+        }
+        // Re-check immutable input identities after analysis.  The digest pass uses the same
+        // scan-boundary tracker and therefore cannot silently obtain a second aggregate budget;
+        // any changed/unavailable input becomes an explicit completeness reason while static
+        // facts remain available for diagnosis.
+        InputDigestVerification inputDigest = InputDigestVerification.verify(target, scanDeps,
+                targetArtifactHash, dependencyHashes, inputTracker);
+        if (!inputDigest.matched()) {
+            inputDigest.reasons().forEach(blackboard::markIncomplete);
+        }
+        // The verifier publishes the join before report identity is assembled.  Enrich that
+        // immutable product exactly once with the scan-boundary target digest so every exported
+        // application chain can be traced back to the bytes that were analyzed.
+        applicationEvidence = applicationEvidence.withArtifactDigest(targetArtifactHash);
+        blackboard.publishFact(applicationEvidence);
         // Publish a non-overlapping static phase for the performance harness.  The aggregate
         // analysis timer includes calibration, while the verifier publishes its own child
         // process duration; subtracting that one explicit interval avoids charging dynamic
@@ -241,24 +389,51 @@ public final class ScanPipeline {
 
         // 报告期
         long reportStart = System.nanoTime();
-        ReportLayout reportLayout = ReportLayout.create(output);
+        try (ReportTransaction transaction = ReportTransaction.begin(output, overwrite)) {
+        ReportLayout reportLayout = transaction.layout();
         // Freeze the blackboard views once at the report boundary.  Each reporter previously
         // requested fresh defensive copies of chains/calibrations/outcomes and rebuilt the
         // chain-note map independently.  On a large closure that turned reporting into a
         // repeated synchronization/copy pass without changing any emitted byte.
-        List<Chain> reportChains = blackboard.chains();
+        // Include calibration-only callback candidates in the audit snapshot.  They never
+        // enter composition/dynamic verification and strict product export still requires the
+        // typed application finding state, but retaining them here preserves an explainable
+        // no-trigger/rejection row instead of silently dropping a solver observation.
+        List<Chain> reportChains = blackboard.reportChains();
         Map<Long, io.just.sast.blackboard.SinkOutcome> reportOutcomes = blackboard.sinkOutcomes();
         Map<String, String> reportCalibrations = blackboard.chainCalibrations();
         Map<String, List<String>> reportNotes = blackboardNotes(blackboard);
         io.just.sast.blackboard.VerificationSummary reportVerification =
                 blackboard.verificationSummary();
+        LinkedHashSet<String> completeness = new LinkedHashSet<>(completenessReasons(load, cpg.graph(),
+                reportOutcomes, blackboard.completenessReasons(), fast, jdkHome, targetFeature));
+        if (jdkSource instanceof TargetJdkSource targetJdk) {
+            completeness.addAll(targetJdk.completenessReasons());
+        } else if (jdkSource instanceof JrtClassSource runtimeJdk) {
+            completeness.addAll(runtimeJdk.completenessReasons());
+        }
+        List<String> scanCompletenessReasons = List.copyOf(completeness);
+        String scanChainProofCompleteness = chainProofCompleteness(reportChains, reportOutcomes,
+                scanCompletenessReasons);
+        RunOutcome scanOutcome = RunOutcome.forScan(
+                scanCompletenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
+                scanChainProofCompleteness,
+                reportVerification == null ? List.of() : reportVerification.statusCounts().keySet());
+        io.just.sast.report.FindingOutputReader.Snapshot findingOutput =
+                new io.just.sast.report.FindingOutputReader().read(
+                        reportChains, reportCalibrations, reportNotes, reportVerification,
+                        applicationEvidence.states(),
+                        exportPolicy == ExportPolicy.STRICT_PRODUCT,
+                        applicationEvidence);
+        long findingOutputStart = System.nanoTime();
+        new io.just.sast.report.FindingOutputWriter().write(reportLayout, findingOutput);
+        phaseMs.put("report.finding_output", elapsedMs(findingOutputStart));
         CsvReporter reporter = new CsvReporter();
         io.just.sast.report.MultiFormatReporter multiFormatReporter = new io.just.sast.report.MultiFormatReporter();
         reporter.withGraph(cpg.graph());
         long csvReportStart = System.nanoTime();
         Map<String, Long> csvTimings = new java.util.LinkedHashMap<>();
-        reporter.write(reportLayout, reportChains, reportOutcomes, reportCalibrations,
-                reportNotes, reportVerification, csvTimings);
+        reporter.write(reportLayout, reportOutcomes, findingOutput, csvTimings);
         phaseMs.put("report.csv", elapsedMs(csvReportStart));
         for (Map.Entry<String, Long> timing : csvTimings.entrySet()) {
             phaseMs.put("report.csv." + timing.getKey(), timing.getValue());
@@ -266,28 +441,49 @@ public final class ScanPipeline {
         // C1: SARIF 2.1.0 + E1-E3: JSON/HTML/Markdown 多格式输出
         long sarifReportStart = System.nanoTime();
         new io.just.sast.report.SarifReporter().withHierarchy(hierarchy).withRules(ruleSet).write(
-                reportLayout, reportChains, reportCalibrations, reportNotes, reportVerification);
+                reportLayout, findingOutput, scanOutcome);
         phaseMs.put("report.sarif", elapsedMs(sarifReportStart));
         long multiFormatReportStart = System.nanoTime();
-        multiFormatReporter.write(reportLayout, reportChains, reportCalibrations, reportNotes,
-                reportVerification);
+        multiFormatReporter.write(reportLayout, findingOutput);
         phaseMs.put("report.multi_format", elapsedMs(multiFormatReportStart));
+        long ruleShadowStart = System.nanoTime();
+        new io.just.sast.report.RuleSchemaShadowWriter().write(reportLayout, ruleSet);
+        phaseMs.put("report.rules_v2_shadow", elapsedMs(ruleShadowStart));
+        long findingShadowStart = System.nanoTime();
+        new io.just.sast.report.FindingShadowWriter().write(reportLayout, findingOutput);
+        phaseMs.put("report.findings_v2_shadow", elapsedMs(findingShadowStart));
+        long inputDigestReportStart = System.nanoTime();
+        new io.just.sast.report.InputDigestWriter().write(reportLayout, inputDigest);
+        phaseMs.put("report.input_digest", elapsedMs(inputDigestReportStart));
+        long applicationEvidenceReportStart = System.nanoTime();
+        new io.just.sast.report.ApplicationChainEvidenceWriter().write(reportLayout,
+                applicationEvidence);
+        phaseMs.put("report.application_chain_evidence",
+                elapsedMs(applicationEvidenceReportStart));
+        VerificationCoverage verificationCoverage = latestVerificationCoverage(blackboard);
+        long verificationCoverageReportStart = System.nanoTime();
+        new io.just.sast.report.VerificationCoverageWriter().write(reportLayout,
+                verificationCoverage == null
+                        ? VerificationCoverage.empty(VerificationCoverage.Status.UNKNOWN)
+                        : verificationCoverage);
+        phaseMs.put("report.verification_coverage",
+                elapsedMs(verificationCoverageReportStart));
         long payloadReportStart = System.nanoTime();
         new io.just.sast.report.PayloadPlanWriter().write(reportLayout, reportChains,
                 reportCalibrations, reportNotes, reportVerification);
         phaseMs.put("report.payload", elapsedMs(payloadReportStart));
         long inventoryStart = System.nanoTime();
         String dependencyInventoryHash = new io.just.sast.report.DependencyInventoryWriter().write(reportLayout, target,
-                scanDeps, targetArtifactHash, load.targetMajorVersion(), dependencyHashes);
+                scanDeps, targetArtifactHash, load.targetMajorVersion(), dependencyHashes, inputBudget,
+                inputTracker);
         phaseMs.put("report.inventory", elapsedMs(inventoryStart));
         new io.just.sast.report.ScanIdentityWriter().write(reportLayout, targetArtifactHash,
                 dependencyIdentity, dependencyInventoryHash, rules, jdkHome,
                 load.targetMajorVersion(), fast, verify, verifyBudget, safeExec,
-                safeReal, requireOsIsolation);
+                safeReal, requireOsIsolation, inputBudget, inputTracker,
+                jdkSource == null ? null : jdkSource.sourceInfo());
         new io.just.sast.report.BaselineSuppressionWriter().write(reportLayout, baseline,
-                suppressions, reportChains, reportCalibrations);
-        JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
-
+                suppressions, reportChains, reportCalibrations, inputBudget);
         // sink/entry 统计从图直接产出（与引擎同一 RuleEngine 实例，access 过滤口径一致）
         int sinkCount = 0;
         for (Node call : cpg.graph().nodesOfType(NodeType.CALL)) {
@@ -304,24 +500,28 @@ public final class ScanPipeline {
         }
         phaseMs.put("report", elapsedMs(reportStart));
         Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes = reportOutcomes;
-        List<String> completenessReasons = completenessReasons(load, cpg.graph(), outcomes,
-                blackboard.completenessReasons(), fast, jdkHome, targetFeature);
+        GcSnapshot gcDelta = gcSnapshot().delta(gcStarted);
+        ScanMetricCapture metricCapture = scanMetricCapture(cpg, blackboard, reportChains,
+                reportNotes, reportVerification, parentCpuStarted, entryCount, phaseMs, gcDelta,
+                applicationEvidence);
         ScanStatistics scanStats = new ScanStatistics(
                 load.filesScanned(), load.classCount(), load.diagnosticCount(),
                 sinkCount, entryCount, reportChains.size(),
                 elapsedMs(start),
                 (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1024 / 1024,
                 heapPeakMb(),
-                completenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
-                completenessReasons, phaseMs, scanMetrics(cpg, blackboard, reportChains, reportNotes,
-                        reportVerification, parentCpuStarted),
+                scanCompletenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
+                scanCompletenessReasons, phaseMs, metricCapture.values(),
                 verify ? blackboard.verificationStatus() : "DISABLED",
                 verify ? reportVerification
                         : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget),
-                chainProofCompleteness(reportChains, outcomes, completenessReasons),
-                targetArtifactHash);
+                scanChainProofCompleteness,
+                targetArtifactHash, metricCapture.status(), metricCapture.namespaces(),
+                metricCapture.namespaceStatus());
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
+        transaction.commit();
+        JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());
         if (stats) {
             ConsoleSummary.print(scanStats, outcomes);
         }
@@ -329,7 +529,8 @@ public final class ScanPipeline {
         // retaining ScanResult do not accidentally retain every materialized method graph.
         blackboard.originSupport().clearForwardOriginCache();
         cpg.index().clearCfgCache();
-        return new ScanResult(ExitCode.OK.code(), blackboard.chains(), scanStats);
+        return new ScanResult(scanStats.runOutcome(), blackboard.chains(), scanStats);
+        }
         } finally {
             // External --jdk-home JRT images own a FileSystem and URLClassLoader.  Close them
             // on both normal and exceptional exits; runtime() deliberately implements a no-op.
@@ -371,9 +572,50 @@ public final class ScanPipeline {
         return bytes / 1024 / 1024;
     }
 
-    private static LoadResult loadApplication(BytecodeFrontend frontend, List<Path> targets,
-                                              int targetFeature) {
-        return frontend.loadStreaming(targets, targetFeature);
+    private static BytecodeFrontend.ScopedLoad loadApplication(BytecodeFrontend frontend,
+                                                               List<Path> targets,
+                                                               int targetFeature,
+                                                               InputBudget.Tracker inputTracker) {
+        return frontend.loadStreamingWithApplicationScope(targets, targetFeature, inputTracker);
+    }
+
+    /** Input identities are computed once at the scan boundary and carried by the universe. */
+    private static List<ArtifactProvenance> artifactProvenance(Path target, List<Path> dependencies,
+                                                                String targetHash,
+                                                                List<String> dependencyHashes,
+                                                                JdkClassSource jdkSource,
+                                                                int targetFeature) {
+        List<ArtifactProvenance> result = new ArrayList<>();
+        result.add(new ArtifactProvenance(logicalArtifactName(target),
+                ArtifactProvenance.Role.APPLICATION, targetHash,
+                regularFileSize(target)));
+        for (int i = 0; i < dependencies.size(); i++) {
+            Path dependency = dependencies.get(i);
+            String hash = i < dependencyHashes.size() ? dependencyHashes.get(i) : "UNKNOWN";
+            result.add(new ArtifactProvenance(logicalArtifactName(dependency),
+                    ArtifactProvenance.Role.DEPENDENCY, hash, regularFileSize(dependency)));
+        }
+        if (jdkSource != null) {
+            result.add(ArtifactProvenance.unknown("jdk:" + Math.max(0, targetFeature),
+                    ArtifactProvenance.Role.JDK));
+        }
+        return List.copyOf(result);
+    }
+
+    private static String logicalArtifactName(Path path) {
+        if (path == null || path.getFileName() == null) {
+            return "<unknown>";
+        }
+        return path.getFileName().toString();
+    }
+
+    private static long regularFileSize(Path path) {
+        try {
+            return path != null && java.nio.file.Files.isRegularFile(path)
+                    ? java.nio.file.Files.size(path) : -1L;
+        } catch (IOException ignored) {
+            return -1L;
+        }
     }
 
     private static int jdkFeature(JdkClassSource source) {
@@ -392,7 +634,8 @@ public final class ScanPipeline {
      * entire JDK image merely to decide that most of it is irrelevant to the target.
      */
     private static LoadResult loadWithJdkSlice(BytecodeFrontend frontend, LoadResult application,
-                                                JdkClassSource jdkSource, RuleSet rules)
+                                                JdkClassSource jdkSource, RuleSet rules,
+                                                InputBudget.Tracker inputTracker)
             throws IOException {
         JdkClassSelector.Selection selection;
         if (jdkSource instanceof TargetJdkSource targetJdk) {
@@ -413,7 +656,7 @@ public final class ScanPipeline {
         JustLogger.info("JDK 类切片：候选 {}，header {} 个，初始种子 {} 个，隐式 entry 新增 {} 个，闭包物化 {} 个",
                 available, selection.headerClasses(), selection.initialSeeds(),
                 selection.implicitEntrySeeds(), selection.closureClasses());
-        return frontend.load(application, selection.classes());
+        return frontend.load(application, selection.classes(), inputTracker);
     }
 
     /** 将“没有发现”与“分析曾触顶/跳过内容”区分开，原因使用稳定类别而不泄漏路径。 */
@@ -485,11 +728,403 @@ public final class ScanPipeline {
                 || reason.startsWith("COMPOSITION_");
     }
 
+    private record ScanMetricCapture(Map<String, Long> values,
+                                     Map<String, String> status,
+                                     Map<String, Map<String, Long>> namespaces,
+                                     Map<String, String> namespaceStatus) {
+    }
+
+    /**
+     * Process-local garbage-collector counters used to compare owner migrations.  MXBeans may
+     * report {@code -1} on a collector that does not expose a counter; that case remains
+     * UNKNOWN rather than being coerced to zero.  The counters are cumulative JVM observations,
+     * so only a monotonic, fully observed delta is published for one scan.
+     */
+    static record GcSnapshot(long collectionCount, long collectionTimeMs, boolean observed) {
+        static GcSnapshot unknown() {
+            return new GcSnapshot(-1L, -1L, false);
+        }
+
+        GcSnapshot delta(GcSnapshot before) {
+            if (before == null || !observed || !before.observed()
+                    || collectionCount < before.collectionCount()
+                    || collectionTimeMs < before.collectionTimeMs()) {
+                return unknown();
+            }
+            return new GcSnapshot(collectionCount - before.collectionCount(),
+                    collectionTimeMs - before.collectionTimeMs(), true);
+        }
+    }
+
+    /** Read all available JVM collector counters without making telemetry a scan dependency. */
+    static GcSnapshot gcSnapshot() {
+        long count = 0L;
+        long timeMs = 0L;
+        boolean any = false;
+        try {
+            for (java.lang.management.GarbageCollectorMXBean bean
+                    : java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()) {
+                if (bean == null) {
+                    continue;
+                }
+                any = true;
+                long beanCount = bean.getCollectionCount();
+                long beanTime = bean.getCollectionTime();
+                if (beanCount < 0L || beanTime < 0L) {
+                    return GcSnapshot.unknown();
+                }
+                count = saturatedAdd(count, beanCount);
+                timeMs = saturatedAdd(timeMs, beanTime);
+            }
+        } catch (RuntimeException ignored) {
+            return GcSnapshot.unknown();
+        }
+        return any ? new GcSnapshot(count, timeMs, true) : GcSnapshot.unknown();
+    }
+
+    private static long saturatedAdd(long left, long right) {
+        if (right > 0L && left > Long.MAX_VALUE - right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
+    }
+
+    /**
+     * Build one deterministic telemetry snapshot at the report boundary.  Engine counters
+     * are observed facts; application anchoring/join/DAG counters remain UNKNOWN until the
+     * typed evidence model exists.  Keeping the axes explicit prevents a raw chain count from
+     * being mistaken for an application finding or a kernel result.
+     */
+    private static ScanMetricCapture scanMetricCapture(BuiltCpg cpg, Blackboard blackboard,
+                                                       List<Chain> chains,
+                                                       Map<String, List<String>> chainNotes,
+                                                       io.just.sast.blackboard.VerificationSummary verification,
+                                                       long parentCpuStarted,
+                                                       int entryCandidates,
+                                                       Map<String, Long> phaseMs,
+                                                       GcSnapshot gcDelta,
+                                                       ApplicationChainEvidence applicationEvidence) {
+        ForwardRunMetrics forward = latestForwardMetrics(blackboard);
+        VerificationPlan verificationPlan = latestVerificationPlan(blackboard);
+        VerificationCoverage verificationCoverage = latestVerificationCoverage(blackboard);
+        Map<String, Long> metrics = scanMetrics(cpg, blackboard, chains, chainNotes,
+                verification, parentCpuStarted, forward, verificationPlan);
+        List<Chain> observedChains = chains == null ? List.of() : chains;
+        long unresolved = observedChains.stream().filter(chain -> chain.unresolvedHops() > 0).count();
+        long structurallyComplete = observedChains.stream()
+                .filter(chain -> chain.unresolvedHops() == 0).count();
+        long terminal = observedChains.stream().filter(Chain::terminalSink).count();
+        long hopTotal = observedChains.stream().mapToLong(chain -> chain.hops().size()).sum();
+        long hopMax = observedChains.stream().mapToLong(chain -> chain.hops().size()).max().orElse(0L);
+        long bridgeHops = observedChains.stream().flatMap(chain -> chain.hops().stream())
+                .filter(hop -> hop.reason() != null && hop.reason().startsWith("bridge-"))
+                .count();
+        long noteCount = chainNotes == null ? 0L
+                : chainNotes.values().stream().filter(java.util.Objects::nonNull)
+                .mapToLong(List::size).sum();
+        io.just.sast.analysis.entry.ApplicationEntryIndex entryIndex =
+                blackboard.applicationEntryIndex();
+        long indexedEntries = entryIndex == null ? -1L : entryIndex.applicationEntries().size();
+        long indexedSites = entryIndex == null ? -1L : entryIndex.deserializeSites().size();
+        long indexedTerminals = entryIndex == null ? -1L : entryIndex.terminalImpacts().size();
+        long indexedForward = entryIndex == null ? -1L : entryIndex.entryForwardSlice().size();
+        long indexedReverse = entryIndex == null ? -1L : entryIndex.sinkReverseSlice().size();
+        long indexedIntersection = entryIndex == null ? -1L
+                : entryIndex.entryTerminalIntersection().size();
+        long indexedDependencies = entryIndex == null ? -1L
+                : entryIndex.dependencyCandidates().size();
+        long applicationSites = applicationEvidence == null ? -1L
+                : applicationEvidence.joins().values().stream()
+                .map(io.just.sast.blackboard.EntryChainJoinEvidence::applicationSiteAtomId)
+                .distinct().count();
+        long candidateJoins = applicationEvidence == null ? -1L
+                : applicationEvidence.candidateJoinCount();
+        long validatedJoins = applicationEvidence == null ? -1L
+                : applicationEvidence.joinCount();
+        long joinedDependencySegments = validatedJoins;
+        long completeAnchoredChains = applicationEvidence == null ? -1L
+                : applicationEvidence.states().values().stream()
+                .filter(io.just.sast.blackboard.FindingState::impactComplete).count();
+        long anchoredCandidates = applicationEvidence == null ? -1L
+                : applicationEvidence.anchoredCandidateCount();
+        long admissionInput = applicationEvidence == null ? -1L
+                : applicationEvidence.admissionDecisions().size();
+        long admissionCandidates = applicationEvidence == null ? -1L
+                : applicationEvidence.admissionCandidateCount();
+        long admissionRejected = applicationEvidence == null ? -1L
+                : applicationEvidence.admissionRejectedCount();
+        Blackboard.SolverAdmissionMetrics solverAdmission = blackboard == null
+                ? new Blackboard.SolverAdmissionMetrics(0, 0, 0, 0, 0, 0, Map.of())
+                : blackboard.solverAdmissionMetrics();
+        long unresolvedBridges = applicationEvidence == null ? -1L
+                : applicationEvidence.graph().nodes().stream()
+                .filter(node -> node instanceof io.just.sast.blackboard.BridgeEvidence bridge
+                        && bridge.status() != io.just.sast.blackboard.BridgeEvidence.Status.PROVED)
+                .count();
+        long evidenceDagNodes = applicationEvidence == null ? -1L
+                : applicationEvidence.graph().nodes().size();
+        long evidenceDagEdges = applicationEvidence == null ? -1L
+                : applicationEvidence.graph().edges().size();
+
+        // Preserve the existing flat counters for compatibility, then add namespaced aliases.
+        metrics.put("chain_candidate_count", (long) observedChains.size());
+        metrics.put("chain_structurally_complete_count", structurallyComplete);
+        metrics.put("chain_unresolved_count", unresolved);
+        metrics.put("chain_terminal_count", terminal);
+        metrics.put("chain_hop_total", hopTotal);
+        metrics.put("chain_hop_max", hopMax);
+        metrics.put("chain_bridge_hop_count", bridgeHops);
+        metrics.put("chain_note_count", noteCount);
+        metrics.put("application_entry_candidates", Math.max(0L, entryCandidates));
+        metrics.put("application_entry_sites_candidates", Math.max(0L, entryCandidates));
+        metrics.put("entry_index_application_entries", indexedEntries);
+        metrics.put("entry_index_deserialize_sites", indexedSites);
+        metrics.put("entry_index_terminal_impacts", indexedTerminals);
+        metrics.put("entry_index_forward_methods", indexedForward);
+        metrics.put("entry_index_reverse_methods", indexedReverse);
+        metrics.put("entry_index_intersection_methods", indexedIntersection);
+        metrics.put("entry_index_dependency_candidates", indexedDependencies);
+        metrics.put("application_sites", applicationSites);
+        metrics.put("candidate_joins", candidateJoins);
+        metrics.put("validated_joins", validatedJoins);
+        metrics.put("joined_dependency_segments", joinedDependencySegments);
+        metrics.put("complete_anchored_chains", completeAnchoredChains);
+        metrics.put("anchored_candidates", anchoredCandidates);
+        metrics.put("application_admission_input", admissionInput);
+        metrics.put("application_admission_candidates", admissionCandidates);
+        metrics.put("application_admission_rejected", admissionRejected);
+        metrics.put("solver_admission_input", solverAdmission.input());
+        metrics.put("solver_application_chains", solverAdmission.applicationChains());
+        metrics.put("solver_bridge_continuations", solverAdmission.bridgeContinuations());
+        metrics.put("solver_dependency_suffixes", solverAdmission.dependencySuffixes());
+        metrics.put("solver_kernel_only", solverAdmission.kernelOnly());
+        metrics.put("solver_rejected", solverAdmission.rejected());
+        metrics.put("unresolved_bridges", unresolvedBridges);
+        metrics.put("dag_nodes", evidenceDagNodes);
+        metrics.put("dag_edges", evidenceDagEdges);
+        metrics.put("gc_collection_count", gcDelta == null || !gcDelta.observed()
+                ? -1L : gcDelta.collectionCount());
+        metrics.put("gc_collection_time_ms", gcDelta == null || !gcDelta.observed()
+                ? -1L : gcDelta.collectionTimeMs());
+        addPassTelemetry(metrics, phaseMs, "frontend", "frontend", -1L);
+        addPassTelemetry(metrics, phaseMs, "cpg", "cpg", cpg.index().cfgCacheHits());
+        addPassTelemetry(metrics, phaseMs, "analysis", "analysis",
+                blackboard.originSupport().forwardOriginCacheHits());
+        addPassTelemetry(metrics, phaseMs, "calibration", "blackboard.calibration", -1L);
+        addPassTelemetry(metrics, phaseMs, "composition", "blackboard.composition", -1L);
+        addPassTelemetry(metrics, phaseMs, "verification", "verify",
+                verification == null ? -1L : verification.selected());
+        addPassTelemetry(metrics, phaseMs, "report", "report", 0L);
+        // A negative value is the stable numeric representation of UNKNOWN.  Its availability
+        // is recorded separately below and consumers must not coerce it to zero.
+        for (String name : List.of("application_sites", "candidate_joins", "validated_joins",
+                "joined_dependency_segments", "complete_anchored_chains", "anchored_candidates",
+                "unresolved_bridges", "avoided_states", "materialized_states", "dag_nodes",
+                "dag_edges", "representative_paths", "kernel_only_results")) {
+            metrics.putIfAbsent(name, -1L);
+        }
+
+        Map<String, String> status = new java.util.LinkedHashMap<>();
+        metrics.keySet().forEach(name -> status.put(name, "OBSERVED"));
+        if (forward == null) {
+            for (String name : ForwardRunMetrics.metricNames()) {
+                status.put(name, "UNKNOWN");
+            }
+        }
+        if (verificationPlan == null) {
+            status.put("verification_plan_input", "UNKNOWN");
+            status.put("verification_plan_unique", "UNKNOWN");
+            status.put("verification_plan_selected", "UNKNOWN");
+        }
+        status.put("application_entry_candidates", "CANDIDATE_ONLY");
+        status.put("application_entry_sites_candidates", "CANDIDATE_ONLY");
+        status.put("entry_index_application_entries", indexedEntries < 0L ? "UNKNOWN" : "OBSERVED");
+        status.put("entry_index_deserialize_sites", indexedSites < 0L ? "UNKNOWN" : "OBSERVED");
+        status.put("entry_index_terminal_impacts", indexedTerminals < 0L ? "UNKNOWN" : "OBSERVED");
+        status.put("entry_index_forward_methods", indexedForward < 0L ? "UNKNOWN" : "OBSERVED");
+        status.put("entry_index_reverse_methods", indexedReverse < 0L ? "UNKNOWN" : "OBSERVED");
+        status.put("entry_index_intersection_methods", indexedIntersection < 0L ? "UNKNOWN" : "OBSERVED");
+        status.put("entry_index_dependency_candidates", indexedDependencies < 0L ? "UNKNOWN" : "OBSERVED");
+        String gcStatus = gcDelta == null || !gcDelta.observed() ? "UNKNOWN" : "OBSERVED";
+        status.put("gc_collection_count", gcStatus);
+        status.put("gc_collection_time_ms", gcStatus);
+        for (String name : List.of("application_sites", "candidate_joins", "validated_joins",
+                "joined_dependency_segments", "complete_anchored_chains", "anchored_candidates",
+                "unresolved_bridges", "avoided_states", "materialized_states", "dag_nodes",
+                "dag_edges", "representative_paths")) {
+            // A present evidence product does not make every derived telemetry field
+            // observed.  The state/materialization/path counters are intentionally not
+            // implemented yet and use -1 as UNKNOWN; advertising them as OBSERVED makes
+            // the run-level metrics contract reject an otherwise valid static scan.
+            long value = metrics.getOrDefault(name, -1L);
+            status.put(name, applicationEvidence == null || value < 0L ? "UNKNOWN" : "OBSERVED");
+        }
+        for (String name : List.of("verification_eligible_finding_groups",
+                "verification_covered_finding_groups", "verification_confirmed_groups",
+                "verification_no_observation_groups", "verification_unique_plans",
+                "verification_attempted_plans", "verification_dynamic_coverage_permille",
+                "verification_plan_reuse_permille")) {
+            long value = metrics.getOrDefault(name, -1L);
+            status.put(name, verificationCoverage == null || value < 0L
+                    ? "UNKNOWN" : "OBSERVED");
+        }
+        status.put("kernel_only_results", "NOT_REQUESTED");
+        addPassTelemetryStatus(status, metrics, phaseMs, "frontend", "frontend", false);
+        addPassTelemetryStatus(status, metrics, phaseMs, "cpg", "cpg", true);
+        addPassTelemetryStatus(status, metrics, phaseMs, "analysis", "analysis", true);
+        addPassTelemetryStatus(status, metrics, phaseMs, "calibration", "blackboard.calibration", false);
+        addPassTelemetryStatus(status, metrics, phaseMs, "composition", "blackboard.composition", false);
+        addPassTelemetryStatus(status, metrics, phaseMs, "verification", "verify", true);
+        addPassTelemetryStatus(status, metrics, phaseMs, "report", "report", true);
+
+        Map<String, Long> application = new java.util.LinkedHashMap<>();
+        application.put("entries", indexedEntries < 0L ? (long) Math.max(0, entryCandidates)
+                : indexedEntries);
+        application.put("sites", indexedSites);
+        application.put("entry_index_forward_methods", indexedForward);
+        application.put("entry_index_reverse_methods", indexedReverse);
+        application.put("entry_index_intersection_methods", indexedIntersection);
+        application.put("entry_index_dependency_candidates", indexedDependencies);
+        application.put("application_sites", applicationSites);
+        application.put("candidate_joins", candidateJoins);
+        application.put("validated_joins", validatedJoins);
+        application.put("joined_dependency_segments", joinedDependencySegments);
+        application.put("complete_anchored_chains", completeAnchoredChains);
+        application.put("anchored_candidates", anchoredCandidates);
+        application.put("admission_input", admissionInput);
+        application.put("admission_candidates", admissionCandidates);
+        application.put("admission_rejected", admissionRejected);
+        application.put("unresolved_bridges", unresolvedBridges);
+        application.put("dag_nodes", evidenceDagNodes);
+        application.put("dag_edges", evidenceDagEdges);
+        Map<String, Long> analysis = new java.util.LinkedHashMap<>();
+        analysis.put("raw_chain_candidates", (long) observedChains.size());
+        analysis.put("structurally_complete_chains", structurallyComplete);
+        analysis.put("unresolved_chain_candidates", unresolved);
+        analysis.put("solver_admission_input", solverAdmission.input());
+        analysis.put("solver_application_chains", solverAdmission.applicationChains());
+        analysis.put("solver_bridge_continuations", solverAdmission.bridgeContinuations());
+        analysis.put("solver_dependency_suffixes", solverAdmission.dependencySuffixes());
+        analysis.put("solver_kernel_only", solverAdmission.kernelOnly());
+        analysis.put("solver_rejected", solverAdmission.rejected());
+        analysis.put("materialized_states", -1L);
+        analysis.put("avoided_states", -1L);
+        analysis.put("dag_nodes", -1L);
+        analysis.put("dag_edges", -1L);
+        analysis.put("representative_paths", -1L);
+        analysis.put("forward_origin_cache_bytes_estimate",
+                blackboard.originSupport().forwardOriginCacheBytesEstimate());
+        if (verificationPlan != null) {
+            analysis.put("verification_plan_input", (long) verificationPlan.inputCount());
+            analysis.put("verification_plan_unique", (long) verificationPlan.uniqueCount());
+            analysis.put("verification_plan_selected", (long) verificationPlan.selectedCount());
+        } else {
+            analysis.put("verification_plan_input", -1L);
+            analysis.put("verification_plan_unique", -1L);
+            analysis.put("verification_plan_selected", -1L);
+        }
+        analysis.put("verification_eligible_finding_groups", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.eligibleFindingGroups());
+        analysis.put("verification_covered_finding_groups", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.coveredFindingGroups());
+        analysis.put("verification_confirmed_groups", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.confirmedGroups());
+        analysis.put("verification_no_observation_groups", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.noObservationGroups());
+        analysis.put("verification_unique_plans", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.uniquePlans());
+        analysis.put("verification_attempted_plans", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.attemptedPlans());
+        analysis.put("verification_dynamic_coverage_permille", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.coveragePermille());
+        analysis.put("verification_plan_reuse_permille", verificationCoverage == null ? -1L
+                : (long) verificationCoverage.planReusePermille());
+        if (forward != null) {
+            analysis.putAll(forward.asMetrics());
+        } else {
+            for (String name : ForwardRunMetrics.metricNames()) {
+                analysis.put(name, -1L);
+            }
+        }
+        Map<String, Long> kernel = new java.util.LinkedHashMap<>();
+        kernel.put("kernel_only_results", -1L);
+
+        Map<String, Map<String, Long>> namespaces = new java.util.LinkedHashMap<>();
+        namespaces.put("analysis", analysis);
+        namespaces.put("application", application);
+        namespaces.put("kernel", kernel);
+        Map<String, String> namespaceStatus = new java.util.LinkedHashMap<>();
+        namespaceStatus.put("analysis", "OBSERVED");
+        namespaceStatus.put("application", applicationEvidence == null ? "UNKNOWN" : "OBSERVED");
+        namespaceStatus.put("kernel", "NOT_REQUESTED");
+        return new ScanMetricCapture(metrics, status, namespaces, namespaceStatus);
+    }
+
+    private static ApplicationChainEvidence latestApplicationChainEvidence(Blackboard blackboard) {
+        if (blackboard == null) {
+            return null;
+        }
+        List<ApplicationChainEvidence> facts = blackboard.facts(ApplicationChainEvidence.class);
+        return facts.isEmpty() ? null : facts.get(facts.size() - 1);
+    }
+
+    private static ForwardRunMetrics latestForwardMetrics(Blackboard blackboard) {
+        if (blackboard == null) {
+            return null;
+        }
+        List<ForwardRunMetrics> facts = blackboard.facts(ForwardRunMetrics.class);
+        return facts.isEmpty() ? null : facts.get(facts.size() - 1);
+    }
+
+    private static VerificationPlan latestVerificationPlan(Blackboard blackboard) {
+        if (blackboard == null) {
+            return null;
+        }
+        List<VerificationPlan> facts = blackboard.facts(VerificationPlan.class);
+        return facts.isEmpty() ? null : facts.get(facts.size() - 1);
+    }
+
+    private static VerificationCoverage latestVerificationCoverage(Blackboard blackboard) {
+        if (blackboard == null) {
+            return null;
+        }
+        List<VerificationCoverage> facts = blackboard.facts(VerificationCoverage.class);
+        return facts.isEmpty() ? null : facts.get(facts.size() - 1);
+    }
+
+    /** Add pass timing/cache fields without pretending phase-local RSS was sampled. */
+    private static void addPassTelemetry(Map<String, Long> values, Map<String, Long> phaseMs,
+                                         String pass, String phase,
+                                         long cacheHits) {
+        long duration = phaseMs == null ? -1L : phaseMs.getOrDefault(phase, -1L);
+        values.put("pass_" + pass + "_time_ms", duration);
+        values.put("pass_" + pass + "_rss_peak_mb", -1L);
+        values.put("pass_" + pass + "_cache_hits", cacheHits);
+    }
+
+    private static void addPassTelemetryStatus(Map<String, String> statuses,
+                                               Map<String, Long> values,
+                                               Map<String, Long> phaseMs, String pass,
+                                               String phase, boolean cacheObserved) {
+        String time = "pass_" + pass + "_time_ms";
+        String rss = "pass_" + pass + "_rss_peak_mb";
+        String cache = "pass_" + pass + "_cache_hits";
+        statuses.put(time, phaseMs != null && phaseMs.containsKey(phase) ? "OBSERVED" : "UNKNOWN");
+        statuses.put(rss, "UNKNOWN");
+        statuses.put(cache, cacheObserved ? "OBSERVED" : "NOT_APPLICABLE");
+        // Keep the helper defensive if a future phase spec is edited independently.
+        values.putIfAbsent(time, -1L);
+        values.putIfAbsent(rss, -1L);
+        values.putIfAbsent(cache, -1L);
+    }
+
     private static Map<String, Long> scanMetrics(BuiltCpg cpg, Blackboard blackboard,
                                                  List<Chain> chains,
                                                  Map<String, List<String>> chainNotes,
                                                  io.just.sast.blackboard.VerificationSummary verification,
-                                                 long parentCpuStarted) {
+                                                 long parentCpuStarted,
+                                                 ForwardRunMetrics forward,
+                                                 VerificationPlan verificationPlan) {
         Map<String, Long> metrics = new java.util.LinkedHashMap<>();
         metrics.put("graph_nodes", (long) cpg.graph().nodeCount());
         metrics.put("graph_edges", (long) cpg.graph().edgeCount());
@@ -501,13 +1136,23 @@ public final class ScanPipeline {
         metrics.put("blackboard_calibrations", (long) blackboard.calibrationCount());
         metrics.put("forward_origin_cache_size",
                 (long) blackboard.originSupport().forwardOriginCacheSize());
+        metrics.put("forward_origin_cache_bytes_estimate",
+                blackboard.originSupport().forwardOriginCacheBytesEstimate());
         metrics.put("forward_origin_compute_calls",
                 blackboard.originSupport().forwardOriginComputeCalls());
         metrics.put("forward_origin_cache_hits",
                 blackboard.originSupport().forwardOriginCacheHits());
         metrics.put("forward_origin_analysis_runs",
                 blackboard.originSupport().forwardOriginAnalysisRuns());
+        if (forward != null) {
+            metrics.putAll(forward.asMetrics());
+        } else {
+            for (String name : ForwardRunMetrics.metricNames()) {
+                metrics.put(name, -1L);
+            }
+        }
         verification = verification == null ? blackboard.verificationSummary() : verification;
+        VerificationCoverage coverage = latestVerificationCoverage(blackboard);
         metrics.put("verification_constructible", (long) verification.constructible());
         metrics.put("verification_rejected", (long) verification.rejected());
         metrics.put("verification_construction_deferred", (chains == null ? List.<Chain>of() : chains).stream()
@@ -516,6 +1161,28 @@ public final class ScanPipeline {
                 .filter(notes -> notes.contains("verify:construction-deferred"))
                 .count());
         metrics.put("verification_selected", (long) verification.selected());
+        metrics.put("verification_plan_input",
+                verificationPlan == null ? -1L : verificationPlan.inputCount());
+        metrics.put("verification_plan_unique",
+                verificationPlan == null ? -1L : verificationPlan.uniqueCount());
+        metrics.put("verification_plan_selected",
+                verificationPlan == null ? -1L : verificationPlan.selectedCount());
+        metrics.put("verification_eligible_finding_groups",
+                coverage == null ? -1L : (long) coverage.eligibleFindingGroups());
+        metrics.put("verification_covered_finding_groups",
+                coverage == null ? -1L : (long) coverage.coveredFindingGroups());
+        metrics.put("verification_confirmed_groups",
+                coverage == null ? -1L : (long) coverage.confirmedGroups());
+        metrics.put("verification_no_observation_groups",
+                coverage == null ? -1L : (long) coverage.noObservationGroups());
+        metrics.put("verification_unique_plans",
+                coverage == null ? -1L : (long) coverage.uniquePlans());
+        metrics.put("verification_attempted_plans",
+                coverage == null ? -1L : (long) coverage.attemptedPlans());
+        metrics.put("verification_dynamic_coverage_permille",
+                coverage == null ? -1L : (long) coverage.coveragePermille());
+        metrics.put("verification_plan_reuse_permille",
+                coverage == null ? -1L : (long) coverage.planReusePermille());
         metrics.put("verification_results", (long) verification.results().size());
         metrics.put("verification_attempts", verification.results().stream()
                 .mapToLong(io.just.sast.blackboard.VerificationSummary.ChainResult::attempt).sum());
@@ -584,7 +1251,7 @@ public final class ScanPipeline {
     /** 链级注释视图（有注释的链 key → 注释列表快照，报告层消费）。 */
     private static Map<String, List<String>> blackboardNotes(Blackboard blackboard) {
         Map<String, List<String>> notes = new java.util.TreeMap<>();
-        for (Chain chain : blackboard.chains()) {
+        for (Chain chain : blackboard.reportChains()) {
             List<String> list = blackboard.chainNotesOf(chain.key());
             if (!list.isEmpty()) {
                 notes.put(chain.key(), list);
@@ -625,42 +1292,89 @@ public final class ScanPipeline {
     }
 
     private static RuleSet loadRules(Path rulesFile) throws IOException {
+        return loadRules(rulesFile, InputBudget.defaults());
+    }
+
+    private static RuleSet loadRules(Path rulesFile, InputBudget budget) throws IOException {
+        return loadRules(rulesFile, budget, null);
+    }
+
+    /** Load rules under the scan-boundary tracker; compatibility callers keep the local path. */
+    private static RuleSet loadRules(Path rulesFile, InputBudget budget,
+                                     InputBudget.Tracker tracker) throws IOException {
         YamlRuleLoader loader = new YamlRuleLoader();
+        InputBudget requested = budget == null ? InputBudget.defaults() : budget;
+        InputBudget policy = tracker == null ? requested : tracker.budget();
         if (rulesFile != null) {
-            try (InputStream in = Files.newInputStream(rulesFile)) {
-                RuleSet custom = loader.load(in);
-                // Container summaries are part of the scanner's JVM value-flow contract,
-                // not a requirement every project-specific sink file must duplicate. Keep
-                // user sinks/entries/sources authoritative, while supplying missing generic
-                // Map/List/Deque summaries from the bundled rule data. An identical custom
-                // matcher wins by omission; a more specific custom matcher is still selected
-                // by RuleEngine's normal specificity ordering.
-                RuleSet bundled = loadBundledRules(loader);
-                List<Rule.ModelRule> models = new ArrayList<>(custom.models());
-                for (Rule.ModelRule model : bundled.models()) {
-                    if (models.stream().noneMatch(existing -> existing.call().equals(model.call()))) {
-                        models.add(model);
-                    }
-                }
-                return new RuleSet(custom.sinks(), custom.magicEntries(), custom.sources(),
-                        models, custom.fragments());
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    rulesFile, policy, "RULES");
+            IOException failure = null;
+            RuleSet custom = null;
+            try (InputStream in = io.just.sast.util.IoUtil.openNoFollow(rulesFile, "RULES")) {
+                custom = loader.load(in, policy, tracker);
+            } catch (IOException parseFailure) {
+                failure = parseFailure;
             }
+            try {
+                ArchiveLimits.verifyRegularFileUnchanged(snapshot, "RULES");
+            } catch (IOException changed) {
+                if (failure == null) {
+                    failure = changed;
+                } else {
+                    failure.addSuppressed(changed);
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+            // Container summaries are part of the scanner's JVM value-flow contract,
+            // not a requirement every project-specific sink file must duplicate. Keep
+            // user sinks/entries/sources authoritative, while supplying missing generic
+            // Map/List/Deque summaries from the bundled rule data. An identical custom
+            // matcher wins by omission; a more specific custom matcher is still selected
+            // by RuleEngine's normal specificity ordering.
+            RuleSet bundled = loadBundledRules(loader, policy, tracker);
+            List<Rule.ModelRule> models = new ArrayList<>(custom.models());
+            for (Rule.ModelRule model : bundled.models()) {
+                if (models.stream().noneMatch(existing -> existing.call().equals(model.call()))) {
+                    models.add(model);
+                }
+            }
+            return new RuleSet(custom.sinks(), custom.magicEntries(), custom.sources(),
+                    models, custom.fragments(), custom.schemaVersion());
         }
-        return loadBundledRules(loader);
+        return loadBundledRules(loader, policy, tracker);
     }
 
     private static RuleSet loadBundledRules(YamlRuleLoader loader) throws IOException {
+        return loadBundledRules(loader, InputBudget.defaults());
+    }
+
+    private static RuleSet loadBundledRules(YamlRuleLoader loader, InputBudget budget) throws IOException {
+        return loadBundledRules(loader, budget, null);
+    }
+
+    private static RuleSet loadBundledRules(YamlRuleLoader loader, InputBudget budget,
+                                            InputBudget.Tracker tracker) throws IOException {
         try (InputStream in = ScanPipeline.class.getResourceAsStream("/rules/default-rules.yaml")) {
             if (in == null) {
                 throw new IOException("内置规则文件不存在: /rules/default-rules.yaml");
             }
-            return loader.load(in);
+            return loader.load(in, budget == null ? InputBudget.defaults() : budget, tracker);
         }
     }
 
     /** Stable SHA-256 identity used by reports and the dynamic child attestation protocol. */
     private static String artifactHash(Path input) throws IOException {
-        return ArtifactFingerprint.sha256(input);
+        return artifactHash(input, InputBudget.defaults());
+    }
+
+    private static String artifactHash(Path input, InputBudget budget) throws IOException {
+        return ArtifactFingerprint.sha256(input, budget);
+    }
+
+    private static String artifactHash(Path input, InputBudget.Tracker tracker) throws IOException {
+        return ArtifactFingerprint.sha256(input, tracker);
     }
 
     /** 从规则数据提取字面量类型种子；正则 owner 仍由现有调用图/规则逻辑处理。 */

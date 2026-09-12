@@ -1,6 +1,7 @@
 package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ClassInfo;
+import io.just.sast.run.InputBudget;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
@@ -47,6 +48,53 @@ class JrtExternalMountTest {
                 Map.of(), Set.of(template), List.of());
         assertTrue(selection.classes().stream().anyMatch(bytes -> template.equals(bytes.className())),
                 "声明式 sink owner 必须作为有界 JDK 类型种子保留");
+    }
+
+    @Test
+    void explicitBudgetBoundsJrtClassMaterialization() {
+        InputBudget budget = InputBudget.defaults().withArchiveLimits(
+                1024 * 1024, 1024 * 1024, 1024 * 1024, 64 * 1024, 128, 1, 1);
+        try (JrtClassSource jrt = JrtClassSource.runtime(budget)) {
+            assertNotNull(jrt.load("java/lang/Object"));
+            assertEquals(null, jrt.load("java/lang/String"));
+            assertTrue(jrt.completenessReasons().stream()
+                    .anyMatch(reason -> reason.startsWith("JDK_CLASS_ENTRIES_CAP")));
+        }
+    }
+
+    @Test
+    void explicitBudgetBoundsJrtIndexStructure() {
+        InputBudget budget = InputBudget.defaults().withArchiveLimits(
+                1024 * 1024, 1024 * 1024, 1024 * 1024, 64 * 1024, 128, 1, 1);
+        try (JrtClassSource jrt = JrtClassSource.runtime(budget)) {
+            assertEquals(null, jrt.moduleOf("not/indexed/OptionalType"));
+            assertTrue(jrt.completenessReasons().stream()
+                    .anyMatch(reason -> reason.startsWith("JDK_CLASS_INDEX_CAP")),
+                    "JRT fallback index must stop at the shared class-entry cap: "
+                            + jrt.completenessReasons());
+        }
+    }
+
+    @Test
+    void explicitBudgetBoundsJrtIndexFilesystemEntries() {
+        InputBudget defaults = InputBudget.defaults();
+        InputBudget budget = new InputBudget(defaults.schemaVersion(),
+                defaults.maxPhysicalBytes(), defaults.maxCompressedBytes(),
+                defaults.maxUncompressedBytes(), defaults.maxEntryBytes(),
+                defaults.maxCompressionRatio(), 2, defaults.maxArchiveNesting(),
+                defaults.maxClassEntries(), defaults.maxRuleInputBytes(),
+                defaults.maxRuleCodePoints(), defaults.maxRuleAliases(),
+                defaults.maxRuleNestingDepth(), defaults.maxRuleDocuments(),
+                defaults.maxRuleCount(), defaults.maxRuleCollectionItems(),
+                defaults.maxRuleNodes(), defaults.maxRuleScalarChars(),
+                defaults.maxPathChars(), defaults.maxParseMillis());
+        try (JrtClassSource jrt = JrtClassSource.runtime(budget)) {
+            assertEquals(null, jrt.moduleOf("not/indexed/OptionalType"));
+            assertTrue(jrt.completenessReasons().stream()
+                    .anyMatch(reason -> reason.startsWith("JDK_CLASS_INDEX_INPUT_BUDGET")),
+                    "JRT index walk must charge filesystem entries through the shared budget: "
+                            + jrt.completenessReasons());
+        }
     }
 
     @Test

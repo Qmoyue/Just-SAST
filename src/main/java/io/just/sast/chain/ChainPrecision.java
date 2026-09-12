@@ -2,6 +2,7 @@ package io.just.sast.chain;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
+import io.just.sast.blackboard.VerificationOutcome;
 import io.just.sast.blackboard.VerificationSummary;
 
 import java.util.ArrayList;
@@ -275,8 +276,10 @@ public final class ChainPrecision {
      */
     public static boolean isHighConfidence(Chain chain, List<String> notes,
                                            VerificationSummary.ChainResult verification) {
+        VerificationOutcome.Status status = verification == null
+                ? VerificationOutcome.Status.UNKNOWN : verification.outcomeStatus();
         if (chain == null || verification == null
-                || !"SINK_EXECUTED_SAFE".equals(verification.status())
+                || status != VerificationOutcome.Status.SINK_EXECUTED_SAFE
                 || verification.sinkDistorted() || !verification.terminalExecuted()
                 || !"TERMINAL_EXECUTED_SAFE".equals(verification.verificationScope())
                 || !verification.sandboxReady()
@@ -376,20 +379,20 @@ public final class ChainPrecision {
     }
 
     private static String runtime(List<String> notes, VerificationSummary.ChainResult result) {
-        if (result != null && result.status() != null && !result.status().isBlank()) {
-            return switch (result.status()) {
-                case "SINK_BLOCKED" -> "SINK_BOUNDARY";
-                case "PRE_SINK_CONFIRMED" -> "PREFIX_CONFIRMED_HIGH_RISK";
-                case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE";
-                case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE";
-                case "SAFE_EFFECT_OBSERVED", "SAFE_SINK_EXECUTED" -> "SAFE_EFFECT_DISTORTED";
-                case "CONCRETE_REACHED" -> "CONCRETE_PREFIX";
-                case "EXECUTED" -> "ENTRY_RETURN";
-                case "PARTIAL" -> "PARTIAL";
-                case "TIMEOUT" -> "TIMEOUT";
-                case "FAILED" -> "FAILED";
-                case "UNTESTABLE" -> "UNTESTABLE";
-                default -> "NOT_SELECTED";
+        if (result != null && result.outcomeStatus() != VerificationOutcome.Status.UNKNOWN) {
+            return switch (result.outcomeStatus()) {
+                case SINK_BLOCKED -> "SINK_BOUNDARY";
+                case PRE_SINK_CONFIRMED -> "PREFIX_CONFIRMED_HIGH_RISK";
+                case SINK_EXECUTED_SAFE -> "REAL_SINK_SAFE";
+                case JNI_EXECUTED_SAFE -> "JNI_SAFE_FIXTURE";
+                case SAFE_EFFECT_OBSERVED -> "SAFE_EFFECT_DISTORTED";
+                case CONCRETE_REACHED -> "CONCRETE_PREFIX";
+                case EXECUTED -> "ENTRY_RETURN";
+                case PARTIAL -> "PARTIAL";
+                case TIMEOUT -> "TIMEOUT";
+                case FAILED -> "FAILED";
+                case UNTESTABLE -> "UNTESTABLE";
+                case UNKNOWN -> "NOT_SELECTED";
             };
         }
         return switch (ConfidenceScorer.statusFromNotes(notes)) {

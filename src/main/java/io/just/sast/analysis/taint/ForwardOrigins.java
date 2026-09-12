@@ -127,6 +127,20 @@ public final class ForwardOrigins {
             return view;
         }
 
+        /** Structural retained-size estimate without materializing compatibility list views. */
+        long structuralBytes() {
+            long size = 16L + 8L * (stack.length + locals.length);
+            for (Slot slot : stack) {
+                if (slot != null) {
+                    size = safeAdd(size, 16L + estimateOriginSetBytes(slot.origins()));
+                }
+            }
+            for (Set<ValueOrigin> origins : locals) {
+                size = safeAdd(size, estimateOriginSetBytes(origins));
+            }
+            return size;
+        }
+
         private Slot[] stackArray() {
             return stack;
         }
@@ -626,6 +640,19 @@ public final class ForwardOrigins {
         return cache.size();
     }
 
+    /**
+     * Estimate retained structural bytes for the shared forward-summary cache.  The JVM does
+     * not expose a portable retained-size API; this bounded estimate is intentionally labeled
+     * as such by report consumers and is never substituted for RSS.
+     */
+    long cacheBytesEstimate() {
+        long total = 0L;
+        for (Result result : cache.values()) {
+            total = safeAdd(total, estimateResultBytes(result));
+        }
+        return total;
+    }
+
     long computeCalls() {
         long total = 0L;
         for (LocalCache cache : metricCaches) {
@@ -654,6 +681,61 @@ public final class ForwardOrigins {
         cacheOrder.clear();
         inFlight.clear();
         cacheGeneration.incrementAndGet();
+    }
+
+    private static long estimateResultBytes(Result result) {
+        if (result == null) {
+            return 0L;
+        }
+        long total = 64L;
+        for (State state : result.stateBefore().values()) {
+            if (state != null) {
+                total = safeAdd(total, state.structuralBytes());
+            }
+        }
+        for (Map.Entry<ValueOrigin, Set<ValueOrigin>> entry
+                : result.arrayElements().entrySet()) {
+            total = safeAdd(total, 32L + estimateOriginBytes(entry.getKey())
+                    + estimateOriginSetBytes(entry.getValue()));
+        }
+        for (Map.Entry<ValueOrigin, Map<Integer, Set<ValueOrigin>>> entry
+                : result.indexedArrayElements().entrySet()) {
+            total = safeAdd(total, 40L + estimateOriginBytes(entry.getKey()));
+            for (Map.Entry<Integer, Set<ValueOrigin>> indexed : entry.getValue().entrySet()) {
+                total = safeAdd(total, 24L + estimateOriginSetBytes(indexed.getValue()));
+            }
+        }
+        for (Map.Entry<ValueOrigin, Set<ValueOrigin>> entry
+                : result.containerElements().entrySet()) {
+            total = safeAdd(total, 32L + estimateOriginBytes(entry.getKey())
+                    + estimateOriginSetBytes(entry.getValue()));
+        }
+        return total;
+    }
+
+    private static long estimateOriginSetBytes(Set<ValueOrigin> values) {
+        if (values == null) {
+            return 24L;
+        }
+        return safeAdd(24L, safeMultiply(values.size(), 32L));
+    }
+
+    private static long estimateOriginBytes(ValueOrigin value) {
+        return value == null ? 0L : 32L;
+    }
+
+    private static long safeMultiply(long left, long right) {
+        if (left <= 0L || right <= 0L) {
+            return 0L;
+        }
+        return left > Long.MAX_VALUE / right ? Long.MAX_VALUE : left * right;
+    }
+
+    private static long safeAdd(long left, long right) {
+        if (right > 0L && left > Long.MAX_VALUE - right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
     }
 
     private static Result interruptedResult() {
@@ -895,14 +977,15 @@ public final class ForwardOrigins {
                     incompleteReasons);
             case GETFIELD -> {
                 ValueOrigin receiver = canonicalReceiver(pop(stack, incompleteReasons).origins());
-                push(stack, new Slot(Set.of(new ValueOrigin.FieldRead(
-                        insn.fieldRef().owner(), insn.fieldRef().name(), insn.fieldRef().descriptor(),
-                        false, receiver)),
-                        isCat2(insn.fieldRef().descriptor())));
+                FieldAlias alias = FieldAliasTransfer.declaration(insn).orElseThrow();
+                push(stack, new Slot(Set.of(FieldAliasTransfer.read(alias, receiver)),
+                        isCat2(alias.descriptor())));
             }
-            case GETSTATIC -> push(stack, new Slot(Set.of(new ValueOrigin.FieldRead(
-                    insn.fieldRef().owner(), insn.fieldRef().name(), insn.fieldRef().descriptor(), true,
-                    new ValueOrigin.Unknown())), isCat2(insn.fieldRef().descriptor())));
+            case GETSTATIC -> {
+                FieldAlias alias = FieldAliasTransfer.declaration(insn).orElseThrow();
+                push(stack, new Slot(Set.of(FieldAliasTransfer.read(alias, new ValueOrigin.Unknown())),
+                        isCat2(alias.descriptor())));
+            }
             case PUTSTATIC -> pop(stack, incompleteReasons);
             case PUTFIELD -> {
                 pop(stack, incompleteReasons);
@@ -1085,7 +1168,7 @@ public final class ForwardOrigins {
         if (values == null || values.isEmpty() || values.size() <= MAX_ORIGIN_SET) {
             return values == null ? Set.of() : values;
         }
-        return truncatedUnion(values, Set.of());
+        return OriginLattice.truncateTrusted(values, Set.of(), MAX_ORIGIN_SET);
     }
 
     private static boolean isContainerRelation(MethodRef ref) {
@@ -1393,68 +1476,9 @@ public final class ForwardOrigins {
     }
 
     private static OriginUnion boundedUnion(Set<ValueOrigin> a, Set<ValueOrigin> b) {
-        if (Thread.currentThread().isInterrupted()) {
-            return new OriginUnion(truncatedUnion(a, b), true);
-        }
-        if (a == null || a.isEmpty()) {
-            return boundedSingle(b);
-        }
-        if (b == null || b.isEmpty()) {
-            return boundedSingle(a);
-        }
-        if (a == b && a.size() <= MAX_ORIGIN_SET) {
-            return new OriginUnion(a, false);
-        }
-        long combined = (long) a.size() + b.size();
-        if (combined <= MAX_ORIGIN_SET) {
-            // Reuse the already immutable superset whenever possible.  The previous code
-            // always asked the smaller/older set whether it contained the newer set; that
-            // check is guaranteed to fail when b is larger and then allocates a merged set
-            // even when b already contains a.  Besides the allocation, the failed probe was
-            // visible as a large containsAll/hashCode hotspot in branch-heavy dependencies.
-            // Keeping the larger set preserves the same may-origin union and deterministic
-            // iteration order; only the allocation strategy changes.
-            if (a.size() >= b.size() && a.containsAll(b)) {
-                return new OriginUnion(a, false);
-            }
-            if (b.size() > a.size() && b.containsAll(a)) {
-                return new OriginUnion(b, false);
-            }
-            LinkedHashSet<ValueOrigin> merged = new LinkedHashSet<>(a);
-            merged.addAll(b);
-            return new OriginUnion(Collections.unmodifiableSet(merged), false);
-        }
-        return new OriginUnion(truncatedUnion(a, b), true);
-    }
-
-    private static OriginUnion boundedSingle(Set<ValueOrigin> values) {
-        if (values == null || values.isEmpty() || values.size() <= MAX_ORIGIN_SET) {
-            return new OriginUnion(values == null ? Set.of() : values, false);
-        }
-        return new OriginUnion(truncatedUnion(values, Set.of()), true);
-    }
-
-    private static Set<ValueOrigin> truncatedUnion(Set<ValueOrigin> first,
-                                                   Set<ValueOrigin> second) {
-        LinkedHashSet<ValueOrigin> retained = new LinkedHashSet<>(MAX_ORIGIN_SET);
-        appendBounded(retained, first);
-        appendBounded(retained, second);
-        return Collections.unmodifiableSet(retained);
-    }
-
-    private static void appendBounded(LinkedHashSet<ValueOrigin> retained,
-                                      Set<ValueOrigin> values) {
-        if (values == null || retained.size() >= MAX_ORIGIN_SET) {
-            return;
-        }
-        for (ValueOrigin value : values) {
-            if (value != null) {
-                retained.add(value);
-            }
-            if (retained.size() >= MAX_ORIGIN_SET) {
-                return;
-            }
-        }
+        OriginLattice.Join joined = OriginLattice.joinTrusted(a, b, MAX_ORIGIN_SET,
+                Thread.currentThread().isInterrupted());
+        return new OriginUnion(joined.values(), joined.truncated());
     }
 
     private static Set<ValueOrigin> union(Set<ValueOrigin> a, Set<ValueOrigin> b) {

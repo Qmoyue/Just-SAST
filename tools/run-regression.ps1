@@ -224,7 +224,7 @@ foreach ($case in $cases) {
     if (-not (Get-BooleanProperty $case "verify" $true)) {
         $null = $arguments.Add("--no-verify")
     }
-    $budget = Get-IntegerProperty $case "verify_budget" 20
+    $budget = Get-IntegerProperty $case "verify_budget" 32
     if ($budget -lt 0) {
         throw "$id verify_budget 不能为负数"
     }

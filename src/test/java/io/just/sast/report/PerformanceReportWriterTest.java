@@ -23,6 +23,8 @@ class PerformanceReportWriterTest {
         assertTrue(json.contains("\"mode\":\"hot\""));
         assertTrue(json.contains("\"p50_limit_ms\":null"));
         assertTrue(json.contains("\"sample_count\":2"));
+        assertTrue(json.contains("\"run_outcome\":{\"schema_version\":1")
+                && json.contains("\"status\":\"SUCCESS\""));
         assertTrue(json.contains("\"completeness\":\"COMPLETE\""));
         assertTrue(json.contains("\"result_digest_stable\":true"));
         assertTrue(json.contains("\"phase_ms\":{}"));

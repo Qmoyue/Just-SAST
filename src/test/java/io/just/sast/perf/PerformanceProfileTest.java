@@ -1,13 +1,16 @@
 package io.just.sast.perf;
 
+import io.just.sast.run.InputBudget;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PerformanceProfileTest {
 
@@ -53,5 +56,57 @@ class PerformanceProfileTest {
         } catch (UnsupportedOperationException | java.nio.file.FileSystemException ignored) {
             // Link creation is an environment capability; the regular-file cases still run.
         }
+    }
+
+    @Test
+    void explicitInputBudgetBoundsProfileBytes(@TempDir Path temp) throws Exception {
+        Path profile = temp.resolve("bounded.properties");
+        Files.writeString(profile, "wall_p50_ms=1\n");
+        InputBudget budget = InputBudget.defaults().withArchiveLimits(
+                1024, 1024, 1024, 4, 32, 1, 32);
+        assertThrows(Exception.class, () -> PerformanceProfile.read(profile, budget));
+        assertEquals(1L, PerformanceProfile.read(profile,
+                InputBudget.defaults()).wallP50Ms());
+    }
+
+    @Test
+    void replacedProfileIdentityFailsClosed(@TempDir Path temp) throws Exception {
+        Path profile = temp.resolve("replace.properties");
+        Files.writeString(profile, "wall_p50_ms=1\n");
+        var snapshot = PerformanceProfile.snapshotForContract(profile);
+        var before = Files.readAttributes(profile,
+                java.nio.file.attribute.BasicFileAttributes.class,
+                java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                before.fileKey() != null,
+                "provider does not expose a stable file identity; creation time alone is not enough");
+        Files.delete(profile);
+        Files.writeString(profile, "wall_p50_ms=1\n");
+        IOException failure = assertThrows(IOException.class,
+                () -> PerformanceProfile.verifySnapshotForContract(snapshot));
+        assertTrue(failure.getMessage().contains("PERFORMANCE_PROFILE_CHANGED_DURING_READ"),
+                failure.getMessage());
+    }
+
+    @Test
+    void replacedProfileParentIdentityFailsClosed(@TempDir Path temp) throws Exception {
+        Path parent = Files.createDirectories(temp.resolve("parent"));
+        Path profile = parent.resolve("profile.properties");
+        Files.writeString(profile, "wall_p50_ms=1\n");
+        var snapshot = PerformanceProfile.snapshotForContract(profile);
+        var before = Files.readAttributes(parent,
+                java.nio.file.attribute.BasicFileAttributes.class,
+                java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                before.fileKey() != null,
+                "provider does not expose a stable directory identity; creation time alone is not enough");
+        Files.delete(profile);
+        Files.delete(parent);
+        Files.createDirectory(parent);
+        Files.writeString(profile, "wall_p50_ms=1\n");
+        IOException failure = assertThrows(IOException.class,
+                () -> PerformanceProfile.verifySnapshotForContract(snapshot));
+        assertTrue(failure.getMessage().contains("PERFORMANCE_PROFILE_CHANGED_DURING_READ"),
+                failure.getMessage());
     }
 }

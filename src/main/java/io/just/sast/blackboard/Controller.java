@@ -3,8 +3,9 @@ package io.just.sast.blackboard;
 import io.just.sast.util.JustLogger;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -34,33 +35,51 @@ public final class Controller {
 
     private final Blackboard blackboard;
     private final List<KnowledgeSource> sources;
+    private volatile PhaseGraph phaseGraph;
+    private final Set<String> failedSourceIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public Controller(Blackboard blackboard, List<KnowledgeSource> sources) {
         this.blackboard = blackboard;
-        this.sources = sources == null ? List.of() : List.copyOf(sources);
+        // Keep null entries visible to the startup validator instead of failing in List.copyOf.
+        this.sources = sources == null
+                ? List.of()
+                : Collections.unmodifiableList(new ArrayList<>(sources));
     }
 
     public void run() {
+        failedSourceIds.clear();
+        PhaseGraph graph = PhaseGraph.from(sources);
+        phaseGraph = graph;
+        PhaseGraph.Validation validation = graph.validate();
+        if (!validation.valid()) {
+            for (String error : validation.errors()) {
+                blackboard.markIncomplete("PHASE_GRAPH_INVALID:" + error);
+            }
+            return;
+        }
+
         ExecutorService phaseExecutor = Executors.newSingleThreadExecutor(
                 new NamedThreadFactory("just-phase-"));
         boolean completed = false;
         try {
-            // priority 升序（稳定）：同阶段执行序显式化。
-            List<KnowledgeSource> ordered = new ArrayList<>(sources);
-            ordered.sort(Comparator.comparingInt(KnowledgeSource::priority)
-                    .thenComparing(source -> source.id() == null ? "" : source.id()));
+            // PhaseGraph captured phase/priority/id once; ServiceLoader registration order is
+            // not consulted again when building subscriptions or initializing sources.
+            List<KnowledgeSource> ordered = new ArrayList<>();
+            for (String sourceId : graph.sourceIds()) {
+                KnowledgeSource source = graph.source(sourceId);
+                if (source != null) {
+                    ordered.add(source);
+                }
+            }
             Map<Phase, Map<EventType, List<KnowledgeSource>>> subsByPhase =
                     new EnumMap<>(Phase.class);
-            Set<KnowledgeSource> initialized = java.util.Collections.newSetFromMap(
-                    new java.util.IdentityHashMap<>());
+            Set<KnowledgeSource> initialized = Collections.newSetFromMap(new IdentityHashMap<>());
             for (KnowledgeSource source : ordered) {
+                PhaseGraph.Node node = graph.node(sourceIdOf(graph, source));
                 try {
                     source.init(blackboard);
-                    Phase phase = source.phase();
-                    Set<EventType> interests = source.interests();
-                    if (phase == null || interests == null) {
-                        throw new IllegalArgumentException("phase/interests must not be null");
-                    }
+                    Phase phase = node.phase();
+                    Set<EventType> interests = node.interests();
                     initialized.add(source);
                     Map<EventType, List<KnowledgeSource>> subscriptions =
                             subsByPhase.computeIfAbsent(phase,
@@ -78,11 +97,18 @@ public final class Controller {
 
             int dispatched = 0;
             long analysisStarted = System.nanoTime();
+            if (!requirementsAvailable(graph, Phase.ANALYSIS)) {
+                return;
+            }
             DispatchResult analysis = dispatchParallel(
-                    subsByPhase.getOrDefault(Phase.ANALYSIS, Map.of()), initialized);
+                    subsByPhase.getOrDefault(Phase.ANALYSIS, Map.of()), initialized, graph);
             blackboard.recordPhaseMs("blackboard.analysis", elapsedMs(analysisStarted));
             dispatched += analysis.dispatched();
             if (!analysis.completed()) {
+                return;
+            }
+            publishPhaseProducts(graph, Phase.ANALYSIS, initialized);
+            if (!requirementsAvailable(graph, Phase.COMPOSITION)) {
                 return;
             }
 
@@ -91,10 +117,15 @@ public final class Controller {
             blackboard.publish(Event.of(EventType.SCAN_ANALYZED, -1, null));
             long compositionStarted = System.nanoTime();
             DispatchResult composition = drain(
-                    subsByPhase.getOrDefault(Phase.COMPOSITION, Map.of()), phaseExecutor);
+                    subsByPhase.getOrDefault(Phase.COMPOSITION, Map.of()), phaseExecutor,
+                    graph, initialized);
             blackboard.recordPhaseMs("blackboard.composition", elapsedMs(compositionStarted));
             dispatched += composition.dispatched();
             if (!composition.completed()) {
+                return;
+            }
+            publishPhaseProducts(graph, Phase.COMPOSITION, initialized);
+            if (!requirementsAvailable(graph, Phase.CALIBRATION)) {
                 return;
             }
 
@@ -102,12 +133,14 @@ public final class Controller {
             blackboard.publish(Event.of(EventType.SCAN_COMPLETE, -1, null));
             long calibrationStarted = System.nanoTime();
             DispatchResult calibration = drain(
-                    subsByPhase.getOrDefault(Phase.CALIBRATION, Map.of()), phaseExecutor);
+                    subsByPhase.getOrDefault(Phase.CALIBRATION, Map.of()), phaseExecutor,
+                    graph, initialized);
             blackboard.recordPhaseMs("blackboard.calibration", elapsedMs(calibrationStarted));
             dispatched += calibration.dispatched();
             if (!calibration.completed()) {
                 return;
             }
+            publishPhaseProducts(graph, Phase.CALIBRATION, initialized);
 
             JustLogger.info("黑板分析完成：分发事件 {} 次，链 {} 条（校准拒绝 {} 条）",
                     dispatched, blackboard.chains().size(), blackboard.calibrationCount());
@@ -120,9 +153,74 @@ public final class Controller {
         }
     }
 
+    /** Immutable phase graph captured for diagnostics and contract tests. */
+    public PhaseGraph phaseGraph() {
+        return phaseGraph;
+    }
+
+    private String sourceIdOf(PhaseGraph graph, KnowledgeSource source) {
+        for (String id : graph.sourceIds()) {
+            if (graph.source(id) == source) return id;
+        }
+        return "<unknown>";
+    }
+
+    /**
+     * Publish only products from successfully initialized sources at a phase barrier.  A
+     * failed producer is not silently treated as an available product; later consumers fail
+     * closed with PRODUCT_UNAVAILABLE while already discovered static facts remain visible.
+     */
+    private void publishPhaseProducts(PhaseGraph graph, Phase phase,
+                                      Set<KnowledgeSource> initialized) {
+        for (PhaseGraph.Node node : graph.nodes()) {
+            if (node.phase() != phase) continue;
+            KnowledgeSource source = graph.source(node.sourceId());
+            boolean successful = source != null && initialized.contains(source)
+                    && !failedSourceIds.contains(node.sourceId());
+            for (RunProduct product : node.providesProducts()) {
+                if (!successful) {
+                    blackboard.markIncomplete("PRODUCT_NOT_PUBLISHED:" + node.sourceId() + ":"
+                            + product.name());
+                    continue;
+                }
+                try {
+                    blackboard.publishProduct(product, node.sourceId(), phase);
+                } catch (RuntimeException failure) {
+                    blackboard.markIncomplete("PRODUCT_PUBLICATION_FAILED:" + node.sourceId()
+                            + ":" + product.name());
+                    JustLogger.error("知识源 {} 产品 {} 发布失败（已隔离）: {}",
+                            node.sourceId(), product, failure.toString());
+                }
+            }
+        }
+    }
+
+    /** Check typed requirements immediately before a phase's event barrier. */
+    private boolean requirementsAvailable(PhaseGraph graph, Phase phase) {
+        boolean available = true;
+        for (PhaseGraph.Node node : graph.nodes()) {
+            if (node.phase() != phase) continue;
+            for (RunProduct product : node.requiresProducts()) {
+                if (!blackboard.hasProduct(product)) {
+                    PhaseGraph.Node current = node;
+                    if (graph.hasEarlierProducer(current, product)) {
+                        // Same-phase producers publish immediately after their event; defer the
+                        // check until that ordered producer has run.
+                        continue;
+                    }
+                    blackboard.markIncomplete("PRODUCT_UNAVAILABLE:" + node.sourceId() + ":"
+                            + product.name());
+                    available = false;
+                }
+            }
+        }
+        return available;
+    }
+
     /** ANALYSIS 并行派发：有界 executor + deadline + 屏障后再进入后续阶段。 */
     private DispatchResult dispatchParallel(Map<EventType, List<KnowledgeSource>> subscriptions,
-                                            Set<KnowledgeSource> initialized) {
+                                            Set<KnowledgeSource> initialized,
+                                            PhaseGraph graph) {
         List<KnowledgeSource> started = new ArrayList<>();
         Set<KnowledgeSource> seen = java.util.Collections.newSetFromMap(
                 new java.util.IdentityHashMap<>());
@@ -145,6 +243,7 @@ public final class Controller {
             futures.add(executor.submit(() -> {
                 try {
                     source.onEvent(blackboard, Event.of(EventType.SCAN_START, -1, null));
+                    publishSourceProducts(graph, source, initialized);
                 } catch (Throwable failure) {
                     sourceFailure(source, "EVENT", failure);
                 }
@@ -186,7 +285,8 @@ public final class Controller {
      * executor 中；超时后不进入下一个阶段，避免后续阶段与失控 worker 并发修改结果。
      */
     private DispatchResult drain(Map<EventType, List<KnowledgeSource>> subscriptions,
-                                 ExecutorService executor) {
+                                 ExecutorService executor, PhaseGraph graph,
+                                 Set<KnowledgeSource> initialized) {
         int dispatched = 0;
         List<Event> deferred = new ArrayList<>();
         long deadline = deadlineNanos();
@@ -212,9 +312,15 @@ public final class Controller {
                 continue;
             }
             for (KnowledgeSource source : interested) {
+                if (!requirementsAvailable(graph, source)) {
+                    // A same-phase producer may have failed or may not subscribe to this event.
+                    // Never dispatch a consumer against an unavailable typed product.
+                    continue;
+                }
                 Future<?> future = executor.submit(() -> source.onEvent(blackboard, event));
                 try {
                     future.get(remainingNanos(deadline), TimeUnit.NANOSECONDS);
+                    publishSourceProducts(graph, source, initialized);
                     dispatched++;
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
@@ -237,6 +343,41 @@ public final class Controller {
         return new DispatchResult(dispatched, true);
     }
 
+    /** Check a source's requirements at its actual dispatch point, not only at a phase barrier. */
+    private boolean requirementsAvailable(PhaseGraph graph, KnowledgeSource source) {
+        if (source == null) return false;
+        String sourceId = sourceIdOf(graph, source);
+        PhaseGraph.Node node = graph.node(sourceId);
+        if (node == null) return false;
+        boolean available = true;
+        for (RunProduct product : node.requiresProducts()) {
+            if (!blackboard.hasProduct(product)) {
+                blackboard.markIncomplete("PRODUCT_UNAVAILABLE:" + sourceId + ":"
+                        + product.name());
+                available = false;
+            }
+        }
+        return available;
+    }
+
+    private void publishSourceProducts(PhaseGraph graph, KnowledgeSource source,
+                                       Set<KnowledgeSource> initialized) {
+        if (source == null || !initialized.contains(source)) return;
+        String id = sourceIdOf(graph, source);
+        PhaseGraph.Node node = graph.node(id);
+        if (node == null || failedSourceIds.contains(id)) return;
+        for (RunProduct product : node.providesProducts()) {
+            try {
+                blackboard.publishProduct(product, id, node.phase());
+            } catch (RuntimeException failure) {
+                blackboard.markIncomplete("PRODUCT_PUBLICATION_FAILED:" + id + ":"
+                        + product.name());
+                JustLogger.error("知识源 {} 产品 {} 发布失败（已隔离）: {}",
+                        id, product, failure.toString());
+            }
+        }
+    }
+
     private long deadlineNanos() {
         return System.nanoTime() + TimeUnit.SECONDS.toNanos(PHASE_TIMEOUT_SECONDS);
     }
@@ -254,15 +395,20 @@ public final class Controller {
     }
 
     private void sourceFailure(KnowledgeSource source, String phase, Throwable failure) {
-        String id;
-        try {
-            id = source == null || source.id() == null ? "<unknown>" : source.id();
-        } catch (Throwable ignored) {
-            id = "<unknown>";
-        }
+        String id = sourceId(source);
+        failedSourceIds.add(id);
         blackboard.markIncomplete("SOURCE_FAILED:" + id + ":" + phase);
         JustLogger.error("知识源 {} {} 失败（已隔离）: {}", id, phase,
                 failure == null ? "unknown" : failure.toString());
+    }
+
+    private String sourceId(KnowledgeSource source) {
+        PhaseGraph graph = phaseGraph;
+        if (graph != null && source != null) {
+            String captured = sourceIdOf(graph, source);
+            if (!"<unknown>".equals(captured)) return captured;
+        }
+        return "<unknown>";
     }
 
     private static void shutdown(ExecutorService executor, String phase) {

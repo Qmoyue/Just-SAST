@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/jdk-discovery-v1.json",
+  "title": "Just Jabba JDK discovery result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "schema",
+    "contract_id",
+    "status",
+    "valid",
+    "resolver_policy",
+    "no_global_use",
+    "path_or_java_home_mutation",
+    "observed_ids",
+    "profiles",
+    "safety"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "schema": { "const": "jdk-discovery-v1" },
+    "contract_id": { "const": "JUST-PROD-D009-V1" },
+    "status": { "enum": ["PASS", "FAIL", "NOT_RUN"] },
+    "valid": { "type": "boolean" },
+    "resolver_policy": { "const": "explicit-jabba-which" },
+    "no_global_use": { "const": true },
+    "path_or_java_home_mutation": { "const": false },
+    "observed_ids": { "type": "array", "items": { "type": "string" } },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "id", "feature", "status"],
+        "properties": {
+          "key": { "type": "string" },
+          "id": { "type": "string" },
+          "feature": { "type": "integer", "minimum": 1 },
+          "status": { "enum": ["MATCH", "NOT_RUN", "FAIL"] },
+          "java_sha256": { "type": ["string", "null"] },
+          "home_digest": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "required": ["target_code_executed", "network_access", "arbitrary_payload", "global_jabba_use"],
+      "properties": {
+        "target_code_executed": { "const": "NO" },
+        "network_access": { "const": "NOT_INVOKED" },
+        "arbitrary_payload": { "const": "NOT_INVOKED" },
+        "global_jabba_use": { "const": "NOT_INVOKED" }
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,5 +1,6 @@
 target/
 just-out/
+.inspect-n1cat/
 .idea/
 *.iml
 .vscode/
@@ -18,6 +19,26 @@ just-fragments.ser
 *.jfr
 *.dump
 *.pid
+
+# Local credentials, signing material and machine-specific configuration.
+# Keep examples/template files reviewable; never commit real values.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.credentials
+*credentials*.json
+*secrets*.json
+*.asc
+
+# OS/editor metadata.
+.DS_Store
+Thumbs.db
 
 # Only the public architecture and requirements contracts belong under docs/.
 docs/*

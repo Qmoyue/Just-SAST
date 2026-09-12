@@ -8,6 +8,7 @@ import io.just.sast.blackboard.EventType;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
+import io.just.sast.blackboard.RunProduct;
 import io.just.sast.chain.ConfidenceScorer;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
@@ -64,6 +65,16 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
     }
 
     @Override
+    public Set<RunProduct> requiresProducts() {
+        return Set.of(RunProduct.COMPOSED_CHAINS, RunProduct.CALIBRATED_CHAINS);
+    }
+
+    @Override
+    public Set<RunProduct> providesProducts() {
+        return Set.of(RunProduct.CALIBRATED_CHAINS);
+    }
+
+    @Override
     public void init(Blackboard blackboard) {
         this.bb = blackboard;
     }
@@ -76,7 +87,11 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         // 1. 触发上下文（入口下游闭包与反向引擎共享）
         Set<String> downstream = bb.originSupport().entryDownstream(bb.graph());
         int noTrigger = 0;
-        for (Chain chain : bb.chains()) {
+        // Producer admission keeps an application-owned lifecycle callback that is not yet
+        // an application entry in a calibration-only store.  Include that audit input here so
+        // it receives the same typed no-trigger decision instead of disappearing before the
+        // report; it remains excluded from composition and dynamic verification.
+        for (Chain chain : bb.reportChains()) {
             if (!TRIGGER_REQUIRED.contains(chain.entryKind())
                     || bb.calibrationOf(chain.key()) != null) {
                 continue;
@@ -144,7 +159,7 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
             }
         }
         JustLogger.info("链剪枝：无触发拒绝 {}，机制内部类 {}，机制去重 {}（共 {} 条）",
-                noTrigger, machinery, dedup, bb.chains().size());
+                noTrigger, machinery, dedup, bb.reportChains().size());
     }
 
     // ---- 触发上下文 ----

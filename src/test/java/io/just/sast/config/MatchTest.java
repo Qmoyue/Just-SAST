@@ -2,6 +2,8 @@ package io.just.sast.config;
 
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -41,5 +43,14 @@ class MatchTest {
         assertTrue(m.matches("invoke"));
         assertTrue(m.matches("invokeExact"));
         assertFalse(m.matches("Invokexact")); // 整体锚定仍生效
+    }
+
+    @Test
+    void catastrophicRegexShapesAreRejectedAndHugeValuesAreBounded() {
+        assertThrows(IllegalArgumentException.class, () -> Match.of("~(a+)+"));
+        assertThrows(IllegalArgumentException.class, () -> Match.of("~(a|aa)+"));
+        Match safe = Match.of("~a+");
+        assertFalse(safe.matches("a".repeat(20_000)),
+                "regex matching must not spend unbounded time on attacker-sized symbols");
     }
 }

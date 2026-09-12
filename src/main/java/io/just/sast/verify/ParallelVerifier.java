@@ -4,6 +4,8 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.chain.ChainRanking;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.VerificationDetailAdapter;
+import io.just.sast.blackboard.VerificationOutcome;
 
 import java.io.File;
 import java.io.IOException;
@@ -25,9 +27,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,12 +35,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
-import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassVisitor;
-import org.objectweb.asm.MethodVisitor;
-import org.objectweb.asm.Opcodes;
+import io.just.sast.frontend.asm.NativeMethodIndex;
+import io.just.sast.run.InputBudget;
+import io.just.sast.util.ArchiveLimits;
 import io.just.sast.util.AdaptiveParallelism;
 import io.just.sast.util.ArtifactFingerprint;
+import io.just.sast.util.IoUtil;
 
 /**
  * 并行链级验证器：沿链 FIELD_FLOW 跳构造完整对象图 → 子进程执行 → sink 特异性判定。
@@ -48,44 +48,47 @@ import io.just.sast.util.ArtifactFingerprint;
  */
 public final class ParallelVerifier {
 
-    /** Closed verifier lifecycle; the serialized string remains for report compatibility. */
+    /**
+     * Legacy wire projection kept for source compatibility.  Verifier decisions use
+     * {@link VerificationOutcome.Status}; this enum must not become a second semantic owner.
+     */
+    @Deprecated
     public enum VerifyStatus {
         SINK_BLOCKED, PRE_SINK_CONFIRMED, SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE, SAFE_EFFECT_OBSERVED,
         CONCRETE_REACHED, EXECUTED, PARTIAL, FAILED, TIMEOUT, UNTESTABLE, UNKNOWN;
 
         static VerifyStatus from(String value) {
-            if (value == null) {
-                return UNKNOWN;
-            }
-            try {
-                return valueOf(value);
-            } catch (IllegalArgumentException ignored) {
-                return UNKNOWN;
-            }
+            return valueOf(VerificationOutcome.Status.fromWire(value).name());
         }
     }
 
-    public record VerifyResult(String chainKey, String status, String detail,
-                               int attempt, long durationMs, String evidence,
-                               String backend, String jdk, String policyDigest,
-                               boolean sinkDistorted, boolean sandboxReady,
-                               String cleanup, String requestedMode, String effectiveMode,
-                               String fallback, String verificationScope, String sinkRisk,
-                               boolean terminalExecuted, String stopReason,
-                               String lastConfirmedStage) {
+    /**
+     * One verification attempt.  The typed {@link VerificationOutcome} is the sole owner of
+     * attempt status/detail/evidence and scope metadata; legacy accessors below are projections
+     * for existing report/probe callers.  Keeping the raw wire status is intentional so unknown
+     * future labels round-trip without becoming policy facts.
+     */
+    public record VerifyResult(String chainKey, String status, VerificationOutcome outcome,
+                               int attempt, long durationMs, String backend, String jdk,
+                               String policyDigest, boolean sinkDistorted,
+                               boolean sandboxReady, String cleanup) {
         public VerifyResult(String chainKey, String status, String detail) {
-            this(chainKey, status, detail, 1, 0L, defaultEvidence(status, detail));
+            this(chainKey, status, VerificationDetailAdapter.fromLegacy(status, detail, null),
+                    1, 0L, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false, "UNKNOWN");
         }
 
         public VerifyResult(String chainKey, String status, String detail,
                             int attempt, long durationMs) {
-            this(chainKey, status, detail, attempt, durationMs, defaultEvidence(status, detail));
+            this(chainKey, status, VerificationDetailAdapter.fromLegacy(status, detail, null),
+                    attempt, durationMs, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false,
+                    "UNKNOWN");
         }
 
         public VerifyResult(String chainKey, String status, String detail,
                             int attempt, long durationMs, String evidence) {
-            this(chainKey, status, detail, attempt, durationMs, evidence,
-                    "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false, "UNKNOWN");
+            this(chainKey, status, VerificationDetailAdapter.fromLegacy(status, detail, evidence),
+                    attempt, durationMs, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false,
+                    "UNKNOWN");
         }
 
         /** Compatibility constructor for the pre-schema runtime metadata shape. */
@@ -94,120 +97,137 @@ public final class ParallelVerifier {
                             String backend, String jdk, String policyDigest,
                             boolean sinkDistorted, boolean sandboxReady,
                             String cleanup) {
-            this(chainKey, status, detail, attempt, durationMs, evidence, backend, jdk,
-                    policyDigest, sinkDistorted, sandboxReady, cleanup,
-                    field(detail, "requested_mode", "UNKNOWN"),
-                    field(detail, "effective_mode", "UNKNOWN"),
-                    field(detail, "fallback", "none"), defaultScope(status), "UNKNOWN",
-                    defaultTerminalExecuted(status), defaultStopReason(status, detail),
-                    defaultLastStage(status));
+            this(chainKey, status, VerificationDetailAdapter.fromLegacy(status, detail, evidence),
+                    attempt, durationMs, backend, jdk, policyDigest, sinkDistorted,
+                    sandboxReady, cleanup);
+        }
+
+        /** Compatibility constructor retaining the complete pre-typed wire shape. */
+        public VerifyResult(String chainKey, String status, String detail,
+                            int attempt, long durationMs, String evidence,
+                            String backend, String jdk, String policyDigest,
+                            boolean sinkDistorted, boolean sandboxReady, String cleanup,
+                            String requestedMode, String effectiveMode, String fallback,
+                            String verificationScope, String sinkRisk, boolean terminalExecuted,
+                            String stopReason, String lastConfirmedStage) {
+            this(chainKey, status, explicitOutcome(status, detail, evidence, requestedMode,
+                    effectiveMode, fallback, verificationScope, sinkRisk, terminalExecuted,
+                    stopReason, lastConfirmedStage), attempt, durationMs, backend, jdk,
+                    policyDigest, sinkDistorted, sandboxReady, cleanup);
+        }
+
+        private VerifyResult(String chainKey, String status, String detail,
+                             int attempt, long durationMs, VerificationOutcome outcome) {
+            this(chainKey, status, outcome == null
+                    ? VerificationDetailAdapter.fromLegacy(status, detail, null) : outcome,
+                    attempt, durationMs, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false,
+                    "UNKNOWN");
+        }
+
+        private VerifyResult(String chainKey, String status, String detail,
+                             int attempt, long durationMs, String evidence,
+                             VerificationOutcome outcome) {
+            this(chainKey, status, outcome == null
+                    ? VerificationDetailAdapter.fromLegacy(status, detail, evidence) : outcome,
+                    attempt, durationMs, "UNKNOWN", "UNKNOWN", "UNKNOWN", false, false,
+                    "UNKNOWN");
+        }
+
+        private VerifyResult(String chainKey, String status, String detail,
+                             int attempt, long durationMs, String evidence,
+                             String backend, String jdk, String policyDigest,
+                             boolean sinkDistorted, boolean sandboxReady, String cleanup,
+                             VerificationOutcome outcome) {
+            this(chainKey, status, outcome == null
+                    ? VerificationDetailAdapter.fromLegacy(status, detail, evidence) : outcome,
+                    attempt, durationMs, backend, jdk, policyDigest, sinkDistorted,
+                    sandboxReady, cleanup);
         }
 
         public VerifyResult {
             chainKey = chainKey == null ? "" : chainKey;
             status = status == null ? "UNKNOWN" : status;
-            detail = detail == null ? "" : detail;
+            outcome = outcome == null
+                    ? VerificationDetailAdapter.fromLegacy(status, "", null) : outcome;
             attempt = Math.max(1, attempt);
             durationMs = Math.max(0L, durationMs);
-            evidence = evidence == null || evidence.isBlank()
-                    ? defaultEvidence(status, detail) : evidence;
             backend = normalize(backend);
             jdk = normalize(jdk);
             policyDigest = normalize(policyDigest);
             cleanup = normalize(cleanup);
-            requestedMode = normalize(requestedMode);
-            effectiveMode = normalize(effectiveMode);
-            fallback = normalize(fallback);
-            verificationScope = normalize(verificationScope);
-            sinkRisk = normalize(sinkRisk);
-            stopReason = normalize(stopReason);
-            lastConfirmedStage = normalize(lastConfirmedStage);
         }
 
         private static String normalize(String value) {
             return value == null || value.isBlank() ? "UNKNOWN" : value;
         }
 
+        /**
+         * Legacy string-to-enum projection retained for source compatibility.  New policy code
+         * must use {@link #outcomeStatus()} so the typed outcome remains the semantic owner.
+         */
+        @Deprecated
         public VerifyStatus statusCode() {
             return VerifyStatus.from(status);
         }
 
-        private static String defaultEvidence(String status, String detail) {
-            return switch (VerifyStatus.from(status)) {
-                case SINK_BLOCKED -> "SINK_CANARY_BOUNDARY";
-                case PRE_SINK_CONFIRMED -> "PREFIX_CHAIN_CONFIRMED";
-                case SINK_EXECUTED_SAFE -> "REAL_SINK_BODY_SAFE_ARGUMENTS";
-                case JNI_EXECUTED_SAFE -> "JNI_LOAD_CALLBACK_SAFE_FIXTURE";
-                case SAFE_EFFECT_OBSERVED -> "SAFE_EFFECT_OBSERVED";
-                case CONCRETE_REACHED -> "CONCRETE_TRIGGER";
-                case EXECUTED -> "ENTRY_RETURNED";
-                case PARTIAL -> "PARTIAL_PATH";
-                case TIMEOUT -> "PROCESS_TIMEOUT";
-                case UNTESTABLE -> detail != null && detail.startsWith("SANDBOX_UNAVAILABLE")
-                        ? "SANDBOX_UNAVAILABLE"
-                        : detail != null && detail.startsWith("PROCESS_OOM")
-                        ? "PROCESS_OOM"
-                        : detail != null && detail.startsWith("PROBE_OUTPUT_LIMIT")
-                        ? "PROBE_OUTPUT_LIMIT"
-                        : detail != null && detail.startsWith("CANARY_ARTIFACT_MISSING")
-                        ? "VERIFIER_ARTIFACT_MISSING" : "VERIFIER_CAPABILITY_LIMIT";
-                case FAILED -> "NO_TRIGGER";
-                default -> "UNKNOWN";
-            };
+        /** Canonical typed status used by verifier policy and scheduling decisions. */
+        public VerificationOutcome.Status outcomeStatus() {
+            return outcome.status();
         }
 
-        private static String field(String detail, String name, String fallback) {
-            if (detail == null) {
-                return fallback;
-            }
-            String marker = name + "=";
-            int start = detail.indexOf(marker);
-            if (start < 0) {
-                return fallback;
-            }
-            start += marker.length();
-            int end = detail.indexOf(';', start);
-            String value = end < 0 ? detail.substring(start) : detail.substring(start, end);
-            return value.isBlank() ? fallback : value;
+        /** Legacy detail projection; semantic consumers should use {@link #outcome()}. */
+        public String detail() {
+            return outcome.detail();
         }
 
-        private static String defaultScope(String status) {
-            return switch (VerifyStatus.from(status)) {
-                case SINK_BLOCKED -> "BOUNDARY_ONLY";
-                case PRE_SINK_CONFIRMED -> "PREFIX_ONLY";
-                case SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE -> "TERMINAL_EXECUTED_SAFE";
-                default -> "NONE";
-            };
+        /** Legacy evidence projection; semantic consumers should use {@link #outcome()}. */
+        public String evidence() {
+            return outcome.evidence();
         }
 
-        private static boolean defaultTerminalExecuted(String status) {
-            VerifyStatus code = VerifyStatus.from(status);
-            return code == VerifyStatus.SINK_EXECUTED_SAFE || code == VerifyStatus.JNI_EXECUTED_SAFE;
+        public String requestedMode() {
+            return outcome.requestedMode();
         }
 
-        private static String defaultStopReason(String status, String detail) {
-            return switch (VerifyStatus.from(status)) {
-                case SINK_BLOCKED -> "SINK_BOUNDARY_CANARY";
-                case PRE_SINK_CONFIRMED -> "HIGH_RISK_SINK";
-                case SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE -> "SAFE_TERMINAL_RETURNED";
-                case SAFE_EFFECT_OBSERVED -> "ADAPTER_EFFECT_ONLY";
-                case TIMEOUT -> "PROCESS_TIMEOUT";
-                case UNTESTABLE -> detail != null && detail.startsWith("SANDBOX_UNAVAILABLE")
-                        ? "SANDBOX_UNAVAILABLE" : "UNTESTABLE";
-                default -> "NONE";
-            };
+        public String effectiveMode() {
+            return outcome.effectiveMode();
         }
 
-        private static String defaultLastStage(String status) {
-            return switch (VerifyStatus.from(status)) {
-                case SINK_BLOCKED -> "SINK_BOUNDARY";
-                case PRE_SINK_CONFIRMED -> "PRE_SINK";
-                case SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE -> "SINK_RETURNED";
-                case SAFE_EFFECT_OBSERVED -> "ADAPTER_EFFECT";
-                case CONCRETE_REACHED -> "CONCRETE_TRIGGER";
-                case EXECUTED -> "ENTRY_RETURNED";
-                default -> "NONE";
-            };
+        public String fallback() {
+            return outcome.fallback();
+        }
+
+        public String verificationScope() {
+            return outcome.scope().name();
+        }
+
+        public String sinkRisk() {
+            return outcome.sinkRisk();
+        }
+
+        public boolean terminalExecuted() {
+            return outcome.terminalExecuted();
+        }
+
+        public String stopReason() {
+            return outcome.stopReason().name();
+        }
+
+        public String lastConfirmedStage() {
+            return outcome.lastConfirmedStage().name();
+        }
+
+        private static VerificationOutcome explicitOutcome(String status, String detail,
+                                                            String evidence, String requestedMode,
+                                                            String effectiveMode, String fallback,
+                                                            String verificationScope,
+                                                            String sinkRisk,
+                                                            boolean terminalExecuted,
+                                                            String stopReason,
+                                                            String lastConfirmedStage) {
+            return VerificationOutcome.fromLegacyFields(status, detail, evidence, requestedMode,
+                    effectiveMode, fallback, verificationScope, sinkRisk, terminalExecuted,
+                    stopReason, lastConfirmedStage);
         }
     }
 
@@ -217,7 +237,6 @@ public final class ParallelVerifier {
 
     private static final int TIMEOUT_SECONDS = 8;
     private static final int MAX_PARALLELISM = 4;
-    private static final int MAX_PER_ENTRY = 2;
     private static final int MAX_OUTPUT_BYTES = 64 * 1024;
     private static final int FUTURE_GRACE_SECONDS = 3;
     private static final String RESULT_CHANNEL_PREFIX = "JUST_VERIFY_RESULT_V1:";
@@ -228,6 +247,10 @@ public final class ParallelVerifier {
     private final String policyBindingDigest;
     /** Kept as an explicit policy bit for CLI/cache identity; Job Object is always the default. */
     private final boolean requireOsIsolation;
+    /** One immutable archive/class budget for optional verifier-side input inspection. */
+    private final InputBudget inputBudget = InputBudget.defaults();
+    /** One verifier-wide tracker for scratch/result/classpath inspection telemetry. */
+    private final InputBudget.Tracker inputTracker = inputBudget.tracker();
 
     private final Path targetJar;
     private final List<Path> deps;
@@ -255,11 +278,19 @@ public final class ParallelVerifier {
     private final Map<String, String> nativeIndexCache = new java.util.LinkedHashMap<>();
     /** One owner for dynamic phase/resource observations; it is not part of the scan state. */
     private final VerificationTelemetry telemetry = new VerificationTelemetry();
+    /** One owner for deterministic candidate de-duplication, quotas and immutable plans. */
+    private final VerificationPlanner planner = new VerificationPlanner();
+    /** Per-attempt scratch observation failure; never shared across parallel chains. */
+    private final ThreadLocal<String> scratchObservationFailure = new ThreadLocal<>();
 
     /** Launcher-owned identities carried by the authenticated probe protocol. */
     static record ProtocolIdentity(String token, String runId, String chainFingerprint,
                                    String sinkFingerprint, String nonce,
                                    String artifactFingerprint) {
+        VerificationProtocol.Identity typed() {
+            return new VerificationProtocol.Identity(token, runId, chainFingerprint,
+                    sinkFingerprint, nonce, artifactFingerprint);
+        }
     }
 
     public ParallelVerifier(Path targetJar, List<Path> deps, ConfirmCallback callback) {
@@ -508,7 +539,7 @@ public final class ParallelVerifier {
      * 不互相挤占（例如反射 sink 不会被两个通用执行器变体完全遮蔽）。
      */
     public List<Chain> selectChains(List<Chain> candidates, int maxTotal) {
-        return selectChains(candidates, maxTotal, Set.of());
+        return planChains(candidates, maxTotal, Set.of()).selectedChains();
     }
 
     /**
@@ -518,78 +549,36 @@ public final class ParallelVerifier {
      */
     public List<Chain> selectChains(List<Chain> candidates, int maxTotal,
                                     Set<String> constructibleKeys) {
-        if (candidates == null || candidates.isEmpty() || maxTotal <= 0) {
-            return List.of();
-        }
-        Set<String> constructible = constructibleKeys == null ? Set.of() : constructibleKeys;
-        // A knowledge source may publish equivalent candidates from concurrent workers.  A
-        // key-indexed snapshot removes duplicate work before the finite budget is applied;
-        // TreeMap also makes the input iteration order irrelevant.
-        Map<String, Chain> unique = new TreeMap<>();
-        for (Chain candidate : candidates) {
-            if (candidate != null) {
-                String key = candidate.key();
-                Chain previous = unique.get(key);
-                if (previous == null || equivalentCandidateOrder(candidate, previous) < 0) {
-                    unique.put(key, candidate);
-                }
-            }
-        }
-        List<Chain> sorted = new ArrayList<>(unique.values());
+        return planChains(candidates, maxTotal, constructibleKeys).selectedChains();
+    }
+
+    /** Build the immutable dynamic selection snapshot before any target classpath is opened. */
+    public VerificationPlan planChains(List<Chain> candidates, int maxTotal,
+                                        Set<String> constructibleKeys) {
+        return planChains(candidates, maxTotal, constructibleKeys, Set.of());
+    }
+
+    /**
+     * Build a plan with an optional typed application-chain priority set.  The set only changes
+     * the bounded primary quota; it never removes unjoined static/kernel candidates.  This is
+     * the migration seam for P3.1: until every consumer publishes a complete join, dynamic
+     * coverage remains recall-preserving while real application chains get the first slots.
+     */
+    public VerificationPlan planChains(List<Chain> candidates, int maxTotal,
+                                        Set<String> constructibleKeys,
+                                        Set<String> applicationJoinedKeys) {
+        Set<String> constructible = constructibleKeys == null ? Set.of()
+                : constructibleKeys.stream().filter(value -> value != null && !value.isBlank())
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Set<String> joined = applicationJoinedKeys == null ? Set.of()
+                : applicationJoinedKeys.stream().filter(value -> value != null && !value.isBlank())
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
         Comparator<Chain> ranking = ChainRanking.comparator(Map.of(), Map.of(), constructible);
-        Map<Chain, Integer> probePriority = new java.util.IdentityHashMap<>();
-        for (Chain chain : sorted) {
-            // probePriority() is intentionally richer than the report tuple, but it is still
-            // invariant during this selection pass.  Precompute it so finite-budget sorting
-            // does not repeatedly rescan every hop for the same candidate.
-            probePriority.put(chain, probePriority(chain, constructible));
-        }
-        sorted.sort(ranking
-                .thenComparingInt(chain -> -probePriority.getOrDefault(chain, 0))
-                .thenComparing(chain -> chain.key() == null ? "" : chain.key()));
-        Map<String, Integer> entryCount = new HashMap<>();
-        List<Chain> selected = new ArrayList<>();
-        Set<String> selectedKeys = new java.util.HashSet<>();
-        int primaryBudget = Math.min(maxTotal, Math.max(1, maxTotal / 4));
-        for (Chain chain : sorted) {
-            if (selected.size() >= primaryBudget || !targetDefines(chain.entryClass())) {
-                continue;
-            }
-            String entryKey = verificationQuotaKey(chain);
-            int count = entryCount.getOrDefault(entryKey, 0);
-            if (count >= MAX_PER_ENTRY) {
-                continue;
-            }
-            entryCount.merge(entryKey, 1, Integer::sum);
-            selected.add(chain);
-            selectedKeys.add(chain.key());
-        }
-        for (Chain chain : sorted) {
-            if (selectedKeys.contains(chain.key())) {
-                continue;
-            }
-            String entryKey = verificationQuotaKey(chain);
-            int count = entryCount.getOrDefault(entryKey, 0);
-            if (count >= MAX_PER_ENTRY) continue;
-            entryCount.merge(entryKey, 1, Integer::sum);
-            selected.add(chain);
-            if (selected.size() >= maxTotal) break;
-        }
-        return selected;
-    }
-
-    private static int equivalentCandidateOrder(Chain left, Chain right) {
-        int unresolved = Integer.compare(left.unresolvedHops(), right.unresolvedHops());
-        if (unresolved != 0) {
-            return unresolved;
-        }
-        return candidateTieKey(left).compareTo(candidateTieKey(right));
-    }
-
-    private static String candidateTieKey(Chain chain) {
-        return String.valueOf(chain.entryClass()) + "|" + String.valueOf(chain.entryMethod())
-                + "|" + String.valueOf(chain.sinkClass()) + "|" + String.valueOf(chain.sinkMethod())
-                + "|" + chain.hops().size();
+        return planner.plan(candidates, maxTotal, constructible,
+                chain -> joined.contains(chain.key()) || targetDefines(chain.entryClass()),
+                chain -> probePriority(chain, constructible),
+                ranking,
+                ParallelVerifier::verificationQuotaKey);
     }
 
     /**
@@ -744,7 +733,7 @@ public final class ParallelVerifier {
             synchronized (this) {
                 classes = targetDefinedClasses;
                 if (classes == null) {
-                    classes = loadTargetDefinedClasses();
+                    classes = loadTargetDefinedClasses(inputBudget, inputTracker);
                     targetDefinedClasses = classes;
                 }
             }
@@ -752,31 +741,59 @@ public final class ParallelVerifier {
         return classes.contains(internalName);
     }
 
-    private Set<String> loadTargetDefinedClasses() {
+    private Set<String> loadTargetDefinedClasses(InputBudget policy,
+                                                InputBudget.Tracker callerTracker) {
         Set<String> result = new java.util.HashSet<>();
+        InputBudget budget = policy == null ? InputBudget.defaults() : policy;
+        InputBudget.Tracker tracker = callerTracker == null ? budget.tracker() : callerTracker;
         try {
+            if (ArchiveLimits.isLinkOrReparsePoint(targetJar)) {
+                return Set.of();
+            }
             if (Files.isDirectory(targetJar)) {
                 try (var stream = Files.walk(targetJar)) {
-                    stream.filter(Files::isRegularFile)
-                            .map(targetJar::relativize)
-                            .map(Path::toString)
-                            .map(value -> value.replace(File.separatorChar, '/'))
-                            .filter(value -> value.endsWith(".class"))
-                            .map(value -> value.substring(0, value.length() - 6))
-                            .forEach(result::add);
+                    var iterator = stream.iterator();
+                    while (iterator.hasNext() && result.size() < budget.maxClassEntries()) {
+                        tracker.checkTime();
+                        Path file = iterator.next();
+                        if (!Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                                || ArchiveLimits.isLinkOrReparsePoint(file)) {
+                            continue;
+                        }
+                        Path relative = targetJar.relativize(file);
+                        String value = relative.toString().replace(File.separatorChar, '/');
+                        if (!value.endsWith(".class")
+                                || !ArchiveLimits.safeEntryName(value, budget)) {
+                            continue;
+                        }
+                        var attrs = Files.readAttributes(file,
+                                java.nio.file.attribute.BasicFileAttributes.class,
+                                java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                        tracker.observeFile(value, attrs.size());
+                        result.add(value.substring(0, value.length() - 6));
+                    }
                 }
                 return Set.copyOf(result);
             }
-            if (!Files.isRegularFile(targetJar)) {
+            if (!Files.isRegularFile(targetJar, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
                 return Set.of();
             }
-            try (java.util.jar.JarFile jar = new java.util.jar.JarFile(targetJar.toFile())) {
+            ArchiveLimits.checkContainerSize(targetJar, budget);
+            try (java.util.zip.ZipFile jar = new java.util.zip.ZipFile(targetJar.toFile())) {
                 var entries = jar.entries();
                 while (entries.hasMoreElements()) {
-                    String name = entries.nextElement().getName();
+                    java.util.zip.ZipEntry entry = entries.nextElement();
+                    tracker.observe(entry);
+                    String name = entry.getName();
+                    if (!ArchiveLimits.safeEntryName(name, budget)) {
+                        continue;
+                    }
                     String className = primaryArtifactClass(name);
                     if (className != null) {
                         result.add(className);
+                    }
+                    if (result.size() >= budget.maxClassEntries()) {
+                        break;
                     }
                 }
             }
@@ -830,7 +847,7 @@ public final class ParallelVerifier {
             String cached = nativeIndexCache.get(cacheKey);
             if (cached != null) return cached;
         }
-        String computed = nativeIndexFor(chain, targetClasspath);
+        String computed = nativeIndexFor(chain, targetClasspath, inputBudget, inputTracker);
         if (!computed.isEmpty()) {
             synchronized (nativeIndexCache) {
                 if (nativeIndexCache.size() >= 32) {
@@ -843,10 +860,14 @@ public final class ParallelVerifier {
         return computed;
     }
 
-    private static String nativeIndexFor(Chain chain, String targetClasspath) {
+    private static String nativeIndexFor(Chain chain, String targetClasspath,
+                                         InputBudget policy,
+                                         InputBudget.Tracker callerTracker) {
         if (chain == null || targetClasspath == null || targetClasspath.isBlank()) {
             return "";
         }
+        InputBudget budget = policy == null ? InputBudget.defaults() : policy;
+        InputBudget.Tracker tracker = callerTracker == null ? budget.tracker() : callerTracker;
         java.util.TreeSet<String> owners = new java.util.TreeSet<>();
         addNativeOwner(owners, chain.entryClass());
         addNativeOwner(owners, chain.sinkClass());
@@ -868,15 +889,27 @@ public final class ParallelVerifier {
             } catch (RuntimeException invalidPath) {
                 continue;
             }
+            if (ArchiveLimits.isLinkOrReparsePoint(root)) {
+                continue;
+            }
             if (Files.isDirectory(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
                 for (String owner : owners) {
                     if (methods.size() >= 256) break;
                     Path classFile = root.resolve(owner + ".class").normalize();
                     if (!classFile.startsWith(root)
                             || !Files.isRegularFile(classFile,
-                            java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue;
-                    try (InputStream input = Files.newInputStream(classFile)) {
-                        collectNativeMethods(owner, input, methods);
+                            java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                            || ArchiveLimits.isLinkOrReparsePoint(classFile)) continue;
+                    String relative = root.relativize(classFile).toString()
+                            .replace(File.separatorChar, '/');
+                    try {
+                        ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                                classFile, budget, "VERIFIER_NATIVE_INDEX");
+                        try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(classFile,
+                                "VERIFIER_NATIVE_INDEX")) {
+                            tracker.observeFile(relative, snapshot.fileAttributes().size());
+                            collectNativeMethods(owner, opened.stream(), methods, budget, tracker);
+                        }
                     } catch (IOException | RuntimeException ignored) {
                         // A missing optional class must remain a bounded coverage limitation.
                     }
@@ -884,16 +917,39 @@ public final class ParallelVerifier {
                 continue;
             }
             if (!Files.isRegularFile(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue;
-            try (java.util.jar.JarFile jar = new java.util.jar.JarFile(root.toFile())) {
+            try {
+                ArchiveLimits.checkContainerSize(root, budget);
+            } catch (IOException bounded) {
+                continue;
+            }
+            try {
+                ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                        root, budget, "VERIFIER_NATIVE_INDEX");
+                try (ArchiveLimits.ZipFileHandle handle = ArchiveLimits.openZipFile(snapshot,
+                        "VERIFIER_NATIVE_INDEX")) {
+                java.util.zip.ZipFile jar = handle.zip();
+                Map<String, java.util.zip.ZipEntry> classEntries = new HashMap<>();
+                var enumeration = jar.entries();
+                while (enumeration.hasMoreElements()) {
+                    java.util.zip.ZipEntry entry = enumeration.nextElement();
+                    tracker.observe(entry);
+                    String name = entry.getName();
+                    if (!ArchiveLimits.safeEntryName(name, budget)) continue;
+                    if (name.endsWith(".class")) {
+                        classEntries.putIfAbsent(name, entry);
+                    }
+                }
                 for (String owner : owners) {
                     if (methods.size() >= 256) break;
-                    String entryName = findClassEntry(jar, owner);
+                    String entryName = findClassEntry(classEntries, owner);
                     if (entryName == null) continue;
-                    try (InputStream input = jar.getInputStream(jar.getJarEntry(entryName))) {
-                        collectNativeMethods(owner, input, methods);
+                    java.util.zip.ZipEntry entry = classEntries.get(entryName);
+                    try (InputStream input = jar.getInputStream(entry)) {
+                        collectNativeMethods(owner, input, methods, budget, tracker);
                     } catch (IOException | RuntimeException ignored) {
                         // A malformed dependency does not make an unrelated candidate unsafe.
                     }
+                }
                 }
             } catch (IOException | RuntimeException ignored) {
                 // The child still uses the exact same-class index and reports limitations.
@@ -910,28 +966,20 @@ public final class ParallelVerifier {
         owners.add(value);
     }
 
-    private static String findClassEntry(java.util.jar.JarFile jar, String owner) {
+    private static String findClassEntry(Map<String, java.util.zip.ZipEntry> entries,
+                                         String owner) {
         for (String name : new String[]{owner + ".class", "BOOT-INF/classes/" + owner + ".class",
                 "WEB-INF/classes/" + owner + ".class"}) {
-            if (jar.getJarEntry(name) != null) return name;
+            if (entries.containsKey(name)) return name;
         }
         return null;
     }
 
     private static void collectNativeMethods(String owner, InputStream input,
-                                             Set<String> methods) throws IOException {
-        byte[] bytes = input.readNBytes(8 * 1024 * 1024);
-        if (bytes.length == 0) return;
-        new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
-            @Override
-            public MethodVisitor visitMethod(int access, String name, String descriptor,
-                                              String signature, String[] exceptions) {
-                if ((access & Opcodes.ACC_NATIVE) != 0 && methods.size() < 256) {
-                    methods.add(owner + "#" + name + "#" + descriptor);
-                }
-                return null;
-            }
-        }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+                                             Set<String> methods, InputBudget budget,
+                                             InputBudget.Tracker tracker) throws IOException {
+        methods.addAll(NativeMethodIndex.read(owner, input,
+                Math.max(0, 256 - methods.size()), budget, tracker));
     }
 
     /** 批量并行验证。 */
@@ -1086,7 +1134,7 @@ public final class ParallelVerifier {
             if (result == null) {
                 continue;
             }
-            if (result.statusCode() != VerifyStatus.UNTESTABLE) {
+            if (result.outcomeStatus() != VerificationOutcome.Status.UNTESTABLE) {
                 // The child cannot produce any non-UNTESTABLE result until the parent has
                 // attached the OS backend and released the authenticated ready marker. This
                 // is stronger than the former JVM-only label and prevents FAILED/TIMEOUT from
@@ -1118,81 +1166,28 @@ public final class ParallelVerifier {
     }
 
     private static boolean retryable(VerifyResult result) {
-        return result != null && (result.statusCode() == VerifyStatus.TIMEOUT
-                || (result.statusCode() == VerifyStatus.UNTESTABLE
+        return result != null && (result.outcomeStatus() == VerificationOutcome.Status.TIMEOUT
+                || (result.outcomeStatus() == VerificationOutcome.Status.UNTESTABLE
                 && "verification-future-timeout".equals(result.detail())));
     }
 
-    private record IndexedResult(int index, VerifyResult result) {
-    }
-
     /**
-     * 完成队列收集一批 fork 任务。单个验证器内部已有进程级硬超时；这里的 grace 只防止
-     * Future/线程异常造成永久等待。结果槽按输入序号填充，避免完成顺序影响报告确定性。
+     * Delegate completion/deadline mechanics to the typed scheduler.  Semantic status mapping,
+     * enrichment and retry policy remain owned by this verifier.
      */
     private List<VerifyResult> runBatch(List<Chain> chains, ExecutorService pool, int attempt,
                                         int workers) {
-        if (chains.isEmpty()) {
-            return List.of();
-        }
-        ExecutorCompletionService<IndexedResult> completion = new ExecutorCompletionService<>(pool);
-        Map<Future<IndexedResult>, Integer> pending = new HashMap<>();
-        List<VerifyResult> results = new ArrayList<>(Collections.nCopies(chains.size(), null));
-        for (int i = 0; i < chains.size(); i++) {
-            final int index = i;
-            final long queuedAt = System.nanoTime();
-            Future<IndexedResult> future = completion.submit(
-                    () -> {
-                        recordGlobalPhase("queue", System.nanoTime() - queuedAt);
-                        return new IndexedResult(index, verifyOne(chains.get(index), attempt));
-                    });
-            pending.put(future, index);
-        }
-        // The process-level timeout belongs to each child, but the collector has one batch
-        // deadline.  Polling the full timeout once per unfinished future made a noisy batch
-        // cost N * (timeout + grace) seconds even after every worker had already been cancelled.
-        // A single monotonic deadline bounds the whole batch while preserving the input-indexed
-        // result order and the explicit opt-in retry policy.
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(
-                batchTimeoutSecondsForRun(chains.size(), workers));
-        while (!pending.isEmpty()) {
-            Future<IndexedResult> future;
-            try {
-                long remaining = deadline - System.nanoTime();
-                if (remaining <= 0L) {
-                    break;
-                }
-                future = completion.poll(remaining, TimeUnit.NANOSECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-            if (future == null) {
-                break;
-            }
-            Integer expectedIndex = pending.remove(future);
-            if (expectedIndex == null) {
-                continue;
-            }
-            try {
-                IndexedResult completed = future.get();
-                results.set(completed.index(), completed.result());
-            } catch (Exception e) {
-                Chain chain = chains.get(expectedIndex);
-                results.set(expectedIndex, enrich(new VerifyResult(chain.key(), "UNTESTABLE",
-                        e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(),
-                        attempt, 0L)));
-            }
-        }
-        for (Map.Entry<Future<IndexedResult>, Integer> entry : pending.entrySet()) {
-            entry.getKey().cancel(true);
-            int index = entry.getValue();
-            Chain chain = chains.get(index);
-            results.set(index, enrich(new VerifyResult(chain.key(), "UNTESTABLE",
-                    "verification-future-timeout", attempt,
-                    (long) batchTimeoutSecondsForRun(chains.size(), workers) * 1000)));
-        }
-        return results;
+        int timeoutSeconds = batchTimeoutSecondsForRun(chains.size(), workers);
+        VerificationScheduler.Batch batch = VerificationScheduler.run(
+                chains, pool, workers, timeoutSeconds,
+                chain -> verifyOne(chain, attempt),
+                (chain, timeoutMs) -> enrich(new VerifyResult(chain.key(), "UNTESTABLE",
+                        "verification-future-timeout", attempt, timeoutMs)),
+                (chain, failure) -> enrich(new VerifyResult(chain.key(), "UNTESTABLE",
+                        failure.getMessage() == null ? failure.getClass().getSimpleName()
+                                : failure.getMessage(), attempt, 0L)),
+                this::recordGlobalPhase);
+        return batch.results();
     }
 
     /**
@@ -1255,9 +1250,14 @@ public final class ParallelVerifier {
         long started = System.nanoTime();
         AttemptTiming timing = telemetry.beginAttempt();
         try {
+            scratchObservationFailure.remove();
             VerifyResult result = verifyOneInternal(chain);
             if (result == null) {
                 result = new VerifyResult(chain.key(), "UNKNOWN", "verifier-returned-null");
+            }
+            String scratchFailure = scratchObservationFailure.get();
+            if (scratchFailure != null) {
+                result = scratchObservationResult(result, scratchFailure);
             }
             VerifyResult timed = copyResult(result, result.detail(), attempt,
                     Math.max(result.durationMs(),
@@ -1268,6 +1268,28 @@ public final class ParallelVerifier {
         } finally {
             telemetry.endAttempt();
         }
+    }
+
+    /** Convert an untrusted scratch-tree observation failure into an explicit unknown result. */
+    private static VerifyResult scratchObservationResult(VerifyResult result, String reason) {
+        if (result == null) {
+            return null;
+        }
+        String safeReason = reason == null || reason.isBlank()
+                ? "UNKNOWN" : sanitizeTierReason(reason);
+        return new VerifyResult(result.chainKey(), "UNTESTABLE",
+                "SCRATCH_TREE_OBSERVATION_FAILED:" + safeReason,
+                result.attempt(), result.durationMs(), "SCRATCH_TREE_OBSERVATION_FAILED",
+                result.backend(), result.jdk(), result.policyDigest(), false,
+                result.sandboxReady(), result.cleanup(), result.requestedMode(),
+                result.effectiveMode(), result.fallback(), result.verificationScope(),
+                result.sinkRisk(), false, "UNTESTABLE", result.lastConfirmedStage());
+    }
+
+    /** Package-local contract seam proving scratch failures cannot remain positive evidence. */
+    static VerifyResult scratchObservationResultForContract(VerifyResult result,
+                                                             String reason) {
+        return scratchObservationResult(result, reason);
     }
 
     private void recordDetailTimings(AttemptTiming timing, String detail) {
@@ -1413,10 +1435,10 @@ public final class ParallelVerifier {
         if (result == null) {
             return true;
         }
-        if (result.statusCode() == VerifyStatus.TIMEOUT) {
+        if (result.outcomeStatus() == VerificationOutcome.Status.TIMEOUT) {
             return true;
         }
-        if (result.statusCode() != VerifyStatus.UNTESTABLE) {
+        if (result.outcomeStatus() != VerificationOutcome.Status.UNTESTABLE) {
             return false;
         }
         String detail = rawDetail(result.detail());
@@ -1445,7 +1467,7 @@ public final class ParallelVerifier {
         if (result == null || result.detail() == null || result.detail().isBlank()) {
             return "unknown";
         }
-        if (result.statusCode() == VerifyStatus.TIMEOUT) {
+        if (result.outcomeStatus() == VerificationOutcome.Status.TIMEOUT) {
             return "PROCESS_TIMEOUT";
         }
         String detail = rawDetail(result.detail());
@@ -1549,7 +1571,7 @@ public final class ParallelVerifier {
     }
 
     private static VerifyResult prefixOnlyResult(VerifyResult result, Chain chain) {
-        if (result == null || result.statusCode() != VerifyStatus.SINK_BLOCKED) {
+        if (result == null || result.outcomeStatus() != VerificationOutcome.Status.SINK_BLOCKED) {
             return result;
         }
         String detail = result.detail() == null ? "" : result.detail();
@@ -1607,7 +1629,7 @@ public final class ParallelVerifier {
                     + (sinkDescriptor.isEmpty() ? "" : "|" + sinkDescriptor);
             Path javaExecPath = javaExecutable(runtime.javaHome());
             String javaExec = javaExecPath.toString();
-            List<Path> classpath = runtimeClasspath(runtime.probeJar());
+            List<Path> classpath = runtimeClasspath(runtime.probeJar(), runtime.feature());
             String cp = probeClasspath(runtime.probeJar());
             String targetCp = classpath.stream()
                     .filter(entry -> !entry.toAbsolutePath().normalize()
@@ -1658,7 +1680,25 @@ public final class ParallelVerifier {
 
             // 隔离工作目录/tmpdir/home、净化环境、子 JVM 限核与内存上限；fork-per-chain
             // 保持类隔离——静态状态不跨链污染。Job Object 是唯一 OS 边界。
-            isoDir = Files.createTempDirectory("just-verify-");
+            // A Job Object is process/resource containment only. Keep the verifier-owned
+            // filesystem root bounded and no-follow as well; target code can still write inside
+            // it, but an unbounded or link-containing scratch tree is never treated as clean.
+            isoDir = VerificationScratch.createRoot(inputBudget);
+            // JDK 24+ resolves java.security through Path.toRealPath(). On restricted Windows
+            // profiles a Jabba home may be readable to the launcher while that final-path query
+            // is denied, so the child fails before any target class runs. Stage only the selected
+            // JDK's bounded security-properties file under the verifier-owned scratch root. The
+            // executable and modules still come from the explicit Jabba home; this is a
+            // compatibility bridge, not a runtime-JDK substitution or policy relaxation.
+            Path stagedSecurityHome = stageSecurityHome(runtime.javaHome(), runtime.feature(),
+                    isoDir, inputBudget);
+            if (stagedSecurityHome == null) {
+                return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
+                        "JDK_SECURITY_CONFIG_UNAVAILABLE", 1, 0L,
+                        "VERIFIER_CAPABILITY_LIMIT", backend.id(), runtimeLabel(runtime),
+                        policyDigestFor(attemptMode, backend), false, false,
+                        "NOT_STARTED"), requestedTier, effectiveTier, fallbackReason);
+            }
             SafeSinkAdapter.Policy sinkPolicy;
             try {
                 sinkPolicy = switch (attemptMode) {
@@ -1685,7 +1725,7 @@ public final class ParallelVerifier {
             }
             String nativeIndex = attemptMode == SafeSinkAdapter.Mode.SAFE_REAL
                     ? nativeIndexForCandidate(chain, targetCp) : "";
-            Path isoTmp = Files.createDirectories(isoDir.resolve("tmp"));
+            Path isoTmp = VerificationScratch.createChild(isoDir, "tmp", inputBudget);
             if (attemptMode == SafeSinkAdapter.Mode.SAFE_REAL
                     && realPlan.kind() == SafeSinkAdapter.RealSinkKind.NATIVE_FIXTURE) {
                 Path parent = isoDir.getParent();
@@ -1751,6 +1791,7 @@ public final class ParallelVerifier {
             command.add("-Djust.verify.sink-fingerprint=" + protocolIdentity.sinkFingerprint());
             command.add("-Djust.verify.nonce=" + protocolIdentity.nonce());
             command.add("-Djust.verify.artifact-fingerprint=" + protocolIdentity.artifactFingerprint());
+            command.add("-Djava.home=" + stagedSecurityHome.toAbsolutePath());
             command.add("-Djust.verify.result-file=" + resultChannelFile.toAbsolutePath());
             String sinkCategory = chain.category() == null ? ""
                     : chain.category().replace('\n', '_').replace('\r', '_');
@@ -1874,7 +1915,7 @@ public final class ParallelVerifier {
                 killProcessTree(proc);
                 outputReader.join(1_000L);
                 ProtocolEvidence timeoutProtocol = protocolEvidence(resultChannelFile,
-                        protocolIdentity, resultChannelSecret);
+                        protocolIdentity, resultChannelSecret, inputBudget, inputTracker);
                 boolean ready = protocolReady(timeoutProtocol, backend, attemptPolicyBindingDigest);
                 return authenticatedResult(chain, "TIMEOUT", TIMEOUT_SECONDS + "s",
                         "PROCESS_TIMEOUT", false, ready,
@@ -1884,7 +1925,7 @@ public final class ParallelVerifier {
             String output = capture.text();
             if (capture.overflow()) {
                 ProtocolEvidence overflowProtocol = protocolEvidence(resultChannelFile,
-                        protocolIdentity, resultChannelSecret);
+                        protocolIdentity, resultChannelSecret, inputBudget, inputTracker);
                 boolean ready = protocolReady(overflowProtocol, backend, attemptPolicyBindingDigest);
                 return authenticatedResult(chain, "UNTESTABLE", "PROBE_OUTPUT_LIMIT",
                         "VERIFIER_CAPABILITY_LIMIT", false, ready, backend, attemptPolicyDigest);
@@ -1895,7 +1936,7 @@ public final class ParallelVerifier {
             // reason prevents OOM from being mistaken for an ordinary no-trigger result.
             if (outOfMemoryDiagnostic(output)) {
                 ProtocolEvidence oomProtocol = protocolEvidence(resultChannelFile,
-                        protocolIdentity, resultChannelSecret);
+                        protocolIdentity, resultChannelSecret, inputBudget, inputTracker);
                 boolean ready = protocolReady(oomProtocol, backend, attemptPolicyBindingDigest);
                 return authenticatedResult(chain, "UNTESTABLE", "PROCESS_OOM",
                         "PROCESS_OOM", false, ready, backend, attemptPolicyDigest);
@@ -1906,10 +1947,14 @@ public final class ParallelVerifier {
             // Never use merged stdout/stderr for a positive result. It is intentionally
             // attacker-controlled because the target runs in the same JVM as the probe.
             ProtocolEvidence protocol = protocolEvidence(resultChannelFile, protocolIdentity,
-                    resultChannelSecret);
+                    resultChannelSecret, inputBudget, inputTracker);
             if (!protocol.bindingValid()) {
+                String failure = protocol.failure() == null
+                        ? ProtocolFailure.IDENTITY_MISMATCH.name() : protocol.failure().name();
+                String diagnostic = firstAny == null || firstAny.isBlank()
+                        ? "" : ";diagnostic=" + firstAny;
                 return decorate(new VerifyResult(chain.key(), "UNTESTABLE",
-                        "PROTOCOL_AUTHENTICATION_FAILED:IDENTITY_MISMATCH", 1, 0L,
+                        "PROTOCOL_AUTHENTICATION_FAILED:" + failure + diagnostic, 1, 0L,
                         "VERIFIER_CAPABILITY_LIMIT", backend.id(),
                         runtimeLabel(runtime), attemptPolicyDigest, false, false,
                         "CLEANUP_BEST_EFFORT"), requestedTier, effectiveTier, fallbackReason);
@@ -2069,6 +2114,9 @@ public final class ParallelVerifier {
             long nativeBytes = saturatedDirectorySize(nativeRoot);
             recordResourceTotal("scratch_bytes", scratchBytes < 0L || nativeBytes < 0L
                     ? -1L : saturatedAdd(scratchBytes, nativeBytes));
+            if (scratchBytes < 0L || nativeBytes < 0L) {
+                recordResourceMax("scratch_budget_exceeded", 1L);
+            }
             if (isolationSession != null) {
                 isolationSession.close();
             }
@@ -2085,15 +2133,7 @@ public final class ParallelVerifier {
 
     /** Extract only a status emitted by the probe for this exact child attempt. */
     static String authenticatedStatus(String line, String token) {
-        if (line == null || token == null || token.isBlank()) {
-            return null;
-        }
-        String prefix = "JUST_VERIFY_V1:" + token + ":";
-        if (!line.startsWith(prefix)) {
-            return null;
-        }
-        String status = line.substring(prefix.length());
-        return isProtocolStatus(status) ? status : null;
+        return VerificationProtocol.authenticatedStatus(line, token);
     }
 
     /**
@@ -2154,20 +2194,70 @@ public final class ParallelVerifier {
                 && "1".equals(fields.get("attempted"));
     }
 
+    /** Closed failure vocabulary for the authenticated result channel. */
+    enum ProtocolFailure {
+        NONE,
+        INPUT_INVALID,
+        RESULT_FILE_MISSING,
+        RESULT_FILE_UNREADABLE,
+        RESULT_FILE_OVERSIZE,
+        RESULT_FILE_EMPTY,
+        RESULT_FRAME_MALFORMED,
+        RESULT_MAC_INVALID,
+        IDENTITY_MISMATCH,
+        PROTOCOL_ORDER_INVALID
+    }
+
     static record ProtocolEvidence(boolean ready, boolean validOrder,
                                    boolean bindingValid, String readyBackend,
                                    String readyPolicyDigest, boolean jobReady,
                                    String attestationVersion,
-                                   String terminal) {
+                                   String terminal,
+                                   ProtocolFailure failure) {
+        ProtocolEvidence {
+            failure = failure == null ? ProtocolFailure.INPUT_INVALID : failure;
+        }
+
         ProtocolEvidence(boolean ready, boolean validOrder, boolean bindingValid,
                          String readyBackend, String terminal) {
-            this(ready, validOrder, bindingValid, readyBackend, "", false, "", terminal);
+            this(ready, validOrder, bindingValid, readyBackend, "", false, "", terminal,
+                    bindingValid ? ProtocolFailure.NONE : ProtocolFailure.IDENTITY_MISMATCH);
         }
 
         ProtocolEvidence(boolean ready, boolean validOrder, boolean bindingValid,
                          String readyBackend, String readyPolicyDigest, String terminal) {
             this(ready, validOrder, bindingValid, readyBackend, readyPolicyDigest,
-                    false, "", terminal);
+                    false, "", terminal,
+                    bindingValid ? ProtocolFailure.NONE : ProtocolFailure.IDENTITY_MISMATCH);
+        }
+
+        ProtocolEvidence(boolean ready, boolean validOrder, boolean bindingValid,
+                         String readyBackend, String readyPolicyDigest, boolean jobReady,
+                         String attestationVersion, String terminal) {
+            this(ready, validOrder, bindingValid, readyBackend, readyPolicyDigest, jobReady,
+                    attestationVersion, terminal,
+                    bindingValid ? (validOrder ? ProtocolFailure.NONE
+                            : ProtocolFailure.PROTOCOL_ORDER_INVALID)
+                            : ProtocolFailure.IDENTITY_MISMATCH);
+        }
+
+        static ProtocolEvidence from(VerificationProtocol.Evidence evidence) {
+            if (evidence == null) {
+                return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                        ProtocolFailure.INPUT_INVALID);
+            }
+            return new ProtocolEvidence(evidence.ready(), evidence.validOrder(),
+                    evidence.bindingValid(), evidence.readyBackend(), evidence.readyPolicyDigest(),
+                    evidence.jobReady(), evidence.attestationVersion(), evidence.terminal(),
+                    evidence.bindingValid()
+                            ? (evidence.validOrder() ? ProtocolFailure.NONE
+                            : ProtocolFailure.PROTOCOL_ORDER_INVALID)
+                            : ProtocolFailure.IDENTITY_MISMATCH);
+        }
+
+        ProtocolEvidence withFailure(ProtocolFailure value) {
+            return new ProtocolEvidence(ready, validOrder, bindingValid, readyBackend,
+                    readyPolicyDigest, jobReady, attestationVersion, terminal, value);
         }
     }
 
@@ -2192,123 +2282,80 @@ public final class ParallelVerifier {
      * emitted before readiness invalidates the entire attempt.
      */
     static ProtocolEvidence protocolEvidence(String output, String token) {
-        boolean ready = false;
-        boolean validOrder = true;
-        String readyBackend = "";
-        String readyPolicyDigest = "";
-        boolean jobReady = false;
-        String attestationVersion = "";
-        String terminal = null;
-        if (output == null) {
-            return new ProtocolEvidence(false, false, true, "", null);
-        }
-        for (String line : output.split("\\R")) {
-            String status = authenticatedStatus(line.strip(), token);
-            if (status == null) {
-                continue;
-            }
-            if (status.startsWith("SANDBOX_READY")) {
-                if (ready) {
-                    validOrder = false;
-                }
-                ready = true;
-                ReadyPayload readyPayload = readyPayload(status);
-                readyBackend = readyPayload.backend();
-                readyPolicyDigest = readyPayload.policyDigest();
-                jobReady = readyPayload.jobReady();
-                attestationVersion = readyPayload.attestationVersion();
-                continue;
-            }
-            if (!ready) {
-                validOrder = false;
-            }
-            if (terminal == null) {
-                terminal = status;
-            }
-        }
-        return new ProtocolEvidence(ready, validOrder, true, readyBackend,
-                readyPolicyDigest, jobReady, attestationVersion, terminal);
+        return ProtocolEvidence.from(VerificationProtocol.parseLegacy(output, token));
     }
 
     /** Parse only the V2 channel bound to this exact chain, sink and artifact attempt. */
     static ProtocolEvidence protocolEvidence(String output, ProtocolIdentity expected) {
-        boolean ready = false;
-        boolean validOrder = true;
-        boolean allFramesValid = true;
-        String readyBackend = "";
-        String readyPolicyDigest = "";
-        boolean jobReady = false;
-        String attestationVersion = "";
-        String terminal = null;
-        if (output == null || expected == null) {
-            return new ProtocolEvidence(false, false, false, "", null);
-        }
-        boolean sawBoundPrefix = false;
-        for (String raw : output.split("\\R")) {
-            String line = raw.strip();
-            if (!line.startsWith("JUST_VERIFY_V2:")) {
-                continue;
-            }
-            sawBoundPrefix = true;
-            ProtocolFrame frame = parseProtocolFrame(line, expected);
-            if (frame == null) {
-                allFramesValid = false;
-                continue;
-            }
-            String status = frame.status();
-            if (status.startsWith("SANDBOX_READY")) {
-                if (ready) {
-                    validOrder = false;
-                }
-                ready = true;
-                ReadyPayload readyPayload = readyPayload(status);
-                readyBackend = readyPayload.backend();
-                readyPolicyDigest = readyPayload.policyDigest();
-                jobReady = readyPayload.jobReady();
-                attestationVersion = readyPayload.attestationVersion();
-                continue;
-            }
-            if (!ready) {
-                validOrder = false;
-            }
-            if (terminal != null) {
-                validOrder = false;
-            }
-            if (terminal == null) {
-                terminal = status;
-            }
-        }
-        boolean bindingValid = sawBoundPrefix && allFramesValid;
-        return new ProtocolEvidence(ready, validOrder, bindingValid, readyBackend,
-                readyPolicyDigest, jobReady, attestationVersion, terminal);
+        return ProtocolEvidence.from(VerificationProtocol.parse(output,
+                expected == null ? null : expected.typed()));
     }
 
     /** Read and authenticate the probe-owned result file; target stdout is never sufficient. */
     static ProtocolEvidence protocolEvidence(Path resultFile, ProtocolIdentity expected,
                                               String secret) {
+        return protocolEvidence(resultFile, expected, secret, InputBudget.defaults());
+    }
+
+    /** Read the authenticated result channel under a caller-owned bounded input policy. */
+    static ProtocolEvidence protocolEvidence(Path resultFile, ProtocolIdentity expected,
+                                              String secret, InputBudget budget) {
+        return protocolEvidence(resultFile, expected, secret, budget, null);
+    }
+
+    /** Read the authenticated result channel while charging a caller-owned run tracker. */
+    static ProtocolEvidence protocolEvidence(Path resultFile, ProtocolIdentity expected,
+                                              String secret, InputBudget budget,
+                                              InputBudget.Tracker callerTracker) {
         if (resultFile == null || expected == null || !validResultSecret(secret)) {
-            return new ProtocolEvidence(false, false, false, "", null);
+            return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                    ProtocolFailure.INPUT_INVALID);
         }
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        InputBudget.Tracker tracker = callerTracker == null ? policy.tracker() : callerTracker;
         try {
-            if (!Files.isRegularFile(resultFile, java.nio.file.LinkOption.NOFOLLOW_LINKS)
-                    || io.just.sast.util.ArchiveLimits.isLinkOrReparsePoint(resultFile)
-                    || Files.size(resultFile) > MAX_OUTPUT_BYTES) {
-                return new ProtocolEvidence(false, false, false, "", null);
+            if (!Files.exists(resultFile, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                        ProtocolFailure.RESULT_FILE_MISSING);
+            }
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    resultFile, policy, "VERIFICATION_RESULT");
+            var before = snapshot.fileAttributes();
+            if (before.size() > MAX_OUTPUT_BYTES) {
+                return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                        ProtocolFailure.RESULT_FILE_OVERSIZE);
+            }
+            long limit = Math.min(MAX_OUTPUT_BYTES,
+                    Math.min(policy.maxEntryBytes(), tracker.remainingReadBytes()));
+            if (before.size() > limit) {
+                return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                        ProtocolFailure.RESULT_FILE_OVERSIZE);
+            }
+            byte[] bytes;
+            try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(resultFile,
+                    "VERIFICATION_RESULT")) {
+                bytes = IoUtil.readAll(opened.stream(), limit, tracker);
+            }
+            ArchiveLimits.verifyRegularFileUnchanged(snapshot, "VERIFICATION_RESULT");
+            if (bytes.length == 0) {
+                return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                        ProtocolFailure.RESULT_FILE_EMPTY);
             }
             StringBuilder frames = new StringBuilder();
-            for (String raw : Files.readString(resultFile, StandardCharsets.US_ASCII)
-                    .split("\\R")) {
+            for (String raw : new String(bytes, StandardCharsets.US_ASCII).split("\\R")) {
                 String line = raw.strip();
                 if (line.isEmpty()) {
                     continue;
                 }
                 int macStart = RESULT_CHANNEL_PREFIX.length();
                 if (!line.startsWith(RESULT_CHANNEL_PREFIX)) {
-                    return new ProtocolEvidence(false, false, false, "", null);
+                    return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                            ProtocolFailure.RESULT_FRAME_MALFORMED);
                 }
                 int macEnd = line.indexOf(':', macStart);
                 if (macEnd <= macStart) {
-                    return new ProtocolEvidence(false, false, false, "", null);
+                    return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                            ProtocolFailure.RESULT_FRAME_MALFORMED);
                 }
                 String mac = line.substring(macStart, macEnd);
                 String frame = line.substring(macEnd + 1);
@@ -2316,17 +2363,46 @@ public final class ParallelVerifier {
                         || !MessageDigest.isEqual(mac.toLowerCase(Locale.ROOT)
                         .getBytes(StandardCharsets.US_ASCII), resultMac(secret, frame)
                         .getBytes(StandardCharsets.US_ASCII))) {
-                    return new ProtocolEvidence(false, false, false, "", null);
+                    return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                            ProtocolFailure.RESULT_MAC_INVALID);
                 }
                 if (frames.length() > 0) {
                     frames.append('\n');
                 }
                 frames.append(frame);
             }
-            return protocolEvidence(frames.toString(), expected);
+            if (frames.length() == 0) {
+                return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                        ProtocolFailure.RESULT_FILE_EMPTY);
+            }
+            ProtocolEvidence parsed = protocolEvidence(frames.toString(), expected);
+            if (parsed.bindingValid() && !parsed.validOrder()) {
+                return parsed.withFailure(ProtocolFailure.PROTOCOL_ORDER_INVALID);
+            }
+            if (!parsed.bindingValid()) {
+                return parsed.withFailure(ProtocolFailure.IDENTITY_MISMATCH);
+            }
+            return parsed;
+        } catch (java.nio.file.NoSuchFileException missing) {
+            return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                    ProtocolFailure.RESULT_FILE_MISSING);
         } catch (IOException | RuntimeException failure) {
-            return new ProtocolEvidence(false, false, false, "", null);
+            return new ProtocolEvidence(false, false, false, "", "", false, "", null,
+                    ProtocolFailure.RESULT_FILE_UNREADABLE);
         }
+    }
+
+    /** Package-local hostile contract seam; production result channels use the same snapshot. */
+    static ArchiveLimits.FileReadSnapshot snapshotResultForContract(Path resultFile)
+            throws IOException {
+        return ArchiveLimits.snapshotRegularFile(resultFile, InputBudget.defaults(),
+                "VERIFICATION_RESULT");
+    }
+
+    /** Package-local hostile contract seam; production result channels use the same snapshot. */
+    static void verifyResultSnapshotForContract(ArchiveLimits.FileReadSnapshot snapshot)
+            throws IOException {
+        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "VERIFICATION_RESULT");
     }
 
     private static boolean validResultSecret(String secret) {
@@ -2357,57 +2433,6 @@ public final class ParallelVerifier {
         }
     }
 
-    private record ReadyPayload(String backend, String policyDigest, boolean jobReady,
-                                String attestationVersion) {
-    }
-
-    private static ReadyPayload readyPayload(String status) {
-        int colon = status == null ? -1 : status.indexOf(':');
-        String payload = colon < 0 ? "" : status.substring(colon + 1).strip();
-        String backend = "";
-        String policy = "";
-        boolean job = false;
-        String attestation = "";
-        String[] fields = payload.split("\\|", -1);
-        if (fields.length > 0) {
-            backend = fields[0].strip();
-        }
-        for (int i = 1; i < fields.length; i++) {
-            int equals = fields[i].indexOf('=');
-            if (equals <= 0) {
-                continue;
-            }
-            String key = fields[i].substring(0, equals).strip();
-            String value = fields[i].substring(equals + 1).strip();
-            switch (key) {
-                case "policy" -> policy = value;
-                case "job" -> job = "1".equals(value)
-                        || "true".equalsIgnoreCase(value);
-                case "attestation" -> attestation = value;
-                default -> { }
-            }
-        }
-        return new ReadyPayload(backend, policy, job, attestation);
-    }
-
-    private record ProtocolFrame(String status) {
-    }
-
-    private static ProtocolFrame parseProtocolFrame(String line, ProtocolIdentity expected) {
-        String prefix = "JUST_VERIFY_V2:";
-        String[] fields = line.substring(prefix.length()).split(":", 7);
-        if (fields.length != 7 || !expected.token().equals(fields[0])
-                || !expected.runId().equals(fields[1])
-                || !expected.chainFingerprint().equals(fields[2])
-                || !expected.sinkFingerprint().equals(fields[3])
-                || !expected.nonce().equals(fields[4])
-                || !expected.artifactFingerprint().equals(fields[5])
-                || !isProtocolStatus(fields[6])) {
-            return null;
-        }
-        return new ProtocolFrame(fields[6]);
-    }
-
     private static String firstDiagnostic(String output) {
         if (output == null) {
             return null;
@@ -2423,9 +2448,27 @@ public final class ParallelVerifier {
         if (diagnostics.isEmpty()) {
             return null;
         }
-        int from = Math.max(0, diagnostics.size() - 8);
-        String value = String.join(" | ", diagnostics.subList(from, diagnostics.size()));
-        return value.length() > 2048 ? value.substring(value.length() - 2048) : value;
+        // Preserve the exception headline as well as the bounded tail of its stack.  The
+        // previous tail-only projection routinely dropped the actual reason (for example an
+        // AccessControlException) and left only JDK frame names, making a fail-closed dynamic
+        // attempt impossible to diagnose without weakening the channel parser.
+        List<String> selected = new ArrayList<>();
+        int head = Math.min(4, diagnostics.size());
+        for (int i = 0; i < head; i++) {
+            selected.add(diagnostics.get(i));
+        }
+        int from = Math.max(head, diagnostics.size() - 7);
+        for (int i = from; i < diagnostics.size(); i++) {
+            selected.add(diagnostics.get(i));
+        }
+        String value = String.join(" | ", selected);
+        if (value.length() <= 2048) {
+            return value;
+        }
+        // Keep the exception class/message (the first 768 characters) and a bounded tail of
+        // frames; truncating from the left would erase the only actionable failure code.
+        return value.substring(0, 768) + " | ... | "
+                + value.substring(Math.max(768, value.length() - 1200));
     }
 
     /** Keep shareable reports path-free while retaining stable capability/error categories. */
@@ -2460,17 +2503,6 @@ public final class ParallelVerifier {
                 || lower.contains("java heap space")
                 || lower.contains("gc overhead limit exceeded")
                 || lower.contains("unable to create native thread");
-    }
-
-    private static boolean isProtocolStatus(String status) {
-        return status.startsWith("SANDBOX_READY") || status.startsWith("SINK_BLOCKED")
-                || status.startsWith("SINK_TRIGGERED")
-                || status.startsWith("SINK_EXECUTED_SAFE")
-                || status.startsWith("JNI_EXECUTED_SAFE")
-                || status.startsWith("SAFE_EFFECT_OBSERVED")
-                || status.startsWith("CONCRETE_REACHED") || status.startsWith("EXECUTED")
-                || status.startsWith("SANDBOX_UNAVAILABLE") || status.startsWith("UNTESTABLE")
-                || status.startsWith("PARTIAL_PATH");
     }
 
     /** 优先使用 Chain 的真实 sink 描述符；兼容旧构造的 Chain 时从调用跳回退推断。 */
@@ -2687,7 +2719,7 @@ public final class ParallelVerifier {
 
 
     /** 统一构造子进程 classpath；展开只做一次，避免每条链重复扫描/解包。 */
-    private List<Path> runtimeClasspath(Path probeJar) throws java.io.IOException {
+    private List<Path> runtimeClasspath(Path probeJar, int targetFeature) throws java.io.IOException {
         NestedClasspath cached = expandedClasspath;
         if (cached != null) {
             return cached.entries();
@@ -2699,7 +2731,7 @@ public final class ParallelVerifier {
                 inputs.add(probeJar);
                 inputs.add(targetJar);
                 inputs.addAll(deps);
-                cached = NestedClasspath.open(inputs);
+                cached = NestedClasspath.open(inputs, inputBudget, targetFeature);
                 expandedClasspath = cached;
             }
             return cached.entries();
@@ -2716,18 +2748,10 @@ public final class ParallelVerifier {
     private static String probeClasspath(Path probeJar) {
         List<String> entries = new ArrayList<>();
         addClasspathEntry(entries, probeJar);
-        try {
-            Class<?> asm = Class.forName("org.objectweb.asm.ClassVisitor", false,
-                    ParallelVerifier.class.getClassLoader());
-            if (asm.getProtectionDomain() != null
-                    && asm.getProtectionDomain().getCodeSource() != null) {
-                Path location = Path.of(asm.getProtectionDomain().getCodeSource()
-                        .getLocation().toURI());
-                addClasspathEntry(entries, location);
-            }
-        } catch (Exception | LinkageError ignored) {
-            // A packaged shaded verifier does not need an external ASM code source.
-        }
+        // A packaged shaded verifier does not need an external ASM code source.  The
+        // frontend-owned helper keeps reflective dependency discovery out of this layer.
+        addClasspathEntry(entries, NativeMethodIndex.asmCodeSource(
+                ParallelVerifier.class.getClassLoader()));
         return String.join(File.pathSeparator, entries);
     }
 
@@ -2821,7 +2845,7 @@ public final class ParallelVerifier {
                 return new RuntimeSelection(null, null, 0,
                         "target-jdk-executable-missing");
             }
-            int requestedFeature = jdkFeature(targetJdkHome);
+            int requestedFeature = jdkFeature(targetJdkHome, inputBudget);
             if (requestedFeature <= 0) {
                 return new RuntimeSelection(null, null, requestedFeature,
                         "target-jdk-feature-unknown");
@@ -2891,10 +2915,30 @@ public final class ParallelVerifier {
 
     /** JDK 9+ and legacy JDK distributions both ship a release metadata file. */
     static int jdkFeature(Path javaHome) {
+        return jdkFeature(javaHome, InputBudget.defaults());
+    }
+
+    /** Read release metadata with an explicit bounded policy; malformed/oversized input is unknown. */
+    static int jdkFeature(Path javaHome, InputBudget budget) {
         Path release = javaHome.resolve("release");
-        if (Files.isRegularFile(release)) {
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
+        InputBudget.Tracker tracker = policy.tracker();
+        if (Files.isRegularFile(release, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                && !ArchiveLimits.isLinkOrReparsePoint(release)) {
             try {
-                for (String line : Files.readAllLines(release, StandardCharsets.UTF_8)) {
+                long cap = Math.min(64L * 1024L,
+                        Math.min(policy.maxEntryBytes(), tracker.remainingReadBytes()));
+                byte[] bytes;
+                ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                        release, policy, "VERIFY_JDK_RELEASE");
+                try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(release,
+                        "VERIFY_JDK_RELEASE");
+                     InputStream input = opened.stream()) {
+                    bytes = IoUtil.readAll(input, cap, tracker);
+                }
+                ArchiveLimits.verifyRegularFileUnchanged(snapshot, "VERIFY_JDK_RELEASE");
+                String text = new String(bytes, StandardCharsets.UTF_8);
+                for (String line : text.split("\\R", -1)) {
                     if (!line.startsWith("JAVA_VERSION=")) {
                         continue;
                     }
@@ -2945,6 +2989,77 @@ public final class ParallelVerifier {
         result.put("NO_COLOR", "1");
         result.put("LANG", "C");
         return Map.copyOf(result);
+    }
+
+    /**
+     * Stage the selected JDK's security properties for the child JVM when running on JDK 24+.
+     *
+     * <p>Recent Windows JDKs resolve {@code java.home} through a final-path query while loading
+     * {@code java.security}.  A Jabba installation can be readable by the launcher but deny that
+     * query to the child, which otherwise produces an untyped {@code InternalError} before the
+     * probe can publish its authenticated result frame.  The executable and modules still come
+     * from the explicitly selected Jabba home; only this bounded, immutable properties file is
+     * copied below the verifier-owned scratch root.  This is a compatibility bridge, not a
+     * policy relaxation or a second runtime JDK.</p>
+     */
+    private Path stageSecurityHome(Path javaHome, int feature, Path isoDir,
+                                   InputBudget policy) {
+        if (javaHome == null || isoDir == null) {
+            return null;
+        }
+        Path normalizedHome;
+        try {
+            normalizedHome = javaHome.toAbsolutePath().normalize();
+        } catch (RuntimeException invalidHome) {
+            return null;
+        }
+        // JDK 8--23 use the real home without changing target-visible paths.  The staging
+        // compatibility is narrowly scoped to the JDK 24+ final-path regression.
+        if (feature < 24) {
+            return normalizedHome;
+        }
+        InputBudget effective = policy == null ? InputBudget.defaults() : policy;
+        Path source = normalizedHome.resolve("conf").resolve("security")
+                .resolve("java.security").normalize();
+        long cap = Math.min(512L * 1024L,
+                Math.min(effective.maxEntryBytes(), inputTracker.remainingReadBytes()));
+        if (cap <= 0L) {
+            return null;
+        }
+        try {
+            ArchiveLimits.checkPathAncestors(source, effective);
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    source, effective, "JDK_SECURITY_CONFIG");
+            byte[] bytes;
+            try (InputStream input = IoUtil.openNoFollow(source, "JDK_SECURITY_CONFIG")) {
+                bytes = IoUtil.readAll(input, cap, inputTracker);
+            }
+            ArchiveLimits.verifyRegularFileUnchanged(snapshot, "JDK_SECURITY_CONFIG");
+            if (bytes.length == 0 || bytes.length > cap) {
+                return null;
+            }
+
+            Path stagedHome = VerificationScratch.createChild(isoDir, "runtime-home", effective);
+            Path stagedConf = VerificationScratch.createChild(stagedHome, "conf", effective);
+            Path stagedSecurity = VerificationScratch.createChild(stagedConf, "security",
+                    effective);
+            Path stagedFile = stagedSecurity.resolve("java.security").normalize();
+            if (!stagedFile.startsWith(stagedSecurity)
+                    || Files.exists(stagedFile, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                return null;
+            }
+            Files.write(stagedFile, bytes, java.nio.file.StandardOpenOption.CREATE_NEW,
+                    java.nio.file.StandardOpenOption.WRITE);
+            if (!Files.isRegularFile(stagedFile, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || ArchiveLimits.isLinkOrReparsePoint(stagedFile)) {
+                return null;
+            }
+            return stagedHome;
+        } catch (IOException | RuntimeException failure) {
+            // Dynamic verification is fail-closed.  The caller preserves the static finding and
+            // reports JDK_SECURITY_CONFIG_UNAVAILABLE instead of launching an unbound child.
+            return null;
+        }
     }
 
     private static void copyIfPresent(Map<String, String> parent, Map<String, String> result, String key) {
@@ -3022,26 +3137,37 @@ public final class ParallelVerifier {
         }
     }
 
-    private static long saturatedDirectorySize(Path path) {
+    private long saturatedDirectorySize(Path path) {
         if (path == null || !existsNoFollow(path)) {
             return 0L;
         }
-        try (var walk = Files.walk(path)) {
-            long total = 0L;
-            for (Path item : (Iterable<Path>) walk::iterator) {
-                if (!Files.isRegularFile(item, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-                    continue;
-                }
-                try {
-                    total = saturatedAdd(total, Math.max(0L, Files.size(item)));
-                } catch (IOException ignored) {
-                    return -1L;
-                }
+        try {
+            // Keep the helper's historical name for telemetry compatibility, but use the
+            // verifier scratch owner so cleanup measurement cannot follow links or walk an
+            // attacker-created tree without entry/depth/time bounds.
+            return VerificationScratch.measure(path, inputBudget, inputTracker).bytes();
+        } catch (IOException | RuntimeException failure) {
+            // A failed observation means the verifier cannot establish what the target wrote.
+            // Preserve the static fact, but force the dynamic attempt to an explicit unknown
+            // result in verifyOne instead of publishing a positive boundary observation.
+            if (scratchObservationFailure.get() == null) {
+                scratchObservationFailure.set(scratchFailureReason(failure));
             }
-            return total;
-        } catch (IOException | RuntimeException ignored) {
             return -1L;
         }
+    }
+
+    private static String scratchFailureReason(Exception failure) {
+        if (failure == null || failure.getMessage() == null
+                || failure.getMessage().isBlank()) {
+            return "UNKNOWN";
+        }
+        String value = failure.getMessage();
+        int colon = value.indexOf(':');
+        if (colon > 0) {
+            value = value.substring(0, colon);
+        }
+        return sanitizeTierReason(value);
     }
 
     private static boolean existsNoFollow(Path path) {
@@ -3248,15 +3374,7 @@ public final class ParallelVerifier {
             if (p == null || !Files.exists(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
                 return;
             }
-            if (Files.isDirectory(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-                try (var walk = Files.walk(p)) {
-                    walk.sorted(Comparator.reverseOrder())
-                            .forEach(ParallelVerifier::deleteFileQuietly);
-                } catch (Exception ignored) {
-                }
-            } else {
-                deleteFileQuietly(p);
-            }
+            VerificationScratch.deleteTree(p);
             if (!Files.exists(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)
                     || !isWindows() || attempt == 3) {
                 return;
@@ -3285,7 +3403,11 @@ public final class ParallelVerifier {
         if (artifactFingerprint != null) {
             return artifactFingerprint;
         }
-        artifactFingerprint = ArtifactFingerprint.sha256(targetJar);
+        // The artifact identity is part of the same verifier input boundary as classpath,
+        // native-index and scratch inspection.  Reusing the verifier-owned tracker prevents
+        // this lazy report call from silently obtaining a fresh archive/time allowance after
+        // the planner has already inspected the target.
+        artifactFingerprint = ArtifactFingerprint.sha256(targetJar, inputTracker);
         return artifactFingerprint;
     }
 

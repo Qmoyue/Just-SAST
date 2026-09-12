@@ -3,7 +3,10 @@ package io.just.sast.chain;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.VerificationOutcome;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -19,8 +22,9 @@ import java.util.List;
  * 动态证据是分层的：SINK_BLOCKED +4；真实安全参数下的目标 sink +3；
  * CONCRETE_REACHED +2；EXECUTED/SAFE_EFFECT_OBSERVED +1。真实安全参数仍带失真标记，
  * 证明可调用性而不是恶意参数可利用性。
- * 分桶：FEASIBLE 只保留静态可行或真实 canary 边界；安全 adapter、具体前缀和入口返回
- * 都显式标记为 DEGRADED(reason)，不可验证不会被当成负向证明。
+ * 分桶：FEASIBLE 必须先通过静态可行性门；真实 canary 边界只能作为静态可行链的附加证据。
+ * 安全 adapter、具体前缀、入口返回和静态退化都显式标记为 DEGRADED(reason)，不可验证不会
+ * 被当成负向证明。
  */
 public final class ConfidenceScorer {
 
@@ -47,83 +51,153 @@ public final class ConfidenceScorer {
 
     private ConfidenceScorer() {}
 
-    public static String score(Chain chain, List<String> notes) {
+    /**
+     * Stable, inspectable inputs to both the confidence transition and chain ranking.
+     *
+     * <p>The static and dynamic dimensions are deliberately disjoint.  In particular,
+     * {@code dynamicScore} is never used to decide {@code staticFeasible}; a canary boundary
+     * cannot repair an unresolved or otherwise statically incomplete path.</p>
+     */
+    public record RankFeatures(int staticScore, int dynamicScore, int totalScore,
+                               int staticRank, int dynamicRank, int unresolvedPenalty,
+                               int degradationCount, boolean staticFeasible,
+                               String runtimeStatus, List<String> reasons) {
+        public RankFeatures {
+            runtimeStatus = runtimeStatus == null ? "" : runtimeStatus;
+            reasons = reasons == null ? List.of() : List.copyOf(reasons);
+            staticScore = staticScore;
+            dynamicScore = dynamicScore;
+            totalScore = totalScore;
+            staticRank = Math.max(0, staticRank);
+            dynamicRank = Math.max(0, dynamicRank);
+            unresolvedPenalty = Math.max(0, unresolvedPenalty);
+            degradationCount = Math.max(0, degradationCount);
+        }
+    }
+
+    /**
+     * Typed explanation of the legacy confidence bucket.  The bucket remains a string for
+     * report compatibility; {@code reasonCode} and {@code features} are the semantic source
+     * for new consumers.
+     */
+    public record ConfidenceTransition(String bucket, String reasonCode,
+                                       String runtimeStatus, boolean staticFeasible,
+                                       RankFeatures features, List<String> reasons) {
+        public ConfidenceTransition {
+            bucket = bucket == null || bucket.isBlank() ? "UNKNOWN" : bucket;
+            reasonCode = reasonCode == null || reasonCode.isBlank() ? "UNKNOWN" : reasonCode;
+            runtimeStatus = runtimeStatus == null ? "" : runtimeStatus;
+            features = features == null ? new RankFeatures(0, 0, 0, 2, 6, 0, 0,
+                    false, runtimeStatus, List.of()) : features;
+            reasons = reasons == null ? List.of() : List.copyOf(reasons);
+        }
+
+        public boolean isFeasible() {
+            return "FEASIBLE".equals(bucket);
+        }
+    }
+
+    /**
+     * Produce the single confidence transition used by the compatibility score API and new
+     * typed readers.  Static admissibility is evaluated before runtime evidence, so a
+     * {@code SINK_BLOCKED} observation can confirm a boundary but cannot promote an unresolved
+     * chain to {@code FEASIBLE}.
+     */
+    public static ConfidenceTransition transition(Chain chain, List<String> notes) {
+        List<String> stableNotes = stableNotes(notes);
+        RankFeatures features = rankFeatures(chain, stableNotes);
+        String runtimeStatus = features.runtimeStatus();
         if (chain == null) {
-            return "UNKNOWN";
+            return new ConfidenceTransition("UNKNOWN", "NULL_CHAIN", runtimeStatus,
+                    false, features, features.reasons());
         }
-        // An authenticated exact canary boundary is direct runtime evidence. It must not be
-        // demoted by a static unresolved-hop penalty or a probe-side construction warning;
-        // those limitations remain visible in the evidence vector and notes.
-        String runtimeStatus = statusFromNotes(notes);
-        if ("SINK_BLOCKED".equals(runtimeStatus)) {
-            return "FEASIBLE";
+        if (!features.staticFeasible()) {
+            return new ConfidenceTransition("NOT_FEASIBLE", "STATIC_INFEASIBLE", runtimeStatus,
+                    false, features, features.reasons());
         }
-        if ("PRE_SINK_CONFIRMED".equals(runtimeStatus)) {
-            return "DEGRADED(PRE_SINK_HIGH_RISK)";
+
+        // A construction/analysis degradation is not erased by a dynamic boundary.  Keep the
+        // first reason deterministic so parallel knowledge sources cannot change report order.
+        String degradation = firstDegradation(stableNotes);
+        if ("SINK_BLOCKED".equals(runtimeStatus) && degradation != null) {
+            return new ConfidenceTransition(degradedBucket(degradation), "STATIC_DEGRADATION",
+                    runtimeStatus, true, features, features.reasons());
         }
-        if ("SINK_EXECUTED_SAFE".equals(runtimeStatus)) {
-            return "DEGRADED(REAL_SINK_SAFE_ARGUMENTS)";
+        return switch (runtimeStatus) {
+            case "SINK_BLOCKED" -> new ConfidenceTransition("FEASIBLE",
+                    "SINK_BOUNDARY_STATIC_FEASIBLE", runtimeStatus, true, features,
+                    features.reasons());
+            case "PRE_SINK_CONFIRMED" -> new ConfidenceTransition(
+                    "DEGRADED(PRE_SINK_HIGH_RISK)", "PRE_SINK_HIGH_RISK", runtimeStatus,
+                    true, features, features.reasons());
+            case "SINK_EXECUTED_SAFE" -> new ConfidenceTransition(
+                    "DEGRADED(REAL_SINK_SAFE_ARGUMENTS)", "REAL_SINK_SAFE_ARGUMENTS",
+                    runtimeStatus, true, features, features.reasons());
+            case "JNI_EXECUTED_SAFE" -> new ConfidenceTransition(
+                    "DEGRADED(JNI_SAFE_FIXTURE)", "JNI_SAFE_FIXTURE", runtimeStatus, true,
+                    features, features.reasons());
+            case "SAFE_EFFECT_OBSERVED" -> new ConfidenceTransition(
+                    "DEGRADED(SAFE_EFFECT_DISTORTED)", "SAFE_EFFECT_DISTORTED", runtimeStatus,
+                    true, features, features.reasons());
+            case "CONCRETE_REACHED" -> new ConfidenceTransition(
+                    "DEGRADED(CONCRETE_TRIGGER_ONLY)", "CONCRETE_TRIGGER_ONLY", runtimeStatus,
+                    true, features, features.reasons());
+            case "EXECUTED" -> new ConfidenceTransition("DEGRADED(ENTRY_RETURN_ONLY)",
+                    "ENTRY_RETURN_ONLY", runtimeStatus, true, features, features.reasons());
+            default -> degradation == null
+                    ? new ConfidenceTransition("FEASIBLE", "STATIC_FEASIBLE", runtimeStatus,
+                    true, features, features.reasons())
+                    : new ConfidenceTransition(degradedBucket(degradation), "STATIC_DEGRADATION",
+                    runtimeStatus, true, features, features.reasons());
+        };
+    }
+
+    /** Compute deterministic static/dynamic rank features without mutating chain or notes. */
+    public static RankFeatures rankFeatures(Chain chain, List<String> notes) {
+        List<String> stableNotes = stableNotes(notes);
+        String runtimeStatus = statusFromNotes(stableNotes);
+        int staticScore = staticEvidenceScore(chain, stableNotes);
+        int dynamicScore = dynamicEvidenceScore(runtimeStatus);
+        int unresolvedPenalty = chain == null ? 0 : chain.unresolvedHops() * 2;
+        int staticRank = rankFromScore(staticScore);
+        int dynamicRank = dynamicRank(runtimeStatus, stableNotes);
+        int degradationCount = (int) stableNotes.stream()
+                .filter(note -> note.startsWith("degrade:")).count();
+        boolean staticFeasible = chain != null && staticRank < 2
+                && unresolvedPenalty <= staticScore;
+        List<String> reasons = new ArrayList<>();
+        if (chain == null) {
+            reasons.add("NULL_CHAIN");
         }
-        if ("JNI_EXECUTED_SAFE".equals(runtimeStatus)) {
-            return "DEGRADED(JNI_SAFE_FIXTURE)";
+        if (staticRank >= 2) {
+            reasons.add("STATIC_SCORE_LOW");
         }
-        int r = rank(chain, notes);
-        List<String> degradations = notes == null ? List.of() : notes.stream()
-                .filter(n -> n != null && n.startsWith("degrade:")).toList();
-        if (r == 2 || chain.unresolvedHops() * 2 > evidenceScore(chain, notes)) {
-            return "NOT_FEASIBLE";
+        if (unresolvedPenalty > staticScore) {
+            reasons.add("UNRESOLVED_STATIC_EVIDENCE");
         }
-        // Safe adapter effects deliberately remain degraded because they are not target
-        // effects. Concrete and entry-return observations are weaker prefix evidence.
-        if ("SAFE_EFFECT_OBSERVED".equals(runtimeStatus)) {
-            return "DEGRADED(SAFE_EFFECT_DISTORTED)";
+        if (degradationCount > 0) {
+            reasons.add("STATIC_DEGRADATION_PRESENT");
         }
-        if ("CONCRETE_REACHED".equals(runtimeStatus)) {
-            return "DEGRADED(CONCRETE_TRIGGER_ONLY)";
+        if (runtimeStatus.isBlank()) {
+            reasons.add("DYNAMIC_NOT_SELECTED");
+        } else {
+            reasons.add("DYNAMIC_" + runtimeStatus);
         }
-        if ("EXECUTED".equals(runtimeStatus)) {
-            return "DEGRADED(ENTRY_RETURN_ONLY)";
-        }
-        if (!degradations.isEmpty()) {
-            return "DEGRADED(" + degradations.get(0).substring("degrade:".length()) + ")";
-        }
-        return r == 0 ? "FEASIBLE" : "FEASIBLE";
+        reasons.sort(Comparator.naturalOrder());
+        return new RankFeatures(staticScore, dynamicScore, staticScore + dynamicScore,
+                staticRank, dynamicRank, unresolvedPenalty, degradationCount, staticFeasible,
+                runtimeStatus, reasons);
+    }
+
+    /** Compatibility bucket projection retained for existing report writers. */
+    public static String score(Chain chain, List<String> notes) {
+        return transition(chain, notes).bucket();
     }
 
     /** 证据分值（越大越可信，供排序与分桶）。notes 为链级注释（pattern 加分来源）。 */
     public static int evidenceScore(Chain chain, List<String> notes) {
-        if (chain == null) {
-            return 0;
-        }
-        int points = 0;
-        for (ChainHop hop : chain.hops()) {
-            points += switch (hop.kind()) {
-                case DIRECT_CALL, FIELD_FLOW -> 1;
-                case VIRTUAL_DISPATCH, LAMBDA, NATIVE_CALLBACK, ENTRY -> 0;
-            };
-        }
-        points += entryWeight(chain.entryKind());
-        if ("HIGH".equals(chain.severity())) {
-            points += 1;
-        }
-        if (hasFrameworkBeanInput(chain)) {
-            points += FRAMEWORK_BEAN_INPUT_BONUS;
-        }
-        points -= chain.unresolvedHops() * 2;
-        if (notes != null) {
-            points += notes.stream().filter(n -> n != null && n.startsWith("pattern:")).count()
-                    * PATTERN_BONUS;
-            // 动态验证证据：真实边界 > 具体触发前缀 > 段归因 > 安全 adapter > 入口返回。
-            points += switch (statusFromNotes(notes)) {
-                case "SINK_BLOCKED" -> SINK_BLOCKED_BONUS;
-                case "PRE_SINK_CONFIRMED" -> SINK_BLOCKED_BONUS;
-                case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> 5;
-                case "CONCRETE_REACHED" -> 2;
-                case "SAFE_EFFECT_OBSERVED", "EXECUTED" -> 1;
-                default -> 0;
-            };
-        }
-        return points;
+        RankFeatures features = rankFeatures(chain, notes);
+        return features.totalScore();
     }
 
     /** Stable dynamic order shared by selection, grouped findings and all report renderers. */
@@ -145,6 +219,15 @@ public final class ConfidenceScorer {
             case "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE" -> DYNAMIC_NEGATIVE_OR_UNTESTABLE;
             default -> DYNAMIC_NOT_SELECTED;
         };
+    }
+
+    /**
+     * Typed policy entry point. Wire strings remain accepted only by the compatibility overload
+     * above; callers that already hold a closed verification outcome must not round-trip it
+     * through free text just to rank a finding.
+     */
+    public static int dynamicRank(VerificationOutcome.Status status, List<String> notes) {
+        return dynamicRank(status == null ? null : status.name(), notes);
     }
 
     /** True only for the authenticated canary boundary; compatibility labels are weaker. */
@@ -170,36 +253,7 @@ public final class ConfidenceScorer {
      * ignored; precedence follows the evidence contract rather than lexical note order.
      */
     public static String statusFromNotes(List<String> notes) {
-        if (notes == null || notes.isEmpty()) {
-            return "";
-        }
-        if (hasNote(notes, "verify:sink-blocked") || hasNote(notes, "verify:confirmed")) {
-            return "SINK_BLOCKED";
-        }
-        if (hasNote(notes, "verify:pre-sink-confirmed")
-                || hasNote(notes, "verify:prefix-confirmed")) {
-            return "PRE_SINK_CONFIRMED";
-        }
-        if (hasNote(notes, "verify:jni-executed-safe")) {
-            return "JNI_EXECUTED_SAFE";
-        }
-        if (hasNote(notes, "verify:sink-executed-safe")) {
-            return "SINK_EXECUTED_SAFE";
-        }
-        if (hasNote(notes, "verify:segment-confirmed")
-                || hasNote(notes, "verify:concrete-reached")) {
-            return "CONCRETE_REACHED";
-        }
-        if (hasNote(notes, "verify:safe-effect-observed")) {
-            return "SAFE_EFFECT_OBSERVED";
-        }
-        if (hasNote(notes, "verify:executed")) {
-            return "EXECUTED";
-        }
-        if (notes.stream().anyMatch(note -> note != null && note.startsWith("degrade:partial-path"))) {
-            return "PARTIAL";
-        }
-        return "";
+        return io.just.sast.blackboard.VerificationDetailAdapter.statusFromLegacyNotes(notes);
     }
 
     /** Compact evidence vector for callers that need an auditable reason, not just a label. */
@@ -285,10 +339,9 @@ public final class ConfidenceScorer {
                 score(chain, stableNotes));
     }
 
-    /** 置信度等级（数字越小越高）。 */
+    /** 置信度等级（数字越小越高），仅由静态证据决定。 */
     public static int rank(Chain chain, List<String> notes) {
-        int score = evidenceScore(chain, notes);
-        return score >= 5 ? 0 : score >= 3 ? 1 : 2;
+        return rankFeatures(chain, notes).staticRank();
     }
 
     /** evidence 列的因子分解串：逐项列出各加分来源，可人工核对总分。 */
@@ -356,6 +409,66 @@ public final class ConfidenceScorer {
         return sb.toString();
     }
 
+    private static int staticEvidenceScore(Chain chain, List<String> notes) {
+        if (chain == null) {
+            return 0;
+        }
+        int points = 0;
+        for (ChainHop hop : chain.hops()) {
+            points += switch (hop.kind()) {
+                case DIRECT_CALL, FIELD_FLOW -> 1;
+                case VIRTUAL_DISPATCH, LAMBDA, NATIVE_CALLBACK, ENTRY -> 0;
+            };
+        }
+        points += entryWeight(chain.entryKind());
+        if ("HIGH".equals(chain.severity())) {
+            points += 1;
+        }
+        if (hasFrameworkBeanInput(chain)) {
+            points += FRAMEWORK_BEAN_INPUT_BONUS;
+        }
+        points -= chain.unresolvedHops() * 2;
+        if (notes != null) {
+            points += notes.stream().filter(n -> n != null && n.startsWith("pattern:"))
+                    .count() * PATTERN_BONUS;
+        }
+        return points;
+    }
+
+    private static int dynamicEvidenceScore(String status) {
+        return switch (status == null ? "" : status) {
+            case "SINK_BLOCKED", "PRE_SINK_CONFIRMED" -> SINK_BLOCKED_BONUS;
+            case "SINK_EXECUTED_SAFE", "JNI_EXECUTED_SAFE" -> 5;
+            case "CONCRETE_REACHED" -> 2;
+            case "SAFE_EFFECT_OBSERVED", "EXECUTED" -> 1;
+            default -> 0;
+        };
+    }
+
+    private static int rankFromScore(int score) {
+        return score >= 5 ? 0 : score >= 3 ? 1 : 2;
+    }
+
+    private static List<String> stableNotes(List<String> notes) {
+        if (notes == null || notes.isEmpty()) {
+            return List.of();
+        }
+        return notes.stream().filter(java.util.Objects::nonNull).toList();
+    }
+
+    private static String firstDegradation(List<String> notes) {
+        return notes.stream().filter(note -> note.startsWith("degrade:"))
+                .map(note -> note.substring("degrade:".length()))
+                .filter(value -> !value.isBlank())
+                .sorted()
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static String degradedBucket(String reason) {
+        return "DEGRADED(" + reason + ")";
+    }
+
     private static int entryWeight(String entryKind) {
         if (entryKind == null) {
             return 0;
@@ -377,7 +490,4 @@ public final class ConfidenceScorer {
                         && "framework-bean-input".equals(hop.reason()));
     }
 
-    private static boolean hasNote(List<String> notes, String expected) {
-        return notes != null && notes.stream().anyMatch(expected::equals);
-    }
 }

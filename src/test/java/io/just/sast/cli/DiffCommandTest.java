@@ -1,5 +1,6 @@
 package io.just.sast.cli;
 
+import io.just.sast.run.InputBudget;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -46,6 +47,13 @@ class DiffCommandTest {
 
     private static DiffCommand diff(Path oldDir, Path newDir) {
         DiffCommand cmd = new DiffCommand();
+        cmd.oldDir = oldDir;
+        cmd.newDir = newDir;
+        return cmd;
+    }
+
+    private static DiffCommand diff(InputBudget budget, Path oldDir, Path newDir) {
+        DiffCommand cmd = new DiffCommand(budget);
         cmd.oldDir = oldDir;
         cmd.newDir = newDir;
         return cmd;
@@ -117,7 +125,7 @@ class DiffCommandTest {
         Path oldDir = writeFindings(tmp.resolve("old"), ROW_A).getParent();
         String headerWithEvidence = HEADER + ",sink_role,construction_status,construction_type,"
                 + "construction_fields,construction_trigger,construction_sink_control,construction_reasons,"
-                + "verification_status,sink_distorted,sandbox_ready";
+                + "verification_status,sink_distorted,resource_containment_ready";
         String rowWithEvidence = ROW_A
                 + ",TERMINAL,DECLARED,DECLARED_SHAPE,DECLARED_ASSIGNMENTS,STATIC_PATH_ONLY,"
                 + "STATIC_ARGUMENT_FLOW,PLAN_NOT_DECLARED,NOT_SELECTED,false,false";
@@ -130,6 +138,34 @@ class DiffCommandTest {
         String out = captureDiff(oldDir, newDir);
         assertTrue(out.contains("变更链: 1"),
                 "新增构造/动态旁车字段必须参与语义 diff:\n" + out);
+    }
+
+    @Test
+    void callerBudgetSpansBothReportsAndDoesNotPublishPartialDiff(@TempDir Path tmp)
+            throws Exception {
+        Path oldDir = writeFindings(tmp.resolve("old"), ROW_A).getParent();
+        Path newDir = writeFindings(tmp.resolve("new"), ROW_A).getParent();
+        InputBudget defaults = InputBudget.defaults();
+        InputBudget budget = new InputBudget(defaults.schemaVersion(), 1024, 1024, 1024,
+                1024, defaults.maxCompressionRatio(), defaults.maxArchiveEntries(),
+                defaults.maxArchiveNesting(), defaults.maxClassEntries(),
+                defaults.maxRuleInputBytes(), defaults.maxRuleCodePoints(),
+                defaults.maxRuleAliases(), defaults.maxRuleNestingDepth(),
+                defaults.maxRuleDocuments(), defaults.maxRuleCount(),
+                defaults.maxRuleCollectionItems(), defaults.maxRuleNodes(),
+                defaults.maxRuleScalarChars(), defaults.maxPathChars(), defaults.maxParseMillis());
+
+        java.io.PrintStream stdout = System.out;
+        java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream();
+        System.setOut(new java.io.PrintStream(output, true, StandardCharsets.UTF_8));
+        try {
+            assertEquals(ExitCode.USAGE.code(), diff(budget, oldDir, newDir).call(),
+                    "the second report must observe the same caller-owned byte budget");
+        } finally {
+            System.setOut(stdout);
+        }
+        assertEquals("", output.toString(StandardCharsets.UTF_8),
+                "a failed second read must not publish a partial diff to stdout");
     }
 
     /** 捕获 diff 的 stdout（结果表是用户可见产物）。 */

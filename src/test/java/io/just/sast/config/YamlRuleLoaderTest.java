@@ -1,5 +1,6 @@
 package io.just.sast.config;
 
+import io.just.sast.run.InputBudget;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -7,8 +8,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Random;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -252,6 +256,166 @@ class YamlRuleLoaderTest {
         e = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
                 new ByteArrayInputStream(badModel.getBytes(StandardCharsets.UTF_8))));
         assertTrue(e.getMessage().contains("argN"), e.getMessage());
+    }
+
+    @Test
+    void hostileYamlIsRejectedWithStableBoundaryReasons() {
+        String unknown = """
+                rules:
+                  - id: X
+                    kind: model
+                    match: {call: {owner: a/B, name: load}}
+                    actions: {return: [this]}
+                    unexpected: true
+                """;
+        IOException failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(unknown.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(failure.getMessage().startsWith("RULE_UNKNOWN_KEY:"), failure.getMessage());
+
+        String duplicateKey = """
+                rules:
+                  - id: X
+                    kind: model
+                    kind: sink
+                """;
+        failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(duplicateKey.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(failure.getMessage().startsWith("RULE_YAML_REJECTED:"), failure.getMessage());
+
+        String customTag = """
+                rules:
+                  - id: X
+                    kind: model
+                    match: {call: {owner: a/B, name: load}}
+                    actions: {return: [!!java.net.URL 'http://127.0.0.1/']}
+                """;
+        failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(customTag.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(failure.getMessage().startsWith("RULE_YAML_REJECTED:"), failure.getMessage());
+
+        String twoDocuments = """
+                rules:
+                  - id: X
+                    kind: model
+                    match: {call: {owner: a/B, name: load}}
+                    actions: {return: [this]}
+                ---
+                rules: []
+                """;
+        failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(twoDocuments.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(failure.getMessage().startsWith("RULE_DOCUMENT_LIMIT:"), failure.getMessage());
+    }
+
+    @Test
+    void hostileYamlCollectionAndNestingLimitsAreBounded() {
+        StringBuilder deep = new StringBuilder("rules:\n  - id: X\n    kind: model\n    match: {call: {owner: a/B, name: load}}\n    actions: {return: ");
+        for (int i = 0; i < YamlRuleLoader.MAX_NESTING_DEPTH + 8; i++) {
+            deep.append("[");
+        }
+        deep.append("this");
+        for (int i = 0; i < YamlRuleLoader.MAX_NESTING_DEPTH + 8; i++) {
+            deep.append("]");
+        }
+        deep.append("}\n");
+        IOException failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(deep.toString().getBytes(StandardCharsets.UTF_8))));
+        assertTrue(failure.getMessage().contains("NESTING")
+                        || failure.getMessage().startsWith("RULE_YAML_REJECTED:"),
+                failure.getMessage());
+    }
+
+    @Test
+    void deterministicMalformedYamlFuzzNeverEscapesRuleBoundary() {
+        byte[] original = ("rules:\n"
+                + "  - id: FUZZ\n"
+                + "    kind: model\n"
+                + "    match: {call: {owner: a/B, name: load}}\n"
+                + "    actions: {return: [this]}\n").getBytes(StandardCharsets.UTF_8);
+        Random random = new Random(0x4A55535452554C45L);
+        for (int iteration = 0; iteration < 512; iteration++) {
+            byte[] mutated = Arrays.copyOf(original, original.length);
+            int flips = 1 + random.nextInt(8);
+            for (int flip = 0; flip < flips; flip++) {
+                int offset = random.nextInt(mutated.length);
+                mutated[offset] ^= (byte) (1 + random.nextInt(255));
+            }
+            assertDoesNotThrow(() -> {
+                try {
+                    new YamlRuleLoader().load(new ByteArrayInputStream(mutated),
+                            InputBudget.defaults());
+                } catch (IOException expected) {
+                    // Malformed configuration must remain a typed, fail-closed rejection.
+                }
+            }, "unchecked rule-loader escape at mutation " + iteration);
+        }
+    }
+
+    @Test
+    void explicitInputBudgetBoundsRuleStreamBeforeYamlAllocation() {
+        String yaml = "rules:\n  - id: X\n    kind: model\n    match: {call: {owner: a/B, name: load}}\n"
+                + "    actions: {return: [this]}\n";
+        InputBudget budget = InputBudget.defaults().withRuleInputBytes(16);
+        IOException failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)), budget));
+        assertTrue(failure.getMessage().startsWith("RULE_INPUT_BYTES_LIMIT:"),
+                failure.getMessage());
+    }
+
+    @Test
+    void ruleSchemaVersionIsExplicitAndUnknownVersionsFailClosed() throws Exception {
+        String yaml = "schema_version: JUST-RULES-YAML-V1\n"
+                + "rules:\n"
+                + "  - id: M\n"
+                + "    kind: model\n"
+                + "    match: {call: {owner: a/B, name: load}}\n"
+                + "    actions: {return: [this]}\n";
+        RuleSet rules = new YamlRuleLoader().load(
+                new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)));
+        assertEquals("JUST-RULES-YAML-V1", rules.schemaVersion());
+
+        String unsupported = yaml.replace("JUST-RULES-YAML-V1", "JUST-RULES-YAML-V0");
+        IOException failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(unsupported.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(failure.getMessage().startsWith("RULE_SCHEMA_VERSION_UNSUPPORTED:"),
+                failure.getMessage());
+    }
+
+    @Test
+    void aggregateRuleAccountingRejectsManySmallNodes() throws Exception {
+        String yaml = "rules:\n"
+                + "  - id: M\n"
+                + "    kind: model\n"
+                + "    match: {call: {owner: a/B, name: load}}\n"
+                + "    actions: {return: [this]}\n";
+        InputBudget budget = new InputBudget(InputBudget.SCHEMA_VERSION,
+                1024 * 1024, 1024 * 1024, 1024 * 1024, 64 * 1024, 1000,
+                128, 1, 1000, 1024 * 1024, 4000, 64, 64, 1, 4096,
+                4096, 2, 16384, 4096, 300_000);
+        IOException failure = assertThrows(IOException.class, () -> new YamlRuleLoader().load(
+                new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)), budget));
+        assertTrue(failure.getMessage().startsWith("RULE_TOTAL_COLLECTION_LIMIT:")
+                        || failure.getMessage().startsWith("RULE_TOTAL_NODE_LIMIT:")
+                        || failure.getMessage().startsWith("RULE_NODE_LIMIT:"),
+                failure.getMessage());
+    }
+
+    @Test
+    void explicitTrackerIsReusedAcrossRuleDocuments() throws Exception {
+        String yaml = "rules: []\n";
+        InputBudget budget = InputBudget.defaults();
+        InputBudget.Tracker tracker = budget.tracker();
+        YamlRuleLoader loader = new YamlRuleLoader();
+
+        loader.load(new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)),
+                budget, tracker);
+        long firstRead = tracker.readUncompressedBytes();
+        loader.load(new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)),
+                budget, tracker);
+
+        assertTrue(firstRead > 0L, "规则流读取必须计入 caller-owned tracker");
+        assertEquals(firstRead * 2L, tracker.readUncompressedBytes(),
+                "连续规则文档不得通过 loader 重置 aggregate tracker");
     }
 
     @Test

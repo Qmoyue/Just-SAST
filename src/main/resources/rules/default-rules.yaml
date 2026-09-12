@@ -1,3 +1,4 @@
+schema_version: JUST-RULES-YAML-V1
 rules:
   # ---- sink 起点 ----
   - id: JUST-SINK-COMMAND-EXEC-RUNTIME

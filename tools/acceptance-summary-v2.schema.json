@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/acceptance-summary-v2.json",
+  "title": "Just production acceptance summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "kind",
+    "profile",
+    "status",
+    "started_at",
+    "finished_at",
+    "plan",
+    "gates",
+    "summary",
+    "tooling",
+    "safety"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "contract_id": { "const": "JUST-PROD-D009-V1" },
+    "kind": { "const": "acceptance-summary" },
+    "profile": { "enum": ["smoke", "phase", "release"] },
+    "status": { "enum": ["PASS", "FAIL", "NOT_RUN", "INCOMPARABLE"] },
+    "started_at": { "type": "string", "minLength": 1 },
+    "finished_at": { "type": "string", "minLength": 1 },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "path", "contract_id", "state", "next_item", "evidence"],
+      "properties": {
+        "status": { "enum": ["PASS", "FAIL", "NOT_RUN", "INCOMPARABLE"] },
+        "path": { "type": "string", "minLength": 1 },
+        "contract_id": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "minLength": 1 },
+        "next_item": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 21,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "required", "status", "reason_code", "evidence", "commands"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+          "required": { "type": "boolean" },
+          "status": { "enum": ["PASS", "FAIL", "NOT_RUN", "INCOMPARABLE"] },
+          "reason_code": { "type": "string", "minLength": 1 },
+          "evidence": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+          "commands": { "type": "array", "items": { "type": "string" } },
+          "exit_code": { "type": ["integer", "null"] },
+          "details": { "type": "object" }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "gate_count", "required_count", "pass_count", "fail_count", "not_run_count", "incomparable_count", "required_failures", "required_not_run", "required_incomparable"],
+      "properties": {
+        "status": { "enum": ["PASS", "FAIL", "NOT_RUN", "INCOMPARABLE"] },
+        "gate_count": { "type": "integer", "minimum": 21 },
+        "required_count": { "type": "integer", "minimum": 1 },
+        "pass_count": { "type": "integer", "minimum": 0 },
+        "fail_count": { "type": "integer", "minimum": 0 },
+        "not_run_count": { "type": "integer", "minimum": 0 },
+        "incomparable_count": { "type": "integer", "minimum": 0 },
+        "required_failures": { "type": "array", "items": { "type": "string" } },
+        "required_not_run": { "type": "array", "items": { "type": "string" } },
+        "required_incomparable": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "tooling": { "type": "object" },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verification_mode", "target_code_execution_possible", "target_code_executed", "resource_containment_only", "filesystem_isolation", "network_isolation", "recommended_for_untrusted_artifacts", "target_trust", "fail_closed_on_isolation_failure", "dangerous_sink", "network", "file_write", "job_object"],
+      "properties": {
+        "verification_mode": { "enum": ["AUTO", "STATIC_ONLY"] },
+        "target_code_execution_possible": { "type": "boolean" },
+        "target_code_executed": { "type": "string", "minLength": 1 },
+        "resource_containment_only": { "const": true },
+        "filesystem_isolation": { "const": false },
+        "network_isolation": { "const": false },
+        "recommended_for_untrusted_artifacts": { "type": "boolean" },
+        "target_trust": { "enum": ["TRUSTED_LOCAL_TARGET_REQUIRED", "STATIC_ONLY_UNTRUSTED_ARTIFACT_PATH"] },
+        "fail_closed_on_isolation_failure": { "const": true },
+        "dangerous_sink": { "type": "string", "minLength": 1 },
+        "network": { "type": "string", "minLength": 1 },
+        "file_write": { "type": "string", "minLength": 1 },
+        "job_object": { "type": "object" }
+      }
+    }
+  }
+}

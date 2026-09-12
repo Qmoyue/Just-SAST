@@ -1,21 +1,29 @@
 package io.just.sast.cli;
 
+import io.just.sast.run.ExitReason;
+
 /** 退出码。 */
 public enum ExitCode {
     /** 扫描成功 */
-    OK(0),
+    OK(ExitReason.OK),
     /** 参数/配置错误 */
-    USAGE(2),
+    USAGE(ExitReason.USAGE),
     /** 内部错误 */
-    INTERNAL(3);
+    INTERNAL(ExitReason.INTERNAL),
+    /** 当前运行时不受支持 */
+    UNSUPPORTED_RUNTIME(ExitReason.UNSUPPORTED_RUNTIME);
 
-    private final int code;
+    private final ExitReason reason;
 
-    ExitCode(int code) {
-        this.code = code;
+    ExitCode(ExitReason reason) {
+        this.reason = reason;
     }
 
     public int code() {
-        return code;
+        return reason.code();
+    }
+
+    public ExitReason reason() {
+        return reason;
     }
 }

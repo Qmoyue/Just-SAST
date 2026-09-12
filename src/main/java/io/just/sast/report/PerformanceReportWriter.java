@@ -23,11 +23,13 @@ public final class PerformanceReportWriter {
             throw new IllegalArgumentException("performance report is null");
         }
         StringBuilder out = new StringBuilder(2048);
+        io.just.sast.run.RunOutcome outcome = report.runOutcome();
         out.append("{\n")
                 .append("  \"schema_version\":1,\n")
                 .append("  \"mode\":\"").append(escape(mode)).append("\",\n")
                 .append("  \"warmups\":").append(report.warmups()).append(",\n")
                 .append("  \"sample_count\":").append(report.samples().size()).append(",\n")
+                .append("  \"run_outcome\":").append(outcome.toCanonicalJson()).append(",\n")
                 .append("  \"gate_passed\":").append(report.passed()).append(",\n")
                 .append("  \"chain_count_stable\":").append(report.chainCountStable()).append(",\n")
                 .append("  \"completeness_stable\":").append(report.completenessStable()).append(",\n")
