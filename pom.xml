@@ -133,9 +133,20 @@
               <goal>unpack-dependencies</goal>
             </goals>
             <configuration>
-              <includeArtifactIds>asm</includeArtifactIds>
+              <!-- The test probe contains SinkCanaryAgent, whose real-call transformer
+                   extends AdviceAdapter from asm-commons. Keep the lifecycle classifier
+                   self-contained so a package-then-test run can instrument target classes. -->
+              <includeArtifactIds>asm,asm-commons</includeArtifactIds>
               <includeScope>runtime</includeScope>
               <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+              <!-- Both ASM artifacts carry module-info.class. Merging those module
+                   descriptors into the test-probe classpath makes Surefire resolve one
+                   synthetic module with duplicate packages; the probe needs classes only. -->
+              <excludes>module-info.class,META-INF/versions/**/module-info.class</excludes>
+              <!-- The verifier8 unpack uses the plugin's default marker directory. A
+                   per-output marker is required here; otherwise the first execution marks
+                   ASM as unpacked and this classifier silently skips its own destination. -->
+              <markersDirectory>${project.build.directory}/dependency-maven-plugin-markers/testprobe</markersDirectory>
             </configuration>
           </execution>
         </executions>
