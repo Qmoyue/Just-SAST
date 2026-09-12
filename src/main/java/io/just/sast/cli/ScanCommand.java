@@ -19,6 +19,10 @@ public final class ScanCommand implements Callable<Integer> {
             description = "目标 JAR 或 class 目录（支持 Spring Boot fat jar）")
     Path target;
 
+    @Option(names = "--mode", defaultValue = "component", paramLabel = "<component|application>",
+            description = "扫描模式：component 挖掘组件/依赖机制链（默认）；application 要求真实应用入口与连接证据")
+    String mode = "component";
+
     @Option(names = "--deps", split = ",", paramLabel = "<jar|dir,...>",
             description = "附加依赖（逗号分隔）")
     List<Path> deps;
@@ -85,13 +89,21 @@ public final class ScanCommand implements Callable<Integer> {
     @Override
     public Integer call() {
         try {
-            printVerificationDisclosure(noVerify);
-            // The default enabled mode is AUTO: static analysis completes first, then the
-            // bounded verifier may load trusted target code behind a Job Object resource
-            // boundary. Legacy adapter flags only select compatibility probes.
-            boolean useSafeReal = !noVerify && (safeRealSink || !safeExec);
-            boolean useOsIsolation = requireOsIsolation;
-            boolean useCache = cache != null && baseline == null && suppressions == null;
+            ScanMode selectedMode = ScanMode.parse(mode);
+            if (safeExec || safeRealSink || requireOsIsolation) {
+                throw new ScanPipeline.UsageException(
+                        "真实动态验证已移除；--mode/静态扫描不接受旧 verifier 选项");
+            }
+            printVerificationDisclosure();
+            // The product CLI is static-only.  The library compatibility overloads still
+            // retain their old verifier seams for characterization until P1.4 removes them.
+            boolean useSafeReal = false;
+            boolean useOsIsolation = false;
+            boolean useCache = selectedMode == ScanMode.APPLICATION
+                    && cache != null && baseline == null && suppressions == null;
+            if (selectedMode == ScanMode.COMPONENT && cache != null) {
+                System.err.println("[just:info] component 模式暂不复用旧 cache；模式身份纳入新缓存契约后启用");
+            }
             if (cache != null && !useCache) {
                 System.err.println("[just:info] --cache 与 baseline/suppressions 同时使用时跳过缓存，"
                         + "避免复用未应用当前差异策略的报告");
@@ -100,7 +112,7 @@ public final class ScanCommand implements Callable<Integer> {
             if (useCache) {
                 try {
                     preflight = ScanCache.preflight(target, deps, rules, jdkHome, fast,
-                            !noVerify, verifyBudget, safeExec, useSafeReal,
+                            false, verifyBudget, false, false,
                             useOsIsolation);
                     if (ScanCache.restore(cache, preflight.cacheKey(), output)) {
                         System.err.println("[just:info] 增量缓存命中（报告身份已校验）");
@@ -111,11 +123,14 @@ public final class ScanCommand implements Callable<Integer> {
                             + cacheFailure.getClass().getSimpleName());
                 }
             }
+            ScanPipeline.ExportPolicy exportPolicy = selectedMode == ScanMode.APPLICATION
+                    ? ScanPipeline.ExportPolicy.STRICT_PRODUCT
+                    : ScanPipeline.ExportPolicy.AUDIT_COMPATIBILITY;
             ScanPipeline.ScanResult result = ScanPipeline.run(target, deps, output, rules, stats,
-                    fast, jdkHome, !noVerify, verifyBudget, safeExec, useSafeReal,
+                    fast, jdkHome, false, verifyBudget, false, false,
                     useOsIsolation,
                     baseline, suppressions, overwrite,
-                    ScanPipeline.ExportPolicy.STRICT_PRODUCT);
+                    exportPolicy);
             if (useCache && preflight != null) {
                 try {
                     boolean stored = ScanCache.store(cache, preflight.cacheKey(), output,
@@ -136,18 +151,9 @@ public final class ScanCommand implements Callable<Integer> {
         }
     }
 
-    private static void printVerificationDisclosure(boolean noVerify) {
-        if (noVerify) {
-            System.err.println("[just:info] verificationMode=STATIC_ONLY; "
-                    + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
-                    + "recommendedForUntrustedArtifacts=true");
-            return;
-        }
-        System.err.println("[just:warning] verificationMode=AUTO; "
-                + "targetCodeExecutionPossible=true; targetCodeExecuted=UNKNOWN; "
-                + "targetTrust=TRUSTED_LOCAL_TARGET_REQUIRED; "
-                + "resourceContainmentOnly=true; filesystemIsolation=false; "
-                + "networkIsolation=false; recommendedForUntrustedArtifacts=false; "
-                + "isolationFailure=FAIL_CLOSED; use --no-verify for untrusted artifacts");
+    private static void printVerificationDisclosure() {
+        System.err.println("[just:info] verificationMode=STATIC_ONLY; "
+                + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
+                + "dynamicFiltering=ANALYSIS_ONLY; recommendedForUntrustedArtifacts=true");
     }
 }
