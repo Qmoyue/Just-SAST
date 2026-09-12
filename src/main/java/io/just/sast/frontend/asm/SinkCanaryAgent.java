@@ -320,7 +320,18 @@ public final class SinkCanaryAgent {
             boolean[] changed = {false};
             try {
                 ClassReader reader = new ClassReader(bytes);
-                ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_FRAMES);
+                // The target loader is intentionally isolated from the verifier/system loader.
+                // ASM's default frame resolver asks that system loader for every common
+                // superclass, which can fail for an application-only class on Windows and
+                // silently discard the transformation.  A conservative Object frame is valid
+                // for all reference merges and keeps bytecode rewriting independent of target
+                // class visibility.
+                ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_FRAMES) {
+                    @Override
+                    protected String getCommonSuperClass(String first, String second) {
+                        return first.equals(second) ? first : "java/lang/Object";
+                    }
+                };
                 reader.accept(new ClassVisitor(Opcodes.ASM9, writer) {
                     @Override
                     public MethodVisitor visitMethod(int access, String name, String desc,
