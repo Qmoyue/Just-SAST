@@ -246,14 +246,16 @@ public final class SandboxSecurityManager extends SecurityManager {
         // The transformed target bytecode invokes the one-purpose canary gate from the
         // bootstrap loader.  ClassLoader.checkPackageAccess() reports that lookup against
         // the target frame, so requiring trustedProbeCaller() here would reject every real
-        // sink boundary before the gate can run.  This package contains only the immutable
-        // gate/error classes; the main verifier namespace remains closed to target code.
+        // sink boundary before the gate can run.  The bootstrap gate is public to transformed
+        // targets; the remaining verifier namespace stays closed except for the code-source
+        // verified frontend transformer below.
         if (packageName != null && (packageName.equals("io.just.sast.verify.boot")
                 || packageName.startsWith("io.just.sast.verify.boot."))) {
             return;
         }
         if (packageName != null && (packageName.equals("io.just.sast")
-                || packageName.startsWith("io.just.sast.")) && !trustedProbeCaller()) {
+                || packageName.startsWith("io.just.sast."))
+                && !trustedProbeCaller() && !trustedTransformerCaller()) {
             throw new SecurityException("verifier package access denied: " + packageName);
         }
     }
@@ -271,6 +273,20 @@ public final class SandboxSecurityManager extends SecurityManager {
     private boolean trustedProbeCaller() {
         Class<?> frame = firstNonPlatformFrame();
         return frame != null && isVerifierFrame(frame);
+    }
+
+    /**
+     * ASM transformation runs from a frontend-owned agent class rather than the verifier
+     * launcher package.  Permit that one code-source-verified transformer frame to resolve
+     * its own nested visitor classes after the manager is installed; an application frame is
+     * still denied because it is the first non-platform frame.
+     */
+    private boolean trustedTransformerCaller() {
+        Class<?> frame = firstNonPlatformFrame();
+        return frame != null
+                && frame.getName().startsWith("io.just.sast.frontend.asm.SinkCanaryAgent")
+                && trustedCodeSource != null
+                && trustedCodeSource.equals(codeSourceOf(frame));
     }
 
     /**
