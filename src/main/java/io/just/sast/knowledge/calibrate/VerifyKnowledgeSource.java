@@ -104,12 +104,12 @@ public final class VerifyKnowledgeSource implements KnowledgeSource {
             bb.publishFact(VerificationPlan.empty(0));
             bb.publishFact(buildCoverage(bb, applicationEvidence, candidates, List.of(), List.of(),
                     false, VerificationCoverage.Status.NOT_REQUESTED));
-            bb.setVerificationStatus("DISABLED");
+            bb.setVerificationStatus("STATIC_ONLY");
             bb.setVerificationResourceMetrics(java.util.Map.of());
             bb.setVerificationSummary(VerificationSummary.empty(
-                    "DISABLED", bb.scanInputs().verifyBudget()));
+                    "STATIC_ONLY", 0));
             bb.recordPhaseMs("verify", 0L);
-            JustLogger.info("动态验证已关闭（--no-verify）");
+            JustLogger.info("静态分析模式：验证调度已禁用，目标代码不会加载");
             return;
         }
         int budget = bb.scanInputs().verifyBudget();

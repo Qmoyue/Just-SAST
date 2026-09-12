@@ -22,7 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class StaticModeBehaviorTest {
 
     @Test
-    void staticScanDoesNotLoadTargetClass(@TempDir Path temp) throws Exception {
+    void legacyVerificationRequestStillDoesNotLoadTargetClass(@TempDir Path temp) throws Exception {
         Path sentinel = temp.resolve("target-loaded.txt");
         String path = sentinel.toString().replace("\\", "\\\\");
         Path jar = compileToJar(temp.resolve("target.jar"), Map.of("app.Sentinel", """
@@ -38,7 +38,7 @@ class StaticModeBehaviorTest {
                 }
                 """.formatted(path)));
         ScanPipeline.run(jar, null, temp.resolve("out"), null, false, true, null,
-                false, 0);
+                true, 20);
         assertFalse(Files.exists(sentinel), "static analysis must not initialize target classes");
         String report = Files.readString(temp.resolve("out").resolve("report.json"));
         assertTrue(report.contains("\"target_code_executed\":\"NO\""));

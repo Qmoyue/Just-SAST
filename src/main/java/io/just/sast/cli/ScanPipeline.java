@@ -236,8 +236,15 @@ public final class ScanPipeline {
             throw new UsageException("--require-os-isolation 需要启用动态验证（不能与 --no-verify 同时使用）");
         }
 
+        // The product contract is static-only.  Keep the legacy boolean and safety switches
+        // at this compatibility seam so older library callers receive the same scan, but do
+        // not prewarm a verifier boundary or pass target-execution capabilities downstream.
         if (verify) {
-            io.just.sast.verify.OsIsolation.prewarmJobObject();
+            JustLogger.info("静态分析模式：忽略旧 verifier 请求，目标代码不会加载或执行");
+            verify = false;
+            safeExec = false;
+            safeReal = false;
+            requireOsIsolation = false;
         }
 
         // Hash immutable inputs once at the scan boundary. Besides making report identity
@@ -512,9 +519,8 @@ public final class ScanPipeline {
                 heapPeakMb(),
                 scanCompletenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
                 scanCompletenessReasons, phaseMs, metricCapture.values(),
-                verify ? blackboard.verificationStatus() : "DISABLED",
-                verify ? reportVerification
-                        : io.just.sast.blackboard.VerificationSummary.empty("DISABLED", verifyBudget),
+                "STATIC_ONLY",
+                io.just.sast.blackboard.VerificationSummary.empty("STATIC_ONLY", 0),
                 scanChainProofCompleteness,
                 targetArtifactHash, metricCapture.status(), metricCapture.namespaces(),
                 metricCapture.namespaceStatus());
