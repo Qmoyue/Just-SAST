@@ -80,6 +80,24 @@ class StaticModeBehaviorTest {
                 "application mode must not promote a dependency chain without a join");
     }
 
+    @Test
+    void negativeFixtureExplainsAnEmptyStaticResult(@TempDir Path temp) throws Exception {
+        Path target = compileToJar(temp.resolve("negative.jar"), Map.of("negative.Empty", """
+                package negative;
+                public class Empty { public void health() { } }
+                """));
+        Path output = temp.resolve("negative-report");
+        ScanPipeline.run(target, null, output, null, false, true, null,
+                false, 0, false, false, false, null, null, false,
+                ModeDemandPolicy.forMode(ScanMode.COMPONENT));
+        String json = Files.readString(output.resolve("report.json"));
+        String markdown = Files.readString(output.resolve("report.md"));
+        assertTrue(json.contains("\"chains\":[]"), "negative fixture should have no chain rows");
+        assertTrue(json.contains("\"kind\":\"EMPTY\""));
+        assertTrue(json.contains("\"NO_CANDIDATES\""));
+        assertTrue(markdown.contains("not proof that the artifact is safe"));
+    }
+
     private static final class Source extends SimpleJavaFileObject {
         private final String code;
 

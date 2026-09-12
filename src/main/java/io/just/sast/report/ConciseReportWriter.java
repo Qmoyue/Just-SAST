@@ -9,6 +9,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.Objects;
 
 /**
@@ -72,7 +74,9 @@ public final class ConciseReportWriter {
                 .append(",\"files_scanned\":").append(stats.filesScanned())
                 .append(",\"classes_loaded\":").append(stats.classesLoaded())
                 .append(",\"elapsed_ms\":").append(stats.elapsedMs()).append('}')
-                .append(",\"chains\":[");
+                .append(",\"result_explanation\":");
+        appendResultExplanation(out, stats, findings);
+        out.append(",\"chains\":[");
         for (int i = 0; i < findings.size(); i++) {
             if (i > 0) out.append(',');
             appendFinding(out, snapshot, findings.get(i));
@@ -109,6 +113,12 @@ public final class ConciseReportWriter {
                 .append(",\"violations\":");
         appendStrings(out, state.defaultFindingViolations());
         out.append('}')
+                .append(",\"constraints\":{\"feasibility\":")
+                .append(quote(state.feasibility().name()))
+                .append(",\"completeness\":").append(quote(state.completeness().name()))
+                .append(",\"violations\":");
+        appendStrings(out, state.defaultFindingViolations());
+        out.append(",\"unresolved_hops\":").append(chain.unresolvedHops()).append('}')
                 .append(",\"ranking\":{\"static_score\":")
                 .append(finding.ranking().staticScore())
                 .append(",\"precision_rank\":").append(finding.ranking().precisionRank())
@@ -118,10 +128,30 @@ public final class ConciseReportWriter {
                 .append(ReportEvidence.constructionJson(finding.construction()))
                 .append(",\"notes\":");
         appendStrings(out, finding.notes());
+        List<ChainHop> hops = orderedHops(chain);
+        out.append(",\"object_relations\":[");
+        boolean firstRelation = true;
+        for (ChainHop hop : hops) {
+            if (hop.field() == null || hop.field().isBlank()) {
+                continue;
+            }
+            if (!firstRelation) {
+                out.append(',');
+            }
+            firstRelation = false;
+            out.append("{\"from\":").append(quote(member(hop.fromOwner(), hop.fromName())))
+                    .append(",\"to\":").append(quote(member(hop.toOwner(), hop.toName())))
+                    .append(",\"kind\":").append(quote(hop.kind() == null
+                            ? "UNKNOWN" : hop.kind().name()))
+                    .append(",\"field\":").append(quote(hop.field()))
+                    .append(",\"field_owner\":").append(nullableQuote(hop.fieldOwner()))
+                    .append('}');
+        }
+        out.append(']');
         out.append(",\"hops\":[");
-        for (int i = 0; i < chain.hops().size(); i++) {
+        for (int i = 0; i < hops.size(); i++) {
             if (i > 0) out.append(',');
-            ChainHop hop = chain.hops().get(i);
+            ChainHop hop = hops.get(i);
             out.append("{\"from\":").append(quote(member(hop.fromOwner(), hop.fromName())))
                     .append(",\"to\":").append(quote(member(hop.toOwner(), hop.toName())))
                     .append(",\"kind\":").append(quote(hop.kind() == null
@@ -129,6 +159,9 @@ public final class ConciseReportWriter {
                     .append(",\"field\":").append(quote(hop.field()))
                     .append(",\"reason\":").append(quote(hop.reason()))
                     .append(",\"descriptor\":").append(quote(hop.desc()))
+                    .append(",\"arg_ordinal\":").append(hop.argOrdinal() == null
+                            ? "null" : hop.argOrdinal())
+                    .append(",\"field_owner\":").append(nullableQuote(hop.fieldOwner()))
                     .append('}');
         }
         out.append(']');
@@ -156,11 +189,18 @@ public final class ConciseReportWriter {
                 .append("- Target code executed: `NO`\n")
                 .append("- Candidates: ").append(findings.size())
                 .append("; exported: ").append(findings.stream()
-                        .filter(FindingOutputReader.Finding::exported).count()).append("\n\n");
+                        .filter(FindingOutputReader.Finding::exported).count()).append('\n')
+                .append("- Result: ").append(md(resultMessage(findings))).append('\n')
+                .append("- Reason codes: `").append(md(String.join(",", resultReasonCodes(stats,
+                        findings)))).append("`\n\n");
         if (findings.isEmpty()) {
-            out.append("No chain candidates were produced. Check completeness and reason codes; ")
+            out.append("No static chain candidate was produced. Check completeness and reason codes; ")
                     .append("an empty result is not proof that the artifact is safe.\n");
             return out.toString();
+        }
+        if (findings.stream().noneMatch(FindingOutputReader.Finding::exported)) {
+            out.append("Candidates were retained as audit evidence, but none met the selected "
+                    + "mode's export contract.\n\n");
         }
         out.append("## Chains\n\n");
         int number = 1;
@@ -189,7 +229,7 @@ public final class ConciseReportWriter {
             }
             if (!chain.hops().isEmpty()) {
                 out.append("- Hops:\n");
-                for (ChainHop hop : chain.hops()) {
+                for (ChainHop hop : orderedHops(chain)) {
                     out.append("  - `").append(md(member(hop.fromOwner(), hop.fromName())))
                             .append("` — ").append(md(hop.kind() == null
                                     ? "UNKNOWN" : hop.kind().name()))
@@ -197,6 +237,15 @@ public final class ConciseReportWriter {
                             .append('`');
                     if (hop.field() != null && !hop.field().isBlank()) {
                         out.append("; field `").append(md(hop.field())).append('`');
+                        if (hop.fieldOwner() != null && !hop.fieldOwner().isBlank()) {
+                            out.append(" declared by `").append(md(hop.fieldOwner())).append('`');
+                        }
+                    }
+                    if (hop.argOrdinal() != null) {
+                        out.append("; arg ").append(hop.argOrdinal());
+                    }
+                    if (hop.desc() != null && !hop.desc().isBlank()) {
+                        out.append("; descriptor `").append(md(hop.desc())).append('`');
                     }
                     if (hop.reason() != null && !hop.reason().isBlank()) {
                         out.append("; ").append(md(hop.reason()));
@@ -207,6 +256,58 @@ public final class ConciseReportWriter {
             out.append('\n');
         }
         return out.toString();
+    }
+
+    private static void appendResultExplanation(StringBuilder out, ScanStatistics stats,
+                                                List<FindingOutputReader.Finding> findings) {
+        long exported = findings.stream().filter(FindingOutputReader.Finding::exported).count();
+        out.append("{\"kind\":").append(quote(resultKind(findings, exported)))
+                .append(",\"message\":").append(quote(resultMessage(findings)))
+                .append(",\"candidate_count\":").append(findings.size())
+                .append(",\"exported_count\":").append(exported)
+                .append(",\"reason_codes\":");
+        appendStrings(out, resultReasonCodes(stats, findings));
+        out.append('}');
+    }
+
+    private static String resultKind(List<FindingOutputReader.Finding> findings, long exported) {
+        if (findings.isEmpty()) {
+            return "EMPTY";
+        }
+        return exported == 0 ? "AUDIT_CANDIDATES_ONLY" : "EXPORTED_CANDIDATES";
+    }
+
+    private static String resultMessage(List<FindingOutputReader.Finding> findings) {
+        if (findings.isEmpty()) {
+            return "No static chain candidate was produced; this does not prove that the artifact is safe.";
+        }
+        if (findings.stream().noneMatch(FindingOutputReader.Finding::exported)) {
+            return "Candidates are available as audit evidence, but none met the selected mode's export contract.";
+        }
+        return "Static chain candidates are available for review.";
+    }
+
+    private static List<String> resultReasonCodes(ScanStatistics stats,
+                                                  List<FindingOutputReader.Finding> findings) {
+        Set<String> reasons = new TreeSet<>();
+        if (stats != null) {
+            reasons.addAll(stats.runOutcome().reasonCodes());
+            reasons.addAll(stats.completenessReasons());
+        }
+        if (findings.isEmpty()) {
+            reasons.add("NO_CANDIDATES");
+        } else if (findings.stream().noneMatch(FindingOutputReader.Finding::exported)) {
+            reasons.add("NO_EXPORTED_CANDIDATES");
+        }
+        return List.copyOf(reasons);
+    }
+
+    /** Chains are built by reverse sink search; reports present the readable entry-to-sink path. */
+    private static List<ChainHop> orderedHops(Chain chain) {
+        List<ChainHop> hops = chain == null || chain.hops() == null
+                ? new ArrayList<>() : new ArrayList<>(chain.hops());
+        java.util.Collections.reverse(hops);
+        return hops;
     }
 
     private static String normalizeMode(String mode) {
@@ -256,6 +357,10 @@ public final class ConciseReportWriter {
             }
         }
         return out.append('"').toString();
+    }
+
+    private static String nullableQuote(String value) {
+        return value == null || value.isBlank() ? "null" : quote(value);
     }
 
     private static String md(String value) {

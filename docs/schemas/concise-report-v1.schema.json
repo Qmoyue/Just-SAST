@@ -3,15 +3,7 @@
   "$id": "https://just.invalid/schema/concise-report-v1.schema.json",
   "title": "Just concise static report",
   "type": "object",
-  "required": [
-    "schema_version",
-    "mode",
-    "static_safety",
-    "artifact_sha256",
-    "run",
-    "summary",
-    "chains"
-  ],
+  "required": ["schema_version", "mode", "static_safety", "artifact_sha256", "run", "summary", "result_explanation", "chains"],
   "properties": {
     "schema_version": { "const": "JUST-REPORT-V1" },
     "mode": { "enum": ["component", "application"] },
@@ -27,9 +19,134 @@
       "additionalProperties": false
     },
     "artifact_sha256": { "type": "string", "minLength": 1 },
-    "run": { "type": "object", "required": ["status", "completeness", "chain_proof_completeness", "reason_codes"] },
-    "summary": { "type": "object", "required": ["candidates", "exported"] },
-    "chains": { "type": "array", "items": { "type": "object", "required": ["id", "exported", "entry", "sink", "state", "hops"] } }
+    "run": {
+      "type": "object",
+      "required": ["status", "completeness", "chain_proof_completeness", "reason_codes"],
+      "properties": {
+        "status": { "enum": ["SUCCESS", "PARTIAL", "FAILED", "USAGE_ERROR", "UNSUPPORTED", "NOT_RUN"] },
+        "completeness": { "type": "string", "minLength": 1 },
+        "chain_proof_completeness": { "type": "string", "minLength": 1 },
+        "reason_codes": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": ["candidates", "exported", "files_scanned", "classes_loaded", "elapsed_ms"],
+      "properties": {
+        "candidates": { "type": "integer", "minimum": 0 },
+        "exported": { "type": "integer", "minimum": 0 },
+        "files_scanned": { "type": "integer", "minimum": 0 },
+        "classes_loaded": { "type": "integer", "minimum": 0 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "result_explanation": {
+      "type": "object",
+      "required": ["kind", "message", "candidate_count", "exported_count", "reason_codes"],
+      "properties": {
+        "kind": { "enum": ["EMPTY", "AUDIT_CANDIDATES_ONLY", "EXPORTED_CANDIDATES"] },
+        "message": { "type": "string", "minLength": 1 },
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "exported_count": { "type": "integer", "minimum": 0 },
+        "reason_codes": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "chains": { "type": "array", "items": { "$ref": "#/$defs/chain" } }
+  },
+  "$defs": {
+    "chain": {
+      "type": "object",
+      "required": ["id", "exported", "rule_id", "category", "severity", "entry", "sink", "state", "constraints", "ranking", "construction", "notes", "object_relations", "hops", "application_trace"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "exported": { "type": "boolean" },
+        "rule_id": { "type": "string" },
+        "category": { "type": "string" },
+        "severity": { "type": "string" },
+        "entry": {
+          "type": "object",
+          "required": ["class", "method", "kind"],
+          "properties": { "class": { "type": "string" }, "method": { "type": "string" }, "kind": { "type": "string" } },
+          "additionalProperties": false
+        },
+        "sink": {
+          "type": "object",
+          "required": ["class", "method", "descriptor", "role", "risk"],
+          "properties": { "class": { "type": "string" }, "method": { "type": "string" }, "descriptor": { "type": "string" }, "role": { "type": "string" }, "risk": { "type": "string" } },
+          "additionalProperties": false
+        },
+        "state": {
+          "type": "object",
+          "required": ["entry_status", "chain_progress", "feasibility", "completeness", "verification", "risk", "eligibility", "violations"],
+          "properties": {
+            "entry_status": { "type": "string" }, "chain_progress": { "type": "string" }, "feasibility": { "type": "string" },
+            "completeness": { "type": "string" }, "verification": { "type": "string" }, "risk": { "type": "string" },
+            "eligibility": { "type": "string" }, "violations": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        },
+        "constraints": {
+          "type": "object",
+          "required": ["feasibility", "completeness", "violations", "unresolved_hops"],
+          "properties": {
+            "feasibility": { "type": "string" }, "completeness": { "type": "string" },
+            "violations": { "type": "array", "items": { "type": "string" } }, "unresolved_hops": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "ranking": {
+          "type": "object",
+          "required": ["static_score", "precision_rank", "explanation"],
+          "properties": { "static_score": { "type": "number" }, "precision_rank": { "type": "integer" }, "explanation": { "type": "string" } },
+          "additionalProperties": false
+        },
+        "construction": {
+          "type": "object",
+          "required": ["overall", "type", "fields", "trigger", "sink_control", "reasons"],
+          "properties": {
+            "overall": { "type": "string" }, "type": { "type": "string" }, "fields": { "type": "string" },
+            "trigger": { "type": "string" }, "sink_control": { "type": "string" }, "reasons": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        },
+        "notes": { "type": "array", "items": { "type": "string" } },
+        "object_relations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to", "kind", "field", "field_owner"],
+            "properties": { "from": { "type": "string" }, "to": { "type": "string" }, "kind": { "type": "string" }, "field": { "type": "string" }, "field_owner": { "type": ["string", "null"] } },
+            "additionalProperties": false
+          }
+        },
+        "hops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to", "kind", "field", "reason", "descriptor", "arg_ordinal", "field_owner"],
+            "properties": {
+              "from": { "type": "string" }, "to": { "type": "string" }, "kind": { "type": "string" }, "field": { "type": "string" },
+              "reason": { "type": "string" }, "descriptor": { "type": "string" }, "arg_ordinal": { "type": ["integer", "null"] }, "field_owner": { "type": ["string", "null"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "application_trace": {
+          "type": ["object", "null"],
+          "properties": {
+            "application_entry_class": { "type": "string" }, "application_entry_method": { "type": "string" },
+            "application_site_class": { "type": "string" }, "application_site_method": { "type": "string" },
+            "application_site_kind": { "type": "string" }, "join_kind": { "type": "string" }, "chain_entry_method": { "type": "string" },
+            "entry_prefix_path": { "type": "string" }, "dependency_owner": { "type": "string" }, "terminal_owner": { "type": "string" }, "terminal_method": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": false
 }
