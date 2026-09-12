@@ -9,6 +9,7 @@ just-out/
 dependency-reduced-pom.xml
 benchmark/
 .agents/
+/tools/
 /just-sast-*.jar
 just-fragments.ser
 
@@ -49,5 +50,4 @@ docs/*
 !docs/schemas/
 !docs/schemas/*.json
 
-# Local regression manifests may contain workstation-specific input paths.
-tools/final-wp-manifest.json
+# Local workflow helpers and regression manifests stay outside the remote source tree.

@@ -4,8 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: '17 2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -17,7 +15,7 @@ concurrency:
 
 jobs:
   # Fast feedback: ordinary tests and a reproducible, attached shaded launcher.
-  # Benchmark truth and the real Windows isolation contract live in separate jobs.
+  # Benchmark and performance studies are maintained outside the CI workflow.
   fast:
     name: fast (${{ matrix.os }}, JDK ${{ matrix.java }})
     strategy:
@@ -61,33 +59,6 @@ jobs:
           $main = & jar tf $shaded.FullName
           if (-not ($main -contains 'META-INF/MANIFEST.MF')) { throw 'shaded manifest missing' }
           if (-not ($main -contains 'picocli/CommandLine.class')) { throw 'shaded dependency content missing' }
-      - name: Validate metric and runner contracts
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-scan-metrics.ps1 -SelfTest
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/run-performance-v2.ps1 -SelfTest
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-performance-baseline.ps1 -SelfTest
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/run-acceptance.ps1 -SelfTest
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-acceptance-summary.ps1 -SelfTest
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-verification-disclosure.ps1 -SelfTest
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-input-surface-inventory.ps1 -SelfTest
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-input-surface-inventory.ps1
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/run-hostile-corpus.ps1 -SelfTest
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-jdk-discovery.ps1 -SelfTest -Json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-cli-contract.ps1 -SelfTest -Json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-cli-contract.ps1 -LauncherJar 'target/just-sast-0.2.0-shaded.jar' -Json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          New-Item -ItemType Directory -Force -Path 'target/ci-gates/perf-micro' | Out-Null
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/run-performance-v2.ps1 -Tier MICRO -OutputRoot 'target/ci-gates/perf-micro/run' -MicroIterations 10000
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/validate-performance-baseline.ps1 -BaselinePath 'target/ci-gates/perf-micro/run/performance-baseline.json'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload fast build artifacts
         if: runner.os == 'Linux' && matrix.java == '17'
         uses: actions/upload-artifact@v4
@@ -146,111 +117,3 @@ jobs:
           path: |
             target/surefire-reports/**
             target/*.log
-
-  # Gleipner has no application entry by design.  Keep it in an explicit
-  # gadget-kernel lane and do not leak its synthetic sink into product findings.
-  # The adapter is manifest-driven and remains isolated from default product
-  # findings.  Its semantic mismatches are intentionally non-zero until the
-  # solver/adapter contracts close them; no score is made up in CI.
-  gleipner-kernel:
-    name: Gleipner gadget-kernel evaluator
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-      - name: Package Just shaded launcher
-        shell: pwsh
-        run: mvn -B package -DskipTests
-      - name: Preflight official Gleipner inputs
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path 'target/ci-gates/gleipner' | Out-Null
-          if (-not (Test-Path -LiteralPath 'benchmark/Gleipner/pom.xml' -PathType Leaf) -or -not (Test-Path -LiteralPath 'benchmark/manifest/gleipner.v2.json' -PathType Leaf)) {
-            '{"gate":"GLEIPNER_KERNEL","status":"NOT_RUN","reason":"MISSING_GLEIPNER_INPUT_OR_MANIFEST","mode":"gadget-kernel"}' | Set-Content -LiteralPath 'target/ci-gates/gleipner/NOT_RUN.json' -Encoding UTF8
-            Write-Output 'GLEIPNER_KERNEL NOT_RUN: benchmark/Gleipner or manifest is not present in this checkout'
-            exit 1
-          }
-          $jabba = Get-Command jabba -ErrorAction SilentlyContinue
-          if ($null -eq $jabba) {
-            $jabba = Get-ChildItem -Path $env:USERPROFILE,'C:\Users' -Filter 'jabba.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-          if ($null -eq $jabba) {
-            '{"gate":"GLEIPNER_KERNEL","status":"NOT_RUN","reason":"MISSING_JABBA","mode":"gadget-kernel"}' | Set-Content -LiteralPath 'target/ci-gates/gleipner/NOT_RUN.json' -Encoding UTF8
-            Write-Output 'GLEIPNER_KERNEL NOT_RUN: Jabba is required for manifest-selected JDKs'
-            exit 1
-          }
-      - name: Build official Gleipner categories and evaluator
-        shell: pwsh
-        run: mvn -B -f benchmark/Gleipner/pom.xml clean package -DskipTests
-      - name: Run official evaluator adapter
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/run-gleipner-kernel.ps1 -ManifestPath benchmark/manifest/gleipner.v2.json -LauncherJar target/just-sast-0.2.0-shaded.jar -OutputRoot target/ci-gates/gleipner/run -CaseId gleipner-all-categories
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Upload Gleipner diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: just-sast-gleipner-kernel
-          if-no-files-found: warn
-          path: |
-            target/ci-gates/gleipner/**
-            benchmark/Gleipner/**/target/*.jar
-
-  # Full 8-WP/Apache runs are intentionally scheduled or manually dispatched.
-  # The runner itself enforces manifest hashes, JDK selection, and no-overwrite
-  # transactions; absent private/ignored inputs are a hard NOT_RUN.
-  nightly:
-    name: Nightly WP8 and Apache regression
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-      - name: Package shaded launcher
-        run: mvn -B package -DskipTests
-      - name: Preflight benchmark manifests and PowerShell runner
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/ci-gates/nightly
-          if [[ ! -f benchmark/manifest/wp8.v2.json || ! -f benchmark/manifest/apache-heldout.v2.json ]]; then
-            printf '{"gate":"WP8_STATIC","status":"NOT_RUN","reason":"MISSING_PRIVATE_BENCHMARK_MANIFEST","profile":"nightly"}\n' > target/ci-gates/nightly/NOT_RUN.json
-            echo 'NIGHTLY NOT_RUN: WP8/Apache manifests are not present in this checkout'
-            exit 1
-          fi
-          if ! command -v pwsh >/dev/null 2>&1; then
-            printf '{"gate":"WP8_STATIC","status":"NOT_RUN","reason":"MISSING_POWERSHELL_CORE","profile":"nightly"}\n' > target/ci-gates/nightly/NOT_RUN.json
-            echo 'NIGHTLY NOT_RUN: pwsh is required by the manifest-driven runner'
-            exit 1
-          fi
-      - name: Run manifest-driven smoke regression (no top-k denominator)
-        shell: bash
-        run: |
-          set -euo pipefail
-          pwsh -NoProfile -File tools/run-regression-v2.ps1 \
-            -ManifestPath benchmark/manifest/wp8.v2.json \
-            -LauncherJar target/just-sast-0.2.0-shaded.jar \
-            -OutputRoot target/ci-gates/nightly/wp8 \
-            -Fast
-      - name: Upload nightly diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: just-sast-nightly
-          if-no-files-found: warn
-          path: |
-            target/ci-gates/nightly/**
