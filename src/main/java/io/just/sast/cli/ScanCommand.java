@@ -90,6 +90,7 @@ public final class ScanCommand implements Callable<Integer> {
     public Integer call() {
         try {
             ScanMode selectedMode = ScanMode.parse(mode);
+            ModeDemandPolicy modePolicy = ModeDemandPolicy.forMode(selectedMode);
             if (safeExec || safeRealSink || requireOsIsolation) {
                 throw new ScanPipeline.UsageException(
                         "真实动态验证已移除；--mode/静态扫描不接受旧 verifier 选项");
@@ -123,14 +124,11 @@ public final class ScanCommand implements Callable<Integer> {
                             + cacheFailure.getClass().getSimpleName());
                 }
             }
-            ScanPipeline.ExportPolicy exportPolicy = selectedMode == ScanMode.APPLICATION
-                    ? ScanPipeline.ExportPolicy.STRICT_PRODUCT
-                    : ScanPipeline.ExportPolicy.AUDIT_COMPATIBILITY;
             ScanPipeline.ScanResult result = ScanPipeline.run(target, deps, output, rules, stats,
                     fast, jdkHome, false, verifyBudget, false, false,
                     useOsIsolation,
                     baseline, suppressions, overwrite,
-                    exportPolicy);
+                    modePolicy);
             if (useCache && preflight != null) {
                 try {
                     boolean stored = ScanCache.store(cache, preflight.cacheKey(), output,

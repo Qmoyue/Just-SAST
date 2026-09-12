@@ -161,16 +161,14 @@ public final class ScanPipeline {
                                  Path suppressions, boolean overwrite) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
                 safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
-                ExportPolicy.AUDIT_COMPATIBILITY);
+                ModeDemandPolicy.forMode(ScanMode.COMPONENT));
     }
 
     /**
-     * Full pipeline entry point with an explicit report export policy.
+     * Compatibility entry point retaining the former export-policy parameter.
      *
-     * <p>Callers that represent the product CLI must pass
-     * {@link ExportPolicy#STRICT_PRODUCT}.  The compatibility overload above is
-     * retained for library/fixture callers so that the audit snapshot remains
-     * testable without changing the user-visible default.</p>
+     * <p>The old enum is converted immediately to the single mode/demand policy so a caller
+     * cannot accidentally use application export with component demand.</p>
      */
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
         boolean stats, boolean fast, Path jdkHome, boolean verify,
@@ -178,8 +176,20 @@ public final class ScanPipeline {
                                  boolean requireOsIsolation, Path baseline,
                                  Path suppressions, boolean overwrite,
                                  ExportPolicy exportPolicy) throws Exception {
-        if (exportPolicy == null) {
-            throw new IllegalArgumentException("export policy is required");
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
+                safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
+                ModeDemandPolicy.fromExportPolicy(exportPolicy));
+    }
+
+    /** Full pipeline entry point with one owner for scan mode, demand roots and export policy. */
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec, boolean safeReal,
+                                 boolean requireOsIsolation, Path baseline,
+                                 Path suppressions, boolean overwrite,
+                                 ModeDemandPolicy modePolicy) throws Exception {
+        if (modePolicy == null) {
+            throw new IllegalArgumentException("mode/demand policy is required");
         }
         long start = System.nanoTime();
         long parentCpuStarted = processCpuTimeMs();
@@ -299,6 +309,10 @@ public final class ScanPipeline {
             BytecodeFrontend.ScopedLoad scopedApplication = loadApplication(frontend, targets,
                     targetFeature, inputTracker);
             LoadResult applicationLoad = scopedApplication.load();
+            java.util.Set<String> demandRoots = modePolicy.demandRootClasses(
+                    scopedApplication.applicationClassNames());
+            java.util.Set<String> applicationClassNames = modePolicy.applicationClassNames(
+                    scopedApplication.applicationClassNames());
         LoadResult load;
         if (fast) {
             load = applicationLoad;
@@ -313,7 +327,7 @@ public final class ScanPipeline {
         // never changes the application-entry/join contract or benchmark truth.
         long demandSliceStart = System.nanoTime();
         DemandDrivenProgramSlice.Result demandSlice = DemandDrivenProgramSlice.select(
-                load, scopedApplication.applicationClassNames(), ruleSet);
+                load, demandRoots, ruleSet);
         load = demandSlice.load();
         phaseMs.put("dependency_slice", elapsedMs(demandSliceStart));
         JustLogger.info("依赖需求切片：{} -> {} 个类，依赖 {} -> {}，能力类 {}，规则锚点 {}，引用轮数 {}{}",
@@ -322,7 +336,7 @@ public final class ScanPipeline {
                 demandSlice.capabilityClasses(), demandSlice.ruleAnchorClasses(),
                 demandSlice.referenceRounds(), demandSlice.capped() ? "（触顶，结果 PARTIAL）" : "");
         JustLogger.debug("应用范围：{} 个类；需求切片应用边界/终端门由前端模型计算，图级入口索引随后复核",
-                scopedApplication.applicationClassNames().size());
+                applicationClassNames.size());
         JustLogger.info("解析完成：{} 个类（{} 个文件），诊断 {} 条",
                 load.classCount(), load.filesScanned(), load.diagnosticCount());
         if (load.targetMajorVersion() > 0) {
@@ -356,8 +370,11 @@ public final class ScanPipeline {
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
                         verifyBudget, jdkHome, load.targetMajorVersion(), safeExec, safeReal,
-                        requireOsIsolation, inputTracker, scopedApplication.applicationClassNames(),
-                        true));
+                        requireOsIsolation, inputTracker, applicationClassNames,
+                        // Component mode still needs the target-owner scope for mechanism seed
+                        // discovery; the policy's application-scope/export bits keep those roots
+                        // out of application findings and application trace output.
+                        modePolicy.solverScopeKnown()));
         new Controller(blackboard, KnowledgeSources.discover()).run();
         for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
             phaseMs.put(timing.getKey(), timing.getValue());
@@ -385,6 +402,10 @@ public final class ScanPipeline {
         // immutable product exactly once with the scan-boundary target digest so every exported
         // application chain can be traced back to the bytes that were analyzed.
         applicationEvidence = applicationEvidence.withArtifactDigest(targetArtifactHash);
+        if (!modePolicy.requireApplicationJoin()) {
+            applicationEvidence = ApplicationChainEvidence.empty(false,
+                    List.of("COMPONENT_MODE_KERNEL_ONLY"));
+        }
         blackboard.publishFact(applicationEvidence);
         // Publish a non-overlapping static phase for the performance harness.  The aggregate
         // analysis timer includes calibration, while the verifier publishes its own child
@@ -430,7 +451,7 @@ public final class ScanPipeline {
                 new io.just.sast.report.FindingOutputReader().read(
                         reportChains, reportCalibrations, reportNotes, reportVerification,
                         applicationEvidence.states(),
-                        exportPolicy == ExportPolicy.STRICT_PRODUCT,
+                        modePolicy.requireApplicationJoin(),
                         applicationEvidence);
         long findingOutputStart = System.nanoTime();
         new io.just.sast.report.FindingOutputWriter().write(reportLayout, findingOutput);
@@ -527,7 +548,7 @@ public final class ScanPipeline {
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
         new io.just.sast.report.ConciseReportWriter().write(reportLayout,
-                exportPolicy == ExportPolicy.STRICT_PRODUCT ? "application" : "component",
+                modePolicy.wireName(),
                 findingOutput, scanStats);
         transaction.commit();
         JustLogger.info("扫描报告已输出到 {}", output.toAbsolutePath());

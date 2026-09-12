@@ -60,7 +60,7 @@ class StaticModeBehaviorTest {
         Path componentOut = temp.resolve("component");
         ScanPipeline.run(dependency, null, componentOut, null, false, true, null,
                 false, 0, false, false, false, null, null, false,
-                ScanPipeline.ExportPolicy.AUDIT_COMPATIBILITY);
+                ModeDemandPolicy.forMode(ScanMode.COMPONENT));
         String component = Files.readString(componentOut.resolve("report.json"));
         assertTrue(component.contains("\"mode\":\"component\""));
         assertTrue(component.contains("\"exported\":true"),
@@ -73,7 +73,7 @@ class StaticModeBehaviorTest {
         Path applicationOut = temp.resolve("application");
         ScanPipeline.run(application, List.of(dependency), applicationOut, null, false, true, null,
                 false, 0, false, false, false, null, null, false,
-                ScanPipeline.ExportPolicy.STRICT_PRODUCT);
+                ModeDemandPolicy.forMode(ScanMode.APPLICATION));
         String applicationReport = Files.readString(applicationOut.resolve("report.json"));
         assertTrue(applicationReport.contains("\"mode\":\"application\""));
         assertFalse(applicationReport.contains("\"exported\":true"),
