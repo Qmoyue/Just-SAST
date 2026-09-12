@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/rules-v2.schema.json",
+  "title": "Just rule catalog v2",
+  "description": "Typed rule data for capability, bridge, boundary, terminal, source, filter and callback semantics.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "rules"],
+  "properties": {
+    "schema_version": { "const": "JUST-RULES-D002-V2" },
+    "rules": {
+      "type": "array",
+      "minItems": 0,
+      "items": { "$ref": "#/$defs/rule" }
+    }
+  },
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "semantics"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "kind": {
+          "enum": ["SINK", "MAGIC_ENTRY", "SOURCE", "MODEL", "CHAIN_FRAGMENT"]
+        },
+        "category": { "type": "string", "maxLength": 64 },
+        "severity": { "enum": ["", "LOW", "MEDIUM", "HIGH", "CRITICAL"] },
+        "semantics": { "$ref": "#/$defs/semantics" }
+      }
+    },
+    "semantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability", "bridge", "boundary", "terminal", "source", "filter", "callback"],
+      "anyOf": [
+        { "required": ["capability"], "properties": { "capability": { "minItems": 1 } } },
+        { "required": ["bridge"], "properties": { "bridge": { "minItems": 1 } } },
+        { "required": ["boundary"], "properties": { "boundary": { "minItems": 1 } } },
+        { "required": ["terminal"], "properties": { "terminal": { "minItems": 1 } } },
+        { "required": ["source"], "properties": { "source": { "minItems": 1 } } },
+        { "required": ["filter"], "properties": { "filter": { "minItems": 1 } } },
+        { "required": ["callback"], "properties": { "callback": { "minItems": 1 } } }
+      ],
+      "properties": {
+        "capability": { "type": "array", "items": { "$ref": "#/$defs/capability" }, "uniqueItems": true },
+        "bridge": { "type": "array", "items": { "$ref": "#/$defs/bridge" }, "uniqueItems": true },
+        "boundary": { "type": "array", "items": { "$ref": "#/$defs/boundary" }, "uniqueItems": true },
+        "terminal": { "type": "array", "items": { "$ref": "#/$defs/terminal" }, "uniqueItems": true },
+        "source": { "type": "array", "items": { "$ref": "#/$defs/source" }, "uniqueItems": true },
+        "filter": { "type": "array", "items": { "$ref": "#/$defs/filter" }, "uniqueItems": true },
+        "callback": { "type": "array", "items": { "$ref": "#/$defs/callback" }, "uniqueItems": true }
+      }
+    },
+    "capability": { "enum": ["REFLECTION", "CLASS_LOADING", "PROCESS", "NETWORK", "JDBC", "JNDI", "DESERIALIZATION", "EXPRESSION", "NATIVE", "FILE", "UNKNOWN"] },
+    "bridge": { "enum": ["DESERIALIZE", "SERIALIZE", "JNDI_RMI", "JDBC_DRIVER", "REFLECTION", "CONFIGURATION", "SECOND_DESERIALIZATION", "UNKNOWN"] },
+    "boundary": { "enum": ["APPLICATION_ENTRY", "DESERIALIZATION", "BINDING", "LOOKUP", "CONFIGURATION", "CAPABILITY", "TERMINAL", "UNKNOWN"] },
+    "terminal": { "enum": ["COMMAND_EXEC", "CLASS_DEFINITION", "FILE_WRITE", "FILE_READ", "NETWORK_SEND", "CODE_EXEC", "SQL_EXEC", "NATIVE_LOAD", "DESERIALIZATION", "UNKNOWN"] },
+    "source": { "enum": ["EXTERNAL_INPUT", "DESERIALIZATION", "SERIALIZATION", "APPLICATION", "ENVIRONMENT", "UNKNOWN"] },
+    "filter": { "enum": ["SAFE_CONFIG", "OBJECT_INPUT_FILTER", "TYPE_ALLOWLIST", "NONE", "UNKNOWN"] },
+    "callback": { "enum": ["READ_OBJECT", "READ_RESOLVE", "READ_EXTERNAL", "VALIDATE_OBJECT", "WRITE_OBJECT", "WRITE_REPLACE", "FINALIZE", "PROXY_INVOKE", "HASH_CODE", "EQUALS", "COMPARE", "TO_STRING", "REFLECTIVE", "BEAN_PROPERTY", "METHOD_SUMMARY", "UNKNOWN"] }
+  }
+}

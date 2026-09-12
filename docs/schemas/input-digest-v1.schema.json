@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/input-digest-v1.json",
+  "title": "Just scan input before/after digest evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "target", "dependencies", "reasons"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "status": { "enum": ["MATCH", "CHANGED", "UNAVAILABLE"] },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before", "after"],
+      "properties": {
+        "before": { "$ref": "#/$defs/digest" },
+        "after": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "before", "after"],
+        "properties": {
+          "index": { "type": "integer", "minimum": 0 },
+          "before": { "$ref": "#/$defs/digest" },
+          "after": { "$ref": "#/$defs/digest" }
+        }
+      }
+    },
+    "reasons": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^(UNKNOWN|[0-9a-fA-F]{64})$"
+    }
+  }
+}

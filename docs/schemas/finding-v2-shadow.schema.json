@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/finding-v2-shadow.schema.json",
+  "title": "Just finding v1/v2 shadow diff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rules_schema_version",
+    "rules_semantics_version",
+    "projection",
+    "findings",
+    "difference_counts"
+  ],
+  "properties": {
+    "schema_version": { "const": "JUST-FINDING-D003-V1" },
+    "rules_schema_version": { "const": "JUST-RULES-D002-V2" },
+    "rules_semantics_version": { "type": "string", "const": "1" },
+    "projection": { "type": "string", "const": "LEGACY_CHAIN_ADAPTER_V1" },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "difference_counts": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 1 },
+      "propertyNames": {
+        "enum": [
+          "NO_DIFFERENCE",
+          "LEGACY_CALIBRATED_HIDDEN",
+          "V2_ENTRY_UNPROVEN",
+          "V2_EXTERNAL_CONTROL_UNPROVEN",
+          "V2_DEPENDENCY_JOIN_UNPROVEN",
+          "V2_IMPACT_UNPROVEN",
+          "V2_CONSTRAINT_UNKNOWN",
+          "V2_COMPLETENESS_UNKNOWN",
+          "LEGACY_TERMINAL_WITHOUT_TYPED_IMPACT",
+          "LEGACY_FEASIBLE_WITHOUT_TYPED_ELIGIBILITY",
+          "V2_DYNAMIC_UNKNOWN_OR_FAILED",
+          "V2_DUPLICATE_FINDING_ID",
+          "V2_PROJECTION_ONLY"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "legacy_count", "legacy", "typed", "differences"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^finding-[0-9a-f]{64}$" },
+        "legacy_count": { "type": "integer", "minimum": 1 },
+        "legacy": { "$ref": "#/$defs/legacy" },
+        "typed": { "$ref": "#/$defs/typed" },
+        "differences": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/difference" }
+        }
+      }
+    },
+    "legacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chain_id",
+        "confidence",
+        "rank",
+        "sink_role",
+        "sink_risk",
+        "entry_kind",
+        "chain_length",
+        "unresolved_hops",
+        "verification_status",
+        "exported",
+        "calibration"
+      ],
+      "properties": {
+        "chain_id": { "type": "string", "pattern": "^[0-9a-f]{8}$" },
+        "confidence": { "type": "string" },
+        "rank": { "type": "integer", "minimum": 0 },
+        "sink_role": { "type": "string" },
+        "sink_risk": { "type": "string" },
+        "entry_kind": { "type": "string" },
+        "chain_length": { "type": "integer", "minimum": 0 },
+        "unresolved_hops": { "type": "integer", "minimum": 0 },
+        "verification_status": { "type": "string" },
+        "exported": { "type": "boolean" },
+        "calibration": { "type": "string" }
+      }
+    },
+    "typed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry_status",
+        "chain_progress",
+        "feasibility",
+        "completeness",
+        "verification",
+        "risk",
+        "eligibility",
+        "violations",
+        "projection",
+        "confidence_bucket",
+        "confidence_reason",
+        "static_rank",
+        "total_score"
+      ],
+      "properties": {
+        "entry_status": { "enum": ["NO_APPLICATION_ENTRY", "APPLICATION_ENTRY", "EXTERNAL_ENTRY"] },
+        "chain_progress": { "enum": ["ENTRY_IDENTIFIED", "BOUNDARY_REACHED", "DEPENDENCY_JOINED", "IMPACT_CHAIN_COMPLETE"] },
+        "feasibility": { "enum": ["SAT", "UNSAT", "UNKNOWN"] },
+        "completeness": { "enum": ["COMPLETE", "PARTIAL", "UNKNOWN"] },
+        "verification": { "enum": ["NOT_REQUESTED", "NOT_ATTEMPTED", "DYNAMIC_SEGMENT_CONFIRMED", "DYNAMIC_BOUNDARY_CONFIRMED", "SAFE_TERMINAL_CONFIRMED", "CONTRADICTION_OBSERVED", "UNKNOWN", "FAILED", "UNSUPPORTED"] },
+        "risk": { "enum": ["NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL", "UNKNOWN"] },
+        "eligibility": { "type": "string" },
+        "violations": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "projection": { "const": "LEGACY_CHAIN_ADAPTER_V1" },
+        "confidence_bucket": { "type": "string" },
+        "confidence_reason": { "type": "string" },
+        "static_rank": { "type": "integer", "minimum": 0 },
+        "total_score": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "difference": {
+      "enum": [
+        "NO_DIFFERENCE",
+        "LEGACY_CALIBRATED_HIDDEN",
+        "V2_ENTRY_UNPROVEN",
+        "V2_EXTERNAL_CONTROL_UNPROVEN",
+        "V2_DEPENDENCY_JOIN_UNPROVEN",
+        "V2_IMPACT_UNPROVEN",
+        "V2_CONSTRAINT_UNKNOWN",
+        "V2_COMPLETENESS_UNKNOWN",
+        "LEGACY_TERMINAL_WITHOUT_TYPED_IMPACT",
+        "LEGACY_FEASIBLE_WITHOUT_TYPED_ELIGIBILITY",
+        "V2_DYNAMIC_UNKNOWN_OR_FAILED",
+        "V2_DUPLICATE_FINDING_ID",
+        "V2_PROJECTION_ONLY"
+      ]
+    }
+  }
+}

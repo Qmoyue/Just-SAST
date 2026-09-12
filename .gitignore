@@ -46,6 +46,8 @@ docs/*
 !docs/
 !docs/architecture.md
 !docs/requirements.md
+!docs/schemas/
+!docs/schemas/*.json
 
 # Local regression manifests may contain workstation-specific input paths.
 tools/final-wp-manifest.json

@@ -2778,12 +2778,13 @@ public final class ParallelVerifier {
             // every dynamic case to verifier-artifact-missing.
             Path target = location.getParent();
             if (target != null) {
-                // Prefer the shaded release artifact when it exists: the Windows/Linux
-                // launcher is part of the single-JAR contract and the lifecycle test probe
-                // intentionally contains only the verifier classes.  The test probe remains
-                // the fallback for a `mvn test` run before package has produced the release JAR.
-                for (String name : List.of("just-sast-0.2.0.jar",
-                        "just-sast-0.2.0-testprobe.jar")) {
+                // A class-directory test run may happen after `mvn package`, leaving the
+                // thin main artifact beside the classes.  It is not an agent and cannot be
+                // used with -javaagent, so prefer the lifecycle-produced test probe whenever
+                // the verifier is loaded from target/classes.  A packaged launcher is loaded
+                // from a regular JAR above and never reaches this branch.
+                for (String name : List.of("just-sast-0.2.0-testprobe.jar",
+                        "just-sast-0.2.0.jar")) {
                     Path candidate = target.resolve(name);
                     if (Files.isRegularFile(candidate)) {
                         return candidate;

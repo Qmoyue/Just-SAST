@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just-sast.dev/schemas/run-outcome-v1.schema.json",
+  "title": "Just run outcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "exit_reason", "exit_code", "support_status", "input_budget", "reason_codes", "detail"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["SUCCESS", "PARTIAL", "FAILED", "USAGE_ERROR", "UNSUPPORTED", "NOT_RUN"]},
+    "exit_reason": {"enum": ["OK", "USAGE", "INTERNAL", "UNSUPPORTED_RUNTIME"]},
+    "exit_code": {"enum": [0, 2, 3, 78]},
+    "support_status": {"enum": ["SUPPORTED", "PARTIAL", "UNSUPPORTED", "UNKNOWN", "NOT_APPLICABLE"]},
+    "input_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "limit", "consumed", "reason_code"],
+      "properties": {
+        "state": {"enum": ["NOT_REQUESTED", "WITHIN_LIMIT", "EXHAUSTED", "INVALID", "UNKNOWN"]},
+        "limit": {"type": "integer", "minimum": -1},
+        "consumed": {"type": "integer", "minimum": -1},
+        "reason_code": {"type": "string", "minLength": 1}
+      }
+    },
+    "reason_codes": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "detail": {"type": "string"}
+  }
+}

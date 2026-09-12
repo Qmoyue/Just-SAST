@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/dynamic-verification-v1.json",
+  "title": "Just dynamic verification disclosure",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "verification_mode",
+    "target_code_execution_possible",
+    "target_code_executed",
+    "resource_containment_only",
+    "filesystem_isolation",
+    "network_isolation",
+    "token_isolation",
+    "dangerous_sink_executed",
+    "recommended_for_untrusted_artifacts",
+    "target_trust",
+    "isolation_backend",
+    "isolation_status",
+    "fail_closed_on_isolation_failure",
+    "capability_gaps",
+    "results"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "verification_mode": { "enum": ["AUTO", "STATIC_ONLY"] },
+    "target_code_execution_possible": { "type": "boolean" },
+    "target_code_executed": { "type": "string", "minLength": 1 },
+    "resource_containment_only": { "const": true },
+    "filesystem_isolation": { "const": false },
+    "network_isolation": { "const": false },
+    "token_isolation": { "const": false },
+    "dangerous_sink_executed": { "const": false },
+    "recommended_for_untrusted_artifacts": { "type": "boolean" },
+    "target_trust": { "enum": ["TRUSTED_LOCAL_TARGET_REQUIRED", "STATIC_ONLY_UNTRUSTED_ARTIFACT_PATH"] },
+    "isolation_backend": { "type": "string", "minLength": 1 },
+    "isolation_status": { "type": "string", "minLength": 1 },
+    "fail_closed_on_isolation_failure": { "const": true },
+    "capability_gaps": { "type": "array", "items": { "type": "string" } },
+    "results": { "type": "array", "items": { "type": "object" } }
+  }
+}

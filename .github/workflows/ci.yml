@@ -154,7 +154,7 @@ jobs:
   # solver/adapter contracts close them; no score is made up in CI.
   gleipner-kernel:
     name: Gleipner gadget-kernel evaluator
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:

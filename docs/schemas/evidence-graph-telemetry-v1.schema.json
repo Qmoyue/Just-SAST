@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just-sast.dev/schema/evidence-graph-telemetry-v1.json",
+  "title": "Just SAST evidence graph telemetry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "graphDigest", "nodeCount", "edgeCount", "serializedBytes",
+    "retainedBytesEstimate", "constructionWallNanos", "constructionCpuNanos",
+    "constructionCpuStatus", "retainedSizeStatus", "rssBytes", "rssStatus",
+    "nodes", "edges"
+  ],
+  "properties": {
+    "schema": {"const": "evidence-graph-telemetry-v1"},
+    "graphDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nodeCount": {"type": "integer", "minimum": 0},
+    "edgeCount": {"type": "integer", "minimum": 0},
+    "serializedBytes": {"type": "integer", "minimum": 0},
+    "retainedBytesEstimate": {"type": "integer", "minimum": 0},
+    "constructionWallNanos": {"type": "integer", "minimum": -1},
+    "constructionCpuNanos": {"type": "integer", "minimum": -1},
+    "constructionCpuStatus": {"type": "string", "enum": ["OBSERVED", "NOT_SUPPORTED", "NOT_OBSERVED"]},
+    "retainedSizeStatus": {"const": "ESTIMATED_STRUCTURAL"},
+    "rssBytes": {"type": "integer", "minimum": -1},
+    "rssStatus": {"const": "NOT_OBSERVED_EXTERNAL_RUNNER"},
+    "nodes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/node"}
+    },
+    "edges": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/edge"}
+    }
+  },
+  "$defs": {
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "serializedBytes", "canonicalBytes", "retainedBytesEstimate"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^(atom|join|bridge)-[0-9a-f]{64}$"},
+        "kind": {"type": "string", "enum": ["ATOM", "ENTRY_CHAIN_JOIN", "PROTOCOL_BRIDGE"]},
+        "serializedBytes": {"type": "integer", "minimum": 0},
+        "canonicalBytes": {"type": "integer", "minimum": 0},
+        "retainedBytesEstimate": {"type": "integer", "minimum": 0}
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "serializedBytes", "canonicalBytes", "retainedBytesEstimate"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^edge-[0-9a-f]{64}$"},
+        "kind": {"type": "string", "enum": ["SUPPORTS", "JOINS", "BRIDGES", "FLOWS_TO", "DERIVES", "REQUIRES", "CONTRADICTS"]},
+        "serializedBytes": {"type": "integer", "minimum": 0},
+        "canonicalBytes": {"type": "integer", "minimum": 0},
+        "retainedBytesEstimate": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}
