@@ -2,6 +2,8 @@ package io.just.sast.dependency;
 
 import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.DependencyGraph;
+import io.just.sast.util.ArchiveLimits;
+import io.just.sast.util.ArtifactFingerprint;
 import org.apache.maven.model.DependencyManagement;
 import org.apache.maven.model.Model;
 import org.apache.maven.model.Profile;
@@ -37,6 +39,10 @@ import org.eclipse.aether.resolution.ArtifactResult;
 import org.eclipse.aether.spi.connector.RepositoryConnectorFactory;
 import org.eclipse.aether.spi.connector.transport.TransporterFactory;
 import org.eclipse.aether.transfer.ArtifactNotFoundException;
+import org.eclipse.aether.transfer.TransferCancelledException;
+import org.eclipse.aether.transfer.TransferEvent;
+import org.eclipse.aether.transfer.TransferListener;
+import org.eclipse.aether.transfer.TransferResource;
 import org.eclipse.aether.util.graph.manager.DependencyManagerUtils;
 import org.eclipse.aether.util.graph.selector.AndDependencySelector;
 import org.eclipse.aether.util.graph.selector.ExclusionDependencySelector;
@@ -53,6 +59,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -61,6 +68,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.Locale;
+import java.util.zip.ZipEntry;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
 /**
  * In-process Maven model and dependency graph owner.
@@ -94,9 +105,13 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
                 throw new IllegalArgumentException("repository URI must be absolute");
             }
             String scheme = uri.getScheme().toLowerCase(java.util.Locale.ROOT);
-            if (!scheme.equals("file") && !scheme.equals("https")) {
+            if (!scheme.equals("file") && !scheme.equals("http") && !scheme.equals("https")) {
                 throw new IllegalArgumentException(
-                        "repository URI must use file or https: " + scheme);
+                        "repository URI must use file, http or https: " + scheme);
+            }
+            if (uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
+                throw new IllegalArgumentException(
+                        "repository URI must not contain credentials, query or fragment");
             }
         }
 
@@ -230,6 +245,57 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         }
     }
 
+    /** Cooperative cancellation boundary for dependency metadata and artifact reads. */
+    @FunctionalInterface
+    public interface Cancellation {
+        boolean isCancelled();
+
+        static Cancellation none() {
+            return () -> false;
+        }
+    }
+
+    /** One complete runtime artifact selected by the effective dependency graph. */
+    public record ArtifactDownload(String coordinate, Path path, DependencyGraph.Source source,
+                                   String repositoryId, String sourceUrl, String sha256,
+                                   long sizeBytes) {
+        public ArtifactDownload {
+            coordinate = text(coordinate, "artifact coordinate");
+            path = absolutePath(path, "artifact path");
+            if (source != DependencyGraph.Source.CACHE
+                    && source != DependencyGraph.Source.REMOTE) {
+                throw new IllegalArgumentException("artifact source must be CACHE or REMOTE");
+            }
+            repositoryId = text(repositoryId, "artifact repository id");
+            sourceUrl = text(sourceUrl, "artifact source URL");
+            sha256 = digestText(sha256);
+            if (sizeBytes < 0L) {
+                throw new IllegalArgumentException("artifact size must be non-negative");
+            }
+        }
+    }
+
+    /** Resolution plus validated bytes and network-only timing for one request. */
+    public record Completion(Resolution resolution, List<ArtifactDownload> artifacts,
+                             long networkDownloadWallMs, long networkRequestMs,
+                             long transferredBytes) {
+        public Completion {
+            resolution = Objects.requireNonNull(resolution, "completion resolution");
+            artifacts = artifacts == null ? List.of() : List.copyOf(artifacts);
+            if (networkDownloadWallMs < 0L || networkRequestMs < 0L || transferredBytes < 0L) {
+                throw new IllegalArgumentException("completion metrics must be non-negative");
+            }
+        }
+
+        public Status status() {
+            return resolution.status();
+        }
+
+        public List<Path> paths() {
+            return artifacts.stream().map(ArtifactDownload::path).toList();
+        }
+    }
+
     private final RepositorySystem repositorySystem;
     private final ModelBuilder modelBuilder;
 
@@ -253,17 +319,65 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
 
     /** Resolve one POM with exact repository/cache/profile choices. */
     public Resolution resolve(Request request) throws IOException {
+        return resolve(request, Cancellation.none(), null);
+    }
+
+    /** Resolve the POM and complete selected runtime artifact bytes. */
+    public Completion complete(Request request) throws IOException {
+        return complete(request, Cancellation.none());
+    }
+
+    /** Complete dependency bytes with a cooperative cancellation boundary. */
+    public Completion complete(Request request, Cancellation cancellation) throws IOException {
         Objects.requireNonNull(request, "request");
+        Cancellation stop = Objects.requireNonNull(cancellation, "cancellation");
+        checkCancelled(stop);
+        TransferStats transferStats = new TransferStats(stop);
+        Resolution initial = resolve(request, stop, transferStats);
+        List<Problem> problems = new ArrayList<>(initial.problems());
+        List<ArtifactDownload> artifacts = new ArrayList<>();
+        List<RepositorySpec> usableRepositorySpecs = usableRepositories(request);
+        List<RemoteRepository> repositories = remoteRepositories(usableRepositorySpecs);
+        DefaultRepositorySystemSession session = newSession(request, usableRepositorySpecs,
+                stop, transferStats);
+        for (DependencyGraph.Node node : initial.graph().nodes().values().stream()
+                .sorted(java.util.Comparator.comparing(DependencyGraph.Node::ref)).toList()) {
+            checkCancelled(stop);
+            if (!downloadable(node)) {
+                continue;
+            }
+            ArtifactAttempt attempt = completeArtifact(request, node, session, repositories, stop);
+            problems.addAll(attempt.problems());
+            if (attempt.artifact() != null) {
+                artifacts.add(attempt.artifact());
+            }
+        }
+        List<Problem> immutableProblems = problems.stream().distinct().toList();
+        Status status = completionStatus(initial, immutableProblems);
+        Resolution completed = new Resolution(initial.effectivePom(), initial.graph(),
+                immutableProblems, status, initial.offline(), initial.repositoryIds());
+        TransferStats.Snapshot metrics = transferStats.snapshot();
+        return new Completion(completed, artifacts, metrics.networkWallMs(),
+                metrics.requestMs(), metrics.transferredBytes());
+    }
+
+    private Resolution resolve(Request request, Cancellation cancellation,
+                               TransferStats transferStats) throws IOException {
+        Objects.requireNonNull(request, "request");
+        Cancellation stop = Objects.requireNonNull(cancellation, "cancellation");
+        checkCancelled(stop);
         validateRequest(request);
         Files.createDirectories(request.localRepository());
 
         List<RepositorySpec> usableRepositorySpecs = usableRepositories(request);
         List<RemoteRepository> repositories = remoteRepositories(usableRepositorySpecs);
-        DefaultRepositorySystemSession session = newSession(request, usableRepositorySpecs);
+        DefaultRepositorySystemSession session = newSession(request, usableRepositorySpecs,
+                stop, transferStats);
         List<Problem> problems = new ArrayList<>();
         List<String> ignoredPomRepositories = new ArrayList<>();
 
         Model raw = new DefaultModelReader().read(request.pomFile().toFile(), Map.of());
+        checkCancelled(stop);
         Coordinates rawCoordinates = coordinates(raw);
         RepositoryModelResolver modelResolver = new RepositoryModelResolver(repositorySystem,
                 session, repositories, ignoredPomRepositories);
@@ -314,7 +428,7 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         DependencyNode collectionRoot = null;
         if (effective != null && effectivePom.version().equals(effective.getVersion())
                 && !effectivePom.version().equals("UNRESOLVED")) {
-            CollectResult collected = collect(session, repositories, effectivePom, problems);
+            CollectResult collected = collect(session, repositories, effectivePom, problems, stop);
             if (collected != null) {
                 collectionRoot = collected.getRoot();
             }
@@ -337,7 +451,8 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
 
     private CollectResult collect(DefaultRepositorySystemSession session,
                                   List<RemoteRepository> repositories, EffectivePom pom,
-                                  List<Problem> problems) throws IOException {
+                                  List<Problem> problems, Cancellation cancellation) throws IOException {
+        checkCancelled(cancellation);
         List<org.eclipse.aether.graph.Dependency> direct = aetherDependencies(
                 pom.dependencies(), problems);
         List<org.eclipse.aether.graph.Dependency> managed = aetherDependencies(
@@ -353,24 +468,281 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         request.setRepositories(repositories);
         request.setRequestContext("just-pom-resolution");
         try {
-            return repositorySystem.collectDependencies(session, request);
+            CollectResult result = repositorySystem.collectDependencies(session, request);
+            checkCancelled(cancellation);
+            return result;
         } catch (DependencyCollectionException failure) {
             CollectResult partial = failure.getResult();
             if (partial == null) {
                 throw new IOException("Maven dependency collection returned no result", failure);
             }
-            List<Exception> exceptions = partial.getExceptions();
-            if (exceptions.isEmpty()) {
-                problems.add(new Problem("DEPENDENCY_RESOLUTION_FAILED", pom.coordinate(),
-                        Severity.ERROR, failure.getClass().getSimpleName()));
+            if (isCancelled(cancellation)) {
+                problems.add(new Problem("DEPENDENCY_DOWNLOAD_CANCELLED", pom.coordinate(),
+                        Severity.ERROR, "cancellation-requested"));
             } else {
-                for (Exception exception : exceptions) {
-                    problems.add(new Problem(problemCode(exception), pom.coordinate(),
-                            Severity.ERROR, exception.getClass().getSimpleName()));
+                List<Exception> exceptions = partial.getExceptions();
+                if (exceptions.isEmpty()) {
+                    problems.add(new Problem("DEPENDENCY_RESOLUTION_FAILED", pom.coordinate(),
+                            Severity.ERROR, detail(failure)));
+                } else {
+                    for (Exception exception : exceptions) {
+                        problems.add(new Problem(problemCode(exception), pom.coordinate(),
+                                Severity.ERROR, detail(exception)));
+                    }
                 }
             }
             return partial;
         }
+    }
+
+    private ArtifactAttempt completeArtifact(Request request, DependencyGraph.Node node,
+                                             DefaultRepositorySystemSession session,
+                                             List<RemoteRepository> repositories,
+                                             Cancellation cancellation) throws IOException {
+        String coordinate = nodeCoordinate(node);
+        String artifactExtension = extension(node.type());
+        Path expected = artifactPath(request.localRepository(), node.group(), node.name(),
+                node.version(), node.classifier(), artifactExtension);
+        List<Problem> problems = new ArrayList<>();
+        CacheProbe cache = probeCache(expected, artifactExtension, request.localRepository());
+        if (cache.artifact() != null) {
+            return new ArtifactAttempt(new ArtifactDownload(coordinate, expected,
+                    DependencyGraph.Source.CACHE, "local-cache", "cache://maven-local",
+                    cache.artifact().sha256(), cache.artifact().sizeBytes()), problems);
+        }
+        if (!cache.invalidDetail().isBlank()) {
+            problems.add(new Problem("DEPENDENCY_CACHE_INVALID", coordinate, Severity.WARNING,
+                    cache.invalidDetail()));
+        }
+        if (!cache.cleanupFailure().isBlank()) {
+            problems.add(new Problem("DEPENDENCY_CACHE_INVALID", coordinate, Severity.ERROR,
+                    cache.cleanupFailure()));
+            return new ArtifactAttempt(null, problems);
+        }
+        boolean explicitFileRepository = repositories.stream()
+                .anyMatch(repository -> repository.getUrl().toLowerCase(Locale.ROOT)
+                        .startsWith("file:"));
+        if (request.offline() && !explicitFileRepository) {
+            problems.add(new Problem("DEPENDENCY_ARTIFACT_MISSING", coordinate, Severity.ERROR,
+                    "offline-cache-miss"));
+            return new ArtifactAttempt(null, problems);
+        }
+
+        checkCancelled(cancellation);
+        Artifact artifact = new DefaultArtifact(node.group(), node.name(), node.classifier(),
+                artifactExtension, node.version())
+                .setProperties(Map.of("maven:type", node.type()));
+        ArtifactRequest artifactRequest = new ArtifactRequest(artifact, repositories,
+                "just-runtime-artifact");
+        ArtifactResult result;
+        try {
+            result = repositorySystem.resolveArtifact(session, artifactRequest);
+            checkCancelled(cancellation);
+        } catch (ArtifactResolutionException failure) {
+            if (isCancelled(cancellation)) {
+                problems.add(new Problem("DEPENDENCY_DOWNLOAD_CANCELLED", coordinate,
+                        Severity.ERROR, "cancellation-requested"));
+            } else {
+                String transferDetail = session.getTransferListener() instanceof TransferStats stats
+                        ? stats.failureDetail(artifactFileName(artifact)) : "";
+                addArtifactFailure(problems, coordinate, failure, transferDetail,
+                        request.offline());
+            }
+            return new ArtifactAttempt(null, problems);
+        }
+        if (!result.isResolved() || result.getArtifact() == null
+                || result.getArtifact().getFile() == null) {
+            List<Exception> failures = result.getExceptions();
+            if (failures.isEmpty()) {
+                problems.add(new Problem("DEPENDENCY_ARTIFACT_UNRESOLVED", coordinate,
+                        Severity.ERROR, "resolver-returned-no-file"));
+            } else {
+                for (Exception failure : failures) {
+                    problems.add(new Problem(problemCode(failure), coordinate, Severity.ERROR,
+                            detail(failure)));
+                }
+            }
+            return new ArtifactAttempt(null, problems);
+        }
+
+        Path resolved = result.getArtifact().getFile().toPath().toAbsolutePath().normalize();
+        if (!resolved.startsWith(request.localRepository())) {
+            problems.add(new Problem("DEPENDENCY_ARTIFACT_OUTSIDE_CACHE", coordinate,
+                    Severity.ERROR, resolved.toString()));
+            return new ArtifactAttempt(null, problems);
+        }
+        ValidatedArtifact validated;
+        try {
+            validated = validateArtifact(resolved, artifactExtension);
+        } catch (IOException | RuntimeException invalid) {
+            String invalidDetail = detail(invalid);
+            String cleanupFailure = invalidateExact(resolved, request.localRepository());
+            if (!cleanupFailure.isBlank()) {
+                invalidDetail += ";cleanup=" + cleanupFailure;
+            }
+            problems.add(new Problem("DEPENDENCY_ARTIFACT_INVALID", coordinate,
+                    Severity.ERROR, invalidDetail));
+            return new ArtifactAttempt(null, problems);
+        }
+
+        boolean fromCache = result.getRepository() == null;
+        DependencyGraph.Source source = fromCache
+                ? DependencyGraph.Source.CACHE : DependencyGraph.Source.REMOTE;
+        String repositoryId = fromCache ? "local-cache" : result.getRepository().getId();
+        String sourceUrl = fromCache ? "cache://maven-local"
+                : result.getRepository() instanceof RemoteRepository remote
+                ? remote.getUrl() : "resolver://" + repositoryId;
+        return new ArtifactAttempt(new ArtifactDownload(coordinate, resolved, source,
+                repositoryId, sourceUrl, validated.sha256(), validated.sizeBytes()), problems);
+    }
+
+    private static CacheProbe probeCache(Path expected, String artifactExtension,
+                                         Path localRepository) throws IOException {
+        if (!Files.exists(expected, LinkOption.NOFOLLOW_LINKS)) {
+            return new CacheProbe(null, "", "");
+        }
+        try {
+            return new CacheProbe(validateArtifact(expected, artifactExtension), "", "");
+        } catch (IOException | RuntimeException invalid) {
+            String invalidDetail = detail(invalid);
+            String cleanupFailure = invalidateExact(expected, localRepository);
+            return new CacheProbe(null, invalidDetail, cleanupFailure);
+        }
+    }
+
+    private static String invalidateExact(Path candidate, Path localRepository) {
+        Path normalized = candidate.toAbsolutePath().normalize();
+        Path root = localRepository.toAbsolutePath().normalize();
+        if (!normalized.startsWith(root) || normalized.equals(root)) {
+            return "cache-path-outside-local-repository";
+        }
+        try {
+            Files.deleteIfExists(normalized);
+            return "";
+        } catch (IOException | RuntimeException failure) {
+            return detail(failure);
+        }
+    }
+
+    private static ValidatedArtifact validateArtifact(Path path, String artifactExtension)
+            throws IOException {
+        Path normalized = path.toAbsolutePath().normalize();
+        ArchiveLimits.checkPathAncestors(normalized, io.just.sast.run.InputBudget.defaults());
+        if (ArchiveLimits.isLinkOrReparsePoint(normalized)
+                || !Files.isRegularFile(normalized, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("artifact-cache-entry-not-regular");
+        }
+        ArchiveLimits.checkContainerSize(normalized, io.just.sast.run.InputBudget.defaults());
+        if (Files.size(normalized) <= 0L) {
+            throw new IOException("artifact-cache-entry-empty");
+        }
+        String extension = value(artifactExtension, "").toLowerCase(Locale.ROOT);
+        if (extension.equals("jar") || extension.equals("war")) {
+            io.just.sast.run.InputBudget.Tracker tracker =
+                    io.just.sast.run.InputBudget.defaults().tracker();
+            try (JarFile jar = new JarFile(normalized.toFile(), false, JarFile.OPEN_READ)) {
+                Enumeration<JarEntry> entries = jar.entries();
+                while (entries.hasMoreElements()) {
+                    ZipEntry entry = entries.nextElement();
+                    if (!ArchiveLimits.safeEntryName(entry.getName(), tracker.budget())) {
+                        throw new IOException("artifact-archive-entry-unsafe:" + entry.getName());
+                    }
+                    tracker.observe(entry);
+                }
+            } catch (IOException | RuntimeException invalid) {
+                throw new IOException("artifact-archive-invalid", invalid);
+            }
+        } else if (extension.equals("pom")) {
+            try {
+                new DefaultModelReader().read(normalized.toFile(), Map.of());
+            } catch (IOException | RuntimeException invalid) {
+                throw new IOException("artifact-pom-invalid", invalid);
+            }
+        } else {
+            throw new IOException("artifact-extension-not-supported:" + extension);
+        }
+        return new ValidatedArtifact(ArtifactFingerprint.sha256(normalized),
+                Files.size(normalized));
+    }
+
+    private static boolean downloadable(DependencyGraph.Node node) {
+        if (node.source() != DependencyGraph.Source.POM_DERIVED
+                || node.deployment() != DependencyGraph.Deployment.DECLARED_ENVIRONMENT
+                || node.resolution() != DependencyGraph.Resolution.SELECTED
+                || node.optional()) {
+            return false;
+        }
+        String scope = node.scope().toLowerCase(Locale.ROOT);
+        if (!scope.equals("compile") && !scope.equals("runtime")) {
+            return false;
+        }
+        String type = node.type().toLowerCase(Locale.ROOT);
+        if (type.equals("pom") || type.equals("maven-plugin") || type.equals("test-jar")
+                || type.equals("java-source") || type.equals("javadoc")) {
+            return false;
+        }
+        return (extension(type).equals("jar") || extension(type).equals("war"))
+                && !node.version().equals("UNRESOLVED") && !node.version().contains("${");
+    }
+
+    private static Path artifactPath(Path localRepository, String group, String artifact,
+                                     String version, String classifier, String extension)
+            throws IOException {
+        Path root = localRepository.toAbsolutePath().normalize();
+        safeCoordinatePart(group, "group");
+        safeCoordinatePart(artifact, "artifact");
+        safeCoordinatePart(version, "version");
+        if (!classifier.isBlank()) {
+            safeCoordinatePart(classifier, "classifier");
+        }
+        safeCoordinatePart(extension, "extension");
+        Path directory = root.resolve(group.replace('.', java.io.File.separatorChar))
+                .resolve(artifact).resolve(version).normalize();
+        String fileName = artifact + '-' + version
+                + (classifier.isBlank() ? "" : '-' + classifier) + '.' + extension;
+        Path result = directory.resolve(fileName).normalize();
+        if (!result.startsWith(root)) {
+            throw new IOException("artifact-cache-path-escapes-local-repository");
+        }
+        return result;
+    }
+
+    private static void safeCoordinatePart(String value, String field) throws IOException {
+        if (value == null || value.isBlank() || value.equals(".") || value.equals("..")
+                || value.indexOf('/') >= 0 || value.indexOf('\\') >= 0
+                || value.indexOf(':') >= 0 || value.indexOf('\0') >= 0) {
+            throw new IOException("artifact-coordinate-invalid:" + field);
+        }
+    }
+
+    private static String nodeCoordinate(DependencyGraph.Node node) {
+        return node.group() + ':' + node.name() + ':' + node.version() + ':'
+                + node.type() + ':' + node.classifier();
+    }
+
+    private static Status completionStatus(Resolution initial, List<Problem> problems) {
+        if (initial.status() == Status.UNRESOLVED
+                || problems.stream().anyMatch(problem -> problem.severity() == Severity.ERROR)) {
+            return Status.UNRESOLVED;
+        }
+        return problems.isEmpty() ? Status.COMPLETE : Status.PARTIAL;
+    }
+
+    private record ArtifactAttempt(ArtifactDownload artifact, List<Problem> problems) {
+        private ArtifactAttempt {
+            problems = problems == null ? List.of() : List.copyOf(problems);
+        }
+    }
+
+    private record CacheProbe(ValidatedArtifact artifact, String invalidDetail,
+                              String cleanupFailure) {
+        private CacheProbe {
+            invalidDetail = invalidDetail == null ? "" : invalidDetail;
+            cleanupFailure = cleanupFailure == null ? "" : cleanupFailure;
+        }
+    }
+
+    private record ValidatedArtifact(String sha256, long sizeBytes) {
     }
 
     private static List<org.eclipse.aether.graph.Dependency> aetherDependencies(
@@ -645,11 +1017,7 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
     private static Status status(Model effective, List<DeclaredDependency> unresolved,
                                  List<Problem> problems) {
         if (effective == null || !unresolved.isEmpty()
-                || problems.stream().anyMatch(problem -> problem.severity() == Severity.ERROR
-                        && (problem.code().contains("UNRESOLVED")
-                        || problem.code().contains("MISSING")
-                        || problem.code().contains("FAILED")
-                        || problem.code().contains("PROBLEM")))) {
+                || problems.stream().anyMatch(problem -> problem.severity() == Severity.ERROR)) {
             return Status.UNRESOLVED;
         }
         return problems.isEmpty() ? Status.COMPLETE : Status.PARTIAL;
@@ -666,6 +1034,14 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
 
     private DefaultRepositorySystemSession newSession(Request request,
                                                        List<RepositorySpec> usableRepositories) {
+        return newSession(request, usableRepositories, Cancellation.none(), null);
+    }
+
+    private DefaultRepositorySystemSession newSession(Request request,
+                                                       List<RepositorySpec> usableRepositories,
+                                                       Cancellation cancellation,
+                                                       TransferStats transferStats) {
+        Objects.requireNonNull(cancellation, "cancellation");
         DefaultRepositorySystemSession session = MavenRepositorySystemUtils.newSession();
         boolean networkRepositoryPresent = usableRepositories.stream()
                 .anyMatch(repository -> !repository.uri().getScheme().equalsIgnoreCase("file"));
@@ -679,6 +1055,9 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         session.setConfigProperty(ConflictResolver.CONFIG_PROP_VERBOSE, Boolean.TRUE);
         session.setDependencySelector(new AndDependencySelector(
                 new OptionalDependencySelector(), new ExclusionDependencySelector()));
+        if (transferStats != null) {
+            session.setTransferListener(transferStats);
+        }
         return session;
     }
 
@@ -699,10 +1078,14 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
     }
 
     private static void validateRequest(Request request) throws IOException {
+        ArchiveLimits.checkPathAncestors(request.pomFile(), io.just.sast.run.InputBudget.defaults());
         if (!Files.isRegularFile(request.pomFile(), LinkOption.NOFOLLOW_LINKS)
                 || Files.isSymbolicLink(request.pomFile())) {
             throw new IOException("POM is not a regular non-link file: " + request.pomFile());
         }
+        ArchiveLimits.checkContainerSize(request.pomFile(), io.just.sast.run.InputBudget.defaults());
+        ArchiveLimits.checkPathAncestors(request.localRepository(),
+                io.just.sast.run.InputBudget.defaults());
         if (Files.exists(request.localRepository(), LinkOption.NOFOLLOW_LINKS)
                 && (Files.isSymbolicLink(request.localRepository())
                 || !Files.isDirectory(request.localRepository(), LinkOption.NOFOLLOW_LINKS))) {
@@ -743,6 +1126,9 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
     }
 
     private static String problemCode(Exception exception) {
+        if (exception instanceof TransferCancelledException) {
+            return "DEPENDENCY_DOWNLOAD_CANCELLED";
+        }
         if (exception instanceof ArtifactNotFoundException) {
             return "DEPENDENCY_ARTIFACT_MISSING";
         }
@@ -753,6 +1139,247 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
             return "DEPENDENCY_ARTIFACT_UNRESOLVED";
         }
         return "DEPENDENCY_RESOLUTION_FAILED";
+    }
+
+    private static void addArtifactFailure(List<Problem> problems, String coordinate,
+                                           ArtifactResolutionException failure,
+                                           String transferDetail, boolean offline) {
+        String prefix = offline ? "offline-cache-miss;" : "";
+        boolean added = false;
+        for (ArtifactResult result : failure.getResults()) {
+            for (Exception exception : result.getExceptions()) {
+                problems.add(new Problem(problemCode(exception), coordinate, Severity.ERROR,
+                        appendDetail(prefix + detail(exception), transferDetail)));
+                added = true;
+            }
+        }
+        if (!added) {
+            problems.add(new Problem(problemCode(failure), coordinate, Severity.ERROR,
+                    appendDetail(prefix + detail(failure), transferDetail)));
+        }
+    }
+
+    private static String appendDetail(String detail, String suffix) {
+        return suffix == null || suffix.isBlank() ? detail : detail + ";transfer=" + suffix;
+    }
+
+    private static String artifactFileName(Artifact artifact) {
+        String classifier = artifact.getClassifier() == null ? "" : artifact.getClassifier();
+        return artifact.getArtifactId() + '-' + artifact.getVersion()
+                + (classifier.isBlank() ? "" : '-' + classifier) + '.' + artifact.getExtension();
+    }
+
+    private static String detail(Throwable failure) {
+        Objects.requireNonNull(failure, "failure");
+        StringBuilder result = new StringBuilder();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        Throwable current = failure;
+        int depth = 0;
+        while (current != null && depth++ < 8 && seen.add(current)) {
+            if (result.length() > 0) {
+                result.append(" <- ");
+            }
+            result.append(current.getClass().getSimpleName());
+            String message = current.getMessage();
+            if (message != null && !message.isBlank()) {
+                result.append(':').append(message.replace('\r', ' ').replace('\n', ' '));
+            }
+            current = current.getCause();
+        }
+        return result.toString();
+    }
+
+    private static void checkCancelled(Cancellation cancellation) throws IOException {
+        if (isCancelled(cancellation)) {
+            throw new IOException("DEPENDENCY_DOWNLOAD_CANCELLED");
+        }
+    }
+
+    private static boolean isCancelled(Cancellation cancellation) {
+        return Thread.currentThread().isInterrupted() || cancellation.isCancelled();
+    }
+
+    private static Path absolutePath(Path path, String field) {
+        if (path == null) {
+            throw new IllegalArgumentException(field + " is required");
+        }
+        return path.toAbsolutePath().normalize();
+    }
+
+    private static String digestText(String value) {
+        if (value == null || !value.matches("[0-9a-fA-F]{64}")) {
+            throw new IllegalArgumentException("artifact sha256 must be a 64-character digest");
+        }
+        return value.toLowerCase(Locale.ROOT);
+    }
+
+    private static final class TransferStats implements TransferListener {
+        private final Cancellation cancellation;
+        private final Map<String, ActiveTransfer> active = new LinkedHashMap<>();
+        private final Map<String, Long> lastTransferred = new LinkedHashMap<>();
+        private final Map<String, String> failures = new LinkedHashMap<>();
+        private long networkStartedNanos = -1L;
+        private long networkWallNanos;
+        private long requestNanos;
+        private long transferredBytes;
+
+        private TransferStats(Cancellation cancellation) {
+            this.cancellation = Objects.requireNonNull(cancellation, "cancellation");
+        }
+
+        @Override
+        public synchronized void transferInitiated(TransferEvent event)
+                throws TransferCancelledException {
+            check(event);
+            begin(event);
+        }
+
+        @Override
+        public synchronized void transferStarted(TransferEvent event)
+                throws TransferCancelledException {
+            check(event);
+            begin(event);
+        }
+
+        @Override
+        public synchronized void transferProgressed(TransferEvent event)
+                throws TransferCancelledException {
+            check(event);
+            begin(event);
+            record(event);
+        }
+
+        @Override
+        public synchronized void transferCorrupted(TransferEvent event)
+                throws TransferCancelledException {
+            check(event);
+            recordFailure(event);
+            finish(event);
+        }
+
+        @Override
+        public synchronized void transferSucceeded(TransferEvent event) {
+            finish(event);
+        }
+
+        @Override
+        public synchronized void transferFailed(TransferEvent event) {
+            recordFailure(event);
+            finish(event);
+        }
+
+        private synchronized String failureDetail(String fileName) {
+            for (Map.Entry<String, String> failure : failures.entrySet()) {
+                if (failure.getKey().contains(fileName)) {
+                    return failure.getValue();
+                }
+            }
+            return "";
+        }
+
+        private void recordFailure(TransferEvent event) {
+            if (!network(event) || event.getException() == null) {
+                return;
+            }
+            String failure = detail(event.getException());
+            if (event.getException() instanceof ArtifactNotFoundException) {
+                failure = "http-status=404;" + failure;
+            }
+            failures.put(key(event), failure);
+        }
+
+        private void check(TransferEvent event) throws TransferCancelledException {
+            Objects.requireNonNull(event, "transfer event");
+            if (isCancelled(cancellation)) {
+                throw new TransferCancelledException("DEPENDENCY_DOWNLOAD_CANCELLED");
+            }
+        }
+
+        private void begin(TransferEvent event) {
+            if (!network(event)) {
+                return;
+            }
+            String key = key(event);
+            if (!active.containsKey(key)) {
+                if (active.isEmpty()) {
+                    networkStartedNanos = System.nanoTime();
+                }
+                active.put(key, new ActiveTransfer(System.nanoTime()));
+                lastTransferred.put(key, 0L);
+            }
+        }
+
+        private void record(TransferEvent event) {
+            if (!network(event)) {
+                return;
+            }
+            String key = key(event);
+            if (!active.containsKey(key)) {
+                begin(event);
+            }
+            long cumulative = event.getTransferredBytes();
+            long previous = lastTransferred.getOrDefault(key, 0L);
+            long delta = cumulative > previous ? cumulative - previous : event.getDataLength();
+            if (delta > 0L) {
+                transferredBytes += delta;
+            }
+            if (cumulative >= previous) {
+                lastTransferred.put(key, cumulative);
+            }
+        }
+
+        private void finish(TransferEvent event) {
+            if (!network(event)) {
+                return;
+            }
+            String key = key(event);
+            record(event);
+            ActiveTransfer transfer = active.remove(key);
+            lastTransferred.remove(key);
+            if (transfer != null) {
+                requestNanos += Math.max(0L, System.nanoTime() - transfer.startedNanos());
+            }
+            if (active.isEmpty() && networkStartedNanos >= 0L) {
+                networkWallNanos += Math.max(0L, System.nanoTime() - networkStartedNanos);
+                networkStartedNanos = -1L;
+            }
+        }
+
+        private static boolean network(TransferEvent event) {
+            if (event.getRequestType() == TransferEvent.RequestType.PUT
+                    || event.getResource() == null) {
+                return false;
+            }
+            String url = event.getResource().getRepositoryUrl();
+            return url != null && (url.toLowerCase(Locale.ROOT).startsWith("http://")
+                    || url.toLowerCase(Locale.ROOT).startsWith("https://"));
+        }
+
+        private static String key(TransferEvent event) {
+            TransferResource resource = Objects.requireNonNull(event.getResource(),
+                    "transfer resource");
+            String file = resource.getFile() == null ? "" : resource.getFile().toPath()
+                    .toAbsolutePath().normalize().toString();
+            return resource.getRepositoryId() + '|' + resource.getResourceName() + '|' + file;
+        }
+
+        private synchronized Snapshot snapshot() {
+            long wall = networkWallNanos;
+            if (!active.isEmpty() && networkStartedNanos >= 0L) {
+                wall += Math.max(0L, System.nanoTime() - networkStartedNanos);
+            }
+            return new Snapshot(toMillis(wall), toMillis(requestNanos), transferredBytes);
+        }
+
+        private static long toMillis(long nanos) {
+            return Math.max(0L, nanos / 1_000_000L);
+        }
+
+        private record ActiveTransfer(long startedNanos) {
+        }
+
+        private record Snapshot(long networkWallMs, long requestMs, long transferredBytes) {
+        }
     }
 
     private static String digest(String value) {
@@ -824,7 +1451,19 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
                     throw new UnresolvableModelException(groupId, artifactId, version,
                             "POM artifact was not resolved");
                 }
-                return new FileModelSource(result.getArtifact().getFile());
+                Path pom = result.getArtifact().getFile().toPath().toAbsolutePath().normalize();
+                try {
+                    validateArtifact(pom, "pom");
+                } catch (IOException | RuntimeException invalid) {
+                    String cleanup = invalidateExact(pom, localRepository(session));
+                    String message = detail(invalid);
+                    if (!cleanup.isBlank()) {
+                        message += ";cleanup=" + cleanup;
+                    }
+                    throw new UnresolvableModelException(groupId, artifactId, version,
+                            "POM artifact is invalid: " + message, invalid);
+                }
+                return new FileModelSource(pom.toFile());
             } catch (ArtifactResolutionException failure) {
                 throw new UnresolvableModelException(failure, groupId, artifactId, version);
             }
@@ -872,6 +1511,11 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         @Override
         public ModelResolver newCopy() {
             return new RepositoryModelResolver(system, session, repositories, ignoredRepositories);
+        }
+
+        private static Path localRepository(DefaultRepositorySystemSession session) {
+            return session.getLocalRepositoryManager().getRepository().getBasedir()
+                    .toPath().toAbsolutePath().normalize();
         }
     }
 }

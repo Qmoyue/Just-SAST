@@ -76,6 +76,7 @@ just-fragments.ser
 /.tmp/
 /.cache/
 /cache/
+/.just-cache/
 /just-cache/
 /just-cache-*/
 /.m2/

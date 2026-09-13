@@ -3,12 +3,19 @@ package io.just.sast.cli;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
+import io.just.sast.dependency.MavenDependencyGraphResolver;
 import io.just.sast.report.ScanCache;
 import io.just.sast.run.RunOutcome;
 import io.just.sast.verify.VerificationDefaults;
 
+import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 import java.util.concurrent.Callable;
 
 /** scan 子命令：深度扫描 JAR/目录（默认含 JDK 运行库全量分析），导出 gadget 链 CSV。 */
@@ -26,6 +33,18 @@ public final class ScanCommand implements Callable<Integer> {
     @Option(names = "--deps", split = ",", paramLabel = "<jar|dir,...>",
             description = "附加依赖（逗号分隔）")
     List<Path> deps;
+
+    @Option(names = "--pom", paramLabel = "<pom.xml>",
+            description = "显式 Maven 根 POM；只解析模型并补齐准确的 compile/runtime 制品")
+    Path pom;
+
+    @Option(names = "--repository", paramLabel = "<url>",
+            description = "显式扩展 Maven 仓库（可重复；仅接受 file/http/https，不读取 POM 仓库）")
+    List<String> repositories;
+
+    @Option(names = "--offline",
+            description = "禁止网络请求；只使用显式输入和已存在的完整 Maven 缓存")
+    boolean offline;
 
     @Option(names = "--output", paramLabel = "<dir>", defaultValue = "just-out",
             description = "CSV 输出目录（默认 just-out）")
@@ -96,6 +115,7 @@ public final class ScanCommand implements Callable<Integer> {
                         "真实动态验证已移除；--mode/静态扫描不接受旧 verifier 选项");
             }
             printVerificationDisclosure();
+            List<Path> scanDeps = resolveDependencies();
             // The product CLI is static-only.  The library compatibility overloads still
             // retain their old verifier seams for characterization until P1.4 removes them.
             boolean useSafeReal = false;
@@ -112,7 +132,7 @@ public final class ScanCommand implements Callable<Integer> {
             ScanCache.Preflight preflight = null;
             if (useCache) {
                 try {
-                    preflight = ScanCache.preflight(target, deps, rules, jdkHome, fast,
+                    preflight = ScanCache.preflight(target, scanDeps, rules, jdkHome, fast,
                             false, verifyBudget, false, false,
                             useOsIsolation);
                     if (ScanCache.restore(cache, preflight.cacheKey(), output)) {
@@ -124,7 +144,7 @@ public final class ScanCommand implements Callable<Integer> {
                             + cacheFailure.getClass().getSimpleName());
                 }
             }
-            ScanPipeline.ScanResult result = ScanPipeline.run(target, deps, output, rules, stats,
+            ScanPipeline.ScanResult result = ScanPipeline.run(target, scanDeps, output, rules, stats,
                     fast, jdkHome, false, verifyBudget, false, false,
                     useOsIsolation,
                     baseline, suppressions, overwrite,
@@ -147,6 +167,90 @@ public final class ScanCommand implements Callable<Integer> {
             System.err.println("[just:error] 扫描失败: " + e);
             return RunOutcome.failed("SCAN_FAILURE", e.getClass().getSimpleName()).exitCode();
         }
+    }
+
+    private List<Path> resolveDependencies() throws ScanPipeline.UsageException {
+        List<Path> resolved = deps == null ? new ArrayList<>() : new ArrayList<>(deps);
+        boolean hasRepositories = repositories != null && !repositories.isEmpty();
+        if (pom == null) {
+            if (offline || hasRepositories) {
+                throw new ScanPipeline.UsageException(
+                        "--offline/--repository 需要同时提供显式 --pom；无 POM 时 Just 不按类名猜包");
+            }
+            return List.copyOf(resolved);
+        }
+
+        List<MavenDependencyGraphResolver.RepositorySpec> selectedRepositories =
+                new ArrayList<>();
+        selectedRepositories.add(MavenDependencyGraphResolver.RepositorySpec.central());
+        if (hasRepositories) {
+            for (int index = 0; index < repositories.size(); index++) {
+                String value = repositories.get(index);
+                if (value == null || value.isBlank()) {
+                    throw new ScanPipeline.UsageException("--repository URL 不能为空");
+                }
+                try {
+                    selectedRepositories.add(new MavenDependencyGraphResolver.RepositorySpec(
+                            "repository-" + (index + 1), URI.create(value)));
+                } catch (IllegalArgumentException invalid) {
+                    throw new ScanPipeline.UsageException("--repository 无效: "
+                            + invalid.getMessage());
+                }
+            }
+        }
+        Path localRepository = dependencyCache();
+        MavenDependencyGraphResolver.Request request =
+                new MavenDependencyGraphResolver.Request(pom, localRepository,
+                        selectedRepositories, List.of(), offline);
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            MavenDependencyGraphResolver.Completion completion = resolver.complete(request);
+            for (MavenDependencyGraphResolver.Problem problem
+                    : completion.resolution().problems()) {
+                if (problem.severity() == MavenDependencyGraphResolver.Severity.WARNING) {
+                    System.err.println("[just:warn] dependency " + problem.code() + " ["
+                            + problem.coordinate() + "]: " + problem.detail());
+                }
+            }
+            if (completion.status() == MavenDependencyGraphResolver.Status.UNRESOLVED) {
+                String detail = completion.resolution().problems().stream()
+                        .filter(problem -> problem.severity()
+                                == MavenDependencyGraphResolver.Severity.ERROR)
+                        .map(problem -> problem.code() + " [" + problem.coordinate() + "]: "
+                                + problem.detail())
+                        .collect(Collectors.joining(" | "));
+                if (detail.isBlank()) {
+                    detail = "no-resolved-dependency-artifacts";
+                }
+                throw new ScanPipeline.UsageException("Maven 依赖补齐未完成: " + detail);
+            }
+            resolved.addAll(completion.paths());
+            System.err.println("[just:info] dependencyCompletion=" + completion.status()
+                    + "; artifacts=" + completion.artifacts().size()
+                    + "; networkDownloadWallMs=" + completion.networkDownloadWallMs());
+            return List.copyOf(resolved);
+        } catch (IOException failure) {
+            throw new ScanPipeline.UsageException("Maven 依赖补齐失败: " + failure.getMessage());
+        }
+    }
+
+    private Path dependencyCache() throws ScanPipeline.UsageException {
+        Path root = (cache == null ? Path.of(".just-cache") : cache)
+                .toAbsolutePath().normalize();
+        Path localRepository = root.resolve("maven-repository").normalize();
+        if (!localRepository.startsWith(root)) {
+            throw new ScanPipeline.UsageException("Maven 缓存路径越界");
+        }
+        if (Files.exists(root, LinkOption.NOFOLLOW_LINKS)
+                && (Files.isSymbolicLink(root)
+                || !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS))) {
+            throw new ScanPipeline.UsageException("Maven 缓存根不是实际目录: " + root);
+        }
+        if (Files.exists(localRepository, LinkOption.NOFOLLOW_LINKS)
+                && (Files.isSymbolicLink(localRepository)
+                || !Files.isDirectory(localRepository, LinkOption.NOFOLLOW_LINKS))) {
+            throw new ScanPipeline.UsageException("Maven 本地仓库不是实际目录: " + localRepository);
+        }
+        return localRepository;
     }
 
     private static void printVerificationDisclosure() {

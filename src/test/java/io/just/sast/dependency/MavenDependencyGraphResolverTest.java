@@ -1,16 +1,23 @@
 package io.just.sast.dependency;
 
 import io.just.sast.model.DependencyGraph;
+import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MavenDependencyGraphResolverTest {
@@ -189,6 +196,165 @@ class MavenDependencyGraphResolverTest {
                         && value.name().equals("unknown")));
     }
 
+    @Test
+    void completesRemoteJarThenReusesTheSameCompleteBytesOffline() throws Exception {
+        Path repository = temp.resolve("artifact-repository");
+        write(repository, "fixture/library/1.0/library-1.0.pom",
+                pom("fixture", "library", "1.0", ""));
+        writeJar(repository.resolve("fixture/library/1.0/library-1.0.jar"),
+                "fixture/data.txt", "complete-bytes");
+        Path root = temp.resolve("artifact-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>1.0</version></dependency></dependencies>"));
+        Path cache = temp.resolve("artifact-cache");
+        MavenDependencyGraphResolver.Request online = new MavenDependencyGraphResolver.Request(
+                root, cache, List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository)),
+                List.of(), false);
+        MavenDependencyGraphResolver.Completion first;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            first = resolver.complete(online);
+        }
+
+        assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, first.status());
+        assertEquals(1, first.artifacts().size());
+        MavenDependencyGraphResolver.ArtifactDownload downloaded = first.artifacts().get(0);
+        assertEquals(DependencyGraph.Source.REMOTE, downloaded.source());
+        assertEquals("fixture:library:1.0:jar:", downloaded.coordinate());
+        assertTrue(Files.isRegularFile(downloaded.path()));
+        String firstDigest = downloaded.sha256();
+
+        Files.write(downloaded.path(), new byte[]{'t', 'r', 'u', 'n', 'c', 'a', 't', 'e', 'd'});
+        MavenDependencyGraphResolver.Completion repaired;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            repaired = resolver.complete(online);
+        }
+        assertEquals(MavenDependencyGraphResolver.Status.PARTIAL, repaired.status());
+        assertEquals(DependencyGraph.Source.REMOTE, repaired.artifacts().get(0).source());
+        assertEquals(firstDigest, repaired.artifacts().get(0).sha256());
+        assertTrue(repaired.resolution().problems().stream()
+                .anyMatch(problem -> problem.code().equals("DEPENDENCY_CACHE_INVALID")));
+
+        Files.delete(repository.resolve("fixture/library/1.0/library-1.0.jar"));
+
+        MavenDependencyGraphResolver.Request offline = new MavenDependencyGraphResolver.Request(
+                root, cache, List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository)),
+                List.of(), true);
+        MavenDependencyGraphResolver.Completion second;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            second = resolver.complete(offline);
+        }
+
+        assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, second.status());
+        assertEquals(1, second.artifacts().size());
+        assertEquals(DependencyGraph.Source.CACHE, second.artifacts().get(0).source());
+        assertEquals(firstDigest, second.artifacts().get(0).sha256());
+        assertEquals(downloaded.path(), second.artifacts().get(0).path());
+        assertEquals(0L, second.networkDownloadWallMs());
+    }
+
+    @Test
+    void offlineCacheMissIsExplicitAndDoesNotUseNetworkRepositories() throws Exception {
+        Path repository = temp.resolve("offline-repository");
+        write(repository, "fixture/library/1.0/library-1.0.pom",
+                pom("fixture", "library", "1.0", ""));
+        Path root = temp.resolve("offline-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>1.0</version></dependency></dependencies>"));
+
+        MavenDependencyGraphResolver.Request request = new MavenDependencyGraphResolver.Request(
+                root, temp.resolve("offline-cache"),
+                List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository),
+                        MavenDependencyGraphResolver.RepositorySpec.central()),
+                List.of(), true);
+        MavenDependencyGraphResolver.Completion completion;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            completion = resolver.complete(request);
+        }
+
+        assertEquals(MavenDependencyGraphResolver.Status.UNRESOLVED, completion.status());
+        assertTrue(completion.artifacts().isEmpty());
+        assertEquals(0L, completion.networkDownloadWallMs());
+        assertTrue(completion.resolution().problems().stream()
+                .anyMatch(problem -> problem.code().equals("DEPENDENCY_ARTIFACT_MISSING")
+                        && problem.detail().contains("offline-cache-miss")));
+    }
+
+    @Test
+    void invalidRemoteJarIsRemovedAndReportedInsteadOfEnteringCache() throws Exception {
+        Path repository = temp.resolve("invalid-repository");
+        write(repository, "fixture/library/1.0/library-1.0.pom",
+                pom("fixture", "library", "1.0", ""));
+        Path invalid = repository.resolve("fixture/library/1.0/library-1.0.jar");
+        writeBytes(invalid, new byte[]{'n', 'o', 't', '-', 'a', '-', 'j', 'a', 'r'});
+        Path root = temp.resolve("invalid-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>1.0</version></dependency></dependencies>"));
+        Path cache = temp.resolve("invalid-cache");
+        MavenDependencyGraphResolver.Request request = new MavenDependencyGraphResolver.Request(
+                root, cache, List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository)),
+                List.of(), false);
+        MavenDependencyGraphResolver.Completion completion;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            completion = resolver.complete(request);
+        }
+
+        assertEquals(MavenDependencyGraphResolver.Status.UNRESOLVED, completion.status());
+        assertTrue(completion.artifacts().isEmpty());
+        assertTrue(completion.resolution().problems().stream()
+                .anyMatch(problem -> problem.code().equals("DEPENDENCY_ARTIFACT_INVALID")
+                        && problem.coordinate().equals("fixture:library:1.0:jar:")));
+        assertFalse(Files.exists(cache.resolve("fixture/library/1.0/library-1.0.jar"),
+                java.nio.file.LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    void http404IsVisibleForTheExactArtifactAndCancellationIsExplicit() throws Exception {
+        Path repository = temp.resolve("http-repository");
+        write(repository, "fixture/library/1.0/library-1.0.pom",
+                pom("fixture", "library", "1.0", ""));
+        Path root = temp.resolve("http-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>1.0</version></dependency></dependencies>"));
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            exchange.sendResponseHeaders(404, -1);
+            exchange.close();
+        });
+        server.start();
+        try {
+            URI url = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/");
+            MavenDependencyGraphResolver.Request request = new MavenDependencyGraphResolver.Request(
+                    root, temp.resolve("http-cache"),
+                    List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository),
+                            new MavenDependencyGraphResolver.RepositorySpec("http-fixture", url)),
+                    List.of(), false);
+            MavenDependencyGraphResolver.Completion completion;
+            try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+                completion = resolver.complete(request);
+            }
+            assertTrue(requests.get() > 0);
+            assertEquals(MavenDependencyGraphResolver.Status.UNRESOLVED, completion.status());
+            assertTrue(completion.resolution().problems().stream()
+                    .anyMatch(problem -> problem.coordinate().equals("fixture:library:1.0:jar:")
+                            && (problem.code().equals("DEPENDENCY_ARTIFACT_MISSING")
+                            || problem.code().equals("DEPENDENCY_ARTIFACT_UNRESOLVED"))
+                            && problem.detail().contains("404")),
+                    completion.resolution().problems().toString());
+
+            try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+                assertThrows(IOException.class, () -> resolver.complete(request, () -> true));
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
     private static MavenDependencyGraphResolver.DeclaredDependency dependency(
             MavenDependencyGraphResolver.Resolution resolution, String name) {
         return resolution.effectivePom().dependencies().stream()
@@ -216,5 +382,19 @@ class MavenDependencyGraphResolverTest {
         Path file = directory.resolve(name);
         Files.createDirectories(file.getParent());
         Files.writeString(file, content);
+    }
+
+    private static void writeBytes(Path file, byte[] bytes) throws IOException {
+        Files.createDirectories(file.getParent());
+        Files.write(file, bytes);
+    }
+
+    private static void writeJar(Path file, String entryName, String content) throws IOException {
+        Files.createDirectories(file.getParent());
+        try (JarOutputStream output = new JarOutputStream(Files.newOutputStream(file))) {
+            output.putNextEntry(new JarEntry(entryName));
+            output.write(content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            output.closeEntry();
+        }
     }
 }
