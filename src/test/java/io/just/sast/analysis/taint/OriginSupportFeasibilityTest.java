@@ -127,6 +127,57 @@ class OriginSupportFeasibilityTest {
     }
 
     @Test
+    void directOisCollectionViewIsNotAnExternalProxyInterfaceSite() {
+        MethodNode method = new MethodNode(Modifier.PUBLIC, "run", "()V", null, null);
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKESPECIAL.code(),
+                "java/io/ObjectInputStream", "<init>", "()V", false));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;", false));
+        method.instructions.add(new TypeInsnNode(Op.CHECKCAST.code(), "java/util/Collection"));
+        method.instructions.add(new VarInsnNode(Op.ASTORE.code(), 1));
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Collection",
+                "iterator", "()Ljava/util/Iterator;", true));
+        method.instructions.add(new VarInsnNode(Op.ASTORE.code(), 2));
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 2));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Iterator",
+                "hasNext", "()Z", true));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        MethodInfo methodInfo = extract("fixture/DeserializeHost", method);
+        ClassInfo host = new ClassInfo(methodInfo.owner(), "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(methodInfo), List.of());
+        ClassInfo collectionType = new ClassInfo("java/util/Collection", "java/lang/Object", List.of(),
+                Modifier.PUBLIC | Modifier.INTERFACE, List.of(), List.of());
+        ClassInfo iteratorType = new ClassInfo("java/util/Iterator", "java/lang/Object", List.of(),
+                Modifier.PUBLIC | Modifier.INTERFACE, List.of(), List.of());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host,
+                collectionType.internalName(), collectionType,
+                iteratorType.internalName(), iteratorType), List.of(), 3, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
+        Node iterator = cpg.graph().nodesOfType(NodeType.CALL).stream()
+                .filter(node -> "java/util/Collection".equals(node.owner())
+                        && "iterator".equals(node.name()))
+                .findFirst().orElseThrow();
+
+        assertTrue(support.directDeserializationReceiver(iterator,
+                        support.origins().compute(methodInfo)),
+                "the immediate OIS result must remain the collection identity boundary");
+        assertFalse(support.serializedProxyInterfaceCallSites().contains(iterator),
+                "a standard container view must not be offered to an unrelated external proxy handler");
+        assertTrue(support.serializedProxyInterfaceCallSites().stream()
+                        .noneMatch(node -> "java/util/Iterator".equals(node.owner())
+                                && "hasNext".equals(node.name())),
+                "a derived iterator operation must remain owned by the container model");
+    }
+
+    @Test
     void zeroArgumentReflectiveLookupRecoversEmptyClassArrayDescriptor() throws Exception {
         MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "run", "()V", null, null);
         method.instructions.add(new LdcInsnNode(Type.getObjectType("fixture/Target")));

@@ -976,13 +976,19 @@ public final class OriginSupport {
                     return owner != null && owner.isInterface();
                 })
                 .filter(call -> !isJdk(call.strProp("methodOwner")))
+                // Standard container operations already have an explicit element/view
+                // provenance model.  They are not evidence that the receiver is a JDK proxy
+                // whose InvocationHandler was supplied by serialized state when the receiver
+                // is proven to be the deserialized container or one of its derived views.
+                // Keep unrelated standard-interface calls eligible: externally assembled
+                // proxies are a supported boundary and their receiver need not be an OIS value.
                 .filter(call -> {
                     if (!isStandardContainerInterfaceCall(call)) {
                         return true;
                     }
                     MethodInfo host = enclosingMethod(call);
                     ForwardOrigins.Result result = host == null ? null : origins.compute(host);
-                    return !directDeserializationReceiver(call, result);
+                    return standardContainerProxyCandidate(call, result);
                 })
                 .filter(this::isExternallySuppliedProxyReceiver)
                 .sorted(java.util.Comparator.comparing((Node call) -> methodKeyOf(
@@ -998,6 +1004,94 @@ public final class OriginSupport {
         }
         serializedProxyInterfaceCallSites.addAll(candidates);
         JustLogger.debug("外部序列化 Proxy 接口调用位点：{} 个", serializedProxyInterfaceCallSites.size());
+    }
+
+    /**
+     * Keep the external-proxy bridge at a typed object boundary.  A direct deserialized
+     * container and an iterator/map view derived from it belong to the container-element
+     * model, not to every serializable InvocationHandler.  For a remaining standard-container
+     * call, a non-serializable field owner is an ordinary application state holder rather than
+     * a serialized proxy boundary; requiring a serializable declaration there removes the
+     * common service-cache false positive without rejecting the externally assembled proxy
+     * shape (a serializable trigger field calling {@code List.iterator}).
+     */
+    private boolean standardContainerProxyCandidate(Node call, ForwardOrigins.Result result) {
+        if (!isStandardContainerInterfaceCall(call)) {
+            return true;
+        }
+        if (directDeserializationReceiver(call, result)
+                || directDeserializationContainerViewReceiver(call, result)) {
+            return false;
+        }
+        MethodInfo host = enclosingMethod(call);
+        if (host == null || result == null) {
+            return true;
+        }
+        Set<ValueOrigin> receivers = argOriginAtOrdinal(call, -1, result);
+        if (receivers.isEmpty()) {
+            return true;
+        }
+        for (ValueOrigin receiver : receivers) {
+            if (receiver instanceof ValueOrigin.FieldRead field && !field.isStatic()) {
+                if (!hierarchy.isSerializable(field.owner())) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Prove that an iterator/map-view receiver is derived from the exact OIS value, while
+     * keeping the same view operation on a serialized application field eligible.  The latter
+     * is the externally assembled proxy fixture: {@code methods.iterator().next()} is the
+     * visible bridge that carries the Method value, whereas an OIS collection's iterator is
+     * already owned by the container-element model.
+     */
+    private boolean directDeserializationContainerViewReceiver(Node call,
+                                                                ForwardOrigins.Result result) {
+        if (call == null || result == null) {
+            return false;
+        }
+        for (ValueOrigin receiver : argOriginAtOrdinal(call, -1, result)) {
+            if (!(receiver instanceof ValueOrigin.CallResult callResult)) {
+                continue;
+            }
+            Node producer = callNodes.get(callResult.callNodeId());
+            if (producer != null && isDerivedContainerViewMethod(producer.owner(), producer.name(),
+                    producer.descriptor())
+                    && directDeserializationContainerViewProducer(producer, result, new HashSet<>())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean directDeserializationContainerViewProducer(Node producer,
+                                                               ForwardOrigins.Result result,
+                                                               Set<Long> visiting) {
+        if (producer == null || !visiting.add(producer.id())) {
+            return false;
+        }
+        try {
+            if (directDeserializationReceiver(producer, result)) {
+                return true;
+            }
+            for (ValueOrigin receiver : argOriginAtOrdinal(producer, -1, result)) {
+                if (!(receiver instanceof ValueOrigin.CallResult callResult)) {
+                    continue;
+                }
+                Node parent = callNodes.get(callResult.callNodeId());
+                if (parent != null && isDerivedContainerViewMethod(parent.owner(), parent.name(),
+                        parent.descriptor())
+                        && directDeserializationContainerViewProducer(parent, result, visiting)) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            visiting.remove(producer.id());
+        }
     }
 
     /**

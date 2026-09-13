@@ -83,6 +83,27 @@ class CsvReporterTest {
     }
 
     @Test
+    void qualityCannotCallAnUnresolvedProxyIdentityComplete(@TempDir Path tmp) throws Exception {
+        Chain proxy = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Trigger", "readObject",
+                "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Trigger", "readObject", "app/Handler", "invoke",
+                        HopKind.VIRTUAL_DISPATCH, null, "serialized-proxy-interface",
+                        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+                        null),
+                new ChainHop("app/Handler", "invoke", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "command", "()V", null),
+                new ChainHop("app/Trigger", "readObject", "app/Trigger", "readObject",
+                        HopKind.ENTRY, null, "readObject", "", null)), 0);
+
+        new CsvReporter().write(ReportLayout.flat(tmp), List.of(proxy), Map.of(), Map.of(), Map.of());
+
+        String findings = Files.readString(tmp.resolve("findings.csv"));
+        assertTrue(findings.contains(",PARTIAL,"),
+                "unresolved external proxy identity must not be exported as COMPLETE: " + findings);
+        assertTrue(findings.contains("completeness=PARTIAL"), findings);
+    }
+
+    @Test
     void groupedFindingRetainsConfirmedNonRepresentativeVariant(@TempDir Path tmp) throws Exception {
         Chain shortest = chain("readObject", "readObject");
         Chain longer = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",

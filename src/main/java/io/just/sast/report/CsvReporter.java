@@ -420,11 +420,13 @@ public final class CsvReporter {
         FindingOutputReader.Finding view = output == null ? null : output.byChainKey().get(chain.key());
         String confidence = view == null ? ConfidenceScorer.score(chain, notes)
                 : view.confidence().bucket();
-        String quality = chain.unresolvedHops() > 0 ? "PARTIAL(unresolved=" + chain.unresolvedHops() + ")" : "COMPLETE";
+        ChainPrecision.Assessment precisionAssessment = view == null
+                ? ChainPrecision.assess(chain, notes, verification) : view.precision();
+        String quality = "COMPLETE".equals(precisionAssessment.completeness())
+                ? "COMPLETE" : "PARTIAL";
         String path = pathSummary(chain);
         String evidence = ConfidenceScorer.evidenceDecomposition(chain, notes);
-        String precision = view == null ? ChainPrecision.assess(chain, notes, verification).compact()
-                : view.precision().compact();
+        String precision = precisionAssessment.compact();
         io.just.sast.blackboard.ConstructionSummary construction = view == null
                 ? ReportEvidence.construction(chain, notes, verification) : view.construction();
         int evidenceScore = view == null ? ConfidenceScorer.evidenceScore(chain, notes)
