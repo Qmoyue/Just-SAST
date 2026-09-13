@@ -177,6 +177,53 @@ class ScanPipelineTest {
     }
 
     @Test
+    void finiteStringGuardPrunesOnlyTheImpossibleSinkPath(@TempDir Path tmp) throws Exception {
+        String unreachable = """
+                package app;
+                public class UnreachableGuard implements java.io.Serializable {
+                    private String cmd;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        if (\"safe\".equals(\"safe\")) {
+                            in.defaultReadObject();
+                            return;
+                        }
+                        Runtime.getRuntime().exec(this.cmd);
+                    }
+                }
+                """;
+        String reachable = """
+                package app;
+                public class ReachableGuard implements java.io.Serializable {
+                    private String cmd;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        if (\"safe\".equals(\"other\")) {
+                            in.defaultReadObject();
+                            return;
+                        }
+                        Runtime.getRuntime().exec(this.cmd);
+                    }
+                }
+                """;
+        Path jar = compileToJar(tmp.resolve("guards.jar"), Map.of(
+                "app.UnreachableGuard", unreachable, "app.ReachableGuard", reachable));
+
+        ScanPipeline.ScanResult result = ScanPipeline.run(jar, null, tmp.resolve("out"), null,
+                false, true, null, true, 20);
+        String findings = Files.readString(tmp.resolve("out").resolve("findings")
+                .resolve("findings.csv"));
+
+        assertTrue(findings.contains("app/ReachableGuard,readObject")
+                        && findings.contains("java/lang/Runtime,exec"),
+                "a false String guard must retain the reachable sink path:\n" + findings);
+        assertFalse(findings.contains("app/UnreachableGuard,readObject"),
+                "an exact true String guard must remove only its impossible sink path");
+        assertTrue(result.stats().metric("dynamic_filter_rejections", 0L) > 0L,
+                "the report must expose that a bounded filter rejected a normal CFG edge");
+        assertTrue("OBSERVED".equals(result.stats().metricStatus("dynamic_filter_ms")),
+                "the report must expose the filter sub-timing when the hotspot runs");
+    }
+
+    @Test
     void deserializeSourceReturnSeedsForwardTaint(@TempDir Path tmp) throws Exception {
         String parser = """
                 package app;

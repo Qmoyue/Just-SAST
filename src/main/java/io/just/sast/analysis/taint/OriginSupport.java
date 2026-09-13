@@ -38,6 +38,7 @@ import java.util.TreeMap;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * 共享分析支撑（经黑板分发，全部知识源复用同一实例）：
@@ -225,6 +226,11 @@ public final class OriginSupport {
     private final Map<CfgProofKey, Boolean> sinkPathCache = new ConcurrentHashMap<>();
     private final ThreadLocal<ConstantProofContext> constantProof = new ThreadLocal<>();
     private final AtomicBoolean constantProofBudgetExceeded = new AtomicBoolean();
+    private final LongAdder finiteFilterNanos = new LongAdder();
+    private final LongAdder finiteFilterEvaluations = new LongAdder();
+    private final LongAdder finiteFilterRejections = new LongAdder();
+    private final LongAdder sinkPathCacheHits = new LongAdder();
+    private final LongAdder sinkPathCacheMisses = new LongAdder();
 
     private record CfgProofKey(String methodKey, int offset) {
     }
@@ -3880,8 +3886,10 @@ public final class OriginSupport {
         CfgProofKey proofKey = new CfgProofKey(methodKey(method), sinkOffset);
         Boolean cached = sinkPathCache.get(proofKey);
         if (cached != null) {
+            sinkPathCacheHits.increment();
             return cached;
         }
+        sinkPathCacheMisses.increment();
         ConstantProofContext previous = constantProof.get();
         constantProof.set(new ConstantProofContext());
         try {
@@ -3962,34 +3970,98 @@ public final class OriginSupport {
         return constantProofBudgetExceeded.get();
     }
 
+    /** Additive evaluator time accumulated across filter calls, as a subset of analysis time. */
+    public long finiteFilterMs() {
+        return finiteFilterNanos.sum() / 1_000_000L;
+    }
+
+    /** Number of CFG edges inspected by the bounded local filters. */
+    public long finiteFilterEvaluations() {
+        return finiteFilterEvaluations.sum();
+    }
+
+    /** Number of normal CFG edges removed by a proof from the bounded local filters. */
+    public long finiteFilterRejections() {
+        return finiteFilterRejections.sum();
+    }
+
+    /** Cache hits for the method/offset proof identity used by the local filter. */
+    public long finiteFilterCacheHits() {
+        return sinkPathCacheHits.sum();
+    }
+
+    /** Cache misses for the method/offset proof identity used by the local filter. */
+    public long finiteFilterCacheMisses() {
+        return sinkPathCacheMisses.sum();
+    }
+
+    public int finiteFilterCacheSize() {
+        return sinkPathCache.size();
+    }
+
     private boolean feasibleCfgEdge(MethodInfo method, ForwardOrigins.Result result,
                                     int source, CfgLabel label) {
         InsnFact insn = method.insnAt(source);
-        if (insn.op().isCondJump()) {
-            Boolean branch = knownBranchResult(method, result, insn);
-            if (branch == null) {
-                return true;
+        boolean measured = isFiniteFilterSite(insn);
+        long started = measured ? System.nanoTime() : 0L;
+        boolean rejected = false;
+        try {
+            if (insn.op().isCondJump()) {
+                Boolean branch = knownBranchResult(method, result, insn);
+                if (branch == null) {
+                    return true;
+                }
+                if (label == CfgLabel.JUMP) {
+                    rejected = !branch;
+                    return branch;
+                }
+                if (label == CfgLabel.FALSE) {
+                    rejected = branch;
+                    return !branch;
+                }
             }
-            if (label == CfgLabel.JUMP) {
-                return branch;
+            if (insn.op() == Op.CHECKCAST && label != CfgLabel.EXCEPTION
+                    && castAlwaysFails(method, result, insn)) {
+                rejected = true;
+                return false;
             }
-            if (label == CfgLabel.FALSE) {
-                return !branch;
+            if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
+                    && reflectiveLookupAlwaysFails(method, result, insn)) {
+                rejected = true;
+                return false;
+            }
+            if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
+                    && reflectiveInvocationAlwaysFails(method, result, insn)) {
+                rejected = true;
+                return false;
+            }
+            return true;
+        } finally {
+            if (measured) {
+                finiteFilterEvaluations.increment();
+                finiteFilterNanos.add(Math.max(0L, System.nanoTime() - started));
+                if (rejected) {
+                    finiteFilterRejections.increment();
+                }
             }
         }
-        if (insn.op() == Op.CHECKCAST && label != CfgLabel.EXCEPTION
-                && castAlwaysFails(method, result, insn)) {
+    }
+
+    private static boolean isFiniteFilterSite(InsnFact insn) {
+        if (insn.op().isCondJump() || insn.op() == Op.CHECKCAST) {
+            return true;
+        }
+        if (!insn.op().isInvoke() || insn.operands().isEmpty()
+                || !(insn.operands().get(0) instanceof MethodRef ref)) {
             return false;
         }
-        if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
-                && reflectiveLookupAlwaysFails(method, result, insn)) {
-            return false;
-        }
-        if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
-                && reflectiveInvocationAlwaysFails(method, result, insn)) {
-            return false;
-        }
-        return true;
+        return ("java/lang/reflect/Method".equals(ref.owner())
+                && "invoke".equals(ref.name()))
+                || ("java/lang/Class".equals(ref.owner())
+                && ("getMethod".equals(ref.name()) || "getDeclaredMethod".equals(ref.name())
+                || "getConstructor".equals(ref.name())
+                || "getDeclaredConstructor".equals(ref.name())
+                || "getField".equals(ref.name()) || "getDeclaredField".equals(ref.name())));
     }
 
     /** A normal edge is impossible when a reflective lookup has an exact missing target. */
@@ -4580,6 +4652,11 @@ public final class OriginSupport {
                 return null;
             }
             ForwardOrigins.Result callResultState = origins.compute(method);
+            Integer stringValue = knownStringInteger(call, method, callResultState,
+                    visiting);
+            if (stringValue != null) {
+                return stringValue;
+            }
             if ("booleanValue".equals(call.name()) && "java/lang/Boolean".equals(call.owner())) {
                 Set<ValueOrigin> receiver = argOriginAtOrdinal(call, -1, callResultState);
                 return knownInteger(receiver, method, callResultState, visiting, methods);
@@ -4617,6 +4694,49 @@ public final class OriginSupport {
             return constantReturnValue(callee, methods);
         }
         return null;
+    }
+
+    /**
+     * Evaluate only final-JDK String operations whose operands are exact local shapes.  The
+     * result feeds the existing branch proof; it never invokes the target method or widens a
+     * prefix/unknown shape into a guessed value.
+     */
+    private Integer knownStringInteger(Node call, MethodInfo method,
+                                       ForwardOrigins.Result result,
+                                       Set<ValueOrigin> visiting) {
+        if (!"java/lang/String".equals(call.owner())) {
+            return null;
+        }
+        StringShape receiver = stringShape(argOriginAtOrdinal(call, -1, result), method,
+                result, visiting);
+        if (receiver == null || receiver.exact() == null) {
+            return null;
+        }
+        return switch (call.name()) {
+            case "length" -> "()I".equals(call.descriptor())
+                    ? receiver.exact().length() : null;
+            case "isEmpty" -> "()Z".equals(call.descriptor())
+                    ? (receiver.exact().isEmpty() ? 1 : 0) : null;
+            case "equals" -> {
+                if (!"(Ljava/lang/Object;)Z".equals(call.descriptor())) {
+                    yield null;
+                }
+                StringShape argument = stringShape(argOriginAtOrdinal(call, 0, result), method,
+                        result, visiting);
+                yield argument == null || argument.exact() == null
+                        ? null : (receiver.exact().equals(argument.exact()) ? 1 : 0);
+            }
+            case "startsWith" -> {
+                if (!"(Ljava/lang/String;)Z".equals(call.descriptor())) {
+                    yield null;
+                }
+                StringShape argument = stringShape(argOriginAtOrdinal(call, 0, result), method,
+                        result, visiting);
+                yield argument == null || argument.exact() == null
+                        ? null : (receiver.exact().startsWith(argument.exact()) ? 1 : 0);
+            }
+            default -> null;
+        };
     }
 
     private static boolean isIntegerWrapperFactory(String owner, String name) {

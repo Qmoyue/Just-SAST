@@ -1057,7 +1057,17 @@ public final class ScanPipeline {
                     dependencySourceCount(dependencyGraph, source));
         }
         metrics.put("analysis_ms", phaseMs.getOrDefault("analysis", -1L));
-        metrics.put("dynamic_filter_ms", 0L);
+        long dynamicFilterMs = blackboard.originSupport().finiteFilterMs();
+        long dynamicFilterEvaluations = blackboard.originSupport().finiteFilterEvaluations();
+        metrics.put("dynamic_filter_ms", dynamicFilterMs);
+        metrics.put("dynamic_filter_evaluations", dynamicFilterEvaluations);
+        metrics.put("dynamic_filter_rejections", blackboard.originSupport().finiteFilterRejections());
+        metrics.put("dynamic_filter_cache_hits", blackboard.originSupport().finiteFilterCacheHits());
+        metrics.put("dynamic_filter_cache_misses", blackboard.originSupport().finiteFilterCacheMisses());
+        metrics.put("dynamic_filter_cache_size",
+                (long) blackboard.originSupport().finiteFilterCacheSize());
+        metrics.put("dynamic_filter_budget_exceeded",
+                blackboard.originSupport().constantProofBudgetExceeded() ? 1L : 0L);
         metrics.put("report_ms", phaseMs.getOrDefault("report", -1L));
         metrics.put("total_wall_ms", totalWallMs);
         addPassTelemetry(metrics, phaseMs, "frontend", "frontend", -1L);
@@ -1111,7 +1121,14 @@ public final class ScanPipeline {
                     "OBSERVED");
         }
         status.put("analysis_ms", phaseMs.containsKey("analysis") ? "OBSERVED" : "UNKNOWN");
-        status.put("dynamic_filter_ms", "NOT_APPLICABLE");
+        String dynamicFilterStatus = dynamicFilterEvaluations == 0L
+                ? "NOT_APPLICABLE" : "OBSERVED";
+        for (String name : List.of("dynamic_filter_ms", "dynamic_filter_evaluations",
+                "dynamic_filter_rejections", "dynamic_filter_cache_hits",
+                "dynamic_filter_cache_misses", "dynamic_filter_cache_size",
+                "dynamic_filter_budget_exceeded")) {
+            status.put(name, dynamicFilterStatus);
+        }
         status.put("report_ms", phaseMs.containsKey("report") ? "OBSERVED" : "UNKNOWN");
         status.put("total_wall_ms", "OBSERVED");
         for (String name : List.of("application_sites", "candidate_joins", "validated_joins",
@@ -1171,6 +1188,18 @@ public final class ScanPipeline {
         analysis.put("representative_paths", -1L);
         analysis.put("forward_origin_cache_bytes_estimate",
                 blackboard.originSupport().forwardOriginCacheBytesEstimate());
+        analysis.put("dynamic_filter_ms", dynamicFilterMs);
+        analysis.put("dynamic_filter_evaluations", dynamicFilterEvaluations);
+        analysis.put("dynamic_filter_rejections",
+                blackboard.originSupport().finiteFilterRejections());
+        analysis.put("dynamic_filter_cache_hits",
+                blackboard.originSupport().finiteFilterCacheHits());
+        analysis.put("dynamic_filter_cache_misses",
+                blackboard.originSupport().finiteFilterCacheMisses());
+        analysis.put("dynamic_filter_cache_size",
+                (long) blackboard.originSupport().finiteFilterCacheSize());
+        analysis.put("dynamic_filter_budget_exceeded",
+                blackboard.originSupport().constantProofBudgetExceeded() ? 1L : 0L);
         if (forward != null) {
             analysis.putAll(forward.asMetrics());
         } else {

@@ -53,6 +53,40 @@ class OriginSupportFeasibilityTest {
     }
 
     @Test
+    void stringEqualityBranchUsesFiniteStringEvaluationAndItsCache() {
+        MethodInfo method = stringEqualityBranchMethod();
+        int guardedOffset = method.instructions().stream()
+                .filter(insn -> insn.op() == Op.NOP)
+                .findFirst()
+                .orElseThrow()
+                .offset();
+
+        OriginSupport support = supportFor(method);
+        assertTrue(support.sinkPathProvablyUnreachable(method, guardedOffset),
+                "exact String equality must remove the impossible normal edge");
+        assertTrue(support.finiteFilterEvaluations() > 0,
+                "the bounded evaluator must expose that it inspected the conditional edges");
+        assertTrue(support.finiteFilterRejections() > 0,
+                "the bounded evaluator must expose the rejected false edge");
+        assertTrue(support.sinkPathProvablyUnreachable(method, guardedOffset));
+        assertEquals(1L, support.finiteFilterCacheHits(),
+                "the method/offset proof identity must reuse the second query");
+    }
+
+    @Test
+    void unknownStringEqualityKeepsBothBranches() {
+        MethodInfo method = unknownStringEqualityBranchMethod();
+        int guardedOffset = method.instructions().stream()
+                .filter(insn -> insn.op() == Op.NOP)
+                .findFirst()
+                .orElseThrow()
+                .offset();
+
+        assertFalse(supportFor(method).sinkPathProvablyUnreachable(method, guardedOffset),
+                "a parameter-dependent String equality must remain UNKNOWN and preserve the path");
+    }
+
+    @Test
     void branchTruthUsesTheSameAbstractStateAsTheSinkGuard() throws Exception {
         OriginSupport support = emptySupport();
         MethodInfo method = constantBranchMethod();
@@ -411,6 +445,49 @@ class OriginSupportFeasibilityTest {
         method.instructions.add(taken);
         method.instructions.add(new InsnNode(Op.RETURN.code()));
         return extract(method);
+    }
+
+    private static MethodInfo stringEqualityBranchMethod() {
+        LabelNode impossible = new LabelNode();
+        MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "guarded", "()V",
+                null, null);
+        method.instructions.add(new LdcInsnNode("safe"));
+        method.instructions.add(new LdcInsnNode("safe"));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(), "java/lang/String",
+                "equals", "(Ljava/lang/Object;)Z", false));
+        method.instructions.add(new JumpInsnNode(Op.IFEQ.code(), impossible));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+        method.instructions.add(impossible);
+        method.instructions.add(new InsnNode(Op.NOP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+        return extract("fixture/StringGuard", method);
+    }
+
+    private static MethodInfo unknownStringEqualityBranchMethod() {
+        LabelNode unknown = new LabelNode();
+        MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "guarded",
+                "(Ljava/lang/String;)V", null, null);
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        method.instructions.add(new LdcInsnNode("safe"));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(), "java/lang/String",
+                "equals", "(Ljava/lang/Object;)Z", false));
+        method.instructions.add(new JumpInsnNode(Op.IFEQ.code(), unknown));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+        method.instructions.add(unknown);
+        method.instructions.add(new InsnNode(Op.NOP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+        return extract("fixture/StringGuard", method);
+    }
+
+    private static OriginSupport supportFor(MethodInfo method) {
+        ClassInfo host = new ClassInfo(method.owner(), "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(method), List.of());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host), List.of(), 1, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        return new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
     }
 
     private static MethodInfo emptyMethod(String owner, String name, String descriptor, int access) {
