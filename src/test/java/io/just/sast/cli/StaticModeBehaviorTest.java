@@ -7,6 +7,7 @@ import javax.tools.JavaCompiler;
 import javax.tools.SimpleJavaFileObject;
 import javax.tools.ToolProvider;
 import java.io.File;
+import java.net.URLClassLoader;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,6 +16,7 @@ import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -29,14 +31,26 @@ class StaticModeBehaviorTest {
                 package app;
                 public class Sentinel implements java.io.Serializable {
                     static {
-                        try { java.nio.file.Files.writeString(java.nio.file.Path.of("%s"), "loaded"); }
-                        catch (Exception ignored) { }
+                        try {
+                            java.nio.file.Files.writeString(
+                                    java.nio.file.Path.of("%s"), "loaded");
+                        } catch (java.io.IOException failure) {
+                            throw new java.io.UncheckedIOException(failure);
+                        }
                     }
                     private void readObject(java.io.ObjectInputStream in) throws Exception {
                         in.defaultReadObject();
                     }
                 }
                 """.formatted(path)));
+        try (URLClassLoader positiveControl = new URLClassLoader(
+                new java.net.URL[]{jar.toUri().toURL()}, null)) {
+            Class.forName("app.Sentinel", true, positiveControl);
+        }
+        assertEquals("loaded", Files.readString(sentinel),
+                "the sentinel must prove that class initialization would be observable");
+        Files.delete(sentinel);
+
         ScanPipeline.run(jar, null, temp.resolve("out"), null, false, true, null,
                 true, 20);
         assertFalse(Files.exists(sentinel), "static analysis must not initialize target classes");
