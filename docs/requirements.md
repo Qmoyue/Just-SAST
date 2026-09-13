@@ -1,130 +1,76 @@
-# Just 需求契约
+# Just 产品需求
 
-版本：2026-09-12。本文件定义当前产品的功能、结果、安全和性能契约。
+契约：JUST-LIGHT-MINING-V3，2026-09-13。状态：开发前目标契约，尚未全部实现或验收；最终发布前按真实行为再次校准本文。本文定义产品，开发任务由本地唯一执行清单管理。
 
-## 1. 目标与范围
+## 1. 定位与交付
 
-Just 面向 Java JAR、WAR 和 class 目录，分析反序列化入口到 gadget/sink 的静态可达关系，
-输出可解释链、证据和动态状态。产品以单 CLI JAR 交付，主程序使用 JDK17，目标 JDK 仍可通过
-`--jdk-home` 指定。
+Just 是轻量、准确、快速的 Java 反序列化链分析工具，用于 Apache 开源组件与完整应用的辅助漏洞挖掘，以及 CTF JAR/WAR/class目录分析。帮助人和 agent 缩小阅读范围，定位应用入口、关键调用/字段关系、漏洞成立条件和最终影响。
+正式运行环境为 Windows/JDK17，发布一个可直接运行的 launcher JAR；不要求用户安装 Maven、容器、外部solver或常驻服务。已有Linux能力可保留，不新增Linux发布门禁。
+目标输入包括普通JAR、Boot fat JAR、WAR、class目录、显式依赖与所选JDK运行库。目标应用不需要启动。
 
-Just 不生成可直接投递的攻击字节流，不把静态命中或固定安全参数调用写成 RCE 结论。
+## 2. 两种模式与准确性
 
-## 2. 功能需求
+| 模式 | 结果对象 | 成立要求 |
+|---|---|---|
+| component（默认） | 机制触发→gadget→最终影响 | 允许无应用入口，列出触发、对象构造、控制、依赖/版本/配置条件 |
+| application（显式） | 应用入口→站点→依赖/JDK→最终影响 | 真实应用ownership、可控输入、逐段join/bridge、对象身份和完整终点后缀 |
 
-### 2.1 输入与前端
+两模式共享分析引擎与证据模型。组件存在gadget不能直接证明应用暴露；classpath共存、类名匹配和调用图共现不能代替值流/对象/控制连接。
+覆盖原生反序列化及真实样本需要的Fastjson/Jackson、Kryo、Hessian、代理/反射、JNDI/RMI、JDBC/XML、二次解析等语义；不宣称所有框架版本均覆盖。
+危险API可能是桥。lookup/connect/构造器/解码之后须继续到最终影响，无法连接则说明缺口。排名不能把UNKNOWN变为SAT，完整链不得隐藏关键未证明条件。
+完整性、应用暴露、链进度、结构可行性和控制状态分别表达。输入不完整可保留独立完整链，但受缺失影响的链不能称完整。输出不等于已确认漏洞，不输出RCE_CONFIRMED或可投递攻击字节流。
 
-| ID | 要求 |
-| --- | --- |
-| FR-01 | 接受普通 JAR、嵌套 JAR、Spring Boot fat JAR、WAR 和 class 目录。 |
-| FR-02 | 接受显式依赖路径，并区分应用、依赖和 JDK class。 |
-| FR-03 | 使用 ASM 解析 classfile，生成类、方法、字段、指令、异常和类型事实。 |
-| FR-04 | 根据目标 classfile 版本选择 Java 8 `rt.jar` 或 Java 9+ `jrt-fs` 模块源。 |
-| FR-05 | 对嵌套深度、条目数量、解压大小、压缩比、classfile 大小和链接/reparse point 设置边界。 |
-| FR-06 | 读取失败、依赖缺失、模块不可读和版本不匹配保留为结构化完整性状态。 |
+## 3. 默认依赖补齐
 
-### 2.2 静态语义
-
-| ID | 要求 |
-| --- | --- |
-| FR-07 | 覆盖原生序列化回调及其继承、代理和框架桥接入口。 |
-| FR-08 | 通过 YAML 描述替代反序列化入口、source、sink、框架桥接和调用模型。 |
-| FR-09 | 支持调用图、CFG、异常边、类型层次、字段写入、数组、容器、receiver、反射、代理和 lambda。 |
-| FR-10 | 支持 forward/backward taint、字段/返回值/receiver/容器来源、对象图和链组合。 |
-| FR-11 | 对 JNI、JRMP、模块、类加载和动态反射保留边界事实；未知目标不得扩展为任意调用。 |
-| FR-12 | 链校准区分类型、序列化、控制流、字段约束、触发条件和安全配置。 |
-| FR-13 | 每条链携带 `rule_id`、entry、sink、逐跳 edge、机制、字段依赖、风险和完整性原因。 |
-
-### 2.3 Blackboard 与扩展
-
-| ID | 要求 |
-| --- | --- |
-| FR-14 | Blackboard 按 phase 和 `KnowledgeSource.priority()` 调度知识源并建立阶段屏障。 |
-| FR-15 | 知识源之间不得直接调用，通过 Blackboard 事实和事件协作。 |
-| FR-16 | `KnowledgeSource` 声明 `phase()`、`priority()`、`interests()`，并通过 ServiceLoader 注册。 |
-| FR-17 | 规则文件负责攻击面数据，分析引擎负责通用语义；不得使用样本、包名或结果文本特判。 |
-| FR-18 | 统一链存储管理 chain identity、语义合并、校准状态和注记。 |
-
-### 2.4 动态确认
-
-| ID | 要求 |
-| --- | --- |
-| FR-19 | 默认动态流程使用独立子 JVM 和 Windows Job Object；可证明的安全终点执行固定安全调用，其他终点停在边界。 |
-| FR-20 | 子 JVM 在认证 ready 后才加载目标类；真实调用和 canary 都必须绑定同一 attempt、chain、sink、artifact 和策略 identity。 |
-| FR-21 | `SAFE_CALLABLE`/`CONTROLLED_EFFECT` 只允许 descriptor、receiver、参数、调用前后观察点和副作用均可约束的终点。 |
-| FR-22 | 固定安全参数不得继承目标命令、路径、URL、类名、脚本、序列化数据或不透明对象。 |
-| FR-23 | `SINK_EXECUTED_SAFE` 必须具备精确调用、固定参数、正常返回/受控效果和认证 Job Object evidence，并标记 `sink_distorted=true`。 |
-| FR-24 | native/JNI/FFM load、任意类加载/定义/初始化、攻击性反序列化、脚本/eval、远端 lookup、非固定网络和不可控外部进程只允许 `PRE_SINK_CONFIRMED`。 |
-| FR-25 | 普通 stdout/stderr、属性、环境变量、异常文本和退出码不能单独形成正向动态证据。 |
-| FR-26 | 结果必须结构化记录 `requested_mode`、`effective_mode`、`fallback`、`verification_scope`、`sink_risk`、`terminal_executed`、`stop_reason` 和 `last_confirmed_stage`。 |
-
-### 2.5 进程边界
-
-| ID | 要求 |
-| --- | --- |
-| FR-27 | Windows 默认 runner 使用普通用户可建立的 Job Object，配置进程树、per-process user CPU time、内存、active-process、kill-on-close、墙钟和独立 scratch。 |
-| FR-28 | 父进程必须真实创建/配置/附加 Job Object，并在 ready/terminal 协议中认证该边界；子进程自报不能替代父进程证据。 |
-| FR-29 | Job Object 不声明完整文件系统或系统网络控制；无法建立时返回明确的 `UNTESTABLE`，不得启动未约束的真实终点。 |
-| FR-30 | Linux 保留 backend 接口和不可用结果，不把普通子 JVM 能力写成隔离能力。 |
-
-### 2.6 结果与报告
-
-| ID | 要求 |
-| --- | --- |
-| FR-31 | 所有报告由同一规范化结果模型生成，包含 findings、evidence、calibration、verification、metadata、dependencies 和 payload plan。 |
-| FR-32 | CSV、JSON、SARIF、HTML、Markdown 使用同一字段语义、风险分组和排序。 |
-| FR-33 | 报告分为互斥的 `real_safe_terminal`、`prefix_confirmed_high_risk` 和 `boundary_only` 集合。 |
-| FR-34 | payload plan 只描述对象图、字段、触发和证据计划，不包含攻击字节流。 |
-| FR-35 | 结果记录 artifact、JDK、规则、参数、预算、阶段耗时、完整性、动态能力和 canonical digest。 |
-| FR-36 | diff、baseline 和 suppression 使用稳定 chain identity，不改变扫描语义。 |
-
-## 3. 状态契约
-
-| 状态 | 定义 |
-| --- | --- |
-| `SINK_BLOCKED` | 精确 sink 边界已到达，canary 阻断方法体 |
-| `PRE_SINK_CONFIRMED` | 高风险终点前的完整前置链已确认，终点未进入 |
-| `SINK_EXECUTED_SAFE` | 固定安全参数下精确 API/body 正常返回 |
-| `SAFE_EFFECT_OBSERVED` | 只观察到 Just 自有 adapter 效果 |
-| `CONCRETE_REACHED` | 到达安全观察点但尚无精确 sink 证据 |
-| `PARTIAL` | 分析、构造或依赖只完成一部分 |
-| `TIMEOUT` | 达到明确时间预算 |
-| `UNTESTABLE` | 缺少依赖、JDK 或所需进程边界能力 |
-
-以上状态均不等价于 RCE；Just 不输出 `RCE_CONFIRMED`。
-
-## 4. 非功能需求
-
-| ID | 要求 |
-| --- | --- |
-| NFR-01 | 核心交付保持单 JAR；主 CLI 使用 JDK17；`--jdk-home` 可选择目标 JDK。 |
-| NFR-02 | 大工件采用流式读取、冻结索引、按需 CFG/CPG、共享 immutable summary 和有界缓存。 |
-| NFR-03 | 静态、动态、runner startup、class-load、真实调用/prefix-stop、queue 和 cleanup 分段计时。 |
-| NFR-04 | 优化不得减少规则、扫描深度、链覆盖、完整性或确定性。 |
-| NFR-05 | 固定配置下记录静态和动态 cold/warm p50/p95；动态门禁以候选结果 duration 为主，并保留整次 verify 阶段；超时样本保留在分位数计算中。 |
-| NFR-06 | 并行度、缓存、验证预算、输出和资源限制有界；默认不自动重复超时。 |
-| NFR-07 | 相同输入和配置的串行、并行、重复运行产生相同链集合、原因、排序、状态和 digest。 |
-| NFR-08 | 测试覆盖 CLI、报告、恶意工件、协议、进程边界、确定性、超时/OOM 和性能。 |
-| NFR-09 | 控制流直接、模块职责单一；不使用宽泛 fallback 掩盖能力缺失。 |
-
-## 5. CLI 契约
-
+默认从准确依赖声明取得缺失依赖，优先目标内置、显式输入和已有有效缓存。依赖图需处理父POM、属性、BOM/dependencyManagement、传递关系、scope、optional/exclusions、classifier/type及Maven版本仲裁。
+内置依赖和shaded/relocated实际字节码优先，不能用下载版本静默覆盖。test/build-plugin不进入目标运行分析；provided、system和可选功能依赖不能被随意补入以证明实际应用漏洞。
+无POM/坐标或版本不可确定时明确说明，不按类名搜索猜包、不换最新版兜底。版本范围/SNAPSHOT若不能确定和固定具体制品须明确不支持。
+读取POM仅为数据解析，不运行目标Maven生命周期、插件、extensions或目标代码。默认使用固定Maven Central；其他仓库由用户显式配置，不自动使用不可信POM中的仓库地址，不隐式读取用户settings/凭据。
+下载失败、缺包、解析歧义/冲突必须可见，报告依赖环境及受影响范围。POM推导的依赖不是实际部署证据，相关结果说明条件。
+保存精确坐标、获选版本、来源、SHA256及仲裁原因，记录embedded/explicit/cache/remote来源；离线复用与依赖更新后的失效正确。缓存不接受半成品，SHA256表示身份，不单独证明来源可信。
+输入参数目标：
 ```text
-just-sast scan --jar=<path> [--deps=<path,...>]
-                 [--jdk-home=<path>] [--output=<path>]
-                 [--rules=<path>] [--verify-budget=<N>]
-                 [--stats] [--fast] [--no-verify]
+scan --jar <jar|war|class-dir>
+     [--mode component|application]
+     [--deps <jar|dir,...>] [--pom <pom.xml>]
+     [--repository <url>] [--offline]
+     [--jdk-home <path>] [--output <path>] [--rules <path>]
 ```
+--repository允许重复；--offline禁止包括元数据解析在内的网络请求，只使用明确输入和缓存。预算/诊断等已有参数只在有实际用途且语义清楚时保留，help准确说明范围。
+这些是目标接口，不宣称当前CLI已经支持全部选项。
 
-`--fast` 和 `--no-verify` 会改变扫描或验证范围。退出码为：`0` 成功，`2` 参数或输入错误，
-`3` 扫描内部错误。
+## 4. 动态筛选与执行边界
 
-默认动态验证预算为 32 个经入口锚定、规范化和去重后的 finding group；这是有限的轻量
-二次筛选上限，显式 `--verify-budget=<N>` 仍然是硬上限，静态链求解和报告证据不会因预算
-被截断而删除。覆盖度必须以 `meta/verification-coverage.json` 中的分母和延迟 reason code
-复核，不能把预算内 selected 数量当作全覆盖。
+所有扫描选项不执行目标代码：不把目标加入可执行classloader，不初始化/构造/调用目标类，不反序列化攻击流，不启动目标进程，不访问目标漏洞终点。
+静态扫描在高成本或高噪声位置按需进行有限具体求值，用工具自身受限操作计算字符串、算术、比较、分支、有限反射名称等；优先在昂贵扩展前或过程中介入。
+只对已知值或完整穷尽且保留值间关联的有限域证明矛盾，UNKNOWN/预算/不支持不能否定静态候选；一个成功输入也不证明全链成立。
+已知操作异常必须尊重目标异常控制流，不能统一转换成false。工具内部错误直接暴露，不能catch-all后变UNKNOWN。
+不建设通用JVM解释器、外部SMT或目标执行沙箱。当前使用进程内有界求值；移除旧verifier、verify8、payload、canary、Job Object/SecurityManager及无消费者原生依赖。
+选择性复用旧字段/类型/构造约束、预算/确定性/证据和测试职责；每个热点用A/B证明降噪或成本收益和有效链保留，无收益不保留。
 
-## 6. 验收
+## 5. 输出与耗时
 
-验收顺序为 focused contract、single-JAR 构建、CLI smoke、完整测试、外部语义回归、确定性和
-固定性能门。Gleipner 的输入、truth、脚本和评分口径与生产代码分离。
+默认只生成report.md和report.json，由同一规范结果生成；日志stderr，stdout只用于明确约定的机器输出，详细诊断显式开启。
+Markdown按价值展示前10组代表链并列出其他候选概要；JSON保留去重有效候选、重要变体和共享证据，所有引用可解析。不同对象身份/触发/条件/终点不可被错误合并。
+报告提供精确方法签名/字节码位置、逐跳依据、对象字段连接、类型/控制/构造/过滤/JDK条件、依赖来源、关键假设与未解决点。没有源码行号则不捏造。
+展示限制、搜索预算、结果截断分别说明，不能静默少报或把片段计入完整链。默认不输出payload计划、verification目录或旧五格式。
+公共契约只保留 concise report、finding output、rules、input digest 和 evidence-graph telemetry；动态验证披露、运行信任边界和 v1/v2 shadow schema 已退役。动态筛选的局部状态属于分析结果与统一报告的一部分，不再创建第二套验证报告或旁路 schema。
+计时分别记录依赖解析、网络下载墙钟、静态analysis、report、total；dynamicFilter是analysis子耗时。并发请求时间总和单列，不能与墙钟混用或重复相加。下载时间不得混入扫描性能。
+首次有用结果以完整链可由消费者读取为准，不能用内存命中或旧缓存时间代替。
+
+## 6. 验收标准
+
+固定八组CTF/WP逐案准确输出完整原始主链、所有必要桥和对象/控制条件，8/8全部通过；全部冻结负锚点通过。Apache固定组件/应用正负例按实际版本/部署环境通过，相关Gleipner官方语义回归无未解释退步。
+低误报验收Q-01：每案默认前min(10,N)高价值组的证据支持比例至少90%，UNKNOWN计入分母而不计支持，明确矛盾和伪完整为0；原始WP主链位于前10，N=0失败。
+前列以外固定种子审查至多20组并要求同样至少90%支持；全部COMPLETE组做结构与证据完整性校验。抽样不能冒充全体精确率，必须列范围/分母/未知/误报；禁止通过隐藏结果或按答案调排名达标。
+报告消费入口/站点、对象关系/条件、最终影响、阻断位置、精确方法五问必须5/5；agent自评明确标注，不捏造人工审计收益。
+通常五分钟内有用是体验目标，组件/CTF优先低延迟；统一analysis预算按实测冻结，下载单列。冷1暖3记录各次值与中位数、RSS和首次有用结果，不凭小样本报告p95。
+对每个优化同时衡量准确性、资源成本和审查负担，不能降低语义强度换速度。
+
+## 7. 工程与发布
+
+禁止兜底和防御性编程：不吞异常、静默默认/降级、无依据兼容或自动重试；内部不变量错误直接失败。外部输入校验、资源预算和声明的未知结果在唯一边界处理，不能用来掩盖内部bug。
+ASM限于frontend；后续使用稳定不可变模型和artifact provenance，每层事实一个owner；规则是数据，求解与约束是通用语义，无样本名/hash/路径特判。
+开发全程及最终全面使用ai-slop-taste和test-doctor，围绕真实用户流程控制复杂度和测试成本；不为删行数重写稳定代码，不为测试镜像实现。
+开发前写需求/架构，过程中同步真实变化，最后按验收行为修订需求/架构/README。验证通过的批次本地commit，日常不push。
+最终全部本地任务通过后push，由Release流程在同提交验证通过后创建tag和发布可用JAR、SHA256、许可及发布说明。构建只读权限，发布最小权限，失败阻断发布；必须核对真实远程回执和资产，不能以workflow存在或RELEASE_READY冒充已发布。

@@ -1,141 +1,86 @@
-# Just 架构设计
+# Just 目标架构
 
-版本：2026-09-04。本文件描述当前实现的模块边界、数据流和动态结果语义。
+契约：JUST-LIGHT-MINING-V3，2026-09-13。本文是开发前目标设计，不是已完成的实现说明。保留稳定分析实现，沿真实能力缺口逐步迁移，最终发布前按实际代码再次校准。
 
-## 1. 定位
+## 1. 用户流程与分层
 
-Just 是面向 Java JAR、WAR 和 class 目录的轻量字节码扫描器，重点分析反序列化入口、
-gadget 组合和 sink 可达性。发布形态是单个 CLI JAR；静态扫描不依赖外部服务。
-
-动态验证只补充静态证据：可完全约束的终点在 Windows Job Object 子 JVM 中以固定安全参数
-真实调用；高风险终点在最终危险操作之前停止。任何动态结果都不等价于 RCE。
-
-## 2. 设计不变量
-
-1. ASM 只在 frontend 使用，后续层只消费 Just model。
-2. 规则描述攻击面数据，知识源实现通用语义，不按样本、包名或结果文本分支。
-3. 静态候选、完整性、校准、动态能力和报告投影彼此独立。
-4. 并行只改变调度顺序，不改变链 identity、证据、状态或排序。
-5. 正向动态证据绑定 attempt、chain、sink、artifact 和 policy identity。
-6. 未知依赖、receiver、字段、模块或反射目标保留为结构化不确定性。
-
-## 3. 分层
+三个直接流程：输入组件得到条件明确的gadget链；输入应用得到真实入口到最终影响的链；通过--offline复用本地依赖完成同类分析。
 
 ```text
-输入工件 / 依赖 / 目标 JDK
-          │
-          ▼
-frontend.asm：读取、ASM、嵌套工件、JDK source
-          │ immutable facts
-          ▼
-model / CPG / CFG / hierarchy / summaries
-          │
-          ▼
-Blackboard：阶段、事实、事件、链 identity
-          │
-          ▼
-knowledge：source、sink、污点、对象图、校准、验证调度
-          │
-          ▼
-verify：子 JVM、Job Object、probe、事件认证
-          │
-          ▼
-report：规范化模型 → CSV/JSON/SARIF/HTML/Markdown
+CLI：mode / input / deps / pom / repository / offline / target JDK
+  → 输入准备：实际制品 + 有效依赖图 + 缓存/下载 + provenance
+  → frontend：ASM读取目标、依赖和JDK，生成不可变程序事实
+  → 共享分析：按需入口/站点/类型/字段/控制/回调/反射/桥求解
+       ↳ 高成本或高噪声位置的有界具体求值
+  → 链证据与模式导出政策：完整性、结构、控制和应用暴露
+  → 一个报告快照 → report.md / report.json
 ```
 
-| 模块 | 负责 | 不负责 |
-| --- | --- | --- |
-| `frontend.asm` | 读取工件并生成类、方法、字段、调用、异常和类型事实 | 污点推理、排序、报告 |
-| `model` / `analysis` | 保存 CPG/CFG、调用关系、类型层次、字段和摘要 | 动态执行 |
-| `blackboard` | 阶段屏障、事实事件、稳定合并和链存储 | 攻击面私有语义 |
-| `knowledge` | source、sink、回调、组合、构造和校准 | 直接调用其他知识源 |
-| `verify` | 候选选择、子 JVM、进程边界、probe 和安全终点调用 | 危险副作用、exploit 生成 |
-| `report` | 将统一模型投影到各格式 | 重新推导扫描结论 |
+依赖下载是输入准备，动态筛选是分析内部操作，两者不拥有另一套求解器。框架规则是分析知识，不能替代目标实际版本字节码。
 
-依赖方向为 `frontend → model/analysis → blackboard/knowledge → verify/report`。
+## 2. 所有权和迁移入口
 
-## 4. 静态模型
+| 职责 | 当前可用入口 | 目标边界 |
+|---|---|---|
+| CLI选项与模式 | ScanCommand、ScanPipeline、ModeDemandPolicy | CLI只组装明确配置；mode一处决定需求根和导出政策 |
+| 制品/依赖身份 | frontend输入、ArtifactProvenance、DependencyInventoryWriter、ScanCache | 输入准备是依赖图/制品身份的唯一owner；report只消费，不再次推导 |
+| 依赖解析/下载（新增） | 现有--deps/嵌套读取可复用 | 有效POM→确定图→精确bytes；不执行构建，不隐式读settings |
+| 字节码与运行库 | BytecodeFrontend、JarReader、TargetJdkSource/JrtClassSource | ASM仅frontend；目标--jdk-home读取与主JVM执行分离 |
+| 程序事实 | model、analysis、Graph/CFG/类型/字段 | 稳定不可变模型，含artifact和位置；重复类/ownership显式 |
+| 来源与需求索引 | ApplicationEntryIndex、OriginSupport、ForwardOrigins | entry/site、值/字段/对象身份和摘要各有明确owner，无全局暗状态 |
+| 通用求解 | ForwardEngine、ForwardDispatch、ChainComposerKnowledgeSource | 按需扩展、单语义路径；不机械拆类、不复制知识源 |
+| 有界求值（新增/迁移） | 从旧字段/约束/预算职责选择复用 | 消费已知值与关联域，返回局部证明/未定；不负责排名和全链确认 |
+| 结果政策 | FindingState、ExportPolicy及现有chain/evidence | component/app完整性分开；分数不影响可达性证明 |
+| 报告 | ConciseReportWriter与相关规范数据 | 单快照、共享证据；不重新求解或创建另一状态owner |
 
-`JarReader` 流式处理普通 JAR、fat JAR、WAR 和嵌套工件，并记录递归深度、条目数量、解压大小、
-压缩比、classfile 大小和链接/reparse point 边界。失败不伪造方法体，而是进入完整性原因。
+新增抽象必须说明替代哪个路径、消费者、生命周期/缓存键、失败语义与删除旧路径的批次。无真实第二消费者或测量收益时优先直接函数/现有模块，不预建平台。
 
-`JdkClassSelector` 根据 classfile major 选择目标 JDK 的 `rt.jar` 或 `jrt-fs` 模块源。主程序
-使用 JDK17；`--jdk-home` 用于选择目标字节码、JRT 和验证子 JVM 所需的 JDK。
+## 3. 依赖输入模型
 
-CPG 保存方法、调用、分发、lambda、字段写入和类型层次；CFG、异常边、def-use、receiver、
-数组和容器 provenance 按 sink/entry 查询按需展开。局部摘要、冻结索引和稳定 identity 用于
-避免重复解析，同时不丢弃未知边。
+先识别真实输入角色：主应用类、内置lib、显式deps、JDK；普通组件根与应用根由mode处理。读取Boot/WAR嵌套路径保留每个制品身份，不把嵌套库误作应用入口。
+依赖图解析支持父POM、BOM、属性、管理版本、scope、排除和正常Maven仲裁；评估嵌入官方model/resolver必要模块，避免外部Maven运行和自造错误解析器。
+根元数据可能多个或被shading改写，不能任取第一个POM作为完整部署事实。--pom可提供明确根；class目录无根信息就显式未解析，不凭类名猜包。
+实际内置字节码优先。POM解析的依赖环境带推导来源，provided/optional、容器库和shaded裁剪分别建模；不能把下载来的库认作部署必然存在。
+每个依赖记录坐标/具体版本/type/classifier、来源、hash、引入边及仲裁原因；重复类/重定位/classloader顺序不明时显示受影响范围，不静默覆盖。
+默认远程Maven Central，显式--repository扩展；--offline禁止任何联网。目标POM里的repositories不是可执行网络授权。下载器只取得元数据和归档；不运行插件/extensions/.mvn或目标类。
+本地缓存保存完整制品；必要单文件原子提交防止半包入缓存，不建设事务平台。并发同制品有单一发布owner；失效由坐标/制品和语义依赖决定，版本/规则/JDK/模式等相关变化不得复用旧链。
+阶段性补齐失败不是另选版本的触发器；明确记录失败，不无限重试、不静默离线降级。无关已完整结果可保留，但整次输入完整性如实。
 
-静态知识覆盖原生序列化回调、规则声明的替代框架入口、forward/backward taint、字段/返回值/
-receiver/数组/容器来源、CHA、反射、代理、lambda、模块、JNI 和 JRMP 边界。无法证明的事实
-保留 `PARTIAL` 或 `UNTESTABLE` 原因。
+## 4. 共享静态求解与动态筛选
 
-## 5. Blackboard 与扩展
+ASM解析事实后，后续层只消费模型。应用模式从真实execution boundary与可控输入延伸到站点；组件模式从机制触发和结构条件延伸。两模式共用传播、约束、桥与证据模型。
+需求交集、按需CFG/摘要/接收者分发减少前置物化。JNDI/RMI、JDBC/XML、二次反序列化等桥连接需对象/协议/制品条件，不因危险API名而截断。
+筛选只在测量确认的成本高或噪声高位置启用；输入为支持的操作、常量/完整关联有限域、位置和预算，输出为精确值/局部条件证明或明确未定。
+目标字节码只能作为被解析的数据；执行的是Just自有操作，不加载/反射调用目标方法，不构造对象、不执行目标decode/序列化/native。
+穷尽证明只允许裁剪对应不成立分支；不能由部分采样、一处SAT或运行异常推断整个链。算术溢出、空值/类型语义及异常边需与分析的JDK/指令语义一致。
+求值开销计入analysis，设操作数/域基数/长度等明确工作量界限；相关域和语义版本入缓存键，超限保留未定。内部bug直接失败，不catch-all转UNKNOWN。
+旧VerificationPlanner/Plan/Scheduler若有可用去重/预算逻辑，先去执行耦合和空值兜底再并入现有owner，不整个模块改名保存。FieldDependencyPlan等静态关系按实际消费者保留。
+旧verifier/verify8/payload/canary/Job Object/SM、子进程认证/scratch/Java agent/native路径在职责迁移后删除；进程内筛选不需要OS隔离平台。
+每次优化固定输入与配置做链/证据/误报和资源A/B，无有效收益删除，不维持永久双实现。
 
-Blackboard 依据 `Phase` 和 `KnowledgeSource.priority()` 调度知识源并建立阶段屏障。分析、
-组合、校准和验证阶段通过事实与事件交换数据；知识源之间不直接调用。
+## 5. 证据与报告
 
-扩展实现 `KnowledgeSource`，声明 `phase()`、`priority()`、`interests()`，并通过 ServiceLoader
-注册。规则文件负责攻击面和调用模型数据，分析引擎负责通用语义。链由稳定 semantic key 合并，
-每条链保留 `rule_id`、entry、sink、逐跳 edge、字段依赖、风险和完整性原因。
+每个hop保留artifact、精确方法/指令位置和连接依据；字段对象关系和控制条件明确。EntryChainJoinEvidence/BridgeEvidence必须可解析，不可由调用图共现或文字说明补造。
+链是否完整、结构可行性、控制、应用暴露和分析完整性独立；ranking只排序不证明，UNKNOWN不变SAT；组件候选不生成应用漏洞结论。
+生成一个规范报告快照，report.md/json共享ID/证据/计数/排序。JSON包含发现的有效候选和重要变体，Markdown前10展开，其余简表；displayLimit与searchBudget各自说明。
+schema边界保持最小且单向：公共 schema 只描述 concise report、finding output、rules、input digest 和 evidence-graph telemetry；动态验证/运行信任边界与 v1/v2 shadow schema 不再是产品契约。动态筛选状态由分析模型和同一报告快照承载，不另写验证目录或兼容旁路。
+依赖解析与网络墙钟在输入准备计时；analysis包括filter；report和total单列。并行下载的request duration汇总不当墙钟相加。首次有用结果在报告可消费时记录。
+缺失依赖、未知条件、截断/取消及写入错误直接影响相应状态；不能产生伪COMPLETE，不为美化报告隐藏难例。
 
-## 6. 动态验证
+## 6. 错误、资源和工程取舍
 
-验证器为每条候选链启动独立子 JVM。父进程生成 attempt、chain/sink/artifact fingerprint、
-结果文件和策略摘要；Windows Job Object 配置并附加到该子进程后，子进程才发送认证 ready 事件。
+禁止兜底和防御性编程：内部不变量和错误状态直接暴露，不重复null检查/默认值归一化，不吞异常/猜值/自动降级/静默重试。
+外部输入校验、未知域、网络错误和用户取消是必须声明的产品边界，由对应owner处理一次。已知目标异常是被分析语义；实现bug是失败，两者不能混用。
+保留实际有用的归档/压缩比/路径/POM/YAML/class预算和输出碰撞保护；不因“精简”引入任意目标执行、路径逃逸或破坏已有报告。
+缓存/并发仅在实测瓶颈需要时增加，写清语义依赖与生命周期；不加无界缓存、常驻服务、数据库、重复状态协议。
+规则/框架入口/sink/callback/摘要是数据，求解/约束/控制/组合是通用语义，禁止样本名、SHA、路径、预期答案分支。
 
-动态范围只有以下三类：
+## 7. 验证与发布边界
 
-| 范围 | 执行内容 | 终点 |
-| --- | --- | --- |
-| `BOUNDARY_ONLY` | 完整前缀抵达精确 sink canary | 不进入 sink body |
-| `PREFIX_ONLY` | 完整前缀到达高风险终点前的最后观察点 | 不执行危险终点 |
-| `TERMINAL_EXECUTED_SAFE` | 用固定、安全、类型正确的参数真实调用可控 body/API，并观察正常返回或受控效果 | 仅执行可控安全终点 |
+行为测试保护真实扫描、依赖补齐/offline、两模式、不执行目标、相关域筛选、报告和错误暴露；端到端使用无害fixture，网络用小型受控仓库加公共制品smoke，不mock掉解析与求解核心。
+八组CTF完整WP链、低误报Q-01、Apache正负/相关Gleipner与性能联合验收；不能以实现结构或测试数量证明产品正确。
+ai-slop-taste和test-doctor在开发全程及最终全面检查：所有权/状态/兜底/表面复杂度、能力→测试映射、重复/脆弱/高成本测试；所有本轮问题落实修复。
+开发前目标设计、过程中实际变化同步、最后requirements/architecture/README一致；本地commit贯穿。
+Release验证与发布职责分开：Windows/JDK17只读校验同一提交和产物，必要检查成功后最小权限publish job创建tag和Release；不假设tag事件会再触发发布、不重新构建未验产物，不上传旧probe或通配JAR。最终核对远程SHA/资产hash/下载可用性。
 
-结果中同时记录 `requested_mode`、`effective_mode`、`fallback`、`verification_scope`、
-`sink_risk`、`terminal_executed`、`stop_reason` 和 `last_confirmed_stage`。三类结果在报告中
-互斥分组：`boundary_only`、`prefix_confirmed_high_risk`、`real_safe_terminal`。
-
-终点风险元数据为 `SAFE_CALLABLE`、`CONTROLLED_EFFECT` 和 `HIGH_RISK_TERMINAL`。native/JNI/FFM
-加载、任意类加载/定义/初始化、攻击性反序列化、脚本/eval、远端 lookup、非固定网络、不可控
-外部进程和不可证明的文件操作只输出前置确认；Just-owned native fixture 只用于验证器自身的
-基础设施契约，不代表目标 native 执行。
-
-## 7. Windows 进程边界
-
-Windows runner 使用普通用户可建立的 Job Object 和独立子 JVM，限制进程树、per-process user
-CPU time、内存、active-process 数量、墙钟时间和 kill-on-close；scratch、净化环境、结果身份
-绑定和父进程清理共同构成动态验证边界。该边界只声明 process/resource containment，不声明
-完整文件系统、token 或系统网络控制。
-
-Linux 保留 backend 接口和明确的不可用结果，当前不把普通子 JVM 的能力写成 OS 隔离能力。
-
-## 8. 报告模型
-
-统一模型包含 findings、全路径 evidence、calibration、verification、metadata、dependencies
-和 payload plan。`payload plan` 只描述对象图、字段、触发和验证计划，不生成攻击字节流。
-
-状态含义：
-
-| 状态 | 含义 |
-| --- | --- |
-| `SINK_BLOCKED` | 精确 sink 边界已到达，canary 阻断 body |
-| `PRE_SINK_CONFIRMED` | 高风险终点前的完整前置链已确认 |
-| `SINK_EXECUTED_SAFE` | 固定安全参数下精确 body/API 正常返回，结果带失真标记 |
-| `SAFE_EFFECT_OBSERVED` | 只观察到 Just 自有 adapter 效果 |
-| `CONCRETE_REACHED` | 到达安全观察点但尚无精确 sink 证据 |
-| `PARTIAL` / `TIMEOUT` / `FAILED` | 分析、构造或执行未完整结束 |
-| `UNTESTABLE` | 缺少依赖、JDK 或所需进程边界能力 |
-
-## 9. 性能与确定性
-
-静态关键路径使用流式读取、按需 CFG/CPG、共享 immutable summary、有限缓存和候选级预算；
-动态关键路径分别计量选择、队列、child startup、class-load、真实调用或 prefix-stop、cleanup；
-性能工具同时按候选结果记录动态调用 duration，避免把并行候选总耗时当作单候选门禁。
-固定输入、JDK、规则、预算和策略下，稳定 key、规范化 reason、固定 tie-break 和结果槽保证
-串行/并行结果可复现。任何以减少链覆盖、完整性或确定性换时间的优化不合入。
-
-## 10. 外部语义回归
-
-Gleipner evaluator 作为外部语义回归使用；输入、truth、脚本和评分口径与生产代码分离，不
-作为运行时依赖，也不改变 Just 的规则和结果模型。
+实现时参考：[Maven Resolver职责边界](https://maven.apache.org/components/resolver/how-resolver-works.html)（还需Maven模型/描述提供方完成POM语义）、[GitHub workflow触发规则](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)（不要依赖发布token创建tag后再触发另一次发布）。
