@@ -14,6 +14,7 @@ import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
+import io.just.sast.model.ClassInfo;
 import io.just.sast.report.ApplicationTrace;
 import org.junit.jupiter.api.Test;
 
@@ -436,10 +437,15 @@ class ApplicationChainJoinerContractTest {
         Rule.SinkRule sinkRule = new Rule.SinkRule("runtime-start", "COMMAND", "HIGH",
                 new Rule.CallMatcher(Match.of(RUNTIME), Match.of("start"), Match.of(sinkDesc)),
                 List.of(), Rule.SinkRole.TERMINAL);
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(
+                "fixture/app/Note", new ClassInfo("fixture/app/Note", "java/lang/Object",
+                        List.of(), Modifier.PUBLIC, List.of(), List.of()),
+                target, new ClassInfo(target, "fixture/app/Note", List.of(), Modifier.PUBLIC,
+                        List.of(), List.of())), null);
         RuleEngine engine = new RuleEngine(new RuleSet(List.of(sinkRule), List.of(),
-                List.of(), List.of(), List.of()), new ClassHierarchy(Map.of(), null));
+                List.of(), List.of(), List.of()), hierarchy);
         ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
-                Set.of(controller, target), true);
+                Set.of(controller, target), true, hierarchy);
 
         assertTrue(index.deserializeSites().stream().anyMatch(site ->
                 site.hostMethodKey().startsWith(controller + "#put")

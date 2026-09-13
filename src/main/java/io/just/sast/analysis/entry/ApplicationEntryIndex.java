@@ -1,5 +1,6 @@
 package io.just.sast.analysis.entry;
 
+import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.analysis.taint.SerializationModel;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
@@ -48,7 +49,7 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 1;
+    public static final int MODEL_VERSION = 2;
     private static final int MAX_SLICE_METHODS = 100_000;
     private static final String FRAMEWORK_ENTRY_RULE = "builtin:framework-entry";
     private static final String FRAMEWORK_BINDING_RULE = "builtin:framework-binding";
@@ -638,6 +639,18 @@ public final class ApplicationEntryIndex {
     public static ApplicationEntryIndex build(Graph graph, RuleEngine rules,
                                                Set<String> applicationOwners,
                                                boolean applicationScopeKnown) {
+        return build(graph, rules, applicationOwners, applicationScopeKnown, null);
+    }
+
+    /**
+     * Build the index with the immutable hierarchy already assembled for this scan.  The
+     * hierarchy is required when a configured auto-type prefix admits a concrete application
+     * subtype of the declared binding parameter; a package prefix alone is never a type proof.
+     */
+    public static ApplicationEntryIndex build(Graph graph, RuleEngine rules,
+                                               Set<String> applicationOwners,
+                                               boolean applicationScopeKnown,
+                                               ClassHierarchy hierarchy) {
         Objects.requireNonNull(graph, "graph");
         Objects.requireNonNull(rules, "rules");
         Set<String> owners = normalizeOwners(applicationOwners);
@@ -787,13 +800,17 @@ public final class ApplicationEntryIndex {
             if (!siteHosts.add(host)) {
                 continue;
             }
-            List<String> bindingTargets = new ArrayList<>(referenceParameterTypes(
-                    method.descriptor()));
+            List<String> declaredBindingTypes = referenceParameterTypes(method.descriptor());
+            List<String> bindingTargets = new ArrayList<>(declaredBindingTypes);
             // Auto-type configuration is a typed protocol fact: a constant prefix passed to
             // Fastjson's addAccept bounds which application classes an external @type value may
-            // select.  It is intentionally intersected with the known application owners; an
-            // arbitrary class-name/string hint never admits a dependency or JDK type.
-            bindingTargets.addAll(acceptedApplicationTypes);
+            // select. It is only a class-name scope; the declared parameter type still owns the
+            // assignability check. An arbitrary accepted class or package prefix never admits a
+            // dependency/JDK type or an unrelated application class.
+            bindingTargets.addAll(acceptedApplicationTypes.stream()
+                    .filter(candidate -> isAssignableBindingTarget(candidate, declaredBindingTypes,
+                            hierarchy))
+                    .toList());
             sites.add(new DeserializeSite(method.id(), host, method.owner(), method.name(),
                     method.descriptor(), FRAMEWORK_BINDING_RULE, "framework-binding", true, true,
                     bindingTargets));
@@ -1730,6 +1747,30 @@ public final class ApplicationEntryIndex {
             return List.of();
         }
         return result.stream().filter(value -> !value.isBlank()).distinct().sorted().toList();
+    }
+
+    /**
+     * A Fastjson accepted-prefix fact narrows candidate class names but does not widen the
+     * declared request type. Exact declarations are always provable; concrete subtypes require
+     * the scan hierarchy. With no hierarchy the subtype relation is UNKNOWN and is therefore
+     * not promoted into a complete typed binding target.
+     */
+    private static boolean isAssignableBindingTarget(String candidate,
+                                                      List<String> declaredTypes,
+                                                      ClassHierarchy hierarchy) {
+        if (candidate == null || candidate.isBlank() || declaredTypes == null
+                || declaredTypes.isEmpty()) {
+            return false;
+        }
+        for (String declared : declaredTypes) {
+            if (candidate.equals(declared) || "java/lang/Object".equals(declared)) {
+                return true;
+            }
+            if (hierarchy != null && hierarchy.isSubtypeOf(candidate, declared)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

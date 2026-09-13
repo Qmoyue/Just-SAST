@@ -10,6 +10,7 @@ import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
+import io.just.sast.model.ClassInfo;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -435,6 +436,48 @@ class ApplicationEntryIndexContractTest {
         assertTrue(index.typedBindingSitesForTarget("fixture/app/Unknown").isEmpty());
         assertThrows(UnsupportedOperationException.class,
                 () -> index.typedBindingSitesForTarget("fixture/app/Model").clear());
+    }
+
+    @Test
+    void acceptedAutoTypePrefixCannotOverrideDeclaredFinalType() {
+        String controller = "fixture/app/Controller";
+        String declared = "fixture/app/Note";
+        String unrelated = "fixture/app/Metric";
+        String endpointDescriptor = "(Lfixture/app/Note;)V";
+        Graph graph = new Graph();
+        Node endpoint = graph.methodNode(controller, "put", endpointDescriptor, false);
+        endpoint.propsNote("methodAccess", Modifier.PUBLIC);
+        endpoint.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        endpoint.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PutMapping;"));
+        Node config = graph.methodNode(controller, "configure", "()V", false);
+        config.propsNote("methodAccess", Modifier.PUBLIC);
+        Node accept = graph.addCallNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", "VIRTUAL", null, 0,
+                controller, "configure", "()V");
+        accept.propsNote("stringLiteralHints", List.of("fixture.app."));
+        Node parserConfig = graph.methodNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", true);
+        graph.addEdge(accept, parserConfig, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(
+                declared, new ClassInfo(declared, "java/lang/Object", List.of(),
+                        Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of()),
+                unrelated, new ClassInfo(unrelated, "java/lang/Object", List.of(),
+                        Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of())), null);
+        RuleEngine engine = new RuleEngine(rules(), hierarchy);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(controller, declared, unrelated), true, hierarchy);
+
+        ApplicationEntryIndex.DeserializeSite site = index.deserializeSites().stream()
+                .filter(value -> value.hostMethodKey().startsWith(controller + "#put"))
+                .findFirst().orElseThrow();
+        assertEquals(List.of(declared), site.targetTypes(),
+                "accepted package names must still satisfy the final declared request type");
+        assertTrue(index.typedBindingSitesForTarget(unrelated).isEmpty(),
+                "an unrelated final class must not become a typed binding target");
     }
 
     @Test
