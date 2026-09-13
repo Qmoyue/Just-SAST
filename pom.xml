@@ -35,9 +35,33 @@
     <asm.version>9.8</asm.version>
     <picocli.version>4.7.7</picocli.version>
     <snakeyaml.version>2.4</snakeyaml.version>
+    <maven.version>3.9.16</maven.version>
+    <maven.resolver.version>1.9.27</maven.resolver.version>
   </properties>
 
   <dependencies>
+    <!-- Parse effective POMs and collect Maven dependency graphs in-process. The scanner
+         never invokes a target Maven lifecycle, plugin, extension or application class. -->
+    <dependency>
+      <groupId>org.apache.maven</groupId>
+      <artifactId>maven-resolver-provider</artifactId>
+      <version>${maven.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.maven.resolver</groupId>
+      <artifactId>maven-resolver-connector-basic</artifactId>
+      <version>${maven.resolver.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.maven.resolver</groupId>
+      <artifactId>maven-resolver-transport-file</artifactId>
+      <version>${maven.resolver.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.maven.resolver</groupId>
+      <artifactId>maven-resolver-transport-http</artifactId>
+      <version>${maven.resolver.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.ow2.asm</groupId>
       <artifactId>asm</artifactId>

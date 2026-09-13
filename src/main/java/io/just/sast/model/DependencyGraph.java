@@ -49,7 +49,8 @@ public final class DependencyGraph {
     public record Node(String ref, ArtifactProvenance provenance, Source source,
                        Deployment deployment, String group, String name, String version,
                        String type, String classifier, String sourceDetail, String parentRef,
-                       String error, String errorDetail, int inputIndex) {
+                       String error, String errorDetail, int inputIndex, String scope,
+                       boolean optional, Resolution resolution, String resolutionReason) {
         public Node {
             requireText(ref, "ref");
             provenance = Objects.requireNonNull(provenance, "provenance");
@@ -64,9 +65,22 @@ public final class DependencyGraph {
             requireValue(parentRef, "parentRef");
             requireValue(error, "error");
             requireValue(errorDetail, "errorDetail");
+            requireValue(scope, "scope");
+            resolution = Objects.requireNonNull(resolution, "resolution");
+            requireValue(resolutionReason, "resolutionReason");
             if (inputIndex < -1) {
                 throw new IllegalArgumentException("inputIndex must be -1 or non-negative");
             }
+        }
+
+        /** Compatibility form for actual-input nodes that predate Maven graph metadata. */
+        public Node(String ref, ArtifactProvenance provenance, Source source,
+                    Deployment deployment, String group, String name, String version,
+                    String type, String classifier, String sourceDetail, String parentRef,
+                    String error, String errorDetail, int inputIndex) {
+            this(ref, provenance, source, deployment, group, name, version, type, classifier,
+                    sourceDetail, parentRef, error, errorDetail, inputIndex, "", false,
+                    Resolution.SELECTED, "");
         }
     }
 
@@ -179,6 +193,7 @@ public final class DependencyGraph {
 
     public boolean hasConflicts() {
         return classOwners.values().stream().anyMatch(owner -> owner.resolution() != Resolution.SELECTED)
+                || nodes.values().stream().anyMatch(node -> node.resolution() != Resolution.SELECTED)
                 || nodes.values().stream().anyMatch(node -> !node.error().isBlank());
     }
 
@@ -287,6 +302,8 @@ public final class DependencyGraph {
                 update(digest, "parent=" + node.parentRef());
                 update(digest, "error=" + node.error() + ':' + node.errorDetail());
                 update(digest, "input-index=" + node.inputIndex());
+                update(digest, "scope=" + node.scope() + ":optional=" + node.optional());
+                update(digest, "resolution=" + node.resolution() + ':' + node.resolutionReason());
             });
             edges.stream().sorted(Comparator.comparing(Edge::fromRef)
                     .thenComparing(Edge::toRef).thenComparing(Edge::kind)
