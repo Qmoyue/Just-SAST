@@ -464,6 +464,68 @@ class ApplicationChainJoinerContractTest {
     }
 
     @Test
+    void acceptedAutoTypePrefixDoesNotJoinUnrelatedFinalBindingType() {
+        String controller = "fixture/app/Controller";
+        String declared = "fixture/app/Note";
+        String unrelated = "fixture/app/Metric";
+        String setterDesc = "(Ljava/lang/String;)V";
+        String sinkDesc = "()Ljava/lang/Process;";
+        Graph graph = new Graph();
+        Node endpoint = graph.methodNode(controller, "put", "(Lfixture/app/Note;)V", false);
+        endpoint.propsNote("methodAccess", Modifier.PUBLIC);
+        endpoint.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        endpoint.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PutMapping;"));
+        Node config = graph.methodNode(controller, "configure", "()V", false);
+        config.propsNote("methodAccess", Modifier.PUBLIC);
+        Node accept = graph.addCallNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", "VIRTUAL", null, 0,
+                controller, "configure", "()V");
+        accept.propsNote("stringLiteralHints", List.of("fixture.app."));
+        Node acceptMethod = graph.methodNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", true);
+        graph.addEdge(accept, acceptMethod, EdgeType.INVOKES, "VIRTUAL");
+
+        graph.methodNode(unrelated, "setValue", setterDesc, false);
+        Node runtime = graph.methodNode(RUNTIME, "start", sinkDesc, true);
+        Node sink = graph.addCallNode(RUNTIME, "start", sinkDesc, "VIRTUAL", null, 0,
+                unrelated, "setValue", setterDesc);
+        graph.addEdge(sink, runtime, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        Rule.SinkRule sinkRule = new Rule.SinkRule("runtime-start", "COMMAND", "HIGH",
+                new Rule.CallMatcher(Match.of(RUNTIME), Match.of("start"), Match.of(sinkDesc)),
+                List.of(), Rule.SinkRole.TERMINAL);
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(
+                declared, new ClassInfo(declared, "java/lang/Object", List.of(), Modifier.PUBLIC,
+                        List.of(), List.of()),
+                unrelated, new ClassInfo(unrelated, "java/lang/Object", List.of(),
+                        Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of())), null);
+        RuleEngine engine = new RuleEngine(new RuleSet(List.of(sinkRule), List.of(),
+                List.of(), List.of(), List.of()), hierarchy);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(controller, declared, unrelated), true, hierarchy);
+
+        assertTrue(index.typedBindingSites().stream().anyMatch(site ->
+                site.hostMethodKey().startsWith(controller + "#put")
+                        && site.targetTypes().equals(List.of(declared))));
+        assertTrue(index.typedBindingSitesForTarget(unrelated).isEmpty());
+
+        Chain chain = new Chain("unrelated-final", "COMMAND", "HIGH", unrelated, "setValue",
+                "deserialize", RUNTIME, "start", List.of(
+                new ChainHop(unrelated, "setValue", RUNTIME, "start", HopKind.DIRECT_CALL,
+                        null, "direct", sinkDesc, 0),
+                new ChainHop(unrelated, "setValue", unrelated, "setValue", HopKind.ENTRY,
+                        null, "deserialize", setterDesc, 0)), 0, sinkDesc, "TERMINAL");
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(chain), true, "A".repeat(64), Set.of());
+
+        assertEquals(0, evidence.joinCount());
+        assertFalse(evidence.joinedChainKeys().contains(chain.key()));
+    }
+
+    @Test
     void typedIntermediateLookupCannotBecomeTerminalFinding() {
         String lookupDesc = "(Ljava/lang/String;)Ljava/lang/Object;";
         Graph graph = new Graph();
