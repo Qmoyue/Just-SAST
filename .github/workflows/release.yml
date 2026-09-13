@@ -32,12 +32,14 @@ jobs:
           cache: maven
 
       - name: Verify tag and project version
+        id: project
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
           version="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
           test "${tag#v}" = "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Test and package
         run: mvn -B test package -DskipTests=false
@@ -55,14 +57,13 @@ jobs:
         run: |
           set -euo pipefail
           version="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
-          sha256sum "target/just-sast-${version}-shaded.jar" \
-            "target/just-sast-${version}-verify8.jar" > target/SHA256SUMS
+          sha256sum "target/just-sast-${version}-shaded.jar" > target/SHA256SUMS
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            target/just-sast-*.jar
+            target/just-sast-${{ steps.project.outputs.version }}-shaded.jar
             target/SHA256SUMS
 
       - name: Publish GitHub release
@@ -71,7 +72,7 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: |
-            target/just-sast-*.jar
+            target/just-sast-${{ steps.project.outputs.version }}-shaded.jar
             target/SHA256SUMS
             LICENSE
             THIRD-PARTY-NOTICES.md

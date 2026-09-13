@@ -8,7 +8,6 @@ import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.Controller;
-import io.just.sast.blackboard.VerificationCoverage;
 import io.just.sast.config.RuleSet;
 import io.just.sast.config.Rule;
 import io.just.sast.config.YamlRuleLoader;
@@ -22,7 +21,6 @@ import io.just.sast.frontend.asm.JrtClassSource;
 import io.just.sast.frontend.asm.JdkClassSelector;
 import io.just.sast.frontend.asm.TargetJdkSource;
 import io.just.sast.knowledge.engine.ForwardRunMetrics;
-import io.just.sast.verify.VerificationPlan;
 import io.just.sast.model.JdkClassSource;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.ArtifactProvenance;
@@ -519,13 +517,10 @@ public final class ScanPipeline {
                     List.of("COMPONENT_MODE_KERNEL_ONLY"));
         }
         blackboard.publishFact(applicationEvidence);
-        // Publish a non-overlapping static phase for the performance harness.  The aggregate
-        // analysis timer includes calibration, while the verifier publishes its own child
-        // process duration; subtracting that one explicit interval avoids charging dynamic
-        // process startup to static p50/p95 and keeps the default scan on a single pass.
+        // Publish one static phase for the performance harness. There is no child verifier
+        // phase, so the complete pre-report interval is static analysis.
         long preReportMs = elapsedMs(start);
-        long dynamicMs = phaseMs.getOrDefault("verify", 0L);
-        phaseMs.put("static", Math.max(0L, preReportMs - dynamicMs));
+        phaseMs.put("static", Math.max(0L, preReportMs));
 
         // 报告期
         long reportStart = System.nanoTime();
@@ -543,8 +538,11 @@ public final class ScanPipeline {
         Map<Long, io.just.sast.blackboard.SinkOutcome> reportOutcomes = blackboard.sinkOutcomes();
         Map<String, String> reportCalibrations = blackboard.chainCalibrations();
         Map<String, List<String>> reportNotes = blackboardNotes(blackboard);
+        // The product has one execution policy: static analysis only. Keep the typed summary
+        // for legacy report consumers, but never infer a dynamic attempt from absent facts or
+        // compatibility flags.
         io.just.sast.blackboard.VerificationSummary reportVerification =
-                blackboard.verificationSummary();
+                io.just.sast.blackboard.VerificationSummary.empty("STATIC_ONLY", 0);
         LinkedHashSet<String> completeness = new LinkedHashSet<>(completenessReasons(load, cpg.graph(),
                 reportOutcomes, blackboard.completenessReasons(), fast, jdkHome, targetFeature));
         if (jdkSource instanceof TargetJdkSource targetJdk) {
@@ -600,14 +598,6 @@ public final class ScanPipeline {
                 applicationEvidence);
         phaseMs.put("report.application_chain_evidence",
                 elapsedMs(applicationEvidenceReportStart));
-        VerificationCoverage verificationCoverage = latestVerificationCoverage(blackboard);
-        long verificationCoverageReportStart = System.nanoTime();
-        new io.just.sast.report.VerificationCoverageWriter().write(reportLayout,
-                verificationCoverage == null
-                        ? VerificationCoverage.empty(VerificationCoverage.Status.UNKNOWN)
-                        : verificationCoverage);
-        phaseMs.put("report.verification_coverage",
-                elapsedMs(verificationCoverageReportStart));
         long payloadReportStart = System.nanoTime();
         new io.just.sast.report.PayloadPlanWriter().write(reportLayout, reportChains,
                 reportCalibrations, reportNotes, reportVerification);
@@ -954,10 +944,8 @@ public final class ScanPipeline {
                                                        DependencyPreparation dependencyPreparation,
                                                        long totalWallMs) {
         ForwardRunMetrics forward = latestForwardMetrics(blackboard);
-        VerificationPlan verificationPlan = latestVerificationPlan(blackboard);
-        VerificationCoverage verificationCoverage = latestVerificationCoverage(blackboard);
         Map<String, Long> metrics = scanMetrics(cpg, blackboard, chains, chainNotes,
-                verification, parentCpuStarted, forward, verificationPlan);
+                verification, parentCpuStarted, forward);
         List<Chain> observedChains = chains == null ? List.of() : chains;
         long unresolved = observedChains.stream().filter(chain -> chain.unresolvedHops() > 0).count();
         long structurallyComplete = observedChains.stream()
@@ -1096,11 +1084,6 @@ public final class ScanPipeline {
                 status.put(name, "UNKNOWN");
             }
         }
-        if (verificationPlan == null) {
-            status.put("verification_plan_input", "UNKNOWN");
-            status.put("verification_plan_unique", "UNKNOWN");
-            status.put("verification_plan_selected", "UNKNOWN");
-        }
         status.put("application_entry_candidates", "CANDIDATE_ONLY");
         status.put("application_entry_sites_candidates", "CANDIDATE_ONLY");
         status.put("entry_index_application_entries", indexedEntries < 0L ? "UNKNOWN" : "OBSERVED");
@@ -1140,15 +1123,6 @@ public final class ScanPipeline {
             // the run-level metrics contract reject an otherwise valid static scan.
             long value = metrics.getOrDefault(name, -1L);
             status.put(name, applicationEvidence == null || value < 0L ? "UNKNOWN" : "OBSERVED");
-        }
-        for (String name : List.of("verification_eligible_finding_groups",
-                "verification_covered_finding_groups", "verification_confirmed_groups",
-                "verification_no_observation_groups", "verification_unique_plans",
-                "verification_attempted_plans", "verification_dynamic_coverage_permille",
-                "verification_plan_reuse_permille")) {
-            long value = metrics.getOrDefault(name, -1L);
-            status.put(name, verificationCoverage == null || value < 0L
-                    ? "UNKNOWN" : "OBSERVED");
         }
         status.put("kernel_only_results", "NOT_REQUESTED");
         addPassTelemetryStatus(status, metrics, phaseMs, "frontend", "frontend", false);
@@ -1196,31 +1170,6 @@ public final class ScanPipeline {
         analysis.put("representative_paths", -1L);
         analysis.put("forward_origin_cache_bytes_estimate",
                 blackboard.originSupport().forwardOriginCacheBytesEstimate());
-        if (verificationPlan != null) {
-            analysis.put("verification_plan_input", (long) verificationPlan.inputCount());
-            analysis.put("verification_plan_unique", (long) verificationPlan.uniqueCount());
-            analysis.put("verification_plan_selected", (long) verificationPlan.selectedCount());
-        } else {
-            analysis.put("verification_plan_input", -1L);
-            analysis.put("verification_plan_unique", -1L);
-            analysis.put("verification_plan_selected", -1L);
-        }
-        analysis.put("verification_eligible_finding_groups", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.eligibleFindingGroups());
-        analysis.put("verification_covered_finding_groups", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.coveredFindingGroups());
-        analysis.put("verification_confirmed_groups", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.confirmedGroups());
-        analysis.put("verification_no_observation_groups", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.noObservationGroups());
-        analysis.put("verification_unique_plans", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.uniquePlans());
-        analysis.put("verification_attempted_plans", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.attemptedPlans());
-        analysis.put("verification_dynamic_coverage_permille", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.coveragePermille());
-        analysis.put("verification_plan_reuse_permille", verificationCoverage == null ? -1L
-                : (long) verificationCoverage.planReusePermille());
         if (forward != null) {
             analysis.putAll(forward.asMetrics());
         } else {
@@ -1263,22 +1212,6 @@ public final class ScanPipeline {
         return facts.isEmpty() ? null : facts.get(facts.size() - 1);
     }
 
-    private static VerificationPlan latestVerificationPlan(Blackboard blackboard) {
-        if (blackboard == null) {
-            return null;
-        }
-        List<VerificationPlan> facts = blackboard.facts(VerificationPlan.class);
-        return facts.isEmpty() ? null : facts.get(facts.size() - 1);
-    }
-
-    private static VerificationCoverage latestVerificationCoverage(Blackboard blackboard) {
-        if (blackboard == null) {
-            return null;
-        }
-        List<VerificationCoverage> facts = blackboard.facts(VerificationCoverage.class);
-        return facts.isEmpty() ? null : facts.get(facts.size() - 1);
-    }
-
     /** Add pass timing/cache fields without pretending phase-local RSS was sampled. */
     private static void addPassTelemetry(Map<String, Long> values, Map<String, Long> phaseMs,
                                          String pass, String phase,
@@ -1310,8 +1243,7 @@ public final class ScanPipeline {
                                                  Map<String, List<String>> chainNotes,
                                                  io.just.sast.blackboard.VerificationSummary verification,
                                                  long parentCpuStarted,
-                                                 ForwardRunMetrics forward,
-                                                 VerificationPlan verificationPlan) {
+                                                 ForwardRunMetrics forward) {
         Map<String, Long> metrics = new java.util.LinkedHashMap<>();
         metrics.put("graph_nodes", (long) cpg.graph().nodeCount());
         metrics.put("graph_edges", (long) cpg.graph().edgeCount());
@@ -1339,7 +1271,6 @@ public final class ScanPipeline {
             }
         }
         verification = verification == null ? blackboard.verificationSummary() : verification;
-        VerificationCoverage coverage = latestVerificationCoverage(blackboard);
         metrics.put("verification_constructible", (long) verification.constructible());
         metrics.put("verification_rejected", (long) verification.rejected());
         metrics.put("verification_construction_deferred", (chains == null ? List.<Chain>of() : chains).stream()
@@ -1348,28 +1279,6 @@ public final class ScanPipeline {
                 .filter(notes -> notes.contains("verify:construction-deferred"))
                 .count());
         metrics.put("verification_selected", (long) verification.selected());
-        metrics.put("verification_plan_input",
-                verificationPlan == null ? -1L : verificationPlan.inputCount());
-        metrics.put("verification_plan_unique",
-                verificationPlan == null ? -1L : verificationPlan.uniqueCount());
-        metrics.put("verification_plan_selected",
-                verificationPlan == null ? -1L : verificationPlan.selectedCount());
-        metrics.put("verification_eligible_finding_groups",
-                coverage == null ? -1L : (long) coverage.eligibleFindingGroups());
-        metrics.put("verification_covered_finding_groups",
-                coverage == null ? -1L : (long) coverage.coveredFindingGroups());
-        metrics.put("verification_confirmed_groups",
-                coverage == null ? -1L : (long) coverage.confirmedGroups());
-        metrics.put("verification_no_observation_groups",
-                coverage == null ? -1L : (long) coverage.noObservationGroups());
-        metrics.put("verification_unique_plans",
-                coverage == null ? -1L : (long) coverage.uniquePlans());
-        metrics.put("verification_attempted_plans",
-                coverage == null ? -1L : (long) coverage.attemptedPlans());
-        metrics.put("verification_dynamic_coverage_permille",
-                coverage == null ? -1L : (long) coverage.coveragePermille());
-        metrics.put("verification_plan_reuse_permille",
-                coverage == null ? -1L : (long) coverage.planReusePermille());
         metrics.put("verification_results", (long) verification.results().size());
         metrics.put("verification_attempts", verification.results().stream()
                 .mapToLong(io.just.sast.blackboard.VerificationSummary.ChainResult::attempt).sum());
@@ -1378,7 +1287,9 @@ public final class ScanPipeline {
         metrics.put("verification_untestable", (long) verification.statusCounts()
                 .getOrDefault("UNTESTABLE", 0));
         metrics.putAll(blackboard.verificationResourceMetrics());
-        metrics.put("parent_rss_mb", io.just.sast.verify.OsIsolation.currentProcessRssMb());
+        // RSS is optional telemetry. The former implementation obtained it from the removed
+        // Job Object verifier; retaining UNKNOWN is safer than reintroducing that dependency.
+        metrics.put("parent_rss_mb", -1L);
         long parentCpuNow = processCpuTimeMs();
         metrics.put("parent_cpu_ms", parentCpuStarted >= 0L && parentCpuNow >= parentCpuStarted
                 ? parentCpuNow - parentCpuStarted : -1L);

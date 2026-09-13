@@ -87,14 +87,6 @@
       <artifactId>snakeyaml</artifactId>
       <version>${snakeyaml.version}</version>
     </dependency>
-    <!-- Windows Job Object support for the optional OS-isolated verifier parent. The
-         Java-8 probe artifact does not include this dependency; the parent owns the
-         operating-system attachment before releasing the child probe. -->
-    <dependency>
-      <groupId>net.java.dev.jna</groupId>
-      <artifactId>jna-platform</artifactId>
-      <version>5.7.0</version>
-    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
@@ -109,158 +101,11 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.13.0</version>
-        <executions>
-          <execution>
-            <id>compile-java8-verifier</id>
-            <phase>compile</phase>
-            <goals>
-              <goal>compile</goal>
-            </goals>
-            <configuration>
-              <source>8</source>
-              <target>8</target>
-              <compileSourceRoots>
-                <compileSourceRoot>${project.basedir}/src/verify8/java</compileSourceRoot>
-              </compileSourceRoots>
-              <outputDirectory>${project.build.directory}/verify8-classes</outputDirectory>
-              <useIncrementalCompilation>false</useIncrementalCompilation>
-              <!-- main uses the Java 17 release in a separate compiler invocation. Reusing
-                   the same javac file manager across the release/output switch triggers
-                   "cannot close compiler resources" on Windows JDK 17. Keep the
-                   compatibility artifact isolated without changing production classes. -->
-              <compilerReuseStrategy>reuseNone</compilerReuseStrategy>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-dependency-plugin</artifactId>
-        <version>3.8.1</version>
-        <executions>
-          <execution>
-            <id>unpack-asm-for-java8-verifier</id>
-            <phase>process-classes</phase>
-            <goals>
-              <goal>unpack-dependencies</goal>
-            </goals>
-            <configuration>
-              <includeArtifactIds>asm,asm-commons,jna</includeArtifactIds>
-              <includeScope>runtime</includeScope>
-              <outputDirectory>${project.build.directory}/verify8-classes</outputDirectory>
-            </configuration>
-          </execution>
-          <execution>
-            <id>unpack-asm-for-test-probe</id>
-            <phase>process-test-classes</phase>
-            <goals>
-              <goal>unpack-dependencies</goal>
-            </goals>
-            <configuration>
-              <!-- The test probe contains SinkCanaryAgent, whose real-call transformer
-                   extends AdviceAdapter from asm-commons. Keep the lifecycle classifier
-                   self-contained so a package-then-test run can instrument target classes. -->
-              <includeArtifactIds>asm,asm-commons</includeArtifactIds>
-              <includeScope>runtime</includeScope>
-              <outputDirectory>${project.build.outputDirectory}</outputDirectory>
-              <!-- Both ASM artifacts carry module-info.class. Merging those module
-                   descriptors into the test-probe classpath makes Surefire resolve one
-                   synthetic module with duplicate packages; the probe needs classes only. -->
-              <excludes>module-info.class,META-INF/versions/**/module-info.class</excludes>
-              <!-- The verifier8 unpack uses the plugin's default marker directory. A
-                   per-output marker is required here; otherwise the first execution marks
-                   ASM as unpacked and this classifier silently skips its own destination. -->
-              <markersDirectory>${project.build.directory}/dependency-maven-plugin-markers/testprobe</markersDirectory>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-resources-plugin</artifactId>
-        <version>3.3.1</version>
-        <executions>
-          <execution>
-            <id>copy-native-fixtures-to-java8-verifier</id>
-            <phase>process-classes</phase>
-            <goals>
-              <goal>copy-resources</goal>
-            </goals>
-            <configuration>
-              <outputDirectory>${project.build.directory}/verify8-classes</outputDirectory>
-              <resources>
-                <resource>
-                  <directory>${project.build.outputDirectory}</directory>
-                  <includes>
-                    <include>native/**</include>
-                  </includes>
-                </resource>
-              </resources>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-jar-plugin</artifactId>
-        <version>3.4.2</version>
-        <executions>
-          <!-- mvn test runs before package. Build the same agent-capable probe JAR at
-               process-test-classes so dynamic contract tests do not silently become
-               verifier-artifact-missing. The package execution below remains the release
-               artifact used by the CLI. -->
-          <execution>
-            <id>test-probe</id>
-            <phase>process-test-classes</phase>
-            <goals>
-              <goal>jar</goal>
-            </goals>
-            <configuration>
-              <classifier>testprobe</classifier>
-              <classesDirectory>${project.build.outputDirectory}</classesDirectory>
-              <archive>
-                <manifestEntries>
-                  <Premain-Class>io.just.sast.verify.SinkCanaryAgent</Premain-Class>
-                  <Can-Retransform-Classes>true</Can-Retransform-Classes>
-                </manifestEntries>
-              </archive>
-            </configuration>
-          </execution>
-          <execution>
-            <id>test-java8-verifier</id>
-            <phase>process-test-classes</phase>
-            <goals>
-              <goal>jar</goal>
-            </goals>
-            <configuration>
-              <classifier>verify8</classifier>
-              <classesDirectory>${project.build.directory}/verify8-classes</classesDirectory>
-              <archive>
-                <manifestEntries>
-                  <Premain-Class>io.just.sast.verify.legacy.LegacySinkCanaryAgent</Premain-Class>
-                  <Can-Retransform-Classes>true</Can-Retransform-Classes>
-                </manifestEntries>
-              </archive>
-            </configuration>
-          </execution>
-          <execution>
-            <id>package-java8-verifier</id>
-            <phase>package</phase>
-            <goals>
-              <goal>jar</goal>
-            </goals>
-            <configuration>
-              <classifier>verify8</classifier>
-              <classesDirectory>${project.build.directory}/verify8-classes</classesDirectory>
-              <archive>
-                <manifestEntries>
-                  <Premain-Class>io.just.sast.verify.legacy.LegacySinkCanaryAgent</Premain-Class>
-                  <Can-Retransform-Classes>true</Can-Retransform-Classes>
-                </manifestEntries>
-              </archive>
-            </configuration>
-          </execution>
-        </executions>
+        <configuration>
+          <source>17</source>
+          <target>17</target>
+          <compilerReuseStrategy>reuseNone</compilerReuseStrategy>
+        </configuration>
       </plugin>
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
@@ -286,10 +131,6 @@
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <mainClass>io.just.sast.cli.JustMain</mainClass>
-                  <manifestEntries>
-                    <Premain-Class>io.just.sast.verify.SinkCanaryAgent</Premain-Class>
-                    <Can-Retransform-Classes>true</Can-Retransform-Classes>
-                  </manifestEntries>
                 </transformer>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
               </transformers>

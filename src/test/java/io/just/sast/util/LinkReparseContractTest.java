@@ -1,7 +1,6 @@
 package io.just.sast.util;
 
 import io.just.sast.frontend.asm.JarReader;
-import io.just.sast.verify.NestedClasspath;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -23,15 +22,6 @@ class LinkReparseContractTest {
         IOException failure = assertThrows(IOException.class,
                 () -> new JarReader().readDetailed(link));
         assertTrue(failure.getMessage().contains("符号链接")
-                        || failure.getMessage().contains("reparse"), failure.getMessage());
-    }
-
-    @Test
-    void nestedClasspathRejectsSymlinkedDirectRoot(@TempDir Path tmp) throws Exception {
-        Path link = symlinkedDirectory(tmp);
-        IOException failure = assertThrows(IOException.class,
-                () -> NestedClasspath.open(List.of(link)));
-        assertTrue(failure.getMessage().contains("link")
                         || failure.getMessage().contains("reparse"), failure.getMessage());
     }
 

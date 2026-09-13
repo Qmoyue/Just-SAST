@@ -1,6 +1,5 @@
 package io.just.sast.blackboard;
 
-import io.just.sast.verify.ParallelVerifier;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -71,41 +70,6 @@ class VerificationDetailAdapterContractTest {
     }
 
     @Test
-    void compatibilityConstructorsUseTheSameAdapterAsTypedOutcome() {
-        String detail = "requested_mode=LIGHT_SAFE_CALL;effective_mode=PREFIX_ONLY;fallback=none;";
-        ParallelVerifier.VerifyResult verifierResult = new ParallelVerifier.VerifyResult(
-                "chain", "PRE_SINK_CONFIRMED", detail);
-        VerificationSummary.ChainResult summaryResult = new VerificationSummary.ChainResult(
-                1, "chain", "PRE_SINK_CONFIRMED", detail, "HIGH", 80, 1, 5L);
-        VerificationOutcome typed = VerificationOutcome.fromLegacy("PRE_SINK_CONFIRMED", detail,
-                null);
-        assertEquals(typed, verifierResult.outcome());
-        assertEquals(typed, summaryResult.outcome());
-        assertEquals(VerificationOutcome.Status.PRE_SINK_CONFIRMED,
-                verifierResult.outcomeStatus());
-        assertEquals(VerificationOutcome.Status.UNKNOWN,
-                new ParallelVerifier.VerifyResult("chain", "future-status", "").outcomeStatus());
-    }
-
-    @Test
-    void explicitVerifierMetadataWinsOverContradictoryLegacyDetail() {
-        ParallelVerifier.VerifyResult result = new ParallelVerifier.VerifyResult(
-                "chain", "PRE_SINK_CONFIRMED", "status=SINK_EXECUTED_SAFE;effective_mode=SAFE_REAL;",
-                1, 7L, "EXPLICIT_PREFIX", "WINDOWS_JOB_OBJECT", "17.0.19", "policy",
-                false, true, "CLEANED", "BOUNDARY", "PREFIX_ONLY", "none",
-                "PREFIX_ONLY", "HIGH_RISK_TERMINAL", false,
-                "SINK_BOUNDARY_CANARY", "SINK_BOUNDARY");
-
-        assertEquals(VerificationOutcome.Status.PRE_SINK_CONFIRMED, result.outcomeStatus());
-        assertEquals("EXPLICIT_PREFIX", result.outcome().evidence());
-        assertEquals(VerificationOutcome.Scope.PREFIX_ONLY, result.outcome().scope());
-        assertEquals(VerificationOutcome.StopReason.SINK_BOUNDARY_CANARY,
-                result.outcome().stopReason());
-        assertEquals(VerificationOutcome.Stage.SINK_BOUNDARY,
-                result.outcome().lastConfirmedStage());
-    }
-
-    @Test
     void wireStatusIsRetainedWhileTypedOutcomeOwnsPolicy() {
         VerificationOutcome typed = new VerificationOutcome(
                 VerificationOutcome.Status.SINK_BLOCKED,
@@ -123,14 +87,6 @@ class VerificationDetailAdapterContractTest {
         assertEquals("SINK_CANARY_BOUNDARY", result.evidence());
         assertEquals(VerificationOutcome.Scope.BOUNDARY_ONLY,
                 VerificationOutcome.Scope.fromWire(result.verificationScope()));
-    }
-
-    @Test
-    void typedOwnerRemovesDuplicatePerResultSemanticSlots() {
-        assertEquals(11, ParallelVerifier.VerifyResult.class.getRecordComponents().length,
-                "verifier result keeps only wire status plus one typed outcome");
-        assertEquals(14, VerificationSummary.ChainResult.class.getRecordComponents().length,
-                "summary result keeps one typed outcome instead of duplicated detail fields");
     }
 
     @Test
