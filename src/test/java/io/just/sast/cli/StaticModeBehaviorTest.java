@@ -95,6 +95,50 @@ class StaticModeBehaviorTest {
     }
 
     @Test
+    void applicationBoundaryBindsAnExternalParameterToARealTerminal(@TempDir Path temp)
+            throws Exception {
+        Path target = compileToJar(temp.resolve("application-positive.jar"), Map.of(
+                "org.springframework.web.bind.annotation.RestController", """
+                        package org.springframework.web.bind.annotation;
+                        @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
+                        @java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE)
+                        public @interface RestController { }
+                        """,
+                "org.springframework.web.bind.annotation.PostMapping", """
+                        package org.springframework.web.bind.annotation;
+                        @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
+                        @java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD)
+                        public @interface PostMapping { }
+                        """,
+                "app.Main", """
+                        package app;
+                        @org.springframework.web.bind.annotation.RestController
+                        public class Main {
+                            @org.springframework.web.bind.annotation.PostMapping
+                            public Object handle(String command) throws Exception {
+                                return Runtime.getRuntime().exec(command);
+                            }
+                        }
+                        """));
+        Path output = temp.resolve("application-positive-report");
+
+        ScanPipeline.run(target, null, output, null, false, true, null,
+                false, 0, false, false, false, null, null, false,
+                ModeDemandPolicy.forMode(ScanMode.APPLICATION));
+
+        String evidence = Files.readString(output.resolve("meta")
+                .resolve("application-chain-evidence.json"));
+        assertTrue(evidence.contains("\"application_scope_known\":true"));
+        assertTrue(evidence.contains("\"join_count\":1"), evidence);
+        assertTrue(evidence.contains("\"entry_status\":\"EXTERNAL_ENTRY\""), evidence);
+        assertTrue(evidence.contains("\"completeness\":\"COMPLETE\""), evidence);
+
+        String findings = Files.readString(output.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/Main,handle"), findings);
+        assertTrue(findings.contains("java/lang/Runtime,exec"), findings);
+    }
+
+    @Test
     void negativeFixtureExplainsAnEmptyStaticResult(@TempDir Path temp) throws Exception {
         Path target = compileToJar(temp.resolve("negative.jar"), Map.of("negative.Empty", """
                 package negative;

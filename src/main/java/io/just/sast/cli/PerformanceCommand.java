@@ -69,23 +69,23 @@ public final class PerformanceCommand implements Callable<Integer> {
     @Option(names = "--fast", description = "快速模式；结果完整性仍会如实记录")
     boolean fast;
 
-    @Option(names = "--no-verify", description = "关闭动态验证，仅测静态扫描；适用于来源不明或不可信制品")
+    @Option(names = "--no-verify", description = "兼容参数；产品始终仅执行静态分析")
     boolean noVerify;
 
     @Option(names = "--safe-exec", hidden = true,
-            description = "已弃用的兼容调试选项；不改变目标信任模型")
+            description = "已移除；传入即拒绝，不会启动目标代码")
     boolean safeExec;
 
     @Option(names = "--safe-real-sink", hidden = true,
-            description = "已弃用的兼容调试选项；固定参数调用不等于隔离或真实利用")
+            description = "已移除；传入即拒绝，不会启动目标代码")
     boolean safeRealSink;
 
     @Option(names = "--require-os-isolation", hidden = true,
-            description = "已弃用的兼容选项；动态验证始终 fail-closed")
+            description = "已移除；传入即拒绝，不会启动目标代码")
     boolean requireOsIsolation;
 
     @Option(names = "--verify-budget", defaultValue = VerificationDefaults.VERIFY_BUDGET_TEXT,
-            paramLabel = "<N>", description = "每次扫描的规范化 finding 组动态验证预算")
+            paramLabel = "<N>", description = "兼容参数；静态-only 扫描不执行动态验证")
     int verifyBudget;
 
     @Option(names = "--mode", defaultValue = "hot", paramLabel = "<hot|cold>",
@@ -150,9 +150,9 @@ public final class PerformanceCommand implements Callable<Integer> {
     public Integer call() {
         Path createdRoot = null;
         try {
-            printVerificationDisclosure(noVerify);
-            profileLimits = limitsFile == null ? null : readProfile(limitsFile);
             validateOptions();
+            profileLimits = limitsFile == null ? null : readProfile(limitsFile);
+            printStaticOnlyDisclosure();
             boolean cold = "cold".equalsIgnoreCase(mode);
             if (!cold && !"hot".equalsIgnoreCase(mode)) {
                 throw new ScanPipeline.UsageException("--mode 必须是 hot 或 cold");
@@ -202,8 +202,10 @@ public final class PerformanceCommand implements Callable<Integer> {
             throw new ScanPipeline.UsageException(
                     "--limits-file 不能与 --*-limit-ms 同时使用");
         }
-        if (safeExec && safeRealSink) {
-            throw new ScanPipeline.UsageException("--safe-exec 与 --safe-real-sink 不能同时使用");
+        if (safeExec || safeRealSink || requireOsIsolation) {
+            throw new ScanPipeline.UsageException(
+                    "动态 verifier 已移除；--safe-exec、--safe-real-sink 和 "
+                            + "--require-os-isolation 均不再接受");
         }
         if (launcherJar != null) {
             Path normalized = launcherJar.toAbsolutePath().normalize();
@@ -270,11 +272,9 @@ public final class PerformanceCommand implements Callable<Integer> {
     }
 
     private ScanStatistics scanOnce(Path output) throws Exception {
-        boolean useSafeReal = !noVerify && (safeRealSink || !safeExec);
-        boolean useOsIsolation = requireOsIsolation;
         return ScanPipeline.run(target, deps, output, rules, false, fast, jdkHome,
-                !noVerify, verifyBudget, safeExec, useSafeReal, useOsIsolation,
-                null, null, false, ScanPipeline.ExportPolicy.STRICT_PRODUCT).stats();
+                false, verifyBudget, false, false, false,
+                null, null, false, ModeDemandPolicy.forMode(ScanMode.COMPONENT)).stats();
     }
 
     private PerformanceHarness.Report runCold(Path root) throws Exception {
@@ -314,9 +314,6 @@ public final class PerformanceCommand implements Callable<Integer> {
         addPath(command, "--jdk-home", jdkHome);
         if (fast) command.add("--fast");
         if (noVerify) command.add("--no-verify");
-        if (safeExec) command.add("--safe-exec");
-        if (safeRealSink) command.add("--safe-real-sink");
-        if (requireOsIsolation) command.add("--require-os-isolation");
         command.add("--verify-budget");
         command.add(Integer.toString(verifyBudget));
 
@@ -696,17 +693,9 @@ public final class PerformanceCommand implements Callable<Integer> {
         }
     }
 
-    private static void printVerificationDisclosure(boolean noVerify) {
-        if (noVerify) {
-            System.err.println("[just:info] perf verificationMode=STATIC_ONLY; "
-                    + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
-                    + "recommendedForUntrustedArtifacts=true");
-            return;
-        }
-        System.err.println("[just:warning] perf verificationMode=AUTO; "
-                + "targetCodeExecutionPossible=true; targetTrust=TRUSTED_LOCAL_TARGET_REQUIRED; "
-                + "resourceContainmentOnly=true; filesystemIsolation=false; "
-                + "networkIsolation=false; isolationFailure=FAIL_CLOSED; "
-                + "use --no-verify for untrusted artifacts");
+    private static void printStaticOnlyDisclosure() {
+        System.err.println("[just:info] perf verificationMode=STATIC_ONLY; "
+                + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
+                + "dynamicFiltering=ANALYSIS_ONLY; recommendedForUntrustedArtifacts=true");
     }
 }
