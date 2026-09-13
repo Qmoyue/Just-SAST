@@ -112,6 +112,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private static final int MAX_CALLEE_RETURN_SITES = 24;
     /** Do not interpret large/platform bodies as a fallback for every call-result origin. */
     private static final int MAX_CALLEE_RETURN_BODY_INSNS = 256;
+    /** Serialized containers may invoke these application object callbacks during read. */
+    private static final Set<String> SERIALIZED_TRIGGER_ENTRY_KINDS = Set.of(
+            "hashCode", "equals", "compareTo", "compare", "toString");
 
     /** V11：按闭包大小调整的每 sink 预算；实例级，避免同 JVM 多扫描互相污染。 */
     private int stepBudgetAdjusted = STEP_BUDGET;
@@ -804,7 +807,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 unresolved++;
                 continue;
             }
-            if (!entryReaching.contains(callerSite.methodKey())) {
+            boolean serializedTriggerCaller = deserializeRootPresent
+                    && isSerializedTriggerMethod(callerMethod);
+            if (!entryReaching.contains(callerSite.methodKey()) && !serializedTriggerCaller) {
                 continue;
             }
             ForwardOrigins.Result callerResult = originsOf(callerMethod);
@@ -812,7 +817,16 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 unresolved++;
                 continue;
             }
-            if (!method.isStatic() && !support.receiverMayDispatchTo(callerCall, callerMethod,
+            if (support.derivedContainerViewReceiver(callerCall, callerResult)) {
+                // A Collection/Map view is not the serialized element object itself.  The
+                // explicit element model owns its value relation; accepting every CHA target
+                // here would connect an unrelated loaded Iterator implementation to a
+                // deserialized collection and manufacture a callback chain.
+                continue;
+            }
+            boolean nativeCallback = support.nativeCallbackSite(callerCall, method);
+            if (!method.isStatic() && !nativeCallback
+                    && !support.receiverMayDispatchTo(callerCall, callerMethod,
                     method.owner(), method.name(), method.descriptor(), callerResult)) {
                 continue;
             }
@@ -821,7 +835,6 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 continue;
             }
             callers++;
-            boolean nativeCallback = support.nativeCallbackSite(callerCall, method);
             boolean reflectiveInvoke = isReflectiveMethodInvoke(callerCall);
             Set<ValueOrigin> argOrigins = nativeCallback
                     ? support.nativeTargetArgumentAt(callerCall, method, slot, callerResult)
@@ -843,7 +856,9 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 case "CHA_BOUNDED" -> "receiver-cha-bounded";
                 default -> "receiver-unknown";
             };
-            String reason = nativeCallback ? "native-callback;" + receiverReason : receiverReason;
+            String reason = nativeCallback ? "native-callback;" + receiverReason
+                    : serializedTriggerCaller ? "serialized-trigger;" + receiverReason
+                    : receiverReason;
             routes.add(new ParamRoute(callerMethod, callerCall,
                     ValueOriginOrder.sorted(argOrigins), argumentOrdinal,
                     nativeCallback ? HopKind.NATIVE_CALLBACK : HopKind.VIRTUAL_DISPATCH, reason));
@@ -851,6 +866,17 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         ParamRoutes result = new ParamRoutes(List.copyOf(routes), unresolved);
         cache.put(key, result);
         return result;
+    }
+
+    /** A lifecycle callback is eligible here only as an object-graph trigger, never as a root. */
+    private boolean isSerializedTriggerMethod(MethodInfo method) {
+        if (method == null || method.isStatic() || isPlatformOwner(method.owner())
+                || !bb.hierarchy().isSerializable(method.owner())) {
+            return false;
+        }
+        Rule.MagicEntryRule entry = entryRuleOf(method);
+        return entry != null && "lifecycle".equalsIgnoreCase(entry.direction())
+                && SERIALIZED_TRIGGER_ENTRY_KINDS.contains(entry.entryKind());
     }
 
     /**
@@ -2184,6 +2210,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 .toList();
         int produced = 0;
         int targets = 0;
+        ForwardOrigins.Result callerResult = originsOf(caller);
         for (Edge edge : edges) {
             if (abortIfInterrupted(trace) || trace.produced >= MAX_CHAINS_PER_SINK
                     || targets++ >= MAX_CALLEE_RETURN_TARGETS) {
@@ -2196,6 +2223,20 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     || target.instructions().size() > MAX_CALLEE_RETURN_BODY_INSNS
                     || Modifier.isAbstract(target.access()) || Modifier.isNative(target.access())
                     || "<init>".equals(target.name())) {
+                continue;
+            }
+            // A standard collection interface call is already owned by its element model.
+            // Body recovery must not turn an OIS result or a derived view into an unrelated
+            // concrete iterator implementation.
+            if (support.isStandardContainerInterfaceCall(edge.from())
+                    && support.directDeserializationReceiver(edge.from(), callerResult)) {
+                continue;
+            }
+            if (!isStaticLike(call.invokeKind()) && "UNKNOWN".equals(support.receiverPrecision(
+                    call, caller, target.owner(), target.name(), target.descriptor(), callerResult))) {
+                // Return-body recovery is a compatibility seam for bounded, known dispatch;
+                // an unknown receiver here is precisely the broad CHA path that manufactures
+                // cross-context dependency suffixes.
                 continue;
             }
             ForwardOrigins.Result targetResult = originsOf(target);

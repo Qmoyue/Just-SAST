@@ -168,6 +168,184 @@ class EngineCapabilityTest {
     }
 
     @Test
+    void derivedIteratorViewDoesNotDispatchToUnrelatedImplementation(@TempDir Path tmp)
+            throws Exception {
+        String gadget = """
+                package app;
+                public class CollectionGadget implements java.io.Serializable {
+                    private java.util.Collection<Object> values;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        java.util.Iterator<Object> iterator = values.iterator();
+                        iterator.next();
+                        in.defaultReadObject();
+                    }
+                }
+                """;
+        String unrelated = """
+                package app;
+                public class UnrelatedIterator implements java.util.Iterator<Object> {
+                    public boolean hasNext() { return true; }
+                    public Object next() {
+                        try {
+                            Runtime.getRuntime().exec("not-a-real-command");
+                        } catch (Exception ignored) {
+                        }
+                        return null;
+                    }
+                    public void remove() { }
+                }
+                """;
+        Path jar = compileToJar(tmp.resolve("iterator-view.jar"),
+                Map.of("app.CollectionGadget", gadget, "app.UnrelatedIterator", unrelated));
+        Path out = tmp.resolve("out");
+        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertFalse(findings.contains("app/UnrelatedIterator,next"),
+                "iterator view 本身不是反序列化对象，不能通过 CHA 把无关实现接入:\n" + findings);
+    }
+
+    @Test
+    void deserializationLifecycleKindsAndSerializedFieldsAreTyped(@TempDir Path tmp)
+            throws Exception {
+        String resolve = """
+                package app;
+                public final class ResolveGadget implements java.io.Serializable {
+                    private String command;
+                    private Object readResolve() throws Exception {
+                        Runtime.getRuntime().exec(this.command);
+                        return this;
+                    }
+                }
+                """;
+        String external = """
+                package app;
+                public final class ExternalGadget implements java.io.Externalizable {
+                    private String command;
+                    public ExternalGadget() { }
+                    public void readExternal(java.io.ObjectInput in) throws java.io.IOException {
+                        Runtime.getRuntime().exec(this.command);
+                    }
+                    public void writeExternal(java.io.ObjectOutput out) throws java.io.IOException { }
+                }
+                """;
+        String field = """
+                package app;
+                public final class FieldGadget implements java.io.Serializable {
+                    private String command;
+                    private transient String transientCommand;
+                    private static String staticCommand;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        Runtime.getRuntime().exec(this.command);
+                        Runtime.getRuntime().exec(this.transientCommand);
+                        Runtime.getRuntime().exec(staticCommand);
+                        in.defaultReadObject();
+                    }
+                }
+                """;
+        Path jar = compileToJar(tmp.resolve("lifecycle-positive.jar"), Map.of(
+                "app.ResolveGadget", resolve, "app.ExternalGadget", external,
+                "app.FieldGadget", field));
+        Path positiveOut = tmp.resolve("positive-out");
+        ScanPipeline.run(jar, null, positiveOut, null, false, true, null, false, 20);
+        String positiveFindings = Files.readString(
+                positiveOut.resolve("findings").resolve("findings.csv"));
+        assertTrue(positiveFindings.contains("app/ResolveGadget,readResolve")
+                        && positiveFindings.contains("app/ExternalGadget,readExternal")
+                        && positiveFindings.contains("app/FieldGadget,readObject")
+                        && positiveFindings.contains("java/lang/Runtime,exec"),
+                "readResolve/readExternal/非 transient 字段应形成反序列化链:\n" + positiveFindings);
+
+        String replace = """
+                package app;
+                public final class ReplaceGadget implements java.io.Serializable {
+                    private String command;
+                    private Object writeReplace() throws Exception {
+                        Runtime.getRuntime().exec(this.command);
+                        return this;
+                    }
+                }
+                """;
+        String fakeExternal = """
+                package app;
+                public final class FakeExternal implements java.io.Serializable {
+                    private String command;
+                    public void readExternal(java.io.ObjectInput in) throws java.io.IOException {
+                        Runtime.getRuntime().exec(this.command);
+                    }
+                }
+                """;
+        String excludedFields = """
+                package app;
+                public final class ExcludedFields implements java.io.Serializable {
+                    private transient String transientCommand;
+                    private static String staticCommand;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        Runtime.getRuntime().exec(this.transientCommand);
+                        Runtime.getRuntime().exec(staticCommand);
+                        in.defaultReadObject();
+                    }
+                }
+                """;
+        Path negativeJar = compileToJar(tmp.resolve("lifecycle-negative.jar"), Map.of(
+                "app.ReplaceGadget", replace, "app.FakeExternal", fakeExternal,
+                "app.ExcludedFields", excludedFields));
+        Path negativeOut = tmp.resolve("negative-out");
+        ScanPipeline.run(negativeJar, null, negativeOut, null, false, true, null, false, 20);
+        String negativeFindings = Files.readString(
+                negativeOut.resolve("findings").resolve("findings.csv"));
+        assertFalse(negativeFindings.contains("app/ReplaceGadget,writeReplace"),
+                "writeReplace 是序列化侧回调，不能成为反序列化根:\n" + negativeFindings);
+        assertFalse(negativeFindings.contains("app/FakeExternal,readExternal"),
+                "Serializable 类的同名方法不是 Externalizable 回调:\n" + negativeFindings);
+        assertFalse(negativeFindings.contains("app/ExcludedFields,readObject"),
+                "transient/static 字段不得制造可控字段流:\n" + negativeFindings);
+    }
+
+    @Test
+    void nativeCallbackUsesSameReceiverAndRejectsUnrelatedMethods(@TempDir Path tmp)
+            throws Exception {
+        String bridge = """
+                package app;
+                public final class NativeBridge implements java.io.Serializable {
+                    private String command;
+                    public native void invokeNative();
+                    public void onCallback() throws Exception {
+                        Runtime.getRuntime().exec(this.command);
+                    }
+                    private void hiddenCallback() throws Exception {
+                        Runtime.getRuntime().exec(this.command);
+                    }
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        invokeNative();
+                        in.defaultReadObject();
+                    }
+                }
+                """;
+        String unrelated = """
+                package app;
+                public final class UnrelatedNativeTarget {
+                    public void onCallback() throws Exception {
+                        Runtime.getRuntime().exec("not-a-real-command");
+                    }
+                }
+                """;
+        Path jar = compileToJar(tmp.resolve("native-callback.jar"), Map.of(
+                "app.NativeBridge", bridge, "app.UnrelatedNativeTarget", unrelated));
+        Path out = tmp.resolve("out");
+        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/NativeBridge,readObject")
+                        && findings.contains("app/NativeBridge.onCallback")
+                        && findings.contains("native=1")
+                        && findings.contains("java/lang/Runtime,exec"),
+                "native 回调应保留同 receiver 的显式 JNI 跳转:\n" + findings);
+        assertFalse(findings.contains("hiddenCallback"),
+                "private callback 不满足 JNI 回调的公开目标契约:\n" + findings);
+        assertFalse(findings.contains("app/UnrelatedNativeTarget.onCallback"),
+                "native callback 不得跨到无关 receiver:\n" + findings);
+    }
+
+    @Test
     void reflectiveLookupWithoutFrameworkKeepsNoPathPruning(@TempDir Path tmp) throws Exception {
         // 无框架类在 classpath：app 内的常量类反射查找不得触发"框架反射供给"（历史缺陷：门恒开，
         // 全应用 public 方法入闭包，NO_PATH 剪枝失效）

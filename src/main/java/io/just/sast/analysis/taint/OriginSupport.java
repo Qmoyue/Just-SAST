@@ -163,6 +163,24 @@ public final class OriginSupport {
      */
     private static final Set<String> SERIALIZED_TRIGGER_ENTRY_KINDS = Set.of(
             "hashCode", "equals", "compareTo", "compare", "toString");
+    /** Standard collection view owners used to preserve derived-object identity at dispatch. */
+    private static final Set<String> STANDARD_ITERABLE_TYPES = Set.of(
+            "java/lang/Iterable", "java/util/Collection", "java/util/List",
+            "java/util/Set", "java/util/SortedSet", "java/util/NavigableSet",
+            "java/util/Queue", "java/util/Deque", "java/util/AbstractCollection",
+            "java/util/AbstractList", "java/util/AbstractSet", "java/util/AbstractQueue");
+    /**
+     * JDK collection interfaces are ordinary object-graph operations, not proof that an
+     * unrelated serialized InvocationHandler services the call.  Keep the interface list
+     * explicit because an application-defined interface extending Collection is still an
+     * application contract and must not be silently collapsed into this guard.
+     */
+    private static final Set<String> STANDARD_CONTAINER_INTERFACE_TYPES = Set.of(
+            "java/lang/Iterable", "java/util/Collection", "java/util/List",
+            "java/util/Set", "java/util/SortedSet", "java/util/NavigableSet",
+            "java/util/Queue", "java/util/Deque", "java/util/Iterator",
+            "java/util/ListIterator", "java/util/Map", "java/util/SortedMap",
+            "java/util/NavigableMap", "java/util/Map$Entry");
 
     /**
      * 方法内字段重初始化的支配关系只在 receiver 精度查询时按需建立。
@@ -958,6 +976,14 @@ public final class OriginSupport {
                     return owner != null && owner.isInterface();
                 })
                 .filter(call -> !isJdk(call.strProp("methodOwner")))
+                .filter(call -> {
+                    if (!isStandardContainerInterfaceCall(call)) {
+                        return true;
+                    }
+                    MethodInfo host = enclosingMethod(call);
+                    ForwardOrigins.Result result = host == null ? null : origins.compute(host);
+                    return !directDeserializationReceiver(call, result);
+                })
                 .filter(this::isExternallySuppliedProxyReceiver)
                 .sorted(java.util.Comparator.comparing((Node call) -> methodKeyOf(
                                 call.methodOwner(), call.methodName(), call.methodDescriptor()))
@@ -972,6 +998,65 @@ public final class OriginSupport {
         }
         serializedProxyInterfaceCallSites.addAll(candidates);
         JustLogger.debug("外部序列化 Proxy 接口调用位点：{} 个", serializedProxyInterfaceCallSites.size());
+    }
+
+    /**
+     * A standard-container interface call on the immediate result of OIS.readObject is the
+     * collection operation itself.  It is not enough evidence to bind every serializable
+     * InvocationHandler in the scan to that call; doing so is the source of the large
+     * Boot-loader false-chain family in application deserializers.  The proof deliberately
+     * follows only CHECKCAST instructions back to the exact OIS call result.
+     */
+    public boolean isStandardContainerInterfaceCall(Node call) {
+        return call != null && STANDARD_CONTAINER_INTERFACE_TYPES.contains(call.owner());
+    }
+
+    /** Same direct-OIS receiver proof when the caller already owns the immutable origin result. */
+    public boolean directDeserializationReceiver(Node call, ForwardOrigins.Result result) {
+        MethodInfo host = enclosingMethod(call);
+        if (host == null || result == null) {
+            return false;
+        }
+        return directDeserializationReceiver(call, host, result, new HashSet<>());
+    }
+
+    private boolean directDeserializationReceiver(Node call, MethodInfo host,
+                                                  ForwardOrigins.Result result,
+                                                  Set<ValueOrigin> visiting) {
+        for (ValueOrigin receiver : argOriginAtOrdinal(call, -1, result)) {
+            if (directDeserializationOrigin(receiver, host, result, visiting)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean directDeserializationOrigin(ValueOrigin value, MethodInfo host,
+                                                ForwardOrigins.Result result,
+                                                Set<ValueOrigin> visiting) {
+        if (value == null || !visiting.add(value)) {
+            return false;
+        }
+        try {
+            if (value instanceof ValueOrigin.CallResult callResult) {
+                Node producer = callNodes.get(callResult.callNodeId());
+                return isOisRead(producer);
+            }
+            if (!(value instanceof ValueOrigin.Insn instruction)
+                    || instruction.offset() < 0
+                    || instruction.offset() >= host.instructions().size()
+                    || host.insnAt(instruction.offset()).op() != Op.CHECKCAST) {
+                return false;
+            }
+            ForwardOrigins.State before = result.stateBefore().get(instruction.offset());
+            if (before == null || before.stack().isEmpty()) {
+                return false;
+            }
+            return before.stack().get(before.stack().size() - 1).origins().stream()
+                    .anyMatch(origin -> directDeserializationOrigin(origin, host, result, visiting));
+        } finally {
+            visiting.remove(value);
+        }
     }
 
     /**
@@ -2901,6 +2986,43 @@ public final class OriginSupport {
             }
         }
         return false;
+    }
+
+    /**
+     * Whether the receiver at a call site is the result of a standard Collection/Map view
+     * method.  The producer identity is retained in ForwardOrigins even when a model projects
+     * the view back to its container elements; both taint engines use this fact to avoid
+     * treating an unrelated Iterator implementation as the deserialized object itself.
+     */
+    public boolean derivedContainerViewReceiver(Node call, ForwardOrigins.Result callerResult) {
+        if (call == null || callerResult == null || "STATIC".equals(call.invokeKind())
+                || "SPECIAL".equals(call.invokeKind()) || "DYNAMIC".equals(call.invokeKind())) {
+            return false;
+        }
+        for (ValueOrigin receiver : argOriginAtOrdinal(call, -1, callerResult)) {
+            if (!(receiver instanceof ValueOrigin.CallResult callResult)
+                    || callResult.callNodeId() < 0) {
+                continue;
+            }
+            Node producer = callNodes.get(callResult.callNodeId());
+            if (producer != null && isDerivedContainerViewMethod(producer.owner(), producer.name(),
+                    producer.descriptor())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Shared API fact for Collection/Map view producers; not an application-name predicate. */
+    public boolean isDerivedContainerViewMethod(String owner, String name, String descriptor) {
+        if ("iterator".equals(name) && "()Ljava/util/Iterator;".equals(descriptor)) {
+            return STANDARD_ITERABLE_TYPES.contains(owner)
+                    || hierarchy.isSubtypeOf(owner, "java/lang/Iterable");
+        }
+        return "java/util/Map".equals(owner)
+                && ("entrySet".equals(name) || "keySet".equals(name) || "values".equals(name))
+                && ("()Ljava/util/Set;".equals(descriptor)
+                || "()Ljava/util/Collection;".equals(descriptor));
     }
 
     /**

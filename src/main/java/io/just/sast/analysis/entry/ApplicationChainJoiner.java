@@ -174,6 +174,10 @@ public final class ApplicationChainJoiner {
         entryAttributes.put("chain_entry_method", entryMatch.chainEntryKey());
         entryAttributes.put("entry_prefix_hops", Integer.toString(
                 Math.max(0, entryMatch.path().size() - 1)));
+        entryAttributes.put("entry_join_kind", entryMatch.typedBinding()
+                ? "TYPED_BINDING_TARGET"
+                : entryMatch.path().size() > 1
+                ? "CALL_GRAPH_PREFIX" : "DIRECT_APPLICATION_ENTRY");
         if (!entryMatch.path().isEmpty()) {
             // The path is a bounded list of canonical method keys, not a renderer note.  It is
             // part of the atom identity so a changed call prefix cannot reuse an old join ID.
@@ -182,7 +186,6 @@ public final class ApplicationChainJoiner {
         ApplicationEntryIndex.DeserializeSite site = entryMatch.bindingSite() != null
                 ? entryMatch.bindingSite() : findSite(index, entryKey, chainMethods);
         if (entryMatch.typedBinding()) {
-            entryAttributes.put("entry_join_kind", "TYPED_BINDING_TARGET");
             entryAttributes.put("binding_target_type", chain.entryClass());
             entryAttributes.put("binding_site_call_id", Long.toString(site.callId()));
             entryAttributes.put("binding_site_host", site.hostMethodKey());

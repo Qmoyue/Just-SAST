@@ -83,6 +83,9 @@ public final class ApplicationEntryIndex {
     /** Serialization callbacks that the object-graph mechanism can invoke during read. */
     private static final Set<String> MECHANISM_ENTRY_KINDS = Set.of(
             "readObject", "readObjectNoData", "readExternal", "readResolve", "validateObject");
+    /** Object callbacks used by serialized hash/ordered containers, never independent roots. */
+    private static final Set<String> SERIALIZED_TRIGGER_ENTRY_KINDS = Set.of(
+            "hashCode", "equals", "compareTo", "compare", "toString");
 
     /** A method-level execution boundary discovered from a real application artifact. */
     public record ExecutionEntry(String methodKey, String owner, String name, String descriptor,
@@ -736,15 +739,24 @@ public final class ApplicationEntryIndex {
             }
             siteHosts.add(host);
             Node hostNode = methods.get(host);
-            boolean publicDeserializeBoundary = externalInput && owned
-                    && isPublicMethod(hostNode);
-            boolean boundaryExternal = publicDeserializeBoundary || entries.stream().anyMatch(entry -> host.equals(entry.methodKey())
+            // Java visibility is not an external-control proof.  A public service/helper that
+            // happens to call ObjectInputStream is still an application-internal site; the
+            // caller must be a typed framework/lifecycle boundary (or an explicitly configured
+            // entry) before this source can become an application root.  Otherwise a public
+            // decoder helper is promoted to EXTERNAL_ENTRY and every dependency callback below
+            // it is misreported as an exposed application chain.
+            boolean explicitExecutionBoundary = entries.stream().anyMatch(entry -> host.equals(entry.methodKey())
                     && (entry.externalControlProven()
                     // An explicit configured magic entry is already a user-declared
                     // execution boundary.  Keep its historical source upgrade, while never
                     // upgrading an arbitrary helper method that merely contains OIS.read.
                     || (!FRAMEWORK_ENTRY_RULE.equals(entry.ruleId())
                     && entry.status() == FindingState.EntryStatus.APPLICATION_ENTRY)));
+            boolean publicDeserializeBoundary = externalInput && owned
+                    && isPublicMethod(hostNode)
+                    && entries.stream().anyMatch(entry -> host.equals(entry.methodKey())
+                    && entry.externalControlProven());
+            boolean boundaryExternal = explicitExecutionBoundary;
             if (externalInput && owned && boundaryExternal) {
                 sourceHosts.put(host, true);
                 if (publicDeserializeBoundary && hostNode != null) {
@@ -1166,7 +1178,7 @@ public final class ApplicationEntryIndex {
                                                          String terminalDescriptor,
                                                          boolean continuationEvidence) {
         return candidateAdmission(entryOwner, entryName, entryDescriptor, terminalOwner,
-                terminalName, terminalDescriptor, continuationEvidence, null);
+                terminalName, terminalDescriptor, continuationEvidence, null, false);
     }
 
     /** Internal admission path allowing a producer to reuse its already-resolved terminal. */
@@ -1177,6 +1189,19 @@ public final class ApplicationEntryIndex {
                                                           String terminalDescriptor,
                                                           boolean continuationEvidence,
                                                           TerminalDecision resolvedTerminal) {
+        return candidateAdmission(entryOwner, entryName, entryDescriptor, terminalOwner,
+                terminalName, terminalDescriptor, continuationEvidence, resolvedTerminal, false);
+    }
+
+    /** Internal trigger admission may cross the ordinary entry slice only after typed OIS evidence. */
+    private CandidateAdmissionDecision candidateAdmission(String entryOwner, String entryName,
+                                                          String entryDescriptor,
+                                                          String terminalOwner,
+                                                          String terminalName,
+                                                          String terminalDescriptor,
+                                                          boolean continuationEvidence,
+                                                          TerminalDecision resolvedTerminal,
+                                                          boolean serializedTriggerContinuation) {
         String owner = entryOwner == null ? "" : entryOwner;
         String name = entryName == null ? "" : entryName;
         String descriptor = entryDescriptor == null ? "" : entryDescriptor;
@@ -1199,7 +1224,7 @@ public final class ApplicationEntryIndex {
                     continuationEvidence);
         }
         if (!applicationEntryMethods.contains(entryKey) && !entryForward
-                && !bindingCallback && !bindingTarget) {
+                && !bindingCallback && !bindingTarget && !serializedTriggerContinuation) {
             return new CandidateAdmissionDecision(
                     CandidateAdmissionStatus.ENTRY_NOT_FORWARD_REACHABLE, entryKey,
                     sinkOwner, sinkName, sinkDescriptor, false, false,
@@ -1256,13 +1281,20 @@ public final class ApplicationEntryIndex {
         }
         TerminalDecision terminal = terminalAdmission(candidate.terminalOwner(),
                 candidate.terminalName(), candidate.terminalDescriptor());
+        boolean serializedTriggerContinuation = candidate.continuationEvidence()
+                && SERIALIZED_TRIGGER_ENTRY_KINDS.contains(candidate.entryKind())
+                && isApplicationOwner(candidate.entryOwner());
         CandidateAdmissionDecision admission = candidateAdmission(candidate.entryOwner(),
                 candidate.entryName(), candidate.entryDescriptor(), candidate.terminalOwner(),
                 candidate.terminalName(), candidate.terminalDescriptor(),
-                candidate.continuationEvidence(), terminal);
+                candidate.continuationEvidence(), terminal, serializedTriggerContinuation);
         if (!applicationScopeKnown) {
             return new ProducerAdmissionDecision(ProducerAdmissionStatus.KERNEL_ONLY,
                     admission, terminal, candidate.continuationEvidence());
+        }
+        if (admission.admitted() && serializedTriggerContinuation) {
+            return new ProducerAdmissionDecision(ProducerAdmissionStatus.BRIDGE_CONTINUATION,
+                    admission, terminal, true);
         }
         if (admission.admitted()) {
             return new ProducerAdmissionDecision(ProducerAdmissionStatus.APPLICATION_CHAIN,
@@ -1327,7 +1359,8 @@ public final class ApplicationEntryIndex {
                 || value.contains("second") || value.contains("remote")
                 || value.contains("response") || value.contains("reflect")
                 || value.contains("method-handle") || value.contains("method-collection")
-                || value.contains("serialized-proxy")
+                || value.contains("serialized-proxy") || value.contains("native-callback")
+                || value.contains("serialized-trigger")
                 || value.startsWith("bridge-");
     }
 

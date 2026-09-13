@@ -1058,7 +1058,26 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         Map<String, Chain> unique = new java.util.TreeMap<>();
         addTriggerInputs(unique, inputs.applicationChains());
         addTriggerInputs(unique, inputs.bridgeContinuations());
-        addTriggerInputs(unique, inputs.dependencySuffixes());
+        // In a known application scope a dependency trigger is only an intermediate runtime
+        // mechanism, never an application object identity.  The serialized element callback
+        // candidates live in the kernel store until a real application OIS host consumes them.
+        // Keeping dependency suffixes in this product was the source of arbitrary
+        // ConcurrentHashMap/Boot callback pairs in the demo application report.
+        if (target == null || target.applicationEntryIndex() == null
+                || !target.applicationEntryIndex().applicationScopeKnown()) {
+            addTriggerInputs(unique, inputs.dependencySuffixes());
+        }
+        if (target != null && target.applicationEntryIndex() != null
+                && target.applicationEntryIndex().applicationScopeKnown()) {
+            for (Chain chain : target.kernelOnlyChains()) {
+                if (isTriggerEntry(chain.entryKind())
+                        && target.applicationEntryIndex().isApplicationOwner(chain.entryClass())
+                        && target.hierarchy().isSerializable(chain.entryClass())
+                        && chain.unresolvedHops() == 0) {
+                    unique.putIfAbsent(chain.key(), chain);
+                }
+            }
+        }
         if (target != null) {
             for (String entryKind : TRIGGER_ENTRY_KINDS) {
                 for (Blackboard.DeferredDependencySuffix deferred :

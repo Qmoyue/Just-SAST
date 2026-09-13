@@ -2889,32 +2889,53 @@ public final class ForwardEngine {
                         if (cancellationRequested()) {
                             return best;
                         }
-                        for (Edge edge : call.out()) {
-                            if (edge.type() == EdgeType.INVOKES || edge.type() == EdgeType.DISPATCHES) {
-                                if (!support.receiverMayDispatchTo(call, method, edge.to().owner(),
-                                        edge.to().name(), edge.to().descriptor(), originResult)) {
-                                    continue;
-                                }
-                                String targetKey = methodNodeKey(edge.to());
-                                admitDynamicDispatchTarget(targetKey,
-                                        isJavaSerializationValue(receiverPath));
+                        if (!isDerivedContainerViewPath(receiverPath)
+                                && !isDerivedContainerViewOrigin(receiver)) {
+                            // A JNI/native call has no ordinary call edge to the Java
+                            // callback.  OriginSupport owns the same-receiver index; materialize
+                            // only those typed targets on the selected receiver slot so an
+                            // unrelated method with the same callback name cannot participate.
+                            for (Node target : support.nativeCallbackTargets(call)) {
+                                String targetKey = methodNodeKey(target);
                                 if (!scheduledMethod(targetKey)) {
                                     continue;
                                 }
-                                List<ChainHop> targetPath = hopTo(receiverPath, method,
-                                        edge.to().owner(), edge.to().name(),
-                                        edge.to().descriptor(), edge.type());
+                                List<ChainHop> targetPath = appendMethodHop(receiverPath, method,
+                                        target.owner(), target.name(), target.descriptor(),
+                                        HopKind.NATIVE_CALLBACK, "native-callback", null);
                                 if (targetPath == null) {
                                     continue;
                                 }
-                                // This is a selected receiver value for one concrete target,
-                                // not proof that every instance of the target class is tainted.
-                                // Keep it on the target method's receiver slot. Class-level
-                                // this facts remain the fallback for real serialization entry
-                                // seeds and inherited callbacks, while method-local facts avoid
-                                // cross-object provenance pollution in nested gadget paths.
-                                addParam(edge.to().owner(), edge.to().name(),
-                                        edge.to().descriptor(), 0, targetPath);
+                                addParam(target.owner(), target.name(), target.descriptor(), 0,
+                                        targetPath);
+                            }
+                            for (Edge edge : call.out()) {
+                                if (edge.type() == EdgeType.INVOKES || edge.type() == EdgeType.DISPATCHES) {
+                                    if (!support.receiverMayDispatchTo(call, method, edge.to().owner(),
+                                            edge.to().name(), edge.to().descriptor(), originResult)) {
+                                        continue;
+                                    }
+                                    String targetKey = methodNodeKey(edge.to());
+                                    admitDynamicDispatchTarget(targetKey,
+                                            isJavaSerializationValue(receiverPath));
+                                    if (!scheduledMethod(targetKey)) {
+                                        continue;
+                                    }
+                                    List<ChainHop> targetPath = hopTo(receiverPath, method,
+                                            edge.to().owner(), edge.to().name(),
+                                            edge.to().descriptor(), edge.type());
+                                    if (targetPath == null) {
+                                        continue;
+                                    }
+                                    // This is a selected receiver value for one concrete target,
+                                    // not proof that every instance of the target class is tainted.
+                                    // Keep it on the target method's receiver slot. Class-level
+                                    // this facts remain the fallback for real serialization entry
+                                    // seeds and inherited callbacks, while method-local facts avoid
+                                    // cross-object provenance pollution in nested gadget paths.
+                                    addParam(edge.to().owner(), edge.to().name(),
+                                            edge.to().descriptor(), 0, targetPath);
+                                }
                             }
                         }
                         if (best == null || better(best, receiverPath)) {
@@ -4180,6 +4201,17 @@ public final class ForwardEngine {
         // argument-only taint at an interface call is not evidence that every
         // implementation object is attacker controlled.
         if (receiverPath == null) {
+            return;
+        }
+        // A standard collection view/iterator is a derived object, not the serialized
+        // element/container receiver itself.  Its element relation is owned by the explicit
+        // container models; expanding Iterator.next (or a view method) through every loaded
+        // implementation would treat unrelated non-serializable iterators as if they had been
+        // read from the stream and can manufacture application chains from a boot loader.
+        if (isDerivedContainerViewPath(receiverPath)) {
+            return;
+        }
+        if (receiverOrigins.stream().anyMatch(this::isDerivedContainerViewOrigin)) {
             return;
         }
         // 候选实现：接口用 implementers，类用有界子类型闭包；是否需要
@@ -5906,11 +5938,47 @@ public final class ForwardEngine {
             if ("deserialization".equals(hop.reason())) {
                 return true;
             }
+            if (hop.reason() != null && hop.reason().startsWith("ois-read:")) {
+                return true;
+            }
             if (JAVA_SERIALIZATION_ENTRY_KINDS.contains(hop.reason())) {
                 return true;
             }
         }
         return false;
+    }
+
+    /** Whether the value is a JVM collection view/iterator produced after deserialization. */
+    private boolean isDerivedContainerViewPath(List<ChainHop> path) {
+        if (path == null || path.isEmpty()) {
+            return false;
+        }
+        ChainHop last = path.get(path.size() - 1);
+        if (last == null || last.kind() == HopKind.ENTRY || last.toOwner() == null
+                || last.toName() == null || last.desc() == null) {
+            return false;
+        }
+        if ("iterator".equals(last.toName())
+                && "()Ljava/util/Iterator;".equals(last.desc())) {
+            return support.isDerivedContainerViewMethod(last.toOwner(), last.toName(), last.desc());
+        }
+        if (!"()Ljava/util/Set;".equals(last.desc())
+                && !"()Ljava/util/Collection;".equals(last.desc())) {
+            return false;
+        }
+        return "java/util/Map".equals(last.toOwner())
+                && ("entrySet".equals(last.toName()) || "keySet".equals(last.toName())
+                || "values".equals(last.toName()));
+    }
+
+    /** Recognize a view origin even when the bounded container relation collapsed its path. */
+    private boolean isDerivedContainerViewOrigin(ValueOrigin origin) {
+        if (!(origin instanceof ValueOrigin.CallResult result) || result.callNodeId() < 0) {
+            return false;
+        }
+        Node producer = support.callNode(result.callNodeId());
+        return producer != null && support.isDerivedContainerViewMethod(producer.owner(),
+                producer.name(), producer.descriptor());
     }
 
     private List<ChainHop> taintedInsn(int offset, MethodInfo method, int depth, Explore ex) {

@@ -170,6 +170,49 @@ class ApplicationEntryIndexContractTest {
     }
 
     @Test
+    void publicDeserializeHelperDoesNotBecomeExternalApplicationEntry() {
+        String controllerOwner = "fixture/app/Controller";
+        String helperOwner = "fixture/app/ImportService";
+        String controllerKey = controllerOwner + "#import(Ljava/lang/String;)V";
+        String helperKey = helperOwner + "#decode(Ljava/lang/String;)V";
+        Graph graph = new Graph();
+        Node controller = graph.methodNode(controllerOwner, "import",
+                "(Ljava/lang/String;)V", false);
+        controller.propsNote("methodAccess", Modifier.PUBLIC);
+        controller.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        controller.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PostMapping;"));
+        Node helper = graph.methodNode(helperOwner, "decode", "(Ljava/lang/String;)V", false);
+        helper.propsNote("methodAccess", Modifier.PUBLIC);
+        Node ois = graph.methodNode("java/io/ObjectInputStream", "readObject",
+                "()Ljava/lang/Object;", true);
+        Node helperCall = graph.addCallNode(helperOwner, "decode", "(Ljava/lang/String;)V",
+                "VIRTUAL", null, 0, controllerOwner, "import", "(Ljava/lang/String;)V");
+        Node read = graph.addCallNode("java/io/ObjectInputStream", "readObject",
+                "()Ljava/lang/Object;", "VIRTUAL", null, 0, helperOwner, "decode",
+                "(Ljava/lang/String;)V");
+        graph.addEdge(helperCall, helper, EdgeType.INVOKES, "VIRTUAL");
+        graph.addEdge(read, ois, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of(controllerOwner, helperOwner), true);
+
+        assertTrue(index.isExternalEntryMethod(controllerKey));
+        assertFalse(index.isExternalEntryMethod(helperKey),
+                "Java public visibility and an OIS call do not prove an external boundary");
+        assertTrue(index.applicationEntryMethods().contains(controllerKey));
+        assertFalse(index.applicationEntryMethods().contains(helperKey));
+        assertTrue(index.entryForwardSlice().contains(helperKey),
+                "the helper remains reachable through the real controller prefix");
+        assertTrue(index.deserializeSites().stream().anyMatch(site ->
+                helperKey.equals(site.hostMethodKey()) && site.applicationOwned()
+                        && site.externalInput()));
+    }
+
+    @Test
     void knownScopeExcludesDependencyOnlyDeserializeRootFromLegacyClosure() {
         Graph graph = new Graph();
         Node dependencyEntry = graph.methodNode(GADGET, "readObject", "()V", false);
