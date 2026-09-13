@@ -37,6 +37,19 @@ class ScanPipelineTest {
     }
 
     @Test
+    void invalidTargetJdkHomeIsReportedAsUsageError(@TempDir Path tmp) throws Exception {
+        Path jar = compileToJar(tmp.resolve("app.jar"),
+                Map.of("app.Entry", "package app; public class Entry {}"));
+        Path missingJdk = tmp.resolve("不存在 JDK");
+
+        ScanPipeline.UsageException failure = assertThrows(ScanPipeline.UsageException.class,
+                () -> ScanPipeline.run(jar, List.of(), tmp.resolve("out"), null,
+                        false, true, missingJdk, false, 0));
+
+        assertTrue(failure.getMessage().contains("--jdk-home"), failure.getMessage());
+    }
+
+    @Test
     void safeExecRequiresDynamicVerification(@TempDir Path tmp) throws Exception {
         Path input = Files.writeString(tmp.resolve("input.jar"), "not-a-jar");
 

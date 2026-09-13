@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.List;
 import java.util.Locale;
 
 /** Writes the path-free identity used to invalidate future incremental caches. */
@@ -223,26 +224,67 @@ public final class ScanIdentityWriter {
         }
         selectedHome = selectedHome.toAbsolutePath().normalize();
         if (ArchiveLimits.isLinkOrReparsePoint(selectedHome)) {
-            // Jabba's `default` selector is commonly a junction. Resolve only the trusted
-            // toolchain root; do not require toRealPath on the release file itself because some
-            // Windows providers deny that metadata operation even when the file is readable.
+            // Jabba's `default` selector is commonly a junction. Mirror the target-source
+            // resolver so the identity is bound to the same concrete home that supplies bytes.
             try {
-                selectedHome = selectedHome.toRealPath();
-            } catch (IOException ignored) {
-                return "runtime-feature=" + Runtime.version().feature()
-                        + ";requested=" + (jdkHome == null ? "runtime" : "requested");
+                Path linkTarget = Files.readSymbolicLink(selectedHome);
+                selectedHome = (linkTarget.isAbsolute()
+                        ? linkTarget : selectedHome.getParent().resolve(linkTarget))
+                        .toAbsolutePath().normalize();
+            } catch (IOException | RuntimeException linkReadFailure) {
+                try {
+                    selectedHome = selectedHome.toRealPath();
+                } catch (IOException | RuntimeException realPathFailure) {
+                    realPathFailure.addSuppressed(linkReadFailure);
+                    throw new IOException("JDK home real path cannot be resolved: " + selectedHome,
+                            realPathFailure);
+                }
+            }
+            if (!Files.isDirectory(selectedHome)
+                    || ArchiveLimits.isLinkOrReparsePoint(selectedHome)) {
+                throw new IOException("JDK home real path is not a safe directory: "
+                        + selectedHome);
             }
         }
-        Path release = selectedHome.resolve("release");
-        if (Files.isRegularFile(release, java.nio.file.LinkOption.NOFOLLOW_LINKS)
-                && !ArchiveLimits.isLinkOrReparsePoint(release)) {
+        Path release = firstRegularFile(selectedHome.resolve("release"),
+                selectedHome.resolve("jre").resolve("release"));
+        if (release != null) {
             // The artifact digest already binds the target classfile major version. Keeping the
             // JDK identity independent of the frontend's discovered major lets cache lookup
             // happen before parsing without weakening invalidation.
             return "release-sha256=" + ArtifactFingerprint.sha256(release, accounting);
         }
+        Path rtJar = firstRegularFile(selectedHome.resolve("jre").resolve("lib").resolve("rt.jar"),
+                selectedHome.resolve("lib").resolve("rt.jar"));
+        if (rtJar != null) {
+            StringBuilder legacyIdentity = new StringBuilder("legacy-rt-jar\n");
+            Path libDir = rtJar.getParent();
+            for (String name : List.of("rt.jar", "jce.jar", "jsse.jar", "charsets.jar",
+                    "resources.jar")) {
+                Path jar = libDir.resolve(name);
+                if (Files.isRegularFile(jar, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                        && !ArchiveLimits.isLinkOrReparsePoint(jar)) {
+                    legacyIdentity.append(name).append('=')
+                            .append(ArtifactFingerprint.sha256(jar, accounting)).append('\n');
+                }
+            }
+            return "legacy-sha256=" + digest(legacyIdentity.toString());
+        }
+        if (jdkHome != null) {
+            throw new IOException("--jdk-home has no readable release or rt.jar: " + selectedHome);
+        }
         return "runtime-feature=" + Runtime.version().feature()
-                + ";requested=" + (jdkHome == null ? "runtime" : "requested");
+                + ";requested=runtime";
+    }
+
+    private static Path firstRegularFile(Path... candidates) {
+        for (Path candidate : candidates) {
+            if (Files.isRegularFile(candidate, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && !ArchiveLimits.isLinkOrReparsePoint(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     private static String digest(InputStream input, long limit) throws IOException {

@@ -73,7 +73,8 @@ public record VerificationSummary(
      * only owner of the trust/risk interpretation used by reports and run metadata.
      */
     public SafetyDisclosure safetyDisclosure() {
-        boolean staticOnly = "DISABLED".equalsIgnoreCase(capability);
+        boolean staticOnly = "DISABLED".equalsIgnoreCase(capability)
+                || "STATIC_ONLY".equalsIgnoreCase(capability);
         boolean possible = !staticOnly;
         boolean selectedPlans = selected > 0 || !results.isEmpty();
         boolean observedTarget = results.stream().anyMatch(VerificationSummary::targetCodeObserved);

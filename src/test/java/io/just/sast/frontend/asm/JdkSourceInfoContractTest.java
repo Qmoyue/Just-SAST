@@ -52,6 +52,28 @@ class JdkSourceInfoContractTest {
     }
 
     @Test
+    void legacyTargetIdentityUsesTargetBytesInsteadOfRuntimeFeature(@TempDir Path temp)
+            throws Exception {
+        Path rt = temp.resolve("jre").resolve("lib").resolve("rt.jar");
+        Files.createDirectories(rt.getParent());
+        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(rt))) {
+            zip.putNextEntry(new ZipEntry("A.class"));
+            zip.write(minimalClass());
+            zip.closeEntry();
+        }
+
+        ReportLayout layout = ReportLayout.flat(temp.resolve("identity-report"));
+        new ScanIdentityWriter().write(layout, "artifact", "dependencies", "inventory", null,
+                temp, 52, false, false, 0, false, false, false, InputBudget.defaults(),
+                InputBudget.defaults().tracker(),
+                new JdkSourceInfo(JdkSourceInfo.ImageKind.TARGET_RT_JAR, 7));
+        String identityJson = Files.readString(layout.meta().resolve("scan-identity.json"));
+
+        assertTrue(identityJson.contains("\"jdk_identity\":\"legacy-sha256="), identityJson);
+        assertFalse(identityJson.contains("runtime-feature="), identityJson);
+    }
+
+    @Test
     void scanIdentityPublishesTypedSourceEvidence(@TempDir Path temp) throws Exception {
         ReportLayout layout = ReportLayout.flat(temp.resolve("report"));
         JdkSourceInfo info = new JdkSourceInfo(JdkSourceInfo.ImageKind.TARGET_RT_JAR, 8);

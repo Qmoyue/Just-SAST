@@ -288,6 +288,65 @@ class BytecodeFrontendTest {
                 "embedded BOOT-INF/lib classes must remain dependency-owned");
     }
 
+    @Test
+    void scopedStreamingExcludesEmbeddedWarLibrariesFromApplicationOwnership() throws Exception {
+        byte[] appBytes = fixtureBytes();
+        byte[] dependencyBytes;
+        try (InputStream input = BytecodeFrontendTest.class.getResourceAsStream(
+                "/io/just/sast/analysis/entry/ApplicationEntryIndexContractTest.class")) {
+            if (input == null) {
+                throw new IOException("dependency fixture class resource is missing");
+            }
+            dependencyBytes = input.readAllBytes();
+        }
+
+        Path nested = temp.resolve("war-dependency.jar");
+        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(nested))) {
+            zip.putNextEntry(new ZipEntry("io/just/sast/analysis/entry/ApplicationEntryIndexContractTest.class"));
+            zip.write(dependencyBytes);
+            zip.closeEntry();
+        }
+        Path war = temp.resolve("application.war");
+        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(war))) {
+            zip.putNextEntry(new ZipEntry(
+                    "WEB-INF/classes/io/just/sast/frontend/asm/BytecodeFrontendTest.class"));
+            zip.write(appBytes);
+            zip.closeEntry();
+            zip.putNextEntry(new ZipEntry("WEB-INF/lib/war-dependency.jar"));
+            zip.write(Files.readAllBytes(nested));
+            zip.closeEntry();
+        }
+
+        BytecodeFrontend.ScopedLoad scoped = new BytecodeFrontend(InputBudget.defaults())
+                .loadStreamingWithApplicationScope(List.of(war), 17,
+                        InputBudget.defaults().tracker());
+
+        assertEquals(2, scoped.load().classCount());
+        assertTrue(scoped.applicationClassNames().contains(
+                "io/just/sast/frontend/asm/BytecodeFrontendTest"));
+        assertTrue(!scoped.applicationClassNames().contains(
+                "io/just/sast/analysis/entry/ApplicationEntryIndexContractTest"),
+                "embedded WEB-INF/lib classes must remain dependency-owned");
+    }
+
+    @Test
+    void scopedStreamingAcceptsUnicodeAndSpaceDirectoryPaths() throws Exception {
+        Path input = temp.resolve("目录 with spaces").resolve("app classes");
+        Path relative = Path.of("io", "just", "sast", "frontend", "asm",
+                "BytecodeFrontendTest.class");
+        Files.createDirectories(input.resolve(relative).getParent());
+        Files.write(input.resolve(relative), fixtureBytes());
+
+        BytecodeFrontend.ScopedLoad scoped = new BytecodeFrontend(InputBudget.defaults())
+                .loadStreamingWithApplicationScope(List.of(input), 17,
+                        InputBudget.defaults().tracker());
+
+        assertEquals(1, scoped.load().classCount());
+        assertTrue(scoped.load().diagnostics().isEmpty(), scoped.load().diagnostics().toString());
+        assertTrue(scoped.applicationClassNames().contains(
+                "io/just/sast/frontend/asm/BytecodeFrontendTest"));
+    }
+
     private static byte[] fixtureBytes() throws Exception {
         try (InputStream input = BytecodeFrontendTest.class.getResourceAsStream(
                 "/io/just/sast/frontend/asm/BytecodeFrontendTest.class")) {

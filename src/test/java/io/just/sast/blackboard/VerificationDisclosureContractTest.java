@@ -29,6 +29,17 @@ class VerificationDisclosureContractTest {
     }
 
     @Test
+    void staticOnlyLabelUsedByScanPipelineHasTheSameDisclosure() {
+        VerificationSummary.SafetyDisclosure disclosure =
+                VerificationSummary.empty("STATIC_ONLY", 0).safetyDisclosure();
+
+        assertEquals("STATIC_ONLY", disclosure.verificationMode());
+        assertFalse(disclosure.targetCodeExecutionPossible());
+        assertEquals("NO", disclosure.targetCodeExecuted());
+        assertTrue(disclosure.recommendedForUntrustedArtifacts());
+    }
+
+    @Test
     void autoDisclosureRequiresTrustedTargetAndPreservesIsolationUnknown() {
         VerificationSummary summary = new VerificationSummary(
                 "UNTESTABLE", 20, 1, 0, 1, Map.of("UNTESTABLE", 1), Map.of(),
