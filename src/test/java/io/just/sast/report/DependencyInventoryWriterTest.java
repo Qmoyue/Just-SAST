@@ -2,17 +2,21 @@ package io.just.sast.report;
 
 import io.just.sast.util.ArtifactFingerprint;
 import io.just.sast.run.InputBudget;
+import io.just.sast.model.DependencyGraph;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.io.ByteArrayOutputStream;
+import java.util.Map;
+import java.util.Set;
 import java.util.List;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DependencyInventoryWriterTest {
@@ -89,6 +93,67 @@ class DependencyInventoryWriterTest {
         assertTrue(csv.contains("duplicateOrdinal=2"));
         assertTrue(bom.contains("just:error-detail"));
         assertTrue(bom.contains("duplicateOrdinal=2"));
+    }
+
+    @Test
+    void buildsOneActualGraphForExplicitAndEmbeddedArtifacts(@TempDir Path tmp) throws Exception {
+        Path target = nestedLibraryArchive(tmp.resolve("app.jar"), "embedded-1.0.jar");
+        Path dependency = tmp.resolve("explicit-2.0.jar");
+        Files.write(dependency, new byte[] {9, 8, 7});
+        String targetHash = ArtifactFingerprint.sha256(target);
+        String dependencyHash = ArtifactFingerprint.sha256(dependency);
+        InputBudget budget = InputBudget.defaults();
+        DependencyGraph graph = new DependencyInventoryWriter().build(target,
+                List.of(dependency), targetHash, 17, List.of(dependencyHash), budget,
+                budget.tracker());
+
+        assertTrue(graph.nodes().values().stream().anyMatch(node ->
+                node.source() == DependencyGraph.Source.ACTUAL_APPLICATION));
+        assertTrue(graph.nodes().values().stream().anyMatch(node ->
+                node.source() == DependencyGraph.Source.ACTUAL_EMBEDDED));
+        assertTrue(graph.nodes().values().stream().anyMatch(node ->
+                node.source() == DependencyGraph.Source.ACTUAL_EXPLICIT));
+        assertTrue(graph.nodes().values().stream().anyMatch(node ->
+                node.source() == DependencyGraph.Source.JDK));
+        assertTrue(graph.edges().stream().anyMatch(edge -> "embedded".equals(edge.kind())));
+        assertTrue(graph.nodes().values().stream().noneMatch(node ->
+                node.sourceDetail().contains(tmp.toAbsolutePath().toString())));
+        assertTrue(graph.semanticDigest().matches("[0-9a-f]{64}"));
+
+        ReportLayout layout = ReportLayout.create(tmp.resolve("graph-report"));
+        new DependencyInventoryWriter().write(layout, graph, targetHash);
+        String csv = Files.readString(layout.evidence().resolve("dependencies.csv"));
+        assertTrue(csv.contains("application"));
+        assertTrue(csv.contains("nested"));
+        assertTrue(csv.contains("direct"));
+    }
+
+    @Test
+    void keepsSameBytesInSeparateActualInputNodesForClassConflictEvidence(@TempDir Path tmp)
+            throws Exception {
+        Path target = tmp.resolve("same.jar");
+        Path dependency = tmp.resolve("same-copy.jar");
+        Files.write(target, new byte[] {4, 5, 6});
+        Files.copy(target, dependency);
+        String hash = ArtifactFingerprint.sha256(target);
+
+        DependencyGraph graph = new DependencyInventoryWriter().build(target, List.of(dependency),
+                hash, 17, List.of(hash), InputBudget.defaults(), InputBudget.defaults().tracker());
+
+        List<DependencyGraph.Node> actual = graph.nodes().values().stream()
+                .filter(node -> node.source() == DependencyGraph.Source.ACTUAL_APPLICATION
+                        || node.source() == DependencyGraph.Source.ACTUAL_EXPLICIT)
+                .toList();
+        assertEquals(2, actual.size());
+        assertEquals(Set.of(0, 1), actual.stream()
+                .map(DependencyGraph.Node::inputIndex).collect(java.util.stream.Collectors.toSet()));
+        assertEquals(2, actual.stream().map(DependencyGraph.Node::ref).distinct().count());
+
+        DependencyGraph bound = graph.bindClassOwners(Map.of("app/Entry", 0),
+                Map.of("app/Entry", List.of(1)), Set.of("app/Entry"));
+        assertEquals(DependencyGraph.Resolution.CONFLICT,
+                bound.classOwner("app/Entry").orElseThrow().resolution());
+        assertTrue(bound.applicationOwned("app/Entry"));
     }
 
     /** Create two distinct equal-length entries, then rewrite the second name in local and

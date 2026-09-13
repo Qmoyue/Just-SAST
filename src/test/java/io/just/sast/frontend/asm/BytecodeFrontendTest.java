@@ -249,6 +249,27 @@ class BytecodeFrontendTest {
     }
 
     @Test
+    void scopedStreamingCapturesDirectArtifactIndexesAndConflicts() throws Exception {
+        Path application = temp.resolve("application-conflict");
+        Path dependency = temp.resolve("dependency-conflict");
+        Path relative = Path.of("io", "just", "sast", "frontend", "asm",
+                "BytecodeFrontendTest.class");
+        Files.createDirectories(application.resolve(relative).getParent());
+        Files.createDirectories(dependency.resolve(relative).getParent());
+        Files.write(application.resolve(relative), fixtureBytes());
+        Files.write(dependency.resolve(relative), fixtureBytes());
+
+        BytecodeFrontend.ScopedLoad scoped = new BytecodeFrontend(InputBudget.defaults())
+                .loadStreamingWithApplicationScope(List.of(application, dependency), 17,
+                        InputBudget.defaults().tracker());
+        String className = "io/just/sast/frontend/asm/BytecodeFrontendTest";
+
+        assertEquals(0, scoped.classArtifactIndexes().get(className));
+        assertEquals(List.of(1), scoped.duplicateArtifactIndexes().get(className));
+        assertTrue(scoped.applicationClassNames().contains(className));
+    }
+
+    @Test
     void scopedStreamingExcludesEmbeddedFatJarLibrariesFromApplicationOwnership() throws Exception {
         byte[] appBytes = fixtureBytes();
         byte[] dependencyBytes;
@@ -286,6 +307,8 @@ class BytecodeFrontendTest {
         assertTrue(!scoped.applicationClassNames().contains(
                 "io/just/sast/analysis/entry/ApplicationEntryIndexContractTest"),
                 "embedded BOOT-INF/lib classes must remain dependency-owned");
+        assertEquals(List.of("nested:BOOT-INF/lib/dependency.jar"), scoped.artifactDetails().get(
+                "io/just/sast/analysis/entry/ApplicationEntryIndexContractTest"));
     }
 
     @Test

@@ -349,11 +349,46 @@ public final class ScanPipeline {
         }
         phaseMs.put("frontend", elapsedMs(frontendStart));
 
+        // Freeze actual artifact/dependency relationships once, before CPG construction. The
+        // same graph is carried by the immutable universe and later serialized by the report
+        // boundary; inventory generation must not reopen paths and invent a second identity.
+        long dependencyResolutionStart = System.nanoTime();
+        List<ArtifactProvenance> artifactInputs = artifactProvenance(target, scanDeps,
+                targetArtifactHash, dependencyHashes, jdkSource, targetFeature);
+        io.just.sast.model.DependencyGraph dependencyGraph = new io.just.sast.report.DependencyInventoryWriter()
+                .build(target, scanDeps, targetArtifactHash, load.targetMajorVersion(),
+                        dependencyHashes, artifactInputs, inputBudget, inputTracker);
+        Map<String, Integer> applicationIndexes = new java.util.LinkedHashMap<>();
+        Map<String, List<Integer>> applicationDuplicates = new java.util.LinkedHashMap<>();
+        java.util.Set<String> graphApplicationClassNames = new LinkedHashSet<>(load.classes().keySet());
+        graphApplicationClassNames.retainAll(scopedApplication.applicationClassNames());
+        for (String className : graphApplicationClassNames) {
+            Integer index = scopedApplication.classArtifactIndexes().get(className);
+            if (index != null) {
+                applicationIndexes.put(className, index);
+                List<Integer> duplicates = scopedApplication.duplicateArtifactIndexes()
+                        .get(className);
+                if (duplicates != null && !duplicates.isEmpty()) {
+                    applicationDuplicates.put(className, duplicates);
+                }
+            }
+        }
+        dependencyGraph = dependencyGraph.bindClassOwners(applicationIndexes,
+                applicationDuplicates, scopedApplication.artifactDetails(),
+                graphApplicationClassNames);
+        phaseMs.put("dependency_resolution", elapsedMs(dependencyResolutionStart));
+
         // Freeze the frontend product at the phase boundary.  Downstream owners consume only
         // the immutable model; raw ASM/class bytes never cross into CPG or knowledge code.
-        ProgramUniverse universe = ProgramUniverse.of(load,
-                artifactProvenance(target, scanDeps, targetArtifactHash, dependencyHashes,
-                        jdkSource, targetFeature));
+        Map<String, ArtifactProvenance> applicationArtifacts = new java.util.LinkedHashMap<>();
+        if (!artifactInputs.isEmpty()) {
+            ArtifactProvenance application = artifactInputs.get(0);
+            for (String className : graphApplicationClassNames) {
+                applicationArtifacts.put(className, application);
+            }
+        }
+        ProgramUniverse universe = ProgramUniverse.of(load, applicationArtifacts,
+                artifactInputs, dependencyGraph);
 
         long cpgStart = System.nanoTime();
         ClassHierarchy hierarchy = new ClassHierarchy(universe.classes(), jdkSource);
@@ -501,9 +536,8 @@ public final class ScanPipeline {
                 reportCalibrations, reportNotes, reportVerification);
         phaseMs.put("report.payload", elapsedMs(payloadReportStart));
         long inventoryStart = System.nanoTime();
-        String dependencyInventoryHash = new io.just.sast.report.DependencyInventoryWriter().write(reportLayout, target,
-                scanDeps, targetArtifactHash, load.targetMajorVersion(), dependencyHashes, inputBudget,
-                inputTracker);
+        String dependencyInventoryHash = new io.just.sast.report.DependencyInventoryWriter()
+                .write(reportLayout, dependencyGraph, targetArtifactHash);
         phaseMs.put("report.inventory", elapsedMs(inventoryStart));
         new io.just.sast.report.ScanIdentityWriter().write(reportLayout, targetArtifactHash,
                 dependencyIdentity, dependencyInventoryHash, rules, jdkHome,

@@ -127,6 +127,29 @@ class ProgramUniverseContractTest {
     }
 
     @Test
+    void dependencyGraphIsCarriedAcrossTheImmutableFrontendBoundary() {
+        MethodInfo method = new MethodInfo("app/Entry", "run", "()V", 0,
+                List.of(new InsnFact(0, Op.RETURN, List.of())), List.of(), false);
+        ClassInfo entry = new ClassInfo("app/Entry", "java/lang/Object", List.of(), 0,
+                List.of(method), List.of());
+        LoadResult load = new LoadResult(Map.of(entry.internalName(), entry), List.of(), 1, 61);
+        ArtifactProvenance application = new ArtifactProvenance("app.jar",
+                ArtifactProvenance.Role.APPLICATION, "b".repeat(64), 10L);
+        DependencyGraph.Node node = new DependencyGraph.Node("sha256:app", application,
+                DependencyGraph.Source.ACTUAL_APPLICATION,
+                DependencyGraph.Deployment.ACTUAL_DISTRIBUTION, "example", "app", "1.0.0",
+                "jar", "", "target", "", "", "", 0);
+        DependencyGraph graph = new DependencyGraph(List.of(node), List.of(), Map.of());
+
+        ProgramUniverse universe = ProgramUniverse.of(load,
+                Map.of("app/Entry", application), List.of(application), graph);
+
+        assertEquals(graph, universe.dependencyGraph());
+        assertEquals(graph.semanticDigest(), universe.dependencyGraph().semanticDigest());
+        assertTrue(universe.semanticDigest().matches("[0-9a-f]{64}"));
+    }
+
+    @Test
     void provenanceUsesCallerTrackerAcrossArtifacts(@TempDir Path temp) throws Exception {
         Path first = temp.resolve("first.jar");
         Path second = temp.resolve("second.jar");

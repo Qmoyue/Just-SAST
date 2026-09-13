@@ -26,6 +26,7 @@ public final class ProgramUniverse {
     private final Map<String, ClassInfo> classes;
     private final Map<String, ArtifactProvenance> classArtifacts;
     private final List<ArtifactProvenance> artifacts;
+    private final DependencyGraph dependencyGraph;
     private final List<ParseDiagnostic> diagnostics;
     private final List<String> completenessReasons;
     private final int filesScanned;
@@ -35,6 +36,7 @@ public final class ProgramUniverse {
     private ProgramUniverse(Map<String, ClassInfo> classes,
                             Map<String, ArtifactProvenance> classArtifacts,
                             List<ArtifactProvenance> artifacts,
+                            DependencyGraph dependencyGraph,
                             List<ParseDiagnostic> diagnostics,
                             List<String> completenessReasons,
                             int filesScanned,
@@ -67,6 +69,7 @@ public final class ProgramUniverse {
         }
         this.classArtifacts = Collections.unmodifiableMap(artifactCopy);
         this.artifacts = immutableDistinctArtifacts(artifacts);
+        this.dependencyGraph = Objects.requireNonNull(dependencyGraph, "dependency graph");
         this.diagnostics = diagnostics == null ? List.of() : List.copyOf(diagnostics);
         this.completenessReasons = completenessReasons == null ? List.of() : List.copyOf(completenessReasons);
         this.filesScanned = filesScanned;
@@ -76,15 +79,17 @@ public final class ProgramUniverse {
 
     public static ProgramUniverse from(LoadResult load) {
         Objects.requireNonNull(load, "load");
-        return new ProgramUniverse(load.classes(), Map.of(), List.of(), load.diagnostics(),
-                load.completenessReasons(), load.filesScanned(), load.targetMajorVersion());
+        return new ProgramUniverse(load.classes(), Map.of(), List.of(), DependencyGraph.empty(),
+                load.diagnostics(), load.completenessReasons(), load.filesScanned(),
+                load.targetMajorVersion());
     }
 
     /** Build a universe with explicit artifact metadata without reparsing classes. */
     public static ProgramUniverse of(LoadResult load, List<ArtifactProvenance> artifacts) {
         Objects.requireNonNull(load, "load");
-        return new ProgramUniverse(load.classes(), Map.of(), artifacts, load.diagnostics(),
-                load.completenessReasons(), load.filesScanned(), load.targetMajorVersion());
+        return new ProgramUniverse(load.classes(), Map.of(), artifacts, DependencyGraph.empty(),
+                load.diagnostics(), load.completenessReasons(), load.filesScanned(),
+                load.targetMajorVersion());
     }
 
     /** Build a universe with explicit class-to-artifact ownership. */
@@ -92,8 +97,20 @@ public final class ProgramUniverse {
                                      Map<String, ArtifactProvenance> classArtifacts,
                                      List<ArtifactProvenance> artifacts) {
         Objects.requireNonNull(load, "load");
-        return new ProgramUniverse(load.classes(), classArtifacts, artifacts, load.diagnostics(),
-                load.completenessReasons(), load.filesScanned(), load.targetMajorVersion());
+        return new ProgramUniverse(load.classes(), classArtifacts, artifacts,
+                DependencyGraph.empty(), load.diagnostics(), load.completenessReasons(),
+                load.filesScanned(), load.targetMajorVersion());
+    }
+
+    /** Build a universe with the single input/dependency graph owned by input preparation. */
+    public static ProgramUniverse of(LoadResult load,
+                                     Map<String, ArtifactProvenance> classArtifacts,
+                                     List<ArtifactProvenance> artifacts,
+                                     DependencyGraph dependencyGraph) {
+        Objects.requireNonNull(load, "load");
+        return new ProgramUniverse(load.classes(), classArtifacts, artifacts, dependencyGraph,
+                load.diagnostics(), load.completenessReasons(), load.filesScanned(),
+                load.targetMajorVersion());
     }
 
     public Map<String, ClassInfo> classes() {
@@ -106,6 +123,10 @@ public final class ProgramUniverse {
 
     public Map<String, ArtifactProvenance> classArtifacts() {
         return classArtifacts;
+    }
+
+    public DependencyGraph dependencyGraph() {
+        return dependencyGraph;
     }
 
     public List<ParseDiagnostic> diagnostics() {
@@ -252,6 +273,7 @@ public final class ProgramUniverse {
                     .sorted(Map.Entry.comparingByKey())
                     .forEach(entry -> update(digest, "class-artifact="
                             + TypeId.of(entry.getKey()).canonical() + '=' + entry.getValue().identity()));
+            update(digest, "dependency-graph=" + dependencyGraph.semanticDigest());
             return hex(digest.digest());
         } catch (NoSuchAlgorithmException impossible) {
             throw new AssertionError(impossible);

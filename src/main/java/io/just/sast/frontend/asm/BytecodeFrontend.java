@@ -115,11 +115,55 @@ public final class BytecodeFrontend {
      * dependency and JDK classes are never inferred to be application-owned by position in the
      * final merged class map.
      */
-    public record ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames) {
+    public record ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames,
+                             Map<String, Integer> classArtifactIndexes,
+                             Map<String, List<Integer>> duplicateArtifactIndexes,
+                             Map<String, List<String>> artifactDetails) {
         public ScopedLoad {
             load = load == null ? new LoadResult(Map.of(), List.of(), 0, 0) : load;
             applicationClassNames = applicationClassNames == null ? java.util.Set.of()
                     : java.util.Set.copyOf(applicationClassNames);
+            classArtifactIndexes = classArtifactIndexes == null ? Map.of()
+                    : Map.copyOf(classArtifactIndexes);
+            if (classArtifactIndexes.values().stream().anyMatch(index -> index == null || index < 0)) {
+                throw new IllegalArgumentException("class artifact indexes must be non-negative");
+            }
+            Map<String, List<Integer>> duplicateCopy = new LinkedHashMap<>();
+            if (duplicateArtifactIndexes != null) {
+                for (Map.Entry<String, List<Integer>> entry : duplicateArtifactIndexes.entrySet()) {
+                    if (entry.getKey() == null || entry.getValue() == null
+                            || entry.getValue().stream().anyMatch(index -> index == null || index < 0)) {
+                        throw new IllegalArgumentException("duplicate artifact indexes are invalid");
+                    }
+                    duplicateCopy.put(entry.getKey(), List.copyOf(entry.getValue()));
+                }
+            }
+            duplicateArtifactIndexes = Map.copyOf(duplicateCopy);
+            Map<String, List<String>> detailCopy = new LinkedHashMap<>();
+            if (artifactDetails != null) {
+                for (Map.Entry<String, List<String>> entry : artifactDetails.entrySet()) {
+                    if (entry.getKey() == null || entry.getValue() == null
+                            || entry.getValue().stream().anyMatch(value -> value == null
+                            || value.isBlank())) {
+                        throw new IllegalArgumentException("artifact details are invalid");
+                    }
+                    detailCopy.put(entry.getKey(), List.copyOf(entry.getValue()));
+                }
+            }
+            artifactDetails = Map.copyOf(detailCopy);
+        }
+
+        /** Compatibility constructor for callers interested only in application scope. */
+        public ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames) {
+            this(load, applicationClassNames, Map.of(), Map.of(), Map.of());
+        }
+
+        /** Compatibility constructor for callers that do not consume embedded provenance. */
+        public ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames,
+                          Map<String, Integer> classArtifactIndexes,
+                          Map<String, List<Integer>> duplicateArtifactIndexes) {
+            this(load, applicationClassNames, classArtifactIndexes, duplicateArtifactIndexes,
+                    Map.of());
         }
     }
 
@@ -428,6 +472,9 @@ public final class BytecodeFrontend {
         private final List<ParseDiagnostic> diagnostics = new ArrayList<>();
         private final LinkedHashSet<String> completenessReasons = new LinkedHashSet<>();
         private final LinkedHashSet<String> applicationClassNames = new LinkedHashSet<>();
+        private final Map<String, Integer> classArtifactIndexes = new LinkedHashMap<>();
+        private final Map<String, List<Integer>> duplicateArtifactIndexes = new LinkedHashMap<>();
+        private final Map<String, List<String>> artifactDetails = new LinkedHashMap<>();
         private final List<ClassBytes> batch = new ArrayList<>(STREAM_BATCH_SIZE);
         private int filesScanned;
         private int maxMajor;
@@ -471,8 +518,17 @@ public final class BytecodeFrontend {
                         && isApplicationArtifactClass(batch.get(i))) {
                     applicationClassNames.add(parsed.className());
                 }
+                String artifactDetail = embeddedArtifactDetail(batch.get(i).origin());
                 if (classes.putIfAbsent(parsed.className(), parsed.info()) != null) {
                     completenessReasons.add("DUPLICATE_CLASS:" + parsed.className());
+                    duplicateArtifactIndexes.computeIfAbsent(parsed.className(), ignored ->
+                            new ArrayList<>()).add(artifactIndex);
+                } else {
+                    classArtifactIndexes.put(parsed.className(), artifactIndex);
+                }
+                if (artifactDetail != null) {
+                    artifactDetails.computeIfAbsent(parsed.className(), ignored ->
+                            new ArrayList<>()).add(artifactDetail);
                 }
                 maxMajor = Math.max(maxMajor, parsed.majorVersion());
             }
@@ -485,7 +541,8 @@ public final class BytecodeFrontend {
         }
 
         private ScopedLoad scopedResult() {
-            return new ScopedLoad(result(), applicationClassNames);
+            return new ScopedLoad(result(), applicationClassNames, classArtifactIndexes,
+                    duplicateArtifactIndexes, artifactDetails);
         }
     }
 
@@ -498,6 +555,25 @@ public final class BytecodeFrontend {
         // BOOT-INF/lib or WEB-INF/lib belongs to an embedded dependency, never to the
         // application execution scope, even though it was read from the first target file.
         return !origin.contains("!boot-inf/lib/") && !origin.contains("!web-inf/lib/");
+    }
+
+    /** Convert an embedded class origin into the same path-free logical detail used by reports. */
+    private static String embeddedArtifactDetail(String origin) {
+        if (origin == null || origin.isBlank()) {
+            return null;
+        }
+        String normalized = origin.replace('\\', '/');
+        for (String marker : List.of("!BOOT-INF/lib/", "!WEB-INF/lib/")) {
+            int start = normalized.indexOf(marker);
+            if (start >= 0) {
+                int nameStart = start + 1;
+                int end = normalized.indexOf('!', nameStart);
+                String name = end < 0 ? normalized.substring(nameStart)
+                        : normalized.substring(nameStart, end);
+                return "nested:" + name;
+            }
+        }
+        return null;
     }
 
     /**

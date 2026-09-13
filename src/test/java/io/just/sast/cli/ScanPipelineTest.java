@@ -907,8 +907,14 @@ class ScanPipelineTest {
         String metadata = Files.readString(output.resolve("meta").resolve("scan-metadata.json"));
         assertTrue(metadata.contains("\"completeness\"")
                         && metadata.contains("\"verification\":\"")
-                        && metadata.contains("\"phase_ms\""),
+                        && metadata.contains("\"phase_ms\"")
+                        && metadata.contains("dependency_resolution"),
                 "扫描元数据必须公开完整性、验证模式和阶段耗时：\n" + metadata);
+        String dependencies = Files.readString(output.resolve("evidence")
+                .resolve("dependencies.csv"));
+        assertTrue(dependencies.contains("application")
+                        && Files.exists(output.resolve("meta").resolve("dependencies.sbom.json")),
+                "依赖报告必须来自扫描阶段冻结的实际制品图：\n" + dependencies);
         assertTrue(Files.exists(output.resolve("index.md"))
                         && Files.exists(output.resolve("findings").resolve("findings.md"))
                         && Files.exists(output.resolve("verification").resolve("payload.json"))
