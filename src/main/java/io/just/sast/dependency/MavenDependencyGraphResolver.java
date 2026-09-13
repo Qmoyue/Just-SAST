@@ -275,14 +275,15 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         }
     }
 
-    /** Resolution plus validated bytes and network-only timing for one request. */
+    /** Resolution plus validated bytes and separate resolution/network timing for one request. */
     public record Completion(Resolution resolution, List<ArtifactDownload> artifacts,
-                             long networkDownloadWallMs, long networkRequestMs,
-                             long transferredBytes) {
+                             long resolutionWallMs, long networkDownloadWallMs,
+                             long networkRequestMs, long transferredBytes) {
         public Completion {
             resolution = Objects.requireNonNull(resolution, "completion resolution");
             artifacts = artifacts == null ? List.of() : List.copyOf(artifacts);
-            if (networkDownloadWallMs < 0L || networkRequestMs < 0L || transferredBytes < 0L) {
+            if (resolutionWallMs < 0L || networkDownloadWallMs < 0L
+                    || networkRequestMs < 0L || transferredBytes < 0L) {
                 throw new IllegalArgumentException("completion metrics must be non-negative");
             }
         }
@@ -393,6 +394,7 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
     public Completion complete(Request request, Cancellation cancellation) throws IOException {
         Objects.requireNonNull(request, "request");
         Cancellation stop = Objects.requireNonNull(cancellation, "cancellation");
+        long resolutionStartedNanos = System.nanoTime();
         checkCancelled(stop);
         TransferStats transferStats = new TransferStats(stop);
         Resolution initial = resolve(request, stop, transferStats);
@@ -418,8 +420,9 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         Status status = completionStatus(initial, immutableProblems);
         Resolution completed = new Resolution(initial.effectivePom(), initial.graph(),
                 immutableProblems, status, initial.offline(), initial.repositoryIds());
-        TransferStats.Snapshot metrics = transferStats.snapshot();
-        return new Completion(completed, artifacts, metrics.networkWallMs(),
+        NetworkTiming.Snapshot metrics = transferStats.snapshot();
+        return new Completion(completed, artifacts, elapsedMs(resolutionStartedNanos),
+                metrics.networkWallMs(),
                 metrics.requestMs(), metrics.transferredBytes());
     }
 
@@ -1353,15 +1356,84 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         return value.toLowerCase(Locale.ROOT);
     }
 
-    private static final class TransferStats implements TransferListener {
-        private final Cancellation cancellation;
+    /**
+     * Overlap-aware timing owner for network transfers.  Request duration is additive per
+     * transfer, while wall time is the union of active intervals; this keeps parallel downloads
+     * from being charged twice to the network wall-clock metric.
+     */
+    static final class NetworkTiming {
         private final Map<String, ActiveTransfer> active = new LinkedHashMap<>();
         private final Map<String, Long> lastTransferred = new LinkedHashMap<>();
-        private final Map<String, String> failures = new LinkedHashMap<>();
         private long networkStartedNanos = -1L;
         private long networkWallNanos;
         private long requestNanos;
         private long transferredBytes;
+
+        synchronized void begin(String key) {
+            Objects.requireNonNull(key, "transfer key");
+            if (active.containsKey(key)) {
+                return;
+            }
+            if (active.isEmpty()) {
+                networkStartedNanos = System.nanoTime();
+            }
+            active.put(key, new ActiveTransfer(System.nanoTime()));
+            lastTransferred.put(key, 0L);
+        }
+
+        synchronized void record(String key, long cumulativeBytes, long dataLength) {
+            Objects.requireNonNull(key, "transfer key");
+            if (!active.containsKey(key)) {
+                begin(key);
+            }
+            long previous = lastTransferred.getOrDefault(key, 0L);
+            long delta = cumulativeBytes > previous ? cumulativeBytes - previous : dataLength;
+            if (delta > 0L) {
+                transferredBytes += delta;
+            }
+            if (cumulativeBytes >= previous) {
+                lastTransferred.put(key, cumulativeBytes);
+            }
+        }
+
+        synchronized void finish(String key, long cumulativeBytes, long dataLength) {
+            Objects.requireNonNull(key, "transfer key");
+            if (!active.containsKey(key)) {
+                return;
+            }
+            record(key, cumulativeBytes, dataLength);
+            ActiveTransfer transfer = active.remove(key);
+            lastTransferred.remove(key);
+            requestNanos += Math.max(0L, System.nanoTime() - transfer.startedNanos());
+            if (active.isEmpty() && networkStartedNanos >= 0L) {
+                networkWallNanos += Math.max(0L, System.nanoTime() - networkStartedNanos);
+                networkStartedNanos = -1L;
+            }
+        }
+
+        synchronized Snapshot snapshot() {
+            long wall = networkWallNanos;
+            if (!active.isEmpty() && networkStartedNanos >= 0L) {
+                wall += Math.max(0L, System.nanoTime() - networkStartedNanos);
+            }
+            return new Snapshot(toMillis(wall), toMillis(requestNanos), transferredBytes);
+        }
+
+        private static long toMillis(long nanos) {
+            return Math.max(0L, nanos / 1_000_000L);
+        }
+
+        private record ActiveTransfer(long startedNanos) {
+        }
+
+        record Snapshot(long networkWallMs, long requestMs, long transferredBytes) {
+        }
+    }
+
+    private static final class TransferStats implements TransferListener {
+        private final Cancellation cancellation;
+        private final Map<String, String> failures = new LinkedHashMap<>();
+        private final NetworkTiming timing = new NetworkTiming();
 
         private TransferStats(Cancellation cancellation) {
             this.cancellation = Objects.requireNonNull(cancellation, "cancellation");
@@ -1439,14 +1511,7 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
             if (!network(event)) {
                 return;
             }
-            String key = key(event);
-            if (!active.containsKey(key)) {
-                if (active.isEmpty()) {
-                    networkStartedNanos = System.nanoTime();
-                }
-                active.put(key, new ActiveTransfer(System.nanoTime()));
-                lastTransferred.put(key, 0L);
-            }
+            timing.begin(key(event));
         }
 
         private void record(TransferEvent event) {
@@ -1454,18 +1519,7 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
                 return;
             }
             String key = key(event);
-            if (!active.containsKey(key)) {
-                begin(event);
-            }
-            long cumulative = event.getTransferredBytes();
-            long previous = lastTransferred.getOrDefault(key, 0L);
-            long delta = cumulative > previous ? cumulative - previous : event.getDataLength();
-            if (delta > 0L) {
-                transferredBytes += delta;
-            }
-            if (cumulative >= previous) {
-                lastTransferred.put(key, cumulative);
-            }
+            timing.record(key, event.getTransferredBytes(), event.getDataLength());
         }
 
         private void finish(TransferEvent event) {
@@ -1473,16 +1527,7 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
                 return;
             }
             String key = key(event);
-            record(event);
-            ActiveTransfer transfer = active.remove(key);
-            lastTransferred.remove(key);
-            if (transfer != null) {
-                requestNanos += Math.max(0L, System.nanoTime() - transfer.startedNanos());
-            }
-            if (active.isEmpty() && networkStartedNanos >= 0L) {
-                networkWallNanos += Math.max(0L, System.nanoTime() - networkStartedNanos);
-                networkStartedNanos = -1L;
-            }
+            timing.finish(key, event.getTransferredBytes(), event.getDataLength());
         }
 
         private static boolean network(TransferEvent event) {
@@ -1503,22 +1548,8 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
             return resource.getRepositoryId() + '|' + resource.getResourceName() + '|' + file;
         }
 
-        private synchronized Snapshot snapshot() {
-            long wall = networkWallNanos;
-            if (!active.isEmpty() && networkStartedNanos >= 0L) {
-                wall += Math.max(0L, System.nanoTime() - networkStartedNanos);
-            }
-            return new Snapshot(toMillis(wall), toMillis(requestNanos), transferredBytes);
-        }
-
-        private static long toMillis(long nanos) {
-            return Math.max(0L, nanos / 1_000_000L);
-        }
-
-        private record ActiveTransfer(long startedNanos) {
-        }
-
-        private record Snapshot(long networkWallMs, long requestMs, long transferredBytes) {
+        private NetworkTiming.Snapshot snapshot() {
+            return timing.snapshot();
         }
     }
 
@@ -1530,6 +1561,10 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         } catch (java.security.NoSuchAlgorithmException impossible) {
             throw new AssertionError(impossible);
         }
+    }
+
+    private static long elapsedMs(long startedNanos) {
+        return Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
     }
 
     private static String text(String value, String field) {

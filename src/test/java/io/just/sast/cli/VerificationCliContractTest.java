@@ -117,20 +117,41 @@ class VerificationCliContractTest {
         writeJar(target);
         Path output = temp.resolve("output");
 
-        int code = new CommandLine(new JustMain()).execute(
-                "scan", "--jar", target.toString(), "--pom", root.toString(),
-                "--repository", repository.toUri().toString(), "--offline",
-                "--fast", "--no-verify", "--cache", temp.resolve("maven-cache").toString(),
-                "--output", output.toString());
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int code;
+        try {
+            System.setErr(new PrintStream(captured, true, StandardCharsets.UTF_8));
+            code = new CommandLine(new JustMain()).execute(
+                    "scan", "--jar", target.toString(), "--pom", root.toString(),
+                    "--repository", repository.toUri().toString(), "--offline",
+                    "--fast", "--no-verify", "--cache", temp.resolve("maven-cache").toString(),
+                    "--output", output.toString());
+        } finally {
+            System.setErr(original);
+        }
 
         assertEquals(0, code);
+        String log = captured.toString(StandardCharsets.UTF_8);
+        assertTrue(log.contains("dependencyCompletion=COMPLETE")
+                        && log.contains("resolutionWallMs=")
+                        && log.contains("scanTiming=dependencyResolutionMs="), log);
         assertTrue(Files.isDirectory(output));
         String inventory = Files.readString(output.resolve("evidence/dependencies.csv"));
         String bom = Files.readString(output.resolve("meta/dependencies.sbom.json"));
+        String metadata = Files.readString(output.resolve("meta/scan-metadata.json"));
+        String index = Files.readString(output.resolve("index.md"));
         assertTrue(inventory.contains("derived"));
         assertTrue(inventory.contains("maven:repository=repository-1"), inventory);
         assertTrue(inventory.contains("DECLARED_ENVIRONMENT"), inventory);
         assertTrue(bom.contains("MAVEN_POM_RESOLVED"), bom);
+        assertTrue(metadata.contains("\"dependency_resolution_ms\"")
+                        && metadata.contains("\"network_download_wall_ms\"")
+                        && metadata.contains("\"analysis_ms\"")
+                        && metadata.contains("\"report_ms\"")
+                        && metadata.contains("\"total_wall_ms\""), metadata);
+        assertTrue(index.contains("| Dependency resolution | ")
+                        && index.contains("| Dependency sources | "), index);
     }
 
     @Test

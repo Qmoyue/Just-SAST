@@ -49,6 +49,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /** 扫描管线编排：frontend → 层次 → CPG/调用图（构建后冻结）→ 黑板（串行三阶段）→ CSV。 */
 public final class ScanPipeline {
@@ -77,6 +78,41 @@ public final class ScanPipeline {
     public static final class UsageException extends Exception {
         public UsageException(String message) {
             super(message);
+        }
+    }
+
+    /**
+     * Typed handoff for input-preparation timing.  Dependency resolution is completed before
+     * the frontend starts; keeping its timing here prevents network work from being charged to
+     * analysis or reconstructed by a report writer.
+     */
+    public record DependencyPreparation(DependencyStatus status, int completedArtifacts,
+                                        int cacheArtifacts, int remoteArtifacts,
+                                        long resolutionWallMs, long networkDownloadWallMs,
+                                        long networkRequestMs, long transferredBytes) {
+        public enum DependencyStatus {
+            NOT_PROVIDED, COMPLETE, PARTIAL, UNRESOLVED
+        }
+
+        public DependencyPreparation {
+            status = Objects.requireNonNull(status, "dependency preparation status");
+            if (completedArtifacts < 0 || cacheArtifacts < 0 || remoteArtifacts < 0
+                    || (long) cacheArtifacts + remoteArtifacts != completedArtifacts) {
+                throw new IllegalArgumentException("dependency artifact counts are invalid");
+            }
+            if (resolutionWallMs < 0L || networkDownloadWallMs < 0L
+                    || networkRequestMs < 0L || transferredBytes < 0L) {
+                throw new IllegalArgumentException("dependency timings must be non-negative");
+            }
+            if (status == DependencyStatus.NOT_PROVIDED && completedArtifacts != 0) {
+                throw new IllegalArgumentException(
+                        "missing POM cannot report completed dependency artifacts");
+            }
+        }
+
+        public static DependencyPreparation notProvided() {
+            return new DependencyPreparation(DependencyStatus.NOT_PROVIDED,
+                    0, 0, 0, 0L, 0L, 0L, 0L);
         }
     }
 
@@ -191,7 +227,8 @@ public final class ScanPipeline {
                                  ModeDemandPolicy modePolicy) throws Exception {
         return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
                 safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
-                modePolicy, null, -1, "MAVEN_POM_NOT_PROVIDED");
+                modePolicy, null, -1, "MAVEN_POM_NOT_PROVIDED",
+                DependencyPreparation.notProvided());
     }
 
     /**
@@ -207,10 +244,12 @@ public final class ScanPipeline {
                                  ModeDemandPolicy modePolicy,
                                  DependencyGraph preparedDependencyGraph,
                                  int explicitDependencyCount,
-                                 String dependencyEnvironmentIdentity) throws Exception {
+                                 String dependencyEnvironmentIdentity,
+                                 DependencyPreparation dependencyPreparation) throws Exception {
         if (modePolicy == null) {
             throw new IllegalArgumentException("mode/demand policy is required");
         }
+        Objects.requireNonNull(dependencyPreparation, "dependency preparation is required");
         long start = System.nanoTime();
         long parentCpuStarted = processCpuTimeMs();
         Map<String, Long> phaseMs = new java.util.LinkedHashMap<>();
@@ -411,7 +450,10 @@ public final class ScanPipeline {
         dependencyGraph = dependencyGraph.bindClassOwners(applicationIndexes,
                 applicationDuplicates, scopedApplication.artifactDetails(),
                 graphApplicationClassNames);
-        phaseMs.put("dependency_resolution", elapsedMs(dependencyResolutionStart));
+        phaseMs.put("dependency_graph", elapsedMs(dependencyResolutionStart));
+        // Resolver timing belongs to input preparation.  The graph assembly above is a local
+        // scan phase and must remain distinguishable from network/model work done by the CLI.
+        phaseMs.put("dependency_resolution", dependencyPreparation.resolutionWallMs());
 
         // Freeze the frontend product at the phase boundary.  Downstream owners consume only
         // the immutable model; raw ASM/class bytes never cross into CPG or knowledge code.
@@ -596,15 +638,20 @@ public final class ScanPipeline {
             }
         }
         phaseMs.put("report", elapsedMs(reportStart));
+        long pipelineWallMs = elapsedMs(start);
+        // Dependency preparation happens before this method is entered.  Add its one measured
+        // wall interval to the end-to-end total, without adding network request durations or
+        // any child interval a second time.
+        long totalWallMs = saturatedAdd(dependencyPreparation.resolutionWallMs(), pipelineWallMs);
         Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes = reportOutcomes;
         GcSnapshot gcDelta = gcSnapshot().delta(gcStarted);
         ScanMetricCapture metricCapture = scanMetricCapture(cpg, blackboard, reportChains,
                 reportNotes, reportVerification, parentCpuStarted, entryCount, phaseMs, gcDelta,
-                applicationEvidence);
+                applicationEvidence, dependencyGraph, dependencyPreparation, totalWallMs);
         ScanStatistics scanStats = new ScanStatistics(
                 load.filesScanned(), load.classCount(), load.diagnosticCount(),
                 sinkCount, entryCount, reportChains.size(),
-                elapsedMs(start),
+                totalWallMs,
                 (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1024 / 1024,
                 heapPeakMb(),
                 scanCompletenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
@@ -902,7 +949,10 @@ public final class ScanPipeline {
                                                        int entryCandidates,
                                                        Map<String, Long> phaseMs,
                                                        GcSnapshot gcDelta,
-                                                       ApplicationChainEvidence applicationEvidence) {
+                                                       ApplicationChainEvidence applicationEvidence,
+                                                       DependencyGraph dependencyGraph,
+                                                       DependencyPreparation dependencyPreparation,
+                                                       long totalWallMs) {
         ForwardRunMetrics forward = latestForwardMetrics(blackboard);
         VerificationPlan verificationPlan = latestVerificationPlan(blackboard);
         VerificationCoverage verificationCoverage = latestVerificationCoverage(blackboard);
@@ -1005,6 +1055,22 @@ public final class ScanPipeline {
                 ? -1L : gcDelta.collectionCount());
         metrics.put("gc_collection_time_ms", gcDelta == null || !gcDelta.observed()
                 ? -1L : gcDelta.collectionTimeMs());
+        metrics.put("dependency_resolution_ms", dependencyPreparation.resolutionWallMs());
+        metrics.put("network_download_wall_ms", dependencyPreparation.networkDownloadWallMs());
+        metrics.put("network_request_ms", dependencyPreparation.networkRequestMs());
+        metrics.put("dependency_transferred_bytes", dependencyPreparation.transferredBytes());
+        metrics.put("dependency_completed_artifacts",
+                (long) dependencyPreparation.completedArtifacts());
+        metrics.put("dependency_cache_artifacts", (long) dependencyPreparation.cacheArtifacts());
+        metrics.put("dependency_remote_artifacts", (long) dependencyPreparation.remoteArtifacts());
+        for (DependencyGraph.Source source : DependencyGraph.Source.values()) {
+            metrics.put("dependency_source_" + source.name().toLowerCase(java.util.Locale.ROOT),
+                    dependencySourceCount(dependencyGraph, source));
+        }
+        metrics.put("analysis_ms", phaseMs.getOrDefault("analysis", -1L));
+        metrics.put("dynamic_filter_ms", 0L);
+        metrics.put("report_ms", phaseMs.getOrDefault("report", -1L));
+        metrics.put("total_wall_ms", totalWallMs);
         addPassTelemetry(metrics, phaseMs, "frontend", "frontend", -1L);
         addPassTelemetry(metrics, phaseMs, "cpg", "cpg", cpg.index().cfgCacheHits());
         addPassTelemetry(metrics, phaseMs, "analysis", "analysis",
@@ -1047,6 +1113,23 @@ public final class ScanPipeline {
         String gcStatus = gcDelta == null || !gcDelta.observed() ? "UNKNOWN" : "OBSERVED";
         status.put("gc_collection_count", gcStatus);
         status.put("gc_collection_time_ms", gcStatus);
+        String dependencyTimingStatus = dependencyPreparation.status()
+                == DependencyPreparation.DependencyStatus.NOT_PROVIDED
+                ? "NOT_APPLICABLE" : "OBSERVED";
+        for (String name : List.of("dependency_resolution_ms", "network_download_wall_ms",
+                "network_request_ms", "dependency_transferred_bytes",
+                "dependency_completed_artifacts", "dependency_cache_artifacts",
+                "dependency_remote_artifacts")) {
+            status.put(name, dependencyTimingStatus);
+        }
+        for (DependencyGraph.Source source : DependencyGraph.Source.values()) {
+            status.put("dependency_source_" + source.name().toLowerCase(java.util.Locale.ROOT),
+                    "OBSERVED");
+        }
+        status.put("analysis_ms", phaseMs.containsKey("analysis") ? "OBSERVED" : "UNKNOWN");
+        status.put("dynamic_filter_ms", "NOT_APPLICABLE");
+        status.put("report_ms", phaseMs.containsKey("report") ? "OBSERVED" : "UNKNOWN");
+        status.put("total_wall_ms", "OBSERVED");
         for (String name : List.of("application_sites", "candidate_joins", "validated_joins",
                 "joined_dependency_segments", "complete_anchored_chains", "anchored_candidates",
                 "unresolved_bridges", "avoided_states", "materialized_states", "dag_nodes",
@@ -1157,6 +1240,11 @@ public final class ScanPipeline {
         namespaceStatus.put("application", applicationEvidence == null ? "UNKNOWN" : "OBSERVED");
         namespaceStatus.put("kernel", "NOT_REQUESTED");
         return new ScanMetricCapture(metrics, status, namespaces, namespaceStatus);
+    }
+
+    private static long dependencySourceCount(DependencyGraph graph,
+                                              DependencyGraph.Source source) {
+        return graph.nodes().values().stream().filter(node -> node.source() == source).count();
     }
 
     private static ApplicationChainEvidence latestApplicationChainEvidence(Blackboard blackboard) {

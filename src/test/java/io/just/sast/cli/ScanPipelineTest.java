@@ -908,8 +908,15 @@ class ScanPipelineTest {
         assertTrue(metadata.contains("\"completeness\"")
                         && metadata.contains("\"verification\":\"")
                         && metadata.contains("\"phase_ms\"")
-                        && metadata.contains("dependency_resolution"),
-                "扫描元数据必须公开完整性、验证模式和阶段耗时：\n" + metadata);
+                        && metadata.contains("dependency_resolution")
+                        && metadata.contains("\"dependency_resolution_ms\"")
+                        && metadata.contains("\"network_download_wall_ms\"")
+                        && metadata.contains("\"analysis_ms\"")
+                        && metadata.contains("\"dynamic_filter_ms\"")
+                        && metadata.contains("\"report_ms\"")
+                        && metadata.contains("\"total_wall_ms\"")
+                        && metadata.contains("\"metric_status\""),
+                "扫描元数据必须公开完整性、验证模式和分段耗时：\n" + metadata);
         String dependencies = Files.readString(output.resolve("evidence")
                 .resolve("dependencies.csv"));
         assertTrue(dependencies.contains("application")
@@ -922,7 +929,12 @@ class ScanPipelineTest {
                 "生产扫描必须生成根索引和分类后的阅读产物");
         String index = Files.readString(output.resolve("index.md"));
         assertTrue(index.contains("[Payload review](verification/payload.md)")
-                        && index.contains("[Dynamic verification](verification/dynamic-verification.json)"),
+                        && index.contains("[Dynamic verification](verification/dynamic-verification.json)")
+                        && index.contains("| Dependency resolution | ")
+                        && index.contains("| Network download wall | ")
+                        && index.contains("| Dynamic filter | ")
+                        && index.contains("| Total wall | ")
+                        && index.contains("| Dependency sources | "),
                 "根索引必须暴露人类/agent 两条阅读入口：\n" + index);
     }
 }

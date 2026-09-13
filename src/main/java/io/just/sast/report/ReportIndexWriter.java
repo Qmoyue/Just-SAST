@@ -1,6 +1,7 @@
 package io.just.sast.report;
 
 import io.just.sast.blackboard.VerificationSummary;
+import io.just.sast.model.DependencyGraph;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -24,6 +25,19 @@ public final class ReportIndexWriter {
                 .append("| Magic entries | ").append(stats.magicEntries()).append(" |\n")
                 .append("| Chains found | ").append(stats.chainsFound()).append(" |\n")
                 .append("| Elapsed | ").append(stats.elapsedMs()).append(" ms |\n")
+                .append("| Dependency resolution | ")
+                .append(timing(stats, "dependency_resolution_ms")).append(" |\n")
+                .append("| Network download wall | ")
+                .append(timing(stats, "network_download_wall_ms")).append(" |\n")
+                .append("| Network request duration | ")
+                .append(timing(stats, "network_request_ms")).append(" |\n")
+                .append("| Analysis | ").append(timing(stats, "analysis_ms")).append(" |\n")
+                .append("| Dynamic filter | ")
+                .append(timing(stats, "dynamic_filter_ms")).append(" |\n")
+                .append("| Report | ").append(timing(stats, "report_ms")).append(" |\n")
+                .append("| Total wall | ").append(timing(stats, "total_wall_ms")).append(" |\n")
+                .append("| Dependency sources | `")
+                .append(markdown(dependencySources(stats))).append("` |\n")
                 .append("| Heap used | ").append(stats.heapUsedMb()).append(" MB |\n")
                 .append("| Heap peak | ").append(stats.heapPeakMb()).append(" MB |\n")
                 .append("| Artifact SHA-256 | `").append(markdown(stats.artifactHash())).append("` |\n")
@@ -91,6 +105,19 @@ public final class ReportIndexWriter {
             markdown.append('\n');
         }
         AtomicFiles.writeUtf8(layout.root().resolve("index.md"), markdown.toString());
+    }
+
+    private static String timing(ScanStatistics stats, String metric) {
+        return stats.metric(metric, -1L) + " ms (" + stats.metricStatus(metric) + ")";
+    }
+
+    private static String dependencySources(ScanStatistics stats) {
+        List<String> values = new ArrayList<>();
+        for (DependencyGraph.Source source : DependencyGraph.Source.values()) {
+            String suffix = source.name().toLowerCase(java.util.Locale.ROOT);
+            values.add(suffix + "=" + stats.metric("dependency_source_" + suffix, -1L));
+        }
+        return String.join(",", values);
     }
 
     private static void appendVerificationSummary(StringBuilder markdown,

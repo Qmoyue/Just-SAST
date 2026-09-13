@@ -10,10 +10,13 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
-import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -252,6 +255,128 @@ class MavenDependencyGraphResolverTest {
         assertEquals(firstDigest, second.artifacts().get(0).sha256());
         assertEquals(downloaded.path(), second.artifacts().get(0).path());
         assertEquals(0L, second.networkDownloadWallMs());
+    }
+
+    @Test
+    void controlledHttpDelaySeparatesResolutionTimingAndCacheReuse() throws Exception {
+        Path root = temp.resolve("delayed-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>1.0</version></dependency></dependencies>"));
+        Path artifact = temp.resolve("delayed-library.jar");
+        writeJar(artifact, "fixture/delay.marker", "delayed-bytes");
+        byte[] pomBytes = pom("fixture", "library", "1.0", "")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] jarBytes = Files.readAllBytes(artifact);
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            String path = exchange.getRequestURI().getPath();
+            byte[] body;
+            boolean delayed;
+            if (path.endsWith("library-1.0.pom")) {
+                body = pomBytes;
+                delayed = false;
+            } else if (path.endsWith("library-1.0.jar")) {
+                body = jarBytes;
+                delayed = true;
+            } else {
+                exchange.sendResponseHeaders(404, -1);
+                exchange.close();
+                return;
+            }
+            exchange.sendResponseHeaders(200, body.length);
+            try (var output = exchange.getResponseBody()) {
+                if (delayed) {
+                    Thread.sleep(180L);
+                }
+                output.write(body);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        server.start();
+        try {
+            URI url = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/");
+            Path cache = temp.resolve("delayed-cache");
+            MavenDependencyGraphResolver.Request online = new MavenDependencyGraphResolver.Request(
+                    root, cache, List.of(new MavenDependencyGraphResolver.RepositorySpec(
+                            "delayed", url)), List.of(), false);
+            MavenDependencyGraphResolver.Completion first;
+            try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+                first = resolver.complete(online);
+            }
+
+            assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, first.status(),
+                    first.resolution().problems().toString());
+            assertEquals(1, first.artifacts().size());
+            assertTrue(first.resolutionWallMs() >= first.networkDownloadWallMs());
+            assertTrue(first.networkDownloadWallMs() >= 100L,
+                    "the delayed artifact must be visible in network wall time: "
+                            + first.networkDownloadWallMs());
+            assertTrue(first.networkRequestMs() >= 100L,
+                    "network request duration must include the delayed body: " + first);
+            assertTrue(first.transferredBytes() > 0L);
+            int onlineRequests = requests.get();
+
+            MavenDependencyGraphResolver.Request offline = new MavenDependencyGraphResolver.Request(
+                    root, cache, List.of(new MavenDependencyGraphResolver.RepositorySpec(
+                            "delayed", url)), List.of(), true);
+            MavenDependencyGraphResolver.Completion second;
+            try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+                second = resolver.complete(offline);
+            }
+            assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, second.status(),
+                    second.resolution().problems().toString());
+            assertEquals(DependencyGraph.Source.CACHE, second.artifacts().get(0).source());
+            assertEquals(0L, second.networkDownloadWallMs());
+            assertEquals(onlineRequests, requests.get(),
+                    "offline cache reuse must not contact the delayed HTTP repository");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void overlappingNetworkIntervalsUseUnionWallClockAndAdditiveRequestDuration()
+            throws Exception {
+        MavenDependencyGraphResolver.NetworkTiming timing =
+                new MavenDependencyGraphResolver.NetworkTiming();
+        CountDownLatch started = new CountDownLatch(2);
+        CountDownLatch release = new CountDownLatch(1);
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        Runnable work = () -> {
+            String key = Thread.currentThread().getName();
+            try {
+                timing.begin(key);
+                started.countDown();
+                if (!release.await(5L, TimeUnit.SECONDS)) {
+                    throw new AssertionError("timing release did not arrive");
+                }
+                Thread.sleep(120L);
+                timing.record(key, 1024L, 1024L);
+                timing.finish(key, 1024L, 0L);
+            } catch (Throwable failure) {
+                failures.add(failure);
+            }
+        };
+        Thread first = new Thread(work, "network-one");
+        Thread second = new Thread(work, "network-two");
+        first.start();
+        second.start();
+        boolean bothStarted = started.await(5L, TimeUnit.SECONDS);
+        release.countDown();
+        first.join(5_000L);
+        second.join(5_000L);
+
+        assertTrue(bothStarted);
+        assertFalse(first.isAlive() || second.isAlive());
+        assertTrue(failures.isEmpty(), failures.toString());
+        MavenDependencyGraphResolver.NetworkTiming.Snapshot snapshot = timing.snapshot();
+        assertTrue(snapshot.networkWallMs() > 50L, snapshot.toString());
+        assertTrue(snapshot.requestMs() > snapshot.networkWallMs(), snapshot.toString());
+        assertEquals(2048L, snapshot.transferredBytes());
     }
 
     @Test

@@ -5,6 +5,7 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import io.just.sast.dependency.MavenDependencyGraphResolver;
 import io.just.sast.model.DependencyGraph;
+import io.just.sast.report.ScanStatistics;
 import io.just.sast.report.ScanCache;
 import io.just.sast.run.RunOutcome;
 import io.just.sast.verify.VerificationDefaults;
@@ -151,7 +152,8 @@ public final class ScanCommand implements Callable<Integer> {
                     useOsIsolation,
                     baseline, suppressions, overwrite,
                     modePolicy, prepared.environmentGraph(), prepared.explicitDependencyCount(),
-                    prepared.environmentIdentity());
+                    prepared.environmentIdentity(), prepared.dependencyPreparation());
+            printScanTiming(result.stats());
             if (useCache && preflight != null) {
                 try {
                     boolean stored = ScanCache.store(cache, preflight.cacheKey(), output,
@@ -182,7 +184,7 @@ public final class ScanCommand implements Callable<Integer> {
                         "--offline/--repository 需要同时提供显式 --pom；无 POM 时 Just 不按类名猜包");
             }
             return new PreparedDependencies(resolved, explicitDependencyCount, null,
-                    "MAVEN_POM_NOT_PROVIDED");
+                    "MAVEN_POM_NOT_PROVIDED", ScanPipeline.DependencyPreparation.notProvided());
         }
 
         List<MavenDependencyGraphResolver.RepositorySpec> selectedRepositories =
@@ -231,10 +233,17 @@ public final class ScanCommand implements Callable<Integer> {
             resolved.addAll(completion.paths());
             System.err.println("[just:info] dependencyCompletion=" + completion.status()
                     + "; artifacts=" + completion.artifacts().size()
-                    + "; networkDownloadWallMs=" + completion.networkDownloadWallMs());
+                    + "; cacheArtifacts=" + completion.artifacts().stream()
+                    .filter(artifact -> artifact.source() == DependencyGraph.Source.CACHE).count()
+                    + "; remoteArtifacts=" + completion.artifacts().stream()
+                    .filter(artifact -> artifact.source() == DependencyGraph.Source.REMOTE).count()
+                    + "; resolutionWallMs=" + completion.resolutionWallMs()
+                    + "; networkDownloadWallMs=" + completion.networkDownloadWallMs()
+                    + "; networkRequestMs=" + completion.networkRequestMs()
+                    + "; transferredBytes=" + completion.transferredBytes());
             return new PreparedDependencies(resolved, explicitDependencyCount,
                     completion.environmentGraph(explicitDependencyCount + 1),
-                    completion.semanticIdentity());
+                    completion.semanticIdentity(), dependencyPreparation(completion));
         } catch (IOException failure) {
             throw new ScanPipeline.UsageException("Maven 依赖补齐失败: " + failure.getMessage());
         }
@@ -266,10 +275,49 @@ public final class ScanCommand implements Callable<Integer> {
                 + "dynamicFiltering=ANALYSIS_ONLY; recommendedForUntrustedArtifacts=true");
     }
 
+    private static ScanPipeline.DependencyPreparation dependencyPreparation(
+            MavenDependencyGraphResolver.Completion completion) {
+        int cacheArtifacts = Math.toIntExact(completion.artifacts().stream()
+                .filter(artifact -> artifact.source() == DependencyGraph.Source.CACHE).count());
+        int remoteArtifacts = Math.toIntExact(completion.artifacts().stream()
+                .filter(artifact -> artifact.source() == DependencyGraph.Source.REMOTE).count());
+        return new ScanPipeline.DependencyPreparation(
+                ScanPipeline.DependencyPreparation.DependencyStatus.valueOf(
+                        completion.status().name()),
+                completion.artifacts().size(), cacheArtifacts, remoteArtifacts,
+                completion.resolutionWallMs(), completion.networkDownloadWallMs(),
+                completion.networkRequestMs(), completion.transferredBytes());
+    }
+
+    private static void printScanTiming(ScanStatistics stats) {
+        System.err.println("[just:info] scanTiming="
+                + "dependencyResolutionMs=" + stats.metric("dependency_resolution_ms", -1L)
+                + "; networkDownloadWallMs=" + stats.metric("network_download_wall_ms", -1L)
+                + "; networkRequestMs=" + stats.metric("network_request_ms", -1L)
+                + "; analysisMs=" + stats.metric("analysis_ms", -1L)
+                + "; dynamicFilterMs=" + stats.metric("dynamic_filter_ms", -1L)
+                + "; reportMs=" + stats.metric("report_ms", -1L)
+                + "; totalWallMs=" + stats.metric("total_wall_ms", -1L)
+                + "; timingStatus=" + stats.metricStatus("total_wall_ms")
+                + "; dependencySources=" + dependencySources(stats));
+    }
+
+    private static String dependencySources(ScanStatistics stats) {
+        List<String> values = new ArrayList<>();
+        for (DependencyGraph.Source source : DependencyGraph.Source.values()) {
+            String key = "dependency_source_"
+                    + source.name().toLowerCase(java.util.Locale.ROOT);
+            values.add(source.name().toLowerCase(java.util.Locale.ROOT)
+                    + "=" + stats.metric(key, -1L));
+        }
+        return String.join(",", values);
+    }
+
     /** Explicit handoff from input preparation to the frontend/cache pipeline. */
     private record PreparedDependencies(List<Path> paths, int explicitDependencyCount,
                                         DependencyGraph environmentGraph,
-                                        String environmentIdentity) {
+                                        String environmentIdentity,
+                                        ScanPipeline.DependencyPreparation dependencyPreparation) {
         private PreparedDependencies {
             paths = paths == null ? List.of() : List.copyOf(paths);
             if (explicitDependencyCount < 0 || explicitDependencyCount > paths.size()) {
@@ -277,6 +325,8 @@ public final class ScanCommand implements Callable<Integer> {
             }
             environmentIdentity = environmentIdentity == null || environmentIdentity.isBlank()
                     ? "MAVEN_POM_NOT_PROVIDED" : environmentIdentity;
+            dependencyPreparation = java.util.Objects.requireNonNull(dependencyPreparation,
+                    "dependency preparation");
         }
     }
 }

@@ -85,6 +85,56 @@ class MultiFormatReporterTest {
     }
 
     @Test
+    void metadataAndIndexExposeOneTimingAndDependencySourceSnapshot(@TempDir Path temp)
+            throws Exception {
+        Map<String, Long> metrics = Map.ofEntries(
+                Map.entry("dependency_resolution_ms", 8L),
+                Map.entry("network_download_wall_ms", 12L),
+                Map.entry("network_request_ms", 15L),
+                Map.entry("analysis_ms", 21L),
+                Map.entry("dynamic_filter_ms", 0L),
+                Map.entry("report_ms", 5L),
+                Map.entry("total_wall_ms", 49L),
+                Map.entry("dependency_source_actual_application", 1L),
+                Map.entry("dependency_source_actual_embedded", 2L),
+                Map.entry("dependency_source_actual_explicit", 3L),
+                Map.entry("dependency_source_pom_derived", 4L),
+                Map.entry("dependency_source_cache", 5L),
+                Map.entry("dependency_source_remote", 6L),
+                Map.entry("dependency_source_jdk", 7L));
+        Map<String, String> statuses = Map.ofEntries(
+                Map.entry("dependency_resolution_ms", "OBSERVED"),
+                Map.entry("network_download_wall_ms", "OBSERVED"),
+                Map.entry("network_request_ms", "OBSERVED"),
+                Map.entry("analysis_ms", "OBSERVED"),
+                Map.entry("dynamic_filter_ms", "NOT_APPLICABLE"),
+                Map.entry("report_ms", "OBSERVED"),
+                Map.entry("total_wall_ms", "OBSERVED"));
+        ScanStatistics stats = new ScanStatistics(1, 1, 0, 1, 1, 1,
+                49L, 10L, 12L, "COMPLETE", List.of(),
+                Map.of("dependency_resolution", 8L, "analysis", 21L, "report", 5L),
+                metrics, "STATIC_ONLY", VerificationSummary.empty("STATIC_ONLY", 0),
+                "COMPLETE", "a".repeat(64), statuses, Map.of(), Map.of());
+
+        new MultiFormatReporter().writeMetadata(temp, stats);
+        new ReportIndexWriter().write(ReportLayout.flat(temp), stats);
+
+        String metadata = Files.readString(temp.resolve("scan-metadata.json"));
+        String index = Files.readString(temp.resolve("index.md"));
+        assertTrue(metadata.contains("\"dependency_resolution_ms\":8")
+                        && metadata.contains("\"network_download_wall_ms\":12")
+                        && metadata.contains("\"dynamic_filter_ms\":0")
+                        && metadata.contains("\"total_wall_ms\":49")
+                        && metadata.contains("\"dynamic_filter_ms\":\"NOT_APPLICABLE\""),
+                metadata);
+        assertTrue(index.contains("| Dependency resolution | 8 ms (OBSERVED) |")
+                        && index.contains("| Dynamic filter | 0 ms (NOT_APPLICABLE) |")
+                        && index.contains("actual_application=1")
+                        && index.contains("pom_derived=4")
+                        && index.contains("jdk=7"), index);
+    }
+
+    @Test
     void findingsFormatsConsumeStructuredVerificationSnapshot(@TempDir Path temp) throws Exception {
         Chain chain = new Chain("RULE-2", "CODE_EXEC", "HIGH",
                 "app.Entry", "readObject", "readObject", "java.lang.Runtime", "exec",
