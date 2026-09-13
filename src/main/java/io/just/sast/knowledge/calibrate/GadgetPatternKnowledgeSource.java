@@ -106,7 +106,7 @@ public final class GadgetPatternKnowledgeSource implements KnowledgeSource {
             return;
         }
         Map<String, Integer> patternCounts = new HashMap<>();
-        for (Chain chain : bb.chains()) {
+        for (Chain chain : bb.reportChains()) {
             if (bb.calibrationOf(chain.key()) != null) {
                 continue;
             }

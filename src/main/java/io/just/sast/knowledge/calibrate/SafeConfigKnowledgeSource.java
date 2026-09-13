@@ -86,7 +86,7 @@ public final class SafeConfigKnowledgeSource implements KnowledgeSource {
             return;
         }
         int rejected = 0;
-        for (Chain chain : bb.chains()) {
+        for (Chain chain : bb.reportChains()) {
             if (bb.calibrationOf(chain.key()) != null) {
                 continue; // 已被前面校验拒绝
             }

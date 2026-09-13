@@ -77,7 +77,7 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
         int serialize = 0;
         int guardDegrade = 0;
         int constraintReject = 0;
-        for (Chain chain : bb.chains()) {
+        for (Chain chain : bb.reportChains()) {
             // 1. PASM 可行性
             String reason = pasmReject(chain);
             if (reason != null) {
@@ -112,7 +112,7 @@ public final class ChainValidatorKnowledgeSource implements KnowledgeSource {
             }
         }
         JustLogger.info("链校验：PASM 拒绝 {}，类型流拒绝 {}，序列化 {}，卫式 {}，约束 {}（共 {} 条）",
-                pasm, typeflow, serialize, guardDegrade, constraintReject, bb.chains().size());
+                pasm, typeflow, serialize, guardDegrade, constraintReject, bb.reportChains().size());
     }
 
     // ---- 1. PASM 可行性 ----

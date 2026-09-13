@@ -104,7 +104,7 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         // 1.5 深链结构门：跳数 >14 且字段流占比 <25% —— 无对象图绑定的游走链（噪声形态），
         // 类型传播强化（U3）解锁的深度上限以此门控制洪水
         int deep = 0;
-        for (Chain chain : bb.chains()) {
+        for (Chain chain : bb.reportChains()) {
             if (bb.calibrationOf(chain.key()) != null || chain.hops().size() <= 14) {
                 continue;
             }
@@ -118,7 +118,7 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         // 1.8 JDK 机制内部类噪音：路径穿过 JDK 机制内部实现类（ServiceLoader$ 迭代器等）
         // 的"链"是框架自身 machinery，非攻击者经反序列化语义可触发的 gadget 路径
         int machinery = 0;
-        for (Chain chain : bb.chains()) {
+        for (Chain chain : bb.reportChains()) {
             if (bb.calibrationOf(chain.key()) != null) {
                 continue;
             }
@@ -130,7 +130,7 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         }
         // 2. 机制去重（按家族）
         Map<String, List<Chain>> groups = new LinkedHashMap<>();
-        for (Chain chain : bb.chains()) {
+        for (Chain chain : bb.reportChains()) {
             if (bb.calibrationOf(chain.key()) != null) {
                 continue; // 已被前面校验拒绝的不再处理
             }

@@ -481,10 +481,11 @@ public final class ScanPipeline {
                 new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
                         verifyBudget, jdkHome, load.targetMajorVersion(), safeExec, safeReal,
                         requireOsIsolation, inputTracker, applicationClassNames,
-                        // Component mode still needs the target-owner scope for mechanism seed
-                        // discovery; the policy's application-scope/export bits keep those roots
-                        // out of application findings and application trace output.
-                        modePolicy.solverScopeKnown()));
+                        // Component mode deliberately has no application-entry scope: its
+                        // mechanism products are retained in the kernel store and exported by
+                        // the component report.  Application mode enables the strict
+                        // entry/site/join admission boundary.
+                        modePolicy.applicationScopeKnown()));
         new Controller(blackboard, KnowledgeSources.discover()).run();
         for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
             phaseMs.put(timing.getKey(), timing.getValue());
@@ -665,7 +666,7 @@ public final class ScanPipeline {
         // retaining ScanResult do not accidentally retain every materialized method graph.
         blackboard.originSupport().clearForwardOriginCache();
         cpg.index().clearCfgCache();
-        return new ScanResult(scanStats.runOutcome(), blackboard.chains(), scanStats);
+        return new ScanResult(scanStats.runOutcome(), reportChains, scanStats);
         }
         } finally {
             // External --jdk-home JRT images own a FileSystem and URLClassLoader.  Close them

@@ -737,10 +737,13 @@ public final class Blackboard {
         return calibrationCandidateStore.snapshot();
     }
 
-    /** Default product plus calibration-only candidates for the audit/report boundary. */
+    /** Default product plus component-kernel and calibration candidates for the report boundary. */
     public synchronized List<Chain> reportChains() {
         Map<String, Chain> unique = new java.util.TreeMap<>();
         chainStore.snapshot().forEach(chain -> unique.putIfAbsent(chain.key(), chain));
+        if (applicationEntryIndex == null || !applicationEntryIndex.applicationScopeKnown()) {
+            kernelChainStore.snapshot().forEach(chain -> unique.putIfAbsent(chain.key(), chain));
+        }
         calibrationCandidateStore.snapshot().forEach(chain -> unique.putIfAbsent(chain.key(), chain));
         return List.copyOf(unique.values());
     }
@@ -795,16 +798,22 @@ public final class Blackboard {
     public void calibrateChain(String chainKey, String reason) {
         chainStore.calibrate(chainKey, reason);
         calibrationCandidateStore.calibrate(chainKey, reason);
+        kernelChainStore.calibrate(chainKey, reason);
     }
 
     public String calibrationOf(String chainKey) {
         String reason = chainStore.calibrationOf(chainKey);
-        return reason != null ? reason : calibrationCandidateStore.calibrationOf(chainKey);
+        if (reason != null) {
+            return reason;
+        }
+        reason = calibrationCandidateStore.calibrationOf(chainKey);
+        return reason != null ? reason : kernelChainStore.calibrationOf(chainKey);
     }
 
     public synchronized Map<String, String> chainCalibrations() {
         Map<String, String> result = new java.util.TreeMap<>(calibrationCandidateStore.calibrations());
         chainStore.calibrations().forEach(result::putIfAbsent);
+        kernelChainStore.calibrations().forEach(result::putIfAbsent);
         return java.util.Collections.unmodifiableMap(result);
     }
 
@@ -883,11 +892,16 @@ public final class Blackboard {
     public void chainNote(String chainKey, String note) {
         chainStore.note(chainKey, note);
         calibrationCandidateStore.note(chainKey, note);
+        kernelChainStore.note(chainKey, note);
     }
 
     public List<String> chainNotesOf(String chainKey) {
         List<String> notes = chainStore.notesOf(chainKey);
-        return notes.isEmpty() ? calibrationCandidateStore.notesOf(chainKey) : notes;
+        if (!notes.isEmpty()) {
+            return notes;
+        }
+        notes = calibrationCandidateStore.notesOf(chainKey);
+        return notes.isEmpty() ? kernelChainStore.notesOf(chainKey) : notes;
     }
 
     private boolean isCalibrationCandidate(ApplicationEntryIndex.ProducerCandidate candidate) {
