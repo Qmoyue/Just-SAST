@@ -156,6 +156,29 @@ class DependencyInventoryWriterTest {
         assertTrue(bound.applicationOwned("app/Entry"));
     }
 
+    @Test
+    void classDirectoryAndEnvironmentColumnsRemainVisible(@TempDir Path tmp) throws Exception {
+        Path classes = tmp.resolve("classes");
+        Path marker = classes.resolve("pkg/Marker.class");
+        Files.createDirectories(marker.getParent());
+        Files.write(marker, new byte[]{1, 2, 3});
+
+        DependencyGraph graph = new DependencyInventoryWriter().build(classes, List.of(),
+                "directory-hash", 17, List.of(), InputBudget.defaults(),
+                InputBudget.defaults().tracker());
+        assertTrue(graph.environmentConditions().contains("CLASS_DIRECTORY_INPUT:0"));
+
+        ReportLayout layout = ReportLayout.create(tmp.resolve("directory-report"));
+        new DependencyInventoryWriter().write(layout, graph, "directory-hash");
+        String csv = Files.readString(layout.evidence().resolve("dependencies.csv"));
+        String bom = Files.readString(layout.meta().resolve("dependencies.sbom.json"));
+        assertTrue(csv.contains("deployment"));
+        assertTrue(csv.contains("resolution_reason"));
+        assertTrue(bom.contains("just:environment-condition"));
+        assertTrue(bom.contains("CLASS_DIRECTORY_INPUT:0"));
+        assertFalse(csv.contains(classes.toAbsolutePath().toString()));
+    }
+
     /** Create two distinct equal-length entries, then rewrite the second name in local and
      * central headers to the first name.  ZipOutputStream itself rejects duplicate names. */
     private static byte[] duplicateNameArchive() throws Exception {

@@ -120,6 +120,7 @@ public final class DependencyInventoryWriter {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         InputBudget.Tracker sharedBudget = tracker == null ? policy.tracker() : tracker;
         Map<String, Component> components = new TreeMap<>();
+        java.util.LinkedHashSet<String> environmentConditions = new java.util.LinkedHashSet<>();
         List<Path> deps = dependencies == null ? List.of() : dependencies;
         int directCount = deps.size() + 1;
         if (inputProvenance != null && inputProvenance.size() < directCount) {
@@ -130,6 +131,9 @@ public final class DependencyInventoryWriter {
                 : inputProvenance.get(0);
         addDirect(components, target, "application", "target", targetHash, "", sharedBudget,
                 policy, 0, applicationProvenance);
+        if (Files.isDirectory(target, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            environmentConditions.add("CLASS_DIRECTORY_INPUT:0");
+        }
         for (int i = 0; i < deps.size(); i++) {
             Path dependency = deps.get(i);
             String knownHash = knownDependencyHashes != null && i < knownDependencyHashes.size()
@@ -139,13 +143,16 @@ public final class DependencyInventoryWriter {
                     : inputProvenance.get(i + 1);
             addDirect(components, dependency, "direct", "dependency-" + (i + 1), knownHash, "",
                     sharedBudget, policy, i + 1, dependencyProvenance);
+            if (Files.isDirectory(dependency, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                environmentConditions.add("CLASS_DIRECTORY_INPUT:" + (i + 1));
+            }
         }
         ArtifactProvenance jdkProvenance = inputProvenance == null ? null
                 : inputProvenance.stream()
                 .filter(value -> value != null && value.role() == ArtifactProvenance.Role.JDK)
                 .findFirst().orElse(null);
         addPlatform(components, targetMajorVersion, jdkProvenance);
-        return graphOf(components.values().stream().toList());
+        return graphOf(components.values().stream().toList(), environmentConditions.stream().toList());
     }
 
     /** Serialize an input graph without reopening any target or dependency path. */
@@ -159,7 +166,7 @@ public final class DependencyInventoryWriter {
         String csv = csvContent(ordered);
         AtomicFiles.writeUtf8(layout.evidence().resolve("dependencies.csv"), csv);
         AtomicFiles.writeUtf8(layout.meta().resolve("dependencies.sbom.json"),
-                bomJson(ordered, targetHash));
+                bomJson(ordered, targetHash, graph.environmentConditions()));
         return digest(csv);
     }
 
@@ -537,7 +544,8 @@ public final class DependencyInventoryWriter {
         return result.toString();
     }
 
-    private static DependencyGraph graphOf(List<Component> components) {
+    private static DependencyGraph graphOf(List<Component> components,
+                                           List<String> environmentConditions) {
         List<DependencyGraph.Node> nodes = new ArrayList<>(components.size());
         List<DependencyGraph.Edge> edges = new ArrayList<>();
         for (Component component : components) {
@@ -573,7 +581,7 @@ public final class DependencyInventoryWriter {
                         "embedded", "archive-entry"));
             }
         }
-        return new DependencyGraph(nodes, edges, Map.of());
+        return new DependencyGraph(nodes, edges, Map.of(), environmentConditions);
     }
 
     private static String inventoryKind(DependencyGraph.Source source) {
@@ -593,7 +601,8 @@ public final class DependencyInventoryWriter {
 
     private static String csvContent(List<DependencyGraph.Node> nodes) {
         StringBuilder csv = new StringBuilder(
-                "bom_ref,kind,group,name,version,sha256,source,parent_ref,error,error_detail\n");
+                "bom_ref,kind,group,name,version,sha256,source,parent_ref,error,error_detail,"
+                        + "deployment,scope,optional,resolution,resolution_reason\n");
         for (DependencyGraph.Node node : nodes) {
             csv.append(csv(node.ref())).append(',')
                     .append(csv(inventoryKind(node.source()))).append(',')
@@ -604,7 +613,12 @@ public final class DependencyInventoryWriter {
                     .append(csv(node.sourceDetail())).append(',')
                     .append(csv(node.parentRef())).append(',')
                     .append(csv(node.error())).append(',')
-                    .append(csv(node.errorDetail())).append('\n');
+                    .append(csv(node.errorDetail())).append(',')
+                    .append(csv(node.deployment().name())).append(',')
+                    .append(csv(node.scope())).append(',')
+                    .append(node.optional()).append(',')
+                    .append(csv(node.resolution().name())).append(',')
+                    .append(csv(node.resolutionReason())).append('\n');
         }
         return csv.toString();
     }
@@ -614,14 +628,25 @@ public final class DependencyInventoryWriter {
         return "\"" + safe.replace("\"", "\"\"").replace("\r", " ").replace("\n", " ") + "\"";
     }
 
-    private static String bomJson(List<DependencyGraph.Node> nodes, String targetHash) {
+    private static String bomJson(List<DependencyGraph.Node> nodes, String targetHash,
+                                  List<String> environmentConditions) {
         String serial = "urn:uuid:" + UUID.nameUUIDFromBytes(
                 (targetHash == null ? "" : targetHash).getBytes(StandardCharsets.UTF_8));
         StringBuilder json = new StringBuilder("{\n")
                 .append("  \"bomFormat\":\"CycloneDX\",\n")
                 .append("  \"specVersion\":\"1.5\",\n")
                 .append("  \"serialNumber\":\"").append(json(serial)).append("\",\n")
-                .append("  \"version\":1,\n  \"metadata\":{\"tools\":[{\"vendor\":\"Just\",\"name\":\"just-sast\",\"version\":\"0.2.0\"}]},\n")
+                .append("  \"version\":1,\n  \"metadata\":{\"tools\":[{\"vendor\":\"Just\",\"name\":\"just-sast\",\"version\":\"0.2.0\"}],\"properties\":[");
+        List<String> conditions = environmentConditions == null ? List.of()
+                : environmentConditions.stream().distinct().sorted().toList();
+        for (int index = 0; index < conditions.size(); index++) {
+            if (index > 0) {
+                json.append(',');
+            }
+            json.append("{\"name\":\"just:environment-condition\",\"value\":\"")
+                    .append(json(conditions.get(index))).append("\"}");
+        }
+        json.append("]},\n")
                 .append("  \"components\":[\n");
         for (int i = 0; i < nodes.size(); i++) {
             if (i > 0) {
@@ -637,7 +662,12 @@ public final class DependencyInventoryWriter {
                     .append("\",\"scope\":\"").append(json(scope(kind)))
                     .append("\",\"properties\":[{\"name\":\"just:kind\",\"value\":\"")
                     .append(json(kind)).append("\"},{\"name\":\"just:source\",\"value\":\"")
-                    .append(json(node.sourceDetail())).append("\"}");
+                    .append(json(node.sourceDetail())).append("\"},{\"name\":\"just:deployment\",\"value\":\"")
+                    .append(json(node.deployment().name())).append("\"},{\"name\":\"just:maven-scope\",\"value\":\"")
+                    .append(json(node.scope())).append("\"},{\"name\":\"just:optional\",\"value\":\"")
+                    .append(Boolean.toString(node.optional())).append("\"},{\"name\":\"just:resolution\",\"value\":\"")
+                    .append(json(node.resolution().name())).append("\"},{\"name\":\"just:resolution-reason\",\"value\":\"")
+                    .append(json(node.resolutionReason())).append("\"}");
             if (!node.error().isBlank()) {
                 json.append(",{\"name\":\"just:error\",\"value\":\"")
                         .append(json(node.error())).append("\"}");

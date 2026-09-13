@@ -22,7 +22,7 @@ import java.util.Set;
  * not rediscover coordinates, ownership or conflict state from paths.</p>
  */
 public final class DependencyGraph {
-    public static final int MODEL_VERSION = 1;
+    public static final int MODEL_VERSION = 2;
 
     public enum Source {
         ACTUAL_APPLICATION,
@@ -82,6 +82,32 @@ public final class DependencyGraph {
                     sourceDetail, parentRef, error, errorDetail, inputIndex, "", false,
                     Resolution.SELECTED, "");
         }
+
+        /** Stable Maven-style coordinate used when binding resolved bytes to graph nodes. */
+        public String coordinate() {
+            return group + ':' + name + ':' + version + ':' + type + ':' + classifier;
+        }
+    }
+
+    /** Validated bytes that replace one selected POM-derived node without changing deployment semantics. */
+    public record ArtifactBinding(String coordinate, ArtifactProvenance provenance,
+                                  Source source, String sourceDetail, int inputIndex) {
+        public ArtifactBinding {
+            requireText(coordinate, "artifact binding coordinate");
+            provenance = Objects.requireNonNull(provenance, "artifact binding provenance");
+            if (provenance.role() != ArtifactProvenance.Role.DEPENDENCY
+                    || !provenance.hasContentDigest()) {
+                throw new IllegalArgumentException(
+                        "artifact binding needs a dependency content provenance");
+            }
+            if (source != Source.CACHE && source != Source.REMOTE) {
+                throw new IllegalArgumentException("artifact binding source must be CACHE or REMOTE");
+            }
+            requireText(sourceDetail, "artifact binding source detail");
+            if (inputIndex < 0) {
+                throw new IllegalArgumentException("artifact binding input index must be non-negative");
+            }
+        }
     }
 
     public record Edge(String fromRef, String toRef, String kind, String reason) {
@@ -118,10 +144,18 @@ public final class DependencyGraph {
     private final Map<String, Node> nodes;
     private final List<Edge> edges;
     private final Map<String, ClassOwner> classOwners;
+    private final List<String> environmentConditions;
     private final String semanticDigest;
 
     public DependencyGraph(List<Node> nodes, List<Edge> edges,
                            Map<String, ClassOwner> classOwners) {
+        this(nodes, edges, classOwners, List.of());
+    }
+
+    /** Immutable graph with explicit conditions that affect deployment/environment interpretation. */
+    public DependencyGraph(List<Node> nodes, List<Edge> edges,
+                           Map<String, ClassOwner> classOwners,
+                           List<String> environmentConditions) {
         LinkedHashMap<String, Node> nodeCopy = new LinkedHashMap<>();
         if (nodes == null) {
             throw new IllegalArgumentException("dependency graph nodes are required");
@@ -160,6 +194,13 @@ public final class DependencyGraph {
         this.nodes = Collections.unmodifiableMap(nodeCopy);
         this.edges = edgeCopy;
         this.classOwners = Collections.unmodifiableMap(ownerCopy);
+        LinkedHashSet<String> conditionCopy = new LinkedHashSet<>();
+        if (environmentConditions != null) {
+            for (String condition : environmentConditions) {
+                conditionCopy.add(requireText(condition, "environment condition"));
+            }
+        }
+        this.environmentConditions = List.copyOf(conditionCopy);
         this.semanticDigest = computeSemanticDigest();
     }
 
@@ -177,6 +218,10 @@ public final class DependencyGraph {
 
     public Map<String, ClassOwner> classOwners() {
         return classOwners;
+    }
+
+    public List<String> environmentConditions() {
+        return environmentConditions;
     }
 
     public Optional<Node> node(String ref) {
@@ -203,7 +248,91 @@ public final class DependencyGraph {
 
     /** Return the same graph with a new immutable class-ownership snapshot. */
     public DependencyGraph withClassOwners(Map<String, ClassOwner> owners) {
-        return new DependencyGraph(new ArrayList<>(nodes.values()), edges, owners);
+        return new DependencyGraph(new ArrayList<>(nodes.values()), edges, owners,
+                environmentConditions);
+    }
+
+    /** Add path-free environment conditions without changing any artifact ownership. */
+    public DependencyGraph withEnvironmentConditions(List<String> conditions) {
+        LinkedHashSet<String> merged = new LinkedHashSet<>(environmentConditions);
+        if (conditions != null) {
+            for (String condition : conditions) {
+                merged.add(requireText(condition, "environment condition"));
+            }
+        }
+        return new DependencyGraph(new ArrayList<>(nodes.values()), edges, classOwners, merged.stream().toList());
+    }
+
+    /**
+     * Bind validated CACHE/REMOTE bytes to selected POM nodes.  The node remains a declared
+     * environment dependency; this operation only supplies its exact bytes, provenance and
+     * frontend input ordinal.
+     */
+    public DependencyGraph withCompletedArtifacts(List<ArtifactBinding> bindings) {
+        if (bindings == null || bindings.isEmpty()) {
+            return this;
+        }
+        Map<String, ArtifactBinding> byCoordinate = new LinkedHashMap<>();
+        for (ArtifactBinding binding : bindings) {
+            Objects.requireNonNull(binding, "artifact binding");
+            if (byCoordinate.putIfAbsent(binding.coordinate(), binding) != null) {
+                throw new IllegalArgumentException("duplicate artifact binding: "
+                        + binding.coordinate());
+            }
+        }
+        List<Node> replaced = new ArrayList<>(nodes.size());
+        Set<String> matched = new LinkedHashSet<>();
+        for (Node node : nodes.values()) {
+            ArtifactBinding binding = byCoordinate.get(node.coordinate());
+            if (binding == null) {
+                replaced.add(node);
+                continue;
+            }
+            if (node.source() != Source.POM_DERIVED
+                    || node.deployment() != Deployment.DECLARED_ENVIRONMENT
+                    || node.resolution() != Resolution.SELECTED) {
+                throw new IllegalArgumentException("artifact binding target is not a selected POM node: "
+                        + node.coordinate());
+            }
+            replaced.add(new Node(node.ref(), binding.provenance(), binding.source(),
+                    node.deployment(), node.group(), node.name(), node.version(), node.type(),
+                    node.classifier(), binding.sourceDetail(), node.parentRef(), node.error(),
+                    node.errorDetail(), binding.inputIndex(), node.scope(), node.optional(),
+                    node.resolution(), node.resolutionReason()));
+            matched.add(binding.coordinate());
+        }
+        if (matched.size() != byCoordinate.size()) {
+            Set<String> missing = new LinkedHashSet<>(byCoordinate.keySet());
+            missing.removeAll(matched);
+            throw new IllegalArgumentException("artifact binding has no selected POM node: " + missing);
+        }
+        return new DependencyGraph(replaced, edges, classOwners, environmentConditions);
+    }
+
+    /** Merge actual distribution nodes with a separate POM-derived environment graph. */
+    public DependencyGraph merge(DependencyGraph other) {
+        Objects.requireNonNull(other, "dependency graph to merge");
+        LinkedHashMap<String, Node> mergedNodes = new LinkedHashMap<>(nodes);
+        for (Node node : other.nodes.values()) {
+            Node previous = mergedNodes.putIfAbsent(node.ref(), node);
+            if (previous != null && !previous.equals(node)) {
+                throw new IllegalArgumentException("dependency graph ref collision: " + node.ref());
+            }
+        }
+        LinkedHashSet<Edge> mergedEdges = new LinkedHashSet<>(edges);
+        mergedEdges.addAll(other.edges);
+        LinkedHashMap<String, ClassOwner> mergedOwners = new LinkedHashMap<>(classOwners);
+        for (Map.Entry<String, ClassOwner> entry : other.classOwners.entrySet()) {
+            ClassOwner previous = mergedOwners.putIfAbsent(entry.getKey(), entry.getValue());
+            if (previous != null && !previous.equals(entry.getValue())) {
+                throw new IllegalArgumentException("dependency graph class owner collision: "
+                        + entry.getKey());
+            }
+        }
+        LinkedHashSet<String> conditions = new LinkedHashSet<>(environmentConditions);
+        conditions.addAll(other.environmentConditions);
+        return new DependencyGraph(new ArrayList<>(mergedNodes.values()),
+                new ArrayList<>(mergedEdges), mergedOwners, conditions.stream().toList());
     }
 
     /**
@@ -292,6 +421,8 @@ public final class DependencyGraph {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             update(digest, "dependency-graph-v" + MODEL_VERSION);
+            environmentConditions.stream().sorted()
+                    .forEach(condition -> update(digest, "environment=" + condition));
             nodes.values().stream().sorted(Comparator.comparing(Node::ref)).forEach(node -> {
                 update(digest, "node=" + node.ref());
                 update(digest, "provenance=" + node.provenance().identity());

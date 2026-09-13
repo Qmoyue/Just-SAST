@@ -76,11 +76,32 @@ public final class ScanCache {
                 safeExec, safeReal, requireOsIsolation, InputBudget.defaults());
     }
 
+    /** Preflight identity including the path-free dependency-environment identity. */
+    public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
+                                      Path jdkHome, boolean fast, boolean verify,
+                                      int verifyBudget, boolean safeExec, boolean safeReal,
+                                      boolean requireOsIsolation,
+                                      String dependencyEnvironmentIdentity) throws IOException {
+        return preflight(target, dependencies, rules, jdkHome, fast, verify, verifyBudget,
+                safeExec, safeReal, requireOsIsolation, InputBudget.defaults(),
+                dependencyEnvironmentIdentity);
+    }
+
     /** Preflight identity under an explicit immutable input policy. */
     public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
                                       Path jdkHome, boolean fast, boolean verify,
                                       int verifyBudget, boolean safeExec, boolean safeReal,
                                       boolean requireOsIsolation, InputBudget budget) throws IOException {
+        return preflight(target, dependencies, rules, jdkHome, fast, verify, verifyBudget,
+                safeExec, safeReal, requireOsIsolation, budget, "");
+    }
+
+    /** Preflight with an explicit immutable dependency graph/environment identity. */
+    public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
+                                      Path jdkHome, boolean fast, boolean verify,
+                                      int verifyBudget, boolean safeExec, boolean safeReal,
+                                      boolean requireOsIsolation, InputBudget budget,
+                                      String dependencyEnvironmentIdentity) throws IOException {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         validateInput(target, true);
         if (dependencies != null) {
@@ -97,7 +118,8 @@ public final class ScanCache {
         InputBudget.Tracker sharedTracker = policy.tracker();
         String artifactHash = ArtifactFingerprint.sha256(target, sharedTracker);
         List<String> dependencyHashes = dependencyHashes(dependencies, sharedTracker);
-        String dependencyIdentity = dependencyIdentityFromHashes(dependencyHashes);
+        String dependencyIdentity = dependencyIdentityFromHashes(dependencyHashes,
+                dependencyEnvironmentIdentity);
         String cacheKey = ScanIdentityWriter.cacheKey(artifactHash, dependencyIdentity, rules,
                 jdkHome, fast, verify, verifyBudget, safeExec, safeReal,
                 requireOsIsolation, policy);
@@ -108,6 +130,13 @@ public final class ScanCache {
     public static String dependencyIdentity(List<Path> dependencies) throws IOException {
         List<Path> values = dependencies == null ? List.of() : dependencies;
         return dependencyIdentityFromHashes(dependencyHashes(values));
+    }
+
+    /** Direct dependency identity plus an explicit path-free environment graph identity. */
+    public static String dependencyIdentity(List<Path> dependencies,
+                                            String dependencyEnvironmentIdentity) throws IOException {
+        List<Path> values = dependencies == null ? List.of() : dependencies;
+        return dependencyIdentityFromHashes(dependencyHashes(values), dependencyEnvironmentIdentity);
     }
 
     /** Hash direct dependencies once; the same list can be reused by inventory generation. */
@@ -136,12 +165,25 @@ public final class ScanCache {
     }
 
     public static String dependencyIdentityFromHashes(List<String> dependencyHashes) throws IOException {
+        return dependencyIdentityFromHashes(dependencyHashes, "");
+    }
+
+    /** Include effective-POM/scope/source semantics in the dependency cache identity. */
+    public static String dependencyIdentityFromHashes(List<String> dependencyHashes,
+                                                      String dependencyEnvironmentIdentity)
+            throws IOException {
         MessageDigest digest = sha256();
         List<String> values = dependencyHashes == null ? List.of() : dependencyHashes;
         for (int i = 0; i < values.size(); i++) {
             digest.update(("dependency[" + i + "]=").getBytes(StandardCharsets.UTF_8));
             digest.update((values.get(i) == null ? "UNAVAILABLE" : values.get(i))
                     .getBytes(StandardCharsets.US_ASCII));
+            digest.update((byte) '\n');
+        }
+        if (dependencyEnvironmentIdentity != null
+                && !dependencyEnvironmentIdentity.isBlank()) {
+            digest.update("dependency-environment=".getBytes(StandardCharsets.UTF_8));
+            digest.update(dependencyEnvironmentIdentity.getBytes(StandardCharsets.US_ASCII));
             digest.update((byte) '\n');
         }
         return hex(digest.digest());

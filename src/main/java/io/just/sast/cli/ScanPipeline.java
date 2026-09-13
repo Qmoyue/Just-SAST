@@ -26,6 +26,7 @@ import io.just.sast.verify.VerificationPlan;
 import io.just.sast.model.JdkClassSource;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.ArtifactProvenance;
+import io.just.sast.model.DependencyGraph;
 import io.just.sast.model.ProgramUniverse;
 import io.just.sast.report.ConsoleSummary;
 import io.just.sast.report.CsvReporter;
@@ -188,6 +189,25 @@ public final class ScanPipeline {
                                  boolean requireOsIsolation, Path baseline,
                                  Path suppressions, boolean overwrite,
                                  ModeDemandPolicy modePolicy) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
+                safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
+                modePolicy, null, -1, "MAVEN_POM_NOT_PROVIDED");
+    }
+
+    /**
+     * Full pipeline entry point with the explicit input-preparation handoff.  Actual direct
+     * inputs remain ahead of POM-derived bytes, while the immutable environment graph carries
+     * selected CACHE/REMOTE provenance into frontend ownership and report identity.
+     */
+    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
+        boolean stats, boolean fast, Path jdkHome, boolean verify,
+                                 int verifyBudget, boolean safeExec, boolean safeReal,
+                                 boolean requireOsIsolation, Path baseline,
+                                 Path suppressions, boolean overwrite,
+                                 ModeDemandPolicy modePolicy,
+                                 DependencyGraph preparedDependencyGraph,
+                                 int explicitDependencyCount,
+                                 String dependencyEnvironmentIdentity) throws Exception {
         if (modePolicy == null) {
             throw new IllegalArgumentException("mode/demand policy is required");
         }
@@ -261,12 +281,20 @@ public final class ScanPipeline {
         // available to the cache layer before frontend parsing, reusing these values avoids a
         // second full read of a large target/dependency archive during report generation.
         List<Path> scanDeps = deps == null ? List.of() : List.copyOf(deps);
+        int actualDependencyCount = preparedDependencyGraph == null ? scanDeps.size()
+                : explicitDependencyCount;
+        if (actualDependencyCount < 0 || actualDependencyCount > scanDeps.size()) {
+            throw new UsageException("依赖输入准备边界无效");
+        }
+        List<Path> actualDependencies = scanDeps.subList(0, actualDependencyCount);
         InputBudget.Tracker inputTracker = inputBudget.tracker();
         String targetArtifactHash = artifactHash(target, inputTracker);
         List<String> dependencyHashes = io.just.sast.report.ScanCache
                 .dependencyHashes(scanDeps, inputTracker);
         String dependencyIdentity = io.just.sast.report.ScanCache
-                .dependencyIdentityFromHashes(dependencyHashes);
+                .dependencyIdentityFromHashes(dependencyHashes,
+                        dependencyEnvironmentIdentity == null || dependencyEnvironmentIdentity.isBlank()
+                                ? "MAVEN_POM_NOT_PROVIDED" : dependencyEnvironmentIdentity);
 
         // 规则
         RuleSet ruleSet;
@@ -355,9 +383,16 @@ public final class ScanPipeline {
         long dependencyResolutionStart = System.nanoTime();
         List<ArtifactProvenance> artifactInputs = artifactProvenance(target, scanDeps,
                 targetArtifactHash, dependencyHashes, jdkSource, targetFeature);
-        io.just.sast.model.DependencyGraph dependencyGraph = new io.just.sast.report.DependencyInventoryWriter()
-                .build(target, scanDeps, targetArtifactHash, load.targetMajorVersion(),
-                        dependencyHashes, artifactInputs, inputBudget, inputTracker);
+        DependencyGraph dependencyGraph = new io.just.sast.report.DependencyInventoryWriter()
+                .build(target, actualDependencies, targetArtifactHash, load.targetMajorVersion(),
+                        dependencyHashes.subList(0, actualDependencyCount), artifactInputs,
+                        inputBudget, inputTracker);
+        if (preparedDependencyGraph != null) {
+            dependencyGraph = dependencyGraph.merge(preparedDependencyGraph);
+        } else {
+            dependencyGraph = dependencyGraph.withEnvironmentConditions(
+                    List.of("MAVEN_POM_NOT_PROVIDED"));
+        }
         Map<String, Integer> applicationIndexes = new java.util.LinkedHashMap<>();
         Map<String, List<Integer>> applicationDuplicates = new java.util.LinkedHashMap<>();
         java.util.Set<String> graphApplicationClassNames = new LinkedHashSet<>(load.classes().keySet());

@@ -294,6 +294,68 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         public List<Path> paths() {
             return artifacts.stream().map(ArtifactDownload::path).toList();
         }
+
+        /**
+         * Project the completed bytes into the immutable dependency graph.  The index is the
+         * first frontend input ordinal after the explicit user dependencies; POM nodes without
+         * a selected runtime artifact retain inputIndex -1 and remain environment-only facts.
+         */
+        public DependencyGraph environmentGraph(int firstInputIndex) {
+            if (firstInputIndex < 0) {
+                throw new IllegalArgumentException("first dependency input index must be non-negative");
+            }
+            List<DependencyGraph.ArtifactBinding> bindings = new ArrayList<>(artifacts.size());
+            for (int index = 0; index < artifacts.size(); index++) {
+                ArtifactDownload artifact = artifacts.get(index);
+                ArtifactProvenance provenance = new ArtifactProvenance(artifact.coordinate(),
+                        ArtifactProvenance.Role.DEPENDENCY, artifact.sha256(), artifact.sizeBytes());
+                bindings.add(new DependencyGraph.ArtifactBinding(artifact.coordinate(),
+                        provenance, artifact.source(), bindingSourceDetail(artifact),
+                        firstInputIndex + index));
+            }
+            return resolution.graph().withCompletedArtifacts(bindings);
+        }
+
+        /** Path-free identity of effective model, selected bytes, source mode and failures. */
+        public String semanticIdentity() {
+            StringBuilder canonical = new StringBuilder("dependency-completion-v1\n")
+                    .append("status=").append(status()).append('\n')
+                    .append("offline=").append(resolution.offline()).append('\n')
+                    .append("repositories=").append(resolution.repositoryIds()).append('\n')
+                    .append("graph=").append(resolution.graph().semanticDigest()).append('\n');
+            EffectivePom pom = resolution.effectivePom();
+            canonical.append("pom=").append(pom.coordinate()).append('|')
+                    .append(pom.packaging()).append('\n');
+            appendDependencies(canonical, "dependency", pom.dependencies());
+            appendDependencies(canonical, "managed", pom.dependencyManagement());
+            canonical.append("declared-profiles=").append(pom.declaredProfileIds()).append('\n')
+                    .append("active-profiles=").append(pom.activeProfileIds()).append('\n')
+                    .append("inactive-profiles=").append(pom.inactiveProfileIds()).append('\n');
+            resolution.problems().stream()
+                    .sorted(java.util.Comparator.comparing(Problem::code)
+                            .thenComparing(Problem::coordinate)
+                            .thenComparing(problem -> problem.severity().name()))
+                    .forEach(problem -> canonical.append("problem=").append(problem.code())
+                            .append('|').append(problem.coordinate()).append('|')
+                            .append(problem.severity()).append('\n'));
+            artifacts.stream().sorted(java.util.Comparator.comparing(ArtifactDownload::coordinate))
+                    .forEach(artifact -> canonical.append("artifact=").append(artifact.coordinate())
+                            .append('|').append(artifact.source()).append('|')
+                            .append(artifact.repositoryId()).append('|')
+                            .append(repositoryScheme(artifact.sourceUrl())).append('|')
+                            .append(artifact.sha256()).append('|').append(artifact.sizeBytes())
+                            .append('\n'));
+            return digest(canonical.toString());
+        }
+
+        private static void appendDependencies(StringBuilder canonical, String label,
+                                               List<DeclaredDependency> dependencies) {
+            dependencies.stream().map(value -> value.groupId() + ':' + value.artifactId() + ':'
+                    + value.version() + ':' + value.type() + ':' + value.classifier() + ':'
+                    + value.scope() + ':' + value.optional() + ':' + value.exclusions())
+                    .sorted().forEach(value -> canonical.append(label).append('=').append(value)
+                            .append('\n'));
+        }
     }
 
     private final RepositorySystem repositorySystem;
@@ -443,6 +505,8 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         }
 
         DependencyGraph graph = graph(effectivePom, collectionRoot, unresolved, problems);
+        graph = graph.withEnvironmentConditions(environmentConditions(graph, effective != null,
+                problems));
         List<Problem> immutableProblems = problems.stream().distinct().toList();
         Status status = status(effective, unresolved, immutableProblems);
         return new Resolution(effectivePom, graph, immutableProblems, status, request.offline(),
@@ -728,6 +792,72 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         return problems.isEmpty() ? Status.COMPLETE : Status.PARTIAL;
     }
 
+    private static List<String> environmentConditions(DependencyGraph graph, boolean pomResolved,
+                                                       List<Problem> problems) {
+        LinkedHashSet<String> conditions = new LinkedHashSet<>();
+        conditions.add(pomResolved ? "MAVEN_POM_RESOLVED" : "MAVEN_POM_MODEL_UNRESOLVED");
+        graph.nodes().values().stream().sorted(java.util.Comparator.comparing(
+                DependencyGraph.Node::ref)).forEach(node -> {
+            String coordinate = node.coordinate();
+            String scope = node.scope().toLowerCase(Locale.ROOT);
+            if (scope.equals("provided") || scope.equals("system")) {
+                conditions.add("MAVEN_SCOPE_" + scope.toUpperCase(Locale.ROOT) + ':' + coordinate);
+            } else if (scope.equals("test")) {
+                conditions.add("MAVEN_TEST_SCOPE:" + coordinate);
+            }
+            if (node.optional()) {
+                conditions.add("MAVEN_OPTIONAL:" + coordinate);
+            }
+            if (node.resolution() == DependencyGraph.Resolution.CONFLICT) {
+                conditions.add("MAVEN_CONFLICT:" + coordinate);
+            }
+            if (node.resolutionReason().contains("relocated-from=")) {
+                conditions.add("MAVEN_RELOCATED:" + coordinate);
+            }
+        });
+        if (problems != null) {
+            problems.stream().sorted(java.util.Comparator.comparing(Problem::code)
+                    .thenComparing(Problem::coordinate)
+                    .thenComparing(problem -> problem.severity().name()))
+                    .forEach(problem -> conditions.add("MAVEN_PROBLEM:" + problem.code() + ':'
+                            + problem.coordinate() + ':' + problem.severity()));
+        }
+        return List.copyOf(conditions);
+    }
+
+    private static String bindingSourceDetail(ArtifactDownload artifact) {
+        String scheme = repositoryScheme(artifact.sourceUrl());
+        StringBuilder detail = new StringBuilder("maven:repository=")
+                .append(artifact.repositoryId()).append(";scheme=").append(scheme);
+        if (scheme.equals("http") || scheme.equals("https")) {
+            detail.append(";url=").append(artifact.sourceUrl());
+        } else if (scheme.equals("file")) {
+            detail.append(";url=<file-repository>");
+        }
+        return detail.toString();
+    }
+
+    private static String repositoryScheme(String sourceUrl) {
+        if (sourceUrl == null) {
+            return "unknown";
+        }
+        int separator = sourceUrl.indexOf(':');
+        if (separator <= 0) {
+            return "unknown";
+        }
+        return sourceUrl.substring(0, separator).toLowerCase(Locale.ROOT);
+    }
+
+    private static String relocationReason(List<? extends Artifact> relocations) {
+        if (relocations.isEmpty()) {
+            return "";
+        }
+        String value = relocations.stream().map(Objects::requireNonNull).map(
+                MavenDependencyGraphResolver::coordinate).sorted()
+                .collect(java.util.stream.Collectors.joining(","));
+        return "relocated-from=" + value;
+    }
+
     private record ArtifactAttempt(ArtifactDownload artifact, List<Problem> problems) {
         private ArtifactAttempt {
             problems = problems == null ? List.of() : List.copyOf(problems);
@@ -839,6 +969,8 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         Artifact artifact = Objects.requireNonNull(node.getArtifact(),
                 "Maven dependency graph node artifact");
         String coordinate = coordinate(artifact);
+        List<? extends Artifact> relocations = Objects.requireNonNull(node.getRelocations(),
+                "Maven dependency graph relocation list");
         Object winnerValue = node.getData().get(ConflictResolver.NODE_DATA_WINNER);
         if (winnerValue != null && !(winnerValue instanceof DependencyNode)) {
             throw new IllegalStateException("Maven conflict winner has an invalid type");
@@ -861,17 +993,25 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
             }
             boolean optional = dependency != null && dependency.isOptional();
             String managedVersion = DependencyManagerUtils.getPremanagedVersion(node);
+            String relocation = relocationReason(relocations);
             String reason = conflict ? "winner=" + winnerCoordinate
                     : managedVersion == null ? "nearest-version" : "managed-version=" + managedVersion;
+            if (!relocation.isBlank()) {
+                reason += ';' + relocation;
+            }
             DependencyGraph.Resolution resolution = conflict
                     ? DependencyGraph.Resolution.CONFLICT : DependencyGraph.Resolution.SELECTED;
             String type = artifact.getProperty("maven:type", artifact.getExtension());
+            String sourceDetail = "maven:depth=" + depth + ";type=" + type;
+            if (!relocation.isBlank()) {
+                sourceDetail += ';' + relocation;
+            }
             nodes.add(new DependencyGraph.Node(ref,
                     ArtifactProvenance.unknown(coordinate, ArtifactProvenance.Role.DEPENDENCY),
                     DependencyGraph.Source.POM_DERIVED,
                     DependencyGraph.Deployment.DECLARED_ENVIRONMENT, artifact.getGroupId(),
                     artifact.getArtifactId(), artifact.getVersion(), type,
-                    artifact.getClassifier(), "maven:depth=" + depth + ";type=" + type, "", "", "", -1, scope,
+                    artifact.getClassifier(), sourceDetail, "", "", "", -1, scope,
                     optional, resolution, reason));
             if (conflict) {
                 conflicts.add(new ConflictLink(ref, winnerCoordinate));

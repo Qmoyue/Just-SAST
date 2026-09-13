@@ -72,6 +72,25 @@ class DependencyGraphContractTest {
     }
 
     @Test
+    void actualExplicitInputWinsOverTheSamePOMDerivedClass() {
+        DependencyGraph.Node explicit = node("explicit", ArtifactProvenance.Role.DEPENDENCY,
+                DependencyGraph.Source.ACTUAL_EXPLICIT,
+                DependencyGraph.Deployment.ACTUAL_DISTRIBUTION, 1);
+        DependencyGraph.Node downloaded = node("downloaded", ArtifactProvenance.Role.DEPENDENCY,
+                DependencyGraph.Source.REMOTE,
+                DependencyGraph.Deployment.DECLARED_ENVIRONMENT, 2);
+        DependencyGraph graph = new DependencyGraph(List.of(explicit, downloaded), List.of(), Map.of())
+                .bindClassOwners(Map.of("shared/Type", 1),
+                        Map.of("shared/Type", List.of(2)), Set.of());
+
+        DependencyGraph.ClassOwner owner = graph.classOwner("shared/Type").orElseThrow();
+        assertEquals(List.of("explicit", "downloaded"), owner.candidateRefs());
+        assertEquals("explicit", owner.selectedRef());
+        assertEquals(DependencyGraph.Resolution.CONFLICT, owner.resolution());
+        assertFalse(owner.applicationOwned());
+    }
+
+    @Test
     void embeddedDuplicateIsNotLostWhenItSharesTheOuterInputOrdinal() {
         DependencyGraph.Node application = node("app", ArtifactProvenance.Role.APPLICATION,
                 DependencyGraph.Source.ACTUAL_APPLICATION,

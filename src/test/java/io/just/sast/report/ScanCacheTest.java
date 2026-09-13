@@ -89,6 +89,19 @@ class ScanCacheTest {
     }
 
     @Test
+    void effectiveDependencyEnvironmentInvalidatesSameBytes(@TempDir Path tmp) throws Exception {
+        Path artifact = tmp.resolve("app.jar");
+        Files.writeString(artifact, "stable-input");
+        ScanCache.Preflight first = ScanCache.preflight(artifact, List.of(), null, null,
+                false, false, 0, false, false, false, "pom-environment-a");
+        ScanCache.Preflight changed = ScanCache.preflight(artifact, List.of(), null, null,
+                false, false, 0, false, false, false, "pom-environment-b");
+
+        assertFalse(first.dependencyIdentity().equals(changed.dependencyIdentity()));
+        assertFalse(first.cacheKey().equals(changed.cacheKey()));
+    }
+
+    @Test
     void preflightSharesInputBudgetAcrossTargetAndDependencies(@TempDir Path tmp) throws Exception {
         Path artifact = tmp.resolve("app.jar");
         Path dependency = tmp.resolve("dep.jar");

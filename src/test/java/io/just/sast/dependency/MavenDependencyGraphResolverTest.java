@@ -17,6 +17,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -353,6 +354,148 @@ class MavenDependencyGraphResolverTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void completedGraphBindsBytesAndRetainsProvidedOptionalEnvironmentConditions() throws Exception {
+        Path repository = temp.resolve("binding-repository");
+        write(repository, "fixture/library/1.0/library-1.0.pom",
+                pom("fixture", "library", "1.0", ""));
+        writeJar(repository.resolve("fixture/library/1.0/library-1.0.jar"),
+                "fixture/library.marker", "library");
+        write(repository, "fixture/container/1.0/container-1.0.pom",
+                pom("fixture", "container", "1.0", ""));
+        write(repository, "fixture/feature/1.0/feature-1.0.pom",
+                pom("fixture", "feature", "1.0", ""));
+        Path root = temp.resolve("binding-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), """
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>fixture</groupId><artifactId>root</artifactId><version>1.0</version>
+                  <dependencies>
+                    <dependency><groupId>fixture</groupId><artifactId>library</artifactId>
+                      <version>1.0</version></dependency>
+                    <dependency><groupId>fixture</groupId><artifactId>container</artifactId>
+                      <version>1.0</version><scope>provided</scope></dependency>
+                    <dependency><groupId>fixture</groupId><artifactId>feature</artifactId>
+                      <version>1.0</version><optional>true</optional></dependency>
+                  </dependencies>
+                </project>
+                """);
+
+        MavenDependencyGraphResolver.Completion completion;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            completion = resolver.complete(new MavenDependencyGraphResolver.Request(
+                    root, temp.resolve("binding-cache"),
+                    List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository)),
+                    List.of(), false));
+        }
+
+        assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, completion.status(),
+                completion.resolution().problems().toString());
+        assertEquals(1, completion.artifacts().size());
+        DependencyGraph graph = completion.environmentGraph(1);
+        DependencyGraph.Node library = graph.nodes().values().stream()
+                .filter(node -> node.name().equals("library")).findFirst().orElseThrow();
+        assertEquals(DependencyGraph.Source.REMOTE, library.source());
+        assertEquals(1, library.inputIndex());
+        assertTrue(completion.artifacts().get(0).sha256()
+                .equalsIgnoreCase(library.provenance().sha256()));
+
+        DependencyGraph.Node provided = graph.nodes().values().stream()
+                .filter(node -> node.name().equals("container")).findFirst().orElseThrow();
+        assertEquals(DependencyGraph.Source.POM_DERIVED, provided.source());
+        assertEquals("provided", provided.scope());
+        assertEquals(-1, provided.inputIndex());
+        DependencyGraph.Node optional = graph.nodes().values().stream()
+                .filter(node -> node.name().equals("feature")).findFirst().orElseThrow();
+        assertTrue(optional.optional());
+        assertEquals(DependencyGraph.Source.POM_DERIVED, optional.source());
+        assertEquals(-1, optional.inputIndex());
+        assertTrue(graph.environmentConditions().stream()
+                .anyMatch(value -> value.startsWith("MAVEN_SCOPE_PROVIDED:")));
+        assertTrue(graph.environmentConditions().stream()
+                .anyMatch(value -> value.startsWith("MAVEN_OPTIONAL:")));
+        assertTrue(graph.environmentConditions().contains("MAVEN_POM_RESOLVED"));
+        assertTrue(completion.semanticIdentity().matches("[0-9a-f]{64}"));
+    }
+
+    @Test
+    void relocationIsRetainedAsAnEnvironmentConditionInsteadOfBeingHidden() throws Exception {
+        Path repository = temp.resolve("relocation-repository");
+        write(repository, "fixture/new-library/1.0/new-library-1.0.pom",
+                pom("fixture", "new-library", "1.0", ""));
+        writeJar(repository.resolve("fixture/new-library/1.0/new-library-1.0.jar"),
+                "fixture/relocated.marker", "relocated");
+        write(repository, "fixture/old-library/1.0/old-library-1.0.pom", """
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>fixture</groupId><artifactId>old-library</artifactId><version>1.0</version>
+                  <distributionManagement><relocation><groupId>fixture</groupId>
+                    <artifactId>new-library</artifactId><version>1.0</version></relocation>
+                  </distributionManagement>
+                </project>
+                """);
+        Path root = temp.resolve("relocation-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>old-library</artifactId><version>1.0</version>"
+                        + "</dependency></dependencies>"));
+
+        MavenDependencyGraphResolver.Completion completion;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            completion = resolver.complete(new MavenDependencyGraphResolver.Request(
+                    root, temp.resolve("relocation-cache"),
+                    List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository)),
+                    List.of(), false));
+        }
+
+        assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, completion.status(),
+                completion.resolution().problems().toString());
+        assertTrue(completion.resolution().graph().environmentConditions().stream()
+                .anyMatch(value -> value.startsWith("MAVEN_RELOCATED:")),
+                completion.resolution().graph().environmentConditions().toString());
+        assertTrue(completion.resolution().graph().nodes().values().stream()
+                .anyMatch(node -> node.resolutionReason().contains("relocated-from=")));
+    }
+
+    @Test
+    void changingTheSelectedDependencyVersionChangesTheCompletionIdentity() throws Exception {
+        Path repository = temp.resolve("identity-repository");
+        for (String version : List.of("1.0", "2.0")) {
+            write(repository, "fixture/library/" + version + "/library-" + version + ".pom",
+                    pom("fixture", "library", version, ""));
+            writeJar(repository.resolve("fixture/library/" + version
+                    + "/library-" + version + ".jar"), "fixture/version.marker", version);
+        }
+        Path root = temp.resolve("identity-root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>1.0</version>"
+                        + "</dependency></dependencies>"));
+        Path cache = temp.resolve("identity-cache");
+        MavenDependencyGraphResolver.Completion first;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            first = resolver.complete(new MavenDependencyGraphResolver.Request(root, cache,
+                    List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository)),
+                    List.of(), false));
+        }
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>2.0</version>"
+                        + "</dependency></dependencies>"));
+        MavenDependencyGraphResolver.Completion second;
+        try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+            second = resolver.complete(new MavenDependencyGraphResolver.Request(root, cache,
+                    List.of(MavenDependencyGraphResolver.RepositorySpec.file(repository)),
+                    List.of(), false));
+        }
+
+        assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, first.status());
+        assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, second.status());
+        assertEquals("fixture:library:1.0:jar:", first.artifacts().get(0).coordinate());
+        assertEquals("fixture:library:2.0:jar:", second.artifacts().get(0).coordinate());
+        assertNotEquals(first.semanticIdentity(), second.semanticIdentity());
     }
 
     private static MavenDependencyGraphResolver.DeclaredDependency dependency(

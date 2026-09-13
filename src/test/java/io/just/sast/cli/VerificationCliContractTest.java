@@ -120,10 +120,42 @@ class VerificationCliContractTest {
         int code = new CommandLine(new JustMain()).execute(
                 "scan", "--jar", target.toString(), "--pom", root.toString(),
                 "--repository", repository.toUri().toString(), "--offline",
-                "--fast", "--no-verify", "--output", output.toString());
+                "--fast", "--no-verify", "--cache", temp.resolve("maven-cache").toString(),
+                "--output", output.toString());
 
         assertEquals(0, code);
         assertTrue(Files.isDirectory(output));
+        String inventory = Files.readString(output.resolve("evidence/dependencies.csv"));
+        String bom = Files.readString(output.resolve("meta/dependencies.sbom.json"));
+        assertTrue(inventory.contains("derived"));
+        assertTrue(inventory.contains("maven:repository=repository-1"), inventory);
+        assertTrue(inventory.contains("DECLARED_ENVIRONMENT"), inventory);
+        assertTrue(bom.contains("MAVEN_POM_RESOLVED"), bom);
+    }
+
+    @Test
+    void classDirectoryWithoutPomReportsTheMissingEnvironmentBoundary(@TempDir Path temp)
+            throws Exception {
+        Path classes = temp.resolve("class-input");
+        Path marker = classes.resolve("fixture/Marker.class");
+        Files.createDirectories(marker.getParent());
+        try (var input = VerificationCliContractTest.class
+                .getResourceAsStream("/io/just/sast/cli/VerificationCliContractTest.class")) {
+            if (input == null) {
+                throw new IOException("test class resource is missing");
+            }
+            Files.write(marker, input.readAllBytes());
+        }
+        Path output = temp.resolve("directory-output");
+
+        int code = new CommandLine(new JustMain()).execute(
+                "scan", "--jar", classes.toString(), "--fast", "--no-verify",
+                "--output", output.toString());
+
+        assertEquals(0, code);
+        String bom = Files.readString(output.resolve("meta/dependencies.sbom.json"));
+        assertTrue(bom.contains("CLASS_DIRECTORY_INPUT:0"), bom);
+        assertTrue(bom.contains("MAVEN_POM_NOT_PROVIDED"), bom);
     }
 
     private static String pom(String group, String artifact, String version, String dependencies) {

@@ -4,6 +4,7 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import io.just.sast.dependency.MavenDependencyGraphResolver;
+import io.just.sast.model.DependencyGraph;
 import io.just.sast.report.ScanCache;
 import io.just.sast.run.RunOutcome;
 import io.just.sast.verify.VerificationDefaults;
@@ -115,7 +116,8 @@ public final class ScanCommand implements Callable<Integer> {
                         "真实动态验证已移除；--mode/静态扫描不接受旧 verifier 选项");
             }
             printVerificationDisclosure();
-            List<Path> scanDeps = resolveDependencies();
+            PreparedDependencies prepared = resolveDependencies();
+            List<Path> scanDeps = prepared.paths();
             // The product CLI is static-only.  The library compatibility overloads still
             // retain their old verifier seams for characterization until P1.4 removes them.
             boolean useSafeReal = false;
@@ -134,7 +136,7 @@ public final class ScanCommand implements Callable<Integer> {
                 try {
                     preflight = ScanCache.preflight(target, scanDeps, rules, jdkHome, fast,
                             false, verifyBudget, false, false,
-                            useOsIsolation);
+                            useOsIsolation, prepared.environmentIdentity());
                     if (ScanCache.restore(cache, preflight.cacheKey(), output)) {
                         System.err.println("[just:info] 增量缓存命中（报告身份已校验）");
                         return RunOutcome.success().exitCode();
@@ -148,7 +150,8 @@ public final class ScanCommand implements Callable<Integer> {
                     fast, jdkHome, false, verifyBudget, false, false,
                     useOsIsolation,
                     baseline, suppressions, overwrite,
-                    modePolicy);
+                    modePolicy, prepared.environmentGraph(), prepared.explicitDependencyCount(),
+                    prepared.environmentIdentity());
             if (useCache && preflight != null) {
                 try {
                     boolean stored = ScanCache.store(cache, preflight.cacheKey(), output,
@@ -169,15 +172,17 @@ public final class ScanCommand implements Callable<Integer> {
         }
     }
 
-    private List<Path> resolveDependencies() throws ScanPipeline.UsageException {
+    private PreparedDependencies resolveDependencies() throws ScanPipeline.UsageException {
         List<Path> resolved = deps == null ? new ArrayList<>() : new ArrayList<>(deps);
+        int explicitDependencyCount = resolved.size();
         boolean hasRepositories = repositories != null && !repositories.isEmpty();
         if (pom == null) {
             if (offline || hasRepositories) {
                 throw new ScanPipeline.UsageException(
                         "--offline/--repository 需要同时提供显式 --pom；无 POM 时 Just 不按类名猜包");
             }
-            return List.copyOf(resolved);
+            return new PreparedDependencies(resolved, explicitDependencyCount, null,
+                    "MAVEN_POM_NOT_PROVIDED");
         }
 
         List<MavenDependencyGraphResolver.RepositorySpec> selectedRepositories =
@@ -227,7 +232,9 @@ public final class ScanCommand implements Callable<Integer> {
             System.err.println("[just:info] dependencyCompletion=" + completion.status()
                     + "; artifacts=" + completion.artifacts().size()
                     + "; networkDownloadWallMs=" + completion.networkDownloadWallMs());
-            return List.copyOf(resolved);
+            return new PreparedDependencies(resolved, explicitDependencyCount,
+                    completion.environmentGraph(explicitDependencyCount + 1),
+                    completion.semanticIdentity());
         } catch (IOException failure) {
             throw new ScanPipeline.UsageException("Maven 依赖补齐失败: " + failure.getMessage());
         }
@@ -257,5 +264,19 @@ public final class ScanCommand implements Callable<Integer> {
         System.err.println("[just:info] verificationMode=STATIC_ONLY; "
                 + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
                 + "dynamicFiltering=ANALYSIS_ONLY; recommendedForUntrustedArtifacts=true");
+    }
+
+    /** Explicit handoff from input preparation to the frontend/cache pipeline. */
+    private record PreparedDependencies(List<Path> paths, int explicitDependencyCount,
+                                        DependencyGraph environmentGraph,
+                                        String environmentIdentity) {
+        private PreparedDependencies {
+            paths = paths == null ? List.of() : List.copyOf(paths);
+            if (explicitDependencyCount < 0 || explicitDependencyCount > paths.size()) {
+                throw new IllegalArgumentException("explicit dependency count is invalid");
+            }
+            environmentIdentity = environmentIdentity == null || environmentIdentity.isBlank()
+                    ? "MAVEN_POM_NOT_PROVIDED" : environmentIdentity;
+        }
     }
 }
