@@ -403,7 +403,7 @@ class ApplicationChainJoinerContractTest {
     }
 
     @Test
-    void acceptedAutoTypePrefixJoinsApplicationBindingToConcreteSetter() {
+    void acceptedAutoTypePrefixJoinsUnrelatedApplicationBindingTarget() {
         String controller = "fixture/app/Controller";
         String target = "fixture/app/Metric";
         String setterDesc = "(Ljava/lang/String;)V";
@@ -440,12 +440,12 @@ class ApplicationChainJoinerContractTest {
         ClassHierarchy hierarchy = new ClassHierarchy(Map.of(
                 "fixture/app/Note", new ClassInfo("fixture/app/Note", "java/lang/Object",
                         List.of(), Modifier.PUBLIC, List.of(), List.of()),
-                target, new ClassInfo(target, "fixture/app/Note", List.of(), Modifier.PUBLIC,
-                        List.of(), List.of())), null);
+                target, new ClassInfo(target, "java/lang/Object", List.of(),
+                        Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of())), null);
         RuleEngine engine = new RuleEngine(new RuleSet(List.of(sinkRule), List.of(),
                 List.of(), List.of(), List.of()), hierarchy);
         ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
-                Set.of(controller, target), true, hierarchy);
+                Set.of(controller, target), true);
 
         assertTrue(index.deserializeSites().stream().anyMatch(site ->
                 site.hostMethodKey().startsWith(controller + "#put")
@@ -467,7 +467,7 @@ class ApplicationChainJoinerContractTest {
     void acceptedAutoTypePrefixDoesNotJoinUnrelatedFinalBindingType() {
         String controller = "fixture/app/Controller";
         String declared = "fixture/app/Note";
-        String unrelated = "fixture/app/Metric";
+        String unrelated = "fixture/other/Metric";
         String setterDesc = "(Ljava/lang/String;)V";
         String sinkDesc = "()Ljava/lang/Process;";
         Graph graph = new Graph();
@@ -505,11 +505,11 @@ class ApplicationChainJoinerContractTest {
         RuleEngine engine = new RuleEngine(new RuleSet(List.of(sinkRule), List.of(),
                 List.of(), List.of(), List.of()), hierarchy);
         ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
-                Set.of(controller, declared, unrelated), true, hierarchy);
+                Set.of(controller, declared, unrelated), true);
 
         assertTrue(index.typedBindingSites().stream().anyMatch(site ->
                 site.hostMethodKey().startsWith(controller + "#put")
-                        && site.targetTypes().equals(List.of(declared))));
+                        && site.targetTypes().contains(declared)));
         assertTrue(index.typedBindingSitesForTarget(unrelated).isEmpty());
 
         Chain chain = new Chain("unrelated-final", "COMMAND", "HIGH", unrelated, "setValue",

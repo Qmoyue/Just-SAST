@@ -405,8 +405,7 @@ public final class Blackboard {
                 ? ScanInputs.fastDefault(Path.of(".")) : scanInputs;
         this.ruleEngine = new RuleEngine(this.rules, hierarchy);
         this.applicationEntryIndex = ApplicationEntryIndex.build(graph, ruleEngine,
-                this.scanInputs.applicationClassNames(), this.scanInputs.applicationScopeKnown(),
-                hierarchy);
+                this.scanInputs.applicationClassNames(), this.scanInputs.applicationScopeKnown());
         this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, this.scanInputs.fast(),
                 this.cpgIndex, this.scanInputs.applicationClassNames(),
                 this.scanInputs.applicationScopeKnown(),

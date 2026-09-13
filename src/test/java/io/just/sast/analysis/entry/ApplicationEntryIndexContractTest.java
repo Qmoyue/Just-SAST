@@ -439,10 +439,10 @@ class ApplicationEntryIndexContractTest {
     }
 
     @Test
-    void acceptedAutoTypePrefixCannotOverrideDeclaredFinalType() {
+    void acceptedAutoTypePrefixDoesNotJoinApplicationClassOutsidePrefix() {
         String controller = "fixture/app/Controller";
         String declared = "fixture/app/Note";
-        String unrelated = "fixture/app/Metric";
+        String unrelated = "fixture/other/Metric";
         String endpointDescriptor = "(Lfixture/app/Note;)V";
         Graph graph = new Graph();
         Node endpoint = graph.methodNode(controller, "put", endpointDescriptor, false);
@@ -469,15 +469,17 @@ class ApplicationEntryIndexContractTest {
                         Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of())), null);
         RuleEngine engine = new RuleEngine(rules(), hierarchy);
         ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
-                Set.of(controller, declared, unrelated), true, hierarchy);
+                Set.of(controller, declared, unrelated), true);
 
         ApplicationEntryIndex.DeserializeSite site = index.deserializeSites().stream()
                 .filter(value -> value.hostMethodKey().startsWith(controller + "#put"))
                 .findFirst().orElseThrow();
-        assertEquals(List.of(declared), site.targetTypes(),
-                "accepted package names must still satisfy the final declared request type");
+        assertTrue(site.targetTypes().contains(declared),
+                "the declared request type remains a binding alternative");
+        assertFalse(site.targetTypes().contains(unrelated),
+                "an application class outside the accepted prefix is not a target");
         assertTrue(index.typedBindingSitesForTarget(unrelated).isEmpty(),
-                "an unrelated final class must not become a typed binding target");
+                "an application class outside the accepted prefix must not become a target");
     }
 
     @Test
