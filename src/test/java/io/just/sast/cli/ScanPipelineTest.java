@@ -268,6 +268,69 @@ class ScanPipelineTest {
     }
 
     @Test
+    void inheritedDefineClassModelReachesClassInstantiation(@TempDir Path tmp) throws Exception {
+        String loader = """
+                package app;
+                public final class Loader extends ClassLoader {
+                    public void trigger(byte[] bytes) throws Exception {
+                        defineClass(null, bytes, 0, bytes.length).newInstance();
+                    }
+                }
+                """;
+        String entry = """
+                package app;
+                public final class Entry implements java.io.Serializable {
+                    private byte[] bytes;
+                    private void readObject(java.io.ObjectInputStream in) throws Exception {
+                        in.defaultReadObject();
+                        new Loader().trigger(bytes);
+                    }
+                }
+                """;
+        String rules = """
+                rules:
+                  - id: T-ENTRY
+                    kind: magic-entry
+                    entryKind: readObject
+                    match:
+                      method: { name: "readObject", descriptor: "(Ljava/io/ObjectInputStream;)V", access: private }
+                      class: { implements: "java/io/Serializable" }
+                  - id: T-DEFINECLASS
+                    kind: model
+                    match:
+                      call: { owner: "java/lang/ClassLoader", name: "defineClass" }
+                    actions: { return: [arg1] }
+                  - id: T-DEFINECLASS-SINK
+                    kind: sink
+                    category: CODE_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "java/lang/ClassLoader", name: "defineClass" }
+                    tainted: [{arg: 1}]
+                  - id: T-NEWINSTANCE
+                    kind: sink
+                    category: CODE_EXEC
+                    severity: HIGH
+                    match:
+                      call: { owner: "java/lang/Class", name: "newInstance" }
+                    tainted: [{receiver: true}]
+                """;
+        Path jar = compileToJar(tmp.resolve("inherited-define-class.jar"), Map.of(
+                "app.Loader", loader, "app.Entry", entry));
+        Path rulesFile = tmp.resolve("inherited-define-class-rules.yaml");
+        Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
+        Path out = tmp.resolve("out");
+
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+
+        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        assertTrue(findings.contains("app/Entry,readObject")
+                        && findings.contains("java/lang/Class,newInstance")
+                        && findings.contains("app/Loader.defineClass"),
+                "继承 ClassLoader 方法的 return model 应接到后续 Class.newInstance：\n" + findings);
+    }
+
+    @Test
     void serializeOnlyDoesNotBecomeAnExternalDeserializeSourceInMixedFlow(@TempDir Path tmp)
             throws Exception {
         String serializer = """

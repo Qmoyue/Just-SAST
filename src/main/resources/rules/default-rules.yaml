@@ -80,6 +80,15 @@ rules:
       call: { owner: "java/lang/ClassLoader", name: "defineClass" }
     tainted: [{arg: 1}]
 
+  # defineClass returns the newly defined Class object.  Preserve the byte-array provenance
+  # through that capability so a subsequent Class.newInstance boundary remains visible in the
+  # same static chain; no class is loaded or initialized by this model.
+  - id: MODEL-CLASSLOADER-DEFINECLASS-RETURN
+    kind: model
+    match:
+      call: { owner: "java/lang/ClassLoader", name: "defineClass" }
+    actions: { return: [arg1] }
+
   - id: JUST-SINK-SCRIPT-ENGINE
     kind: sink
     category: CODE_EXEC

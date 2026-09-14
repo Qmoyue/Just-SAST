@@ -2715,18 +2715,33 @@ public final class ForwardEngine {
         return false;
     }
 
-    /** Whether a model names this call directly rather than matching through a supertype. */
-    private static boolean isExactModel(Rule.ModelRule model, Node call) {
+    /**
+     * Whether a model names this call directly or names the method declaration resolved from
+     * the call's symbolic owner.  The latter matters for inherited API calls: bytecode may
+     * legally emit {@code HashCode.defineClass} even though the method is declared by
+     * {@code ClassLoader}.  Treating that as an unresolved broad model would suppress the
+     * return provenance when the JDK body has a summary, hiding a subsequent
+     * {@code Class.newInstance} boundary.
+     */
+    private boolean isExactModel(Rule.ModelRule model, Node call) {
         if (model == null || call == null || model.call() == null) {
             return false;
         }
         var matcher = model.call();
-        if (matcher.owner().isRegex() || !matcher.owner().pattern().equals(call.owner())
-                || matcher.name().isRegex() || !matcher.name().pattern().equals(call.name())) {
+        if (matcher.owner().isRegex() || matcher.name().isRegex()) {
             return false;
         }
-        return matcher.descriptor() == null || (!matcher.descriptor().isRegex()
-                && matcher.descriptor().pattern().equals(call.descriptor()));
+        if (!matcher.name().pattern().equals(call.name())
+                || (matcher.descriptor() != null && (matcher.descriptor().isRegex()
+                || !matcher.descriptor().pattern().equals(call.descriptor())))) {
+            return false;
+        }
+        if (matcher.owner().pattern().equals(call.owner())) {
+            return true;
+        }
+        String resolvedOwner = bb.hierarchy().resolveMethod(call.owner(), call.name(),
+                call.descriptor());
+        return matcher.owner().pattern().equals(resolvedOwner);
     }
 
     /** Resolve the input precondition of a data-declared secondary source. */
