@@ -259,6 +259,43 @@ rules:
     tainted: [{receiver: true}]
   # 来源：su18"sink 前置"——CC 链终点直接 sink 化，砍掉冗长中间链
 
+  # Component conditions are data, not version branches.  The calibration owner only
+  # annotates a path when the selected bytecode fact is present and rejects it when a
+  # serialized target is provably not Serializable.
+  - id: CONDITION-CC3-UNSAFE-SERIALIZATION
+    kind: condition
+    match:
+      class: ~"^org/apache/commons/collections/functors/(InvokerTransformer|InstantiateTransformer)$"
+    condition:
+      type: serialization-guard
+      call:
+        owner: org/apache/commons/collections/functors/FunctorUtils
+        name: checkUnsafeSerialization
+      property:
+        key: org.apache.commons.collections.enableUnsafeSerialization
+        required: "true"
+
+  - id: CONDITION-CC4-FUNCTOR-SERIALIZABLE
+    kind: condition
+    match:
+      class: ~"^org/apache/commons/collections4/functors/(InvokerTransformer|InstantiateTransformer)$"
+    condition:
+      type: serializable
+      interface: java/io/Serializable
+
+  - id: CONDITION-BEANUTILS-CLASS-PROPERTY
+    kind: condition
+    match:
+      class: org/apache/commons/beanutils/BeanComparator
+    condition:
+      type: property-filter
+      registration:
+        owner: org/apache/commons/beanutils/PropertyUtilsBean
+        method: resetBeanIntrospectors
+        marker: org/apache/commons/beanutils/SuppressPropertiesBeanIntrospector
+      field: property
+      blocked-value: class
+
   - id: JUST-SINK-SQL-EXECUTE
     kind: sink
     category: SQLI

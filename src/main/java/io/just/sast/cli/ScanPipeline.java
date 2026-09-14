@@ -1468,8 +1468,14 @@ public final class ScanPipeline {
                     models.add(model);
                 }
             }
+            List<Rule.ConditionRule> conditions = new ArrayList<>(custom.conditions());
+            for (Rule.ConditionRule condition : bundled.conditions()) {
+                if (conditions.stream().noneMatch(existing -> existing.id().equals(condition.id()))) {
+                    conditions.add(condition);
+                }
+            }
             return new RuleSet(custom.sinks(), custom.magicEntries(), custom.sources(),
-                    models, custom.fragments(), custom.schemaVersion());
+                    models, custom.fragments(), conditions, custom.schemaVersion());
         }
         return loadBundledRules(loader, policy, tracker);
     }

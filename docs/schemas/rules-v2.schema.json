@@ -22,7 +22,7 @@
       "properties": {
         "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
         "kind": {
-          "enum": ["SINK", "MAGIC_ENTRY", "SOURCE", "MODEL", "CHAIN_FRAGMENT"]
+          "enum": ["SINK", "MAGIC_ENTRY", "SOURCE", "MODEL", "CHAIN_FRAGMENT", "CONDITION"]
         },
         "category": { "type": "string", "maxLength": 64 },
         "severity": { "enum": ["", "LOW", "MEDIUM", "HIGH", "CRITICAL"] },

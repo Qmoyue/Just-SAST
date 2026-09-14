@@ -30,15 +30,24 @@ class YamlRuleLoaderTest {
         assertTrue(set.sources().size() >= 42, "source 规则能力退化：实际 " + set.sources().size());
         assertTrue(set.models().size() >= 21, "model 规则能力退化：实际 " + set.models().size());
         assertTrue(set.magicEntries().size() >= 14, "magic-entry 含序列化侧入口，实际 " + set.magicEntries().size());
+        assertEquals(3, set.conditions().size(), "默认 Apache 条件规则必须全部装载");
+        assertTrue(set.conditions().stream().anyMatch(rule ->
+                rule.spec() instanceof Rule.SerializationGuard));
+        assertTrue(set.conditions().stream().anyMatch(rule ->
+                rule.spec() instanceof Rule.SerializableRequirement));
+        assertTrue(set.conditions().stream().anyMatch(rule ->
+                rule.spec() instanceof Rule.PropertyFilterDecl));
         Rule.ModelRule defineClassReturn = set.models().stream()
                 .filter(rule -> "MODEL-CLASSLOADER-DEFINECLASS-RETURN".equals(rule.id()))
                 .findFirst().orElseThrow();
         assertEquals(List.of("arg1"), defineClassReturn.actions().get("return"),
                 "defineClass 必须保留受控字节到 Class 返回对象的声明式模型");
         // id 唯一
-        long ids = java.util.stream.Stream.of(set.sinks(), set.magicEntries(), set.sources(), set.models())
+        long ids = java.util.stream.Stream.of(set.sinks(), set.magicEntries(), set.sources(),
+                        set.models(), set.conditions())
                 .flatMap(List::stream).map(Rule::id).distinct().count();
-        assertEquals(ids, set.sinks().size() + set.magicEntries().size() + set.sources().size() + set.models().size(),
+        assertEquals(ids, set.sinks().size() + set.magicEntries().size() + set.sources().size()
+                        + set.models().size() + set.conditions().size(),
                 "规则 id 不得重复");
     }
 

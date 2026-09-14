@@ -10,14 +10,28 @@ import java.util.Set;
 /** 编译后的规则集。 */
 public record RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magicEntries,
                       List<Rule.SourceRule> sources, List<Rule.ModelRule> models,
-                      List<Rule.FragmentRule> fragments, String schemaVersion) {
+                      List<Rule.FragmentRule> fragments, List<Rule.ConditionRule> conditions,
+                      String schemaVersion) {
 
     public static final String YAML_SCHEMA_VERSION = "JUST-RULES-YAML-V1";
 
     public RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magicEntries,
                    List<Rule.SourceRule> sources, List<Rule.ModelRule> models,
                    List<Rule.FragmentRule> fragments) {
-        this(sinks, magicEntries, sources, models, fragments, YAML_SCHEMA_VERSION);
+        this(sinks, magicEntries, sources, models, fragments, List.of(), YAML_SCHEMA_VERSION);
+    }
+
+    public RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magicEntries,
+                   List<Rule.SourceRule> sources, List<Rule.ModelRule> models,
+                   List<Rule.FragmentRule> fragments, List<Rule.ConditionRule> conditions) {
+        this(sinks, magicEntries, sources, models, fragments, conditions, YAML_SCHEMA_VERSION);
+    }
+
+    /** Compatibility constructor retained for callers that provide the schema version. */
+    public RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magicEntries,
+                   List<Rule.SourceRule> sources, List<Rule.ModelRule> models,
+                   List<Rule.FragmentRule> fragments, String schemaVersion) {
+        this(sinks, magicEntries, sources, models, fragments, List.of(), schemaVersion);
     }
 
     public RuleSet {
@@ -26,6 +40,7 @@ public record RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magic
         sources = sources == null ? List.of() : List.copyOf(sources);
         models = models == null ? List.of() : List.copyOf(models);
         fragments = fragments == null ? List.of() : List.copyOf(fragments);
+        conditions = conditions == null ? List.of() : List.copyOf(conditions);
         schemaVersion = schemaVersion == null || schemaVersion.isBlank()
                 ? YAML_SCHEMA_VERSION : schemaVersion.trim();
         if (!YAML_SCHEMA_VERSION.equals(schemaVersion)) {
@@ -96,6 +111,13 @@ public record RuleSet(List<Rule.SinkRule> sinks, List<Rule.MagicEntryRule> magic
                     || !rule.sinkDescriptor().contains(")"))) {
                 issues.add(issue("DESCRIPTOR_INVALID", rule.id(),
                         "fragment.sinkDescriptor is not a JVM method descriptor"));
+            }
+        }
+        for (Rule.ConditionRule rule : conditions) {
+            checkId(rule, ids, issues);
+            if (rule.targetClass() == null || rule.spec() == null) {
+                issues.add(issue("CONDITION_SHAPE_INVALID", rule.id(),
+                        "condition target and specification are required"));
             }
         }
         checkExactOverlaps("sink", sinks.stream().map(Rule.SinkRule::id).toList(),

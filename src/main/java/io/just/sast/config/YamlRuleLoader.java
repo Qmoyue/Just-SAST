@@ -45,6 +45,7 @@ public final class YamlRuleLoader {
     private static final Set<String> FRAGMENT_KEYS = Set.of("id", "kind", "entryClass", "entryKind",
             "entryMethod", "entryDescriptor", "activation", "sinkOwner", "sinkName",
             "sinkDescriptor", "hops", "construction", "direct");
+    private static final Set<String> CONDITION_KEYS = Set.of("id", "kind", "match", "condition");
     private static final Set<String> CALL_KEYS = Set.of("owner", "name", "descriptor");
     private static final Set<String> METHOD_KEYS = Set.of("name", "descriptor", "access");
     private static final Set<String> CLASS_KEYS = Set.of("implements");
@@ -144,6 +145,7 @@ public final class YamlRuleLoader {
         List<Rule.SourceRule> sources = new ArrayList<>();
         List<Rule.ModelRule> models = new ArrayList<>();
         List<Rule.FragmentRule> fragments = new ArrayList<>();
+        List<Rule.ConditionRule> conditions = new ArrayList<>();
         java.util.Set<String> seenIds = new java.util.HashSet<>();
         for (Object item : list) {
             parseBudget.checkTime();
@@ -155,9 +157,9 @@ public final class YamlRuleLoader {
             if (id == null || kind == null) {
                 throw new IOException("规则缺少 id/kind 字段（静默跳过会掩盖拼写错误）: " + ruleMap);
             }
-            if (!Set.of("sink", "magic-entry", "source", "model", "chain-fragment").contains(kind)) {
+            if (!Set.of("sink", "magic-entry", "source", "model", "chain-fragment", "condition").contains(kind)) {
                 throw new IOException("未知规则 kind: " + kind
-                        + "（规则 " + id + "；合法值 sink/magic-entry/source/model/chain-fragment）");
+                        + "（规则 " + id + "；合法值 sink/magic-entry/source/model/chain-fragment/condition）");
             }
             validateRuleKeys(ruleMap, kind, id);
             if (!seenIds.add(id)) {
@@ -170,8 +172,9 @@ public final class YamlRuleLoader {
                     case "source" -> sources.add(parseSource(id, ruleMap));
                     case "model" -> models.add(parseModel(id, ruleMap));
                     case "chain-fragment" -> fragments.add(parseFragment(id, ruleMap));
+                    case "condition" -> conditions.add(parseCondition(id, ruleMap));
                     default -> throw new IOException("未知规则 kind: " + kind + "（规则 " + id
-                            + "；合法值 sink/magic-entry/source/model/chain-fragment）");
+                            + "；合法值 sink/magic-entry/source/model/chain-fragment/condition）");
                 }
             } catch (ClassCastException | IllegalArgumentException e) {
                 throw new IOException("规则 " + id + " 字段类型或匹配表达式错误: " + e.getMessage(), e);
@@ -179,7 +182,7 @@ public final class YamlRuleLoader {
         }
         parseBudget.checkTime();
         return new RuleSet(List.copyOf(sinks), List.copyOf(entries), List.copyOf(sources),
-                List.copyOf(models), List.copyOf(fragments), schemaVersion);
+                List.copyOf(models), List.copyOf(fragments), List.copyOf(conditions), schemaVersion);
     }
 
     private static void validateRuleKeys(Map<?, ?> map, String kind, String id) throws IOException {
@@ -189,6 +192,7 @@ public final class YamlRuleLoader {
             case "source" -> SOURCE_KEYS;
             case "model" -> MODEL_KEYS;
             case "chain-fragment" -> FRAGMENT_KEYS;
+            case "condition" -> CONDITION_KEYS;
             default -> COMMON_RULE_KEYS;
         };
         rejectUnknownKeys(map, allowed, "rule " + id);
@@ -423,6 +427,72 @@ public final class YamlRuleLoader {
         }
         List<Rule.TaintedPos> tainted = parseOptionalTainted(ruleMap, "source 规则 " + id);
         return new Rule.SourceRule(id, bridge, callMatcher, safeConfig, tainted);
+    }
+
+    private Rule.ConditionRule parseCondition(String id, Map<?, ?> ruleMap) throws IOException {
+        Map<?, ?> match = requiredMap(ruleMap, "match", "condition 规则 " + id + " 缺少 match 块",
+                "condition 规则 " + id + " 的 match 必须是 map");
+        rejectUnknownKeys(match, Set.of("class"), "condition rule " + id + " match");
+        Match targetClass = matchOf(match.get("class"));
+        Map<?, ?> condition = requiredMap(ruleMap, "condition",
+                "condition 规则 " + id + " 缺少 condition 块",
+                "condition 规则 " + id + " 的 condition 必须是 map");
+        String type = requiredString(condition, "type", "condition 规则 " + id + " 缺少 condition.type")
+                .toLowerCase(java.util.Locale.ROOT);
+        return switch (type) {
+            case "serialization-guard" -> parseSerializationGuard(id, targetClass, condition);
+            case "serializable" -> parseSerializableRequirement(id, targetClass, condition);
+            case "property-filter" -> parsePropertyFilter(id, targetClass, condition);
+            default -> throw new IOException("condition 规则 " + id + " 的 type 无效: " + type);
+        };
+    }
+
+    private Rule.ConditionRule parseSerializationGuard(String id, Match targetClass,
+                                                        Map<?, ?> condition) throws IOException {
+        rejectUnknownKeys(condition, Set.of("type", "call", "property"),
+                "condition rule " + id + " serialization-guard");
+        Map<?, ?> call = requiredMap(condition, "call", "condition 规则 " + id + " 缺少 guard call",
+                "condition 规则 " + id + " 的 guard call 必须是 map");
+        rejectUnknownKeys(call, CALL_KEYS, "condition rule " + id + " guard call");
+        Rule.CallMatcher guard = new Rule.CallMatcher(matchOf(call.get("owner")),
+                matchOf(call.get("name")), matchNullable(call.get("descriptor")));
+        Map<?, ?> property = requiredMap(condition, "property",
+                "condition 规则 " + id + " 缺少 property",
+                "condition 规则 " + id + " 的 property 必须是 map");
+        rejectUnknownKeys(property, Set.of("key", "required"),
+                "condition rule " + id + " property");
+        return new Rule.ConditionRule(id, targetClass,
+                new Rule.SerializationGuard(guard,
+                        requiredString(property, "key", "condition 规则 " + id + " 缺少 property.key"),
+                        requiredString(property, "required",
+                                "condition 规则 " + id + " 缺少 property.required")));
+    }
+
+    private Rule.ConditionRule parseSerializableRequirement(String id, Match targetClass,
+                                                             Map<?, ?> condition) throws IOException {
+        rejectUnknownKeys(condition, Set.of("type", "interface"),
+                "condition rule " + id + " serializable");
+        return new Rule.ConditionRule(id, targetClass,
+                new Rule.SerializableRequirement(requiredString(condition, "interface",
+                        "condition 规则 " + id + " 缺少 interface")));
+    }
+
+    private Rule.ConditionRule parsePropertyFilter(String id, Match targetClass,
+                                                   Map<?, ?> condition) throws IOException {
+        rejectUnknownKeys(condition, Set.of("type", "registration", "field", "blocked-value"),
+                "condition rule " + id + " property-filter");
+        Map<?, ?> registration = requiredMap(condition, "registration",
+                "condition 规则 " + id + " 缺少 registration",
+                "condition 规则 " + id + " 的 registration 必须是 map");
+        rejectUnknownKeys(registration, Set.of("owner", "method", "marker"),
+                "condition rule " + id + " registration");
+        Rule.PropertyFilterDecl filter = new Rule.PropertyFilterDecl(
+                matchOf(registration.get("owner")), matchOf(registration.get("method")),
+                matchOf(registration.get("marker")),
+                requiredString(condition, "field", "condition 规则 " + id + " 缺少 field"),
+                requiredString(condition, "blocked-value",
+                        "condition 规则 " + id + " 缺少 blocked-value"));
+        return new Rule.ConditionRule(id, targetClass, filter);
     }
 
     /** source 的 tainted 为空表示无条件入口；出现该字段时必须是非空位置列表。 */

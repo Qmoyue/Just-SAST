@@ -29,7 +29,7 @@ public final class RuleSchemaV2 {
     public static final String SEMANTICS_VERSION = "1";
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,127}");
 
-    public enum RuleKind { SINK, MAGIC_ENTRY, SOURCE, MODEL, CHAIN_FRAGMENT }
+    public enum RuleKind { SINK, MAGIC_ENTRY, SOURCE, MODEL, CHAIN_FRAGMENT, CONDITION }
 
     public enum Capability {
         REFLECTION, CLASS_LOADING, PROCESS, NETWORK, JDBC, JNDI, DESERIALIZATION,
@@ -254,6 +254,7 @@ public final class RuleSchemaV2 {
         rules.sources().forEach(rule -> definitions.add(adapt(rule)));
         rules.models().forEach(rule -> definitions.add(adapt(rule)));
         rules.fragments().forEach(rule -> definitions.add(adapt(rule)));
+        rules.conditions().forEach(rule -> definitions.add(adapt(rule)));
         return new Catalog(SCHEMA_VERSION, definitions);
     }
 
@@ -272,6 +273,8 @@ public final class RuleSchemaV2 {
         rules.models().forEach(rule -> addShadow(grouped, rule, "model",
                 "NONE", false));
         rules.fragments().forEach(rule -> addShadow(grouped, rule, "chain-fragment",
+                "NONE", false));
+        rules.conditions().forEach(rule -> addShadow(grouped, rule, "condition",
                 "NONE", false));
         List<ShadowRecord> records = new ArrayList<>(grouped.size());
         for (List<ShadowRecord> candidates : grouped.values()) {
@@ -369,7 +372,25 @@ public final class RuleSchemaV2 {
         if (rule instanceof Rule.ModelRule model) {
             return new Definition(model.id(), RuleKind.MODEL, "", "",
                     new Semantics(Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
-                            Set.of(Filter.NONE), Set.of(Callback.METHOD_SUMMARY)));
+                    Set.of(Filter.NONE), Set.of(Callback.METHOD_SUMMARY)));
+        }
+        if (rule instanceof Rule.ConditionRule condition) {
+            if (condition.spec() instanceof Rule.SerializationGuard) {
+                return new Definition(condition.id(), RuleKind.CONDITION, "", "",
+                        new Semantics(Set.of(Capability.DESERIALIZATION), Set.of(),
+                                Set.of(Boundary.CONFIGURATION), Set.of(), Set.of(),
+                                Set.of(Filter.SAFE_CONFIG), Set.of(Callback.METHOD_SUMMARY)));
+            }
+            if (condition.spec() instanceof Rule.SerializableRequirement) {
+                return new Definition(condition.id(), RuleKind.CONDITION, "", "",
+                        new Semantics(Set.of(Capability.DESERIALIZATION), Set.of(),
+                                Set.of(Boundary.DESERIALIZATION), Set.of(), Set.of(),
+                                Set.of(Filter.TYPE_ALLOWLIST), Set.of(Callback.METHOD_SUMMARY)));
+            }
+            return new Definition(condition.id(), RuleKind.CONDITION, "", "",
+                    new Semantics(Set.of(Capability.REFLECTION), Set.of(),
+                            Set.of(Boundary.BINDING), Set.of(), Set.of(),
+                            Set.of(Filter.TYPE_ALLOWLIST), Set.of(Callback.BEAN_PROPERTY)));
         }
         Rule.FragmentRule fragment = (Rule.FragmentRule) rule;
         Capability capability = capabilityFor("", fragment.sinkOwner(), fragment.sinkName());

@@ -24,12 +24,20 @@ class RuleSchemaV2ContractTest {
 
         int legacyCount = legacy.sinks().size() + legacy.magicEntries().size()
                 + legacy.sources().size() + legacy.models().size() + legacy.fragments().size();
+        legacyCount += legacy.conditions().size();
         assertTrue(legacyCount >= 200,
                 "default catalog must retain the established rule baseline");
         assertEquals(legacyCount, catalog.rules().size(), "v1 rules must not be silently dropped");
         assertEquals(legacyCount,
                 catalog.rules().stream().map(RuleSchemaV2.Definition::id).distinct().count());
         assertTrue(catalog.rules().stream().allMatch(rule -> rule.semantics().hasAnyAxis()));
+        assertEquals(Set.of("CONDITION-CC3-UNSAFE-SERIALIZATION",
+                        "CONDITION-CC4-FUNCTOR-SERIALIZABLE",
+                        "CONDITION-BEANUTILS-CLASS-PROPERTY"),
+                catalog.rules().stream()
+                        .filter(rule -> rule.kind() == RuleSchemaV2.RuleKind.CONDITION)
+                        .map(RuleSchemaV2.Definition::id)
+                        .collect(java.util.stream.Collectors.toSet()));
         assertEquals(catalog.toCanonicalJson(), RuleSchemaV2.adapt(legacy).toCanonicalJson());
         assertEquals(64, catalog.digest().length());
 

@@ -170,6 +170,74 @@ public sealed interface Rule {
     }
 
     /**
+     * A bounded, declarative condition attached to a component path.  Conditions are facts
+     * about an artifact, not a second solver: the calibration owner may annotate a chain or
+     * reject it only when the selected condition is statically disproved.
+     */
+    sealed interface ConditionSpec permits SerializationGuard, SerializableRequirement,
+            PropertyFilterDecl {
+    }
+
+    /** A callback calls a guard whose configuration must equal the declared value. */
+    record SerializationGuard(CallMatcher guardCall, String propertyKey, String requiredValue)
+            implements ConditionSpec {
+        public SerializationGuard {
+            if (guardCall == null || propertyKey == null || propertyKey.isBlank()
+                    || requiredValue == null || requiredValue.isBlank()) {
+                throw new IllegalArgumentException("serialization guard is incomplete");
+            }
+        }
+    }
+
+    /** The serialized object must implement the declared marker interface. */
+    record SerializableRequirement(String interfaceType) implements ConditionSpec {
+        public SerializableRequirement {
+            if (interfaceType == null || interfaceType.isBlank()) {
+                throw new IllegalArgumentException("serializable condition interface is blank");
+            }
+        }
+    }
+
+    /** A default property filter is proven by a registration method and marker class. */
+    record PropertyFilterDecl(Match registrationOwner, Match registrationMethod,
+                              Match markerClass, String propertyField, String blockedValue)
+            implements ConditionSpec {
+        public PropertyFilterDecl {
+            if (registrationOwner == null || registrationMethod == null || markerClass == null
+                    || propertyField == null || propertyField.isBlank()
+                    || blockedValue == null || blockedValue.isBlank()) {
+                throw new IllegalArgumentException("property filter condition is incomplete");
+            }
+        }
+    }
+
+    /**
+     * A condition rule is deliberately separate from sink/entry matching.  It cannot create a
+     * chain or an application entry; it only supplies a typed calibration fact for chains whose
+     * path contains targetClass.
+     */
+    record ConditionRule(String id, Match targetClass, ConditionSpec spec) implements Rule {
+        public ConditionRule {
+            if (id == null || id.isBlank()) {
+                throw new IllegalArgumentException("condition id must not be blank");
+            }
+            if (targetClass == null || spec == null) {
+                throw new IllegalArgumentException("condition target/spec must not be null");
+            }
+        }
+
+        public String kind() {
+            if (spec instanceof SerializationGuard) {
+                return "serialization-guard";
+            }
+            if (spec instanceof SerializableRequirement) {
+                return "serializable";
+            }
+            return "property-filter";
+        }
+    }
+
+    /**
      * model 规则（tabby actions 模式）：声明式方法摘要——无字节码体的外部/JDK 方法的污点传播。
      * targets: 污点到达位置 → 来源位置集合。如 {return: [arg0]} 表示 arg0 的污点传播到返回值；
      * {this: [arg1]} 表示 arg1 的污点投毒整个接收者对象（容器投毒，Map.put 语义）。
