@@ -112,6 +112,22 @@ class ChainRankingTest {
     }
 
     @Test
+    void partialNestedDeserializationCannotOutrankCompleteOrdinaryChain() {
+        Chain complete = chain("complete-ordinary", "TERMINAL");
+        Chain partialNested = new Chain("RULE-partial-nested", "CODE_EXEC", "HIGH", "app/Entry",
+                "deserialize", "deserialize", "app/Terminal", "run", List.of(
+                new ChainHop("app/Entry", "deserialize", "java/security/SignedObject", "getObject",
+                        HopKind.DIRECT_CALL, null, "fragment-activation-invoke", "()V", null),
+                new ChainHop("java/security/SignedObject", "getObject", "app/Terminal", "run",
+                        HopKind.DIRECT_CALL, null, "bridge-deser", "()V", null)), 1,
+                "()V", "TERMINAL");
+
+        assertTrue(ChainRanking.compare(complete, partialNested, Map.of(), Map.of(), Set.of()) < 0);
+        assertEquals(1, ChainRanking.evidence(partialNested, Map.of(), Map.of(), Set.of())
+                .semanticRank());
+    }
+
+    @Test
     void malformedDeclaredPlanDoesNotReceiveConstructibleRank() {
         ObjectGraphPlan partial = new ObjectGraphPlan(
                 List.of(new ObjectGraphPlan.Node("entry", "app/Entry",

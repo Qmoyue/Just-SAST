@@ -81,6 +81,10 @@ public final class ChainRanking {
         if (result != 0) return result;
         result = Integer.compare(a.sinkRoleRank(), b.sinkRoleRank());
         if (result != 0) return result;
+        // Evidence completeness is a hard boundary: a semantically attractive but partial
+        // chain must not outrank a complete chain merely because it carries a bridge marker.
+        result = Integer.compare(a.incompleteness(), b.incompleteness());
+        if (result != 0) return result;
         result = Integer.compare(a.semanticRank(), b.semanticRank());
         if (result != 0) return result;
         result = Integer.compare(a.constructionRank(), b.constructionRank());
