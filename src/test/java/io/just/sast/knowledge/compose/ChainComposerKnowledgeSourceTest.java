@@ -51,6 +51,23 @@ class ChainComposerKnowledgeSourceTest {
                 sinkClass, sinkMethod, List.of(hop), 0);
     }
 
+    private static Chain activatedSecondDeserialization(String activation) {
+        String reason = "fragment-activation-" + activation;
+        String descriptor = "()Ljava/lang/Object;";
+        List<ChainHop> hops = List.of(
+                new ChainHop("java/io/ObjectInputStream", "<init>", "java/io/ObjectInput",
+                        "readObject", HopKind.DIRECT_CALL, null, reason, descriptor, null),
+                new ChainHop("java/security/SignedObject", "getObject",
+                        "java/io/ObjectInputStream", "<init>", HopKind.DIRECT_CALL, null,
+                        reason, "", null),
+                new ChainHop("java/security/SignedObject", "getObject",
+                        "java/security/SignedObject", "getObject", HopKind.ENTRY, null,
+                        "secondDeserialization", descriptor, null));
+        return new Chain("signed-second", "DESERIALIZE", "HIGH",
+                "java/security/SignedObject", "getObject", "secondDeserialization",
+                "java/io/ObjectInput", "readObject", hops, 0, descriptor, "CAPABILITY");
+    }
+
     @Test
     void deserializeSinkFrontBridgesToMechanismEntryBack() {
         // 前段：SignedObject.getObject 类二次反序列化 sink；后段：readObject 机制入口链
@@ -71,6 +88,68 @@ class ChainComposerKnowledgeSourceTest {
                         && c.hops().stream().anyMatch(h -> "bridge-deser".equals(h.reason())));
         assertTrue(composed, "DESER 桥应组装 SignedObject 前段与 readObject 后段，实际链："
                 + bb.chains().stream().map(Chain::key).toList());
+    }
+
+    @Test
+    void secondDeserializationFragmentRequiresItsTypedActivationAxis() {
+        Chain invokeFront = chain("T-INVOKE", "REFLECTION", "app/Front", "lifecycle",
+                "java/lang/reflect/Method", "invoke");
+        Chain deserializeFront = chain("T-DESER", "DESERIALIZE", "app/Deserializer",
+                "readObject", "app/Deserializer", "readObject");
+        Chain signed = activatedSecondDeserialization("invoke");
+        Blackboard bb = new Blackboard(new io.just.sast.cpg.graph.Graph(),
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
+                Blackboard.ScanInputs.fastDefault(java.nio.file.Path.of(".")));
+        bb.addChain(invokeFront);
+        bb.addChain(deserializeFront);
+        bb.addChain(signed);
+
+        new ChainComposerKnowledgeSource().onEvent(bb, Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertTrue(bb.chains().stream().anyMatch(c -> c.hops().stream()
+                        .anyMatch(h -> "bridge-invoke".equals(h.reason()))),
+                "invoke capability must be able to select SignedObject#getObject");
+        assertFalse(bb.chains().stream()
+                        .filter(c -> "app/Deserializer".equals(c.entryClass()))
+                        .anyMatch(c -> c.hops().stream()
+                                .anyMatch(h -> "bridge-deser".equals(h.reason()))),
+                "a nested-deserialization prefix must not activate an invoke-only fragment");
+    }
+
+    @Test
+    void deserializationOnlyRomeFragmentCannotBeSelectedByInvoke() {
+        Chain invokeFront = chain("T-INVOKE", "REFLECTION", "app/Front", "lifecycle",
+                "java/lang/reflect/Method", "invoke");
+        Chain rome = new Chain("rome-deser", "CODE_EXEC", "HIGH",
+                "com/sun/syndication/feed/impl/EqualsBean", "equals", "equals",
+                "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl", "newTransformer",
+                List.of(
+                        new ChainHop("com/sun/syndication/feed/impl/ToStringBean", "toString",
+                                "com/sun/org/apache/xalan/internal/xsltc/trax/Templates",
+                                "getOutputProperties", HopKind.DIRECT_CALL, null,
+                                "fragment-activation-deserialize", "", null),
+                        new ChainHop("com/sun/syndication/feed/impl/EqualsBean", "equals",
+                                "com/sun/syndication/feed/impl/ToStringBean", "toString",
+                                HopKind.DIRECT_CALL, null, "fragment-activation-deserialize", "", null),
+                        new ChainHop("com/sun/syndication/feed/impl/EqualsBean", "equals",
+                                "com/sun/syndication/feed/impl/EqualsBean", "equals", HopKind.ENTRY,
+                                null, "equals", "(Ljava/lang/Object;)Z", null)),
+                0, "()Ljavax/xml/transform/Transformer;", "TERMINAL");
+        Blackboard bb = new Blackboard(new io.just.sast.cpg.graph.Graph(),
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
+                Blackboard.ScanInputs.fastDefault(java.nio.file.Path.of(".")));
+        bb.addChain(invokeFront);
+        bb.addChain(rome);
+
+        new ChainComposerKnowledgeSource().onEvent(bb,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertFalse(bb.chains().stream().anyMatch(c -> c.hops().stream()
+                        .anyMatch(h -> "bridge-invoke".equals(h.reason())
+                                && "com/sun/syndication/feed/impl/EqualsBean".equals(h.toOwner()))),
+                "ROME callback fragments must require a deserialization activation axis");
     }
 
     @Test

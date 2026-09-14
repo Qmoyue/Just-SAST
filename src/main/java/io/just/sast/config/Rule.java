@@ -187,21 +187,47 @@ public sealed interface Rule {
      */
     record FragmentRule(String id, String entryClass, String entryKind,
                         List<HopSpec> hops, String sinkOwner, String sinkName,
-                        String sinkDescriptor, ObjectGraphPlan constructionPlan) implements Rule {
+                        String sinkDescriptor, String entryMethod, String entryDescriptor,
+                        String activation, ObjectGraphPlan constructionPlan) implements Rule {
         /** 兼容旧的程序化规则构造；YAML 可用 sinkDescriptor 消除重载歧义。 */
         public FragmentRule(String id, String entryClass, String entryKind,
                             List<HopSpec> hops, String sinkOwner, String sinkName) {
-            this(id, entryClass, entryKind, hops, sinkOwner, sinkName, null, null);
+            this(id, entryClass, entryKind, hops, sinkOwner, sinkName,
+                    null, null, null, null, null);
         }
 
         /** Compatibility constructor for fragment rules without an object-shape plan. */
         public FragmentRule(String id, String entryClass, String entryKind,
                             List<HopSpec> hops, String sinkOwner, String sinkName,
                             String sinkDescriptor) {
-            this(id, entryClass, entryKind, hops, sinkOwner, sinkName, sinkDescriptor, null);
+            this(id, entryClass, entryKind, hops, sinkOwner, sinkName,
+                    sinkDescriptor, null, null, null, null);
+        }
+
+        /** Compatibility constructor for fragment rules with an object-shape plan. */
+        public FragmentRule(String id, String entryClass, String entryKind,
+                            List<HopSpec> hops, String sinkOwner, String sinkName,
+                            String sinkDescriptor, ObjectGraphPlan constructionPlan) {
+            this(id, entryClass, entryKind, hops, sinkOwner, sinkName,
+                    sinkDescriptor, null, null, null, constructionPlan);
         }
 
         public FragmentRule {
+            entryClass = entryClass == null ? "" : entryClass.trim();
+            entryKind = entryKind == null || entryKind.isBlank() ? "readObject"
+                    : entryKind.trim();
+            sinkOwner = sinkOwner == null ? "" : sinkOwner.trim();
+            sinkName = sinkName == null ? "" : sinkName.trim();
+            sinkDescriptor = sinkDescriptor == null ? "" : sinkDescriptor.trim();
+            entryMethod = entryMethod == null ? "" : entryMethod.trim();
+            entryDescriptor = entryDescriptor == null ? "" : entryDescriptor.trim();
+            activation = activation == null || activation.isBlank() ? "any"
+                    : activation.trim().toLowerCase(java.util.Locale.ROOT);
+            if (!Set.of("any", "invoke", "deserialize", "trigger", "template", "jndi")
+                    .contains(activation)) {
+                throw new IllegalArgumentException("fragment activation must be any/invoke/deserialize/"
+                        + "trigger/template/jndi: " + activation);
+            }
             constructionPlan = constructionPlan == null || constructionPlan.isEmpty()
                     ? null : constructionPlan;
         }

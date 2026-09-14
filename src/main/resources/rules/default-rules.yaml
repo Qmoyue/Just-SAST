@@ -144,6 +144,19 @@ rules:
       call: { owner: "org/springframework/util/SerializationUtils", name: "deserialize" }
     tainted: [{arg: 0}]
 
+  # ObjectInput is the interface actually referenced by JDK8 SignedObject#getObject.
+  # This is a nested-deserialization boundary, not a terminal effect; the fragment below
+  # proves the concrete SignedObject method body before composition can cross it.
+  - id: JUST-SINK-OBJECTINPUT-READOBJECT
+    kind: sink
+    category: DESERIALIZE
+    severity: HIGH
+    match:
+      call: { owner: "java/io/ObjectInput", name: "readObject",
+              descriptor: "()Ljava/lang/Object;" }
+    tainted: [{receiver: true}]
+    role: capability
+
   - id: JUST-SINK-JMX-INVOKE
     kind: sink
     category: CODE_EXEC
@@ -793,6 +806,7 @@ rules:
     kind: chain-fragment
     entryClass: "com/sun/syndication/feed/impl/EqualsBean"
     entryKind: equals
+    activation: deserialize
     hops:
       - { class: "com/sun/syndication/feed/impl/ToStringBean", method: "toString" }
     sinkOwner: "java/lang/reflect/Method"
@@ -802,6 +816,7 @@ rules:
     kind: chain-fragment
     entryClass: "com/sun/syndication/feed/impl/EqualsBean"
     entryKind: hashCode
+    activation: deserialize
     hops:
       - { class: "com/sun/syndication/feed/impl/ToStringBean", method: "toString" }
     sinkOwner: "java/lang/reflect/Method"
@@ -811,10 +826,53 @@ rules:
     kind: chain-fragment
     entryClass: "com/sun/syndication/feed/impl/ToStringBean"
     entryKind: toString
+    activation: deserialize
     hops:
       - { class: "javax/xml/transform/Templates", method: "getOutputProperties" }
     sinkOwner: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"
     sinkName: "newTransformer"
+
+  # ROME's EqualsBean callback can invoke the Templates getter directly.  Keep this as a
+  # separate terminal fragment from FRAG-ROME (which ends at Method.invoke); composing the
+  # latter with FRAG-ROME-TEMPLATE would reuse ToStringBean.toString and create a false cycle.
+  - id: FRAG-ROME-EQUALS-TEMPLATE
+    kind: chain-fragment
+    entryClass: "com/sun/syndication/feed/impl/EqualsBean"
+    entryKind: equals
+    activation: deserialize
+    hops:
+      - { class: "com/sun/syndication/feed/impl/ToStringBean", method: "toString" }
+      - { class: "javax/xml/transform/Templates", method: "getOutputProperties" }
+    sinkOwner: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"
+    sinkName: "newTransformer"
+
+  - id: FRAG-ROME-HASHCODE-TEMPLATE
+    kind: chain-fragment
+    entryClass: "com/sun/syndication/feed/impl/EqualsBean"
+    entryKind: hashCode
+    activation: deserialize
+    hops:
+      - { class: "com/sun/syndication/feed/impl/ToStringBean", method: "toString" }
+      - { class: "javax/xml/transform/Templates", method: "getOutputProperties" }
+    sinkOwner: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"
+    sinkName: "newTransformer"
+
+  # JDK8 SignedObject#getObject creates a fresh ObjectInputStream over its content and then
+  # calls ObjectInput.readObject.  The explicit entry method/descriptor avoids mapping this
+  # endpoint to the normal readObject callback family; activation=invoke records that ROME's
+  # Method.invoke capability must select this public method before the nested stream opens.
+  - id: FRAG-SIGNEDOBJECT-SECOND-DESERIALIZE
+    kind: chain-fragment
+    entryClass: "java/security/SignedObject"
+    entryKind: secondDeserialization
+    entryMethod: getObject
+    entryDescriptor: "()Ljava/lang/Object;"
+    activation: invoke
+    hops:
+      - { class: "java/io/ObjectInputStream", method: "<init>" }
+    sinkOwner: "java/io/ObjectInput"
+    sinkName: readObject
+    sinkDescriptor: "()Ljava/lang/Object;"
 
   - id: FRAG-SPRING1
     kind: chain-fragment

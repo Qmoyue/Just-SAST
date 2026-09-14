@@ -92,7 +92,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     private static final List<String> PUBLIC_ENTRY_KINDS = List.of(
             "readObject", "readResolve", "readObjectNoData", "readExternal",
             "hashCode", "equals", "compareTo", "compare", "toString",
-            "proxyInvoke", "validateObject");
+            "proxyInvoke", "validateObject", "secondDeserialization");
     private static final List<String> TRIGGER_ENTRY_KINDS = List.of(
             "hashCode", "equals", "compareTo", "compare", "toString");
 
@@ -162,6 +162,14 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         int score = index.isApplicationEntryMethod(key) ? 1_000 : 0;
         if (index.isApplicationOwner(chain.entryClass())) {
             score += 64;
+        }
+        // A typed nested-deserialization endpoint is the next composition frontier.  Keep one
+        // such application prefix ahead of ordinary source-host variants so its deserialized
+        // object can still request the bounded terminal-suffix pass.  The predicate uses the
+        // protocol endpoint and explicit fragment activation marker; it does not name a gadget
+        // or benchmark class.
+        if (isTypedNestedDeserializationFront(chain)) {
+            score += 1_024;
         }
         if ("source".equals(chain.entryKind()) || "deserialize".equals(chain.entryKind())) {
             score += 16;
@@ -783,6 +791,13 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         }
         if ("JNDI".equalsIgnoreCase(chain.category()) || "JDBC".equalsIgnoreCase(chain.category())) {
             score += 120;
+        }
+        // Declarative fragments are typed knowledge-source outputs.  Give their immutable
+        // endpoints a bounded scheduling preference so a large raw sink frontier cannot starve
+        // a reusable suffix that carries an explicit callback/bridge identity.  This is
+        // provenance-based and applies to every fragment rule, not to a fixture or class name.
+        if (isFragmentChain(chain)) {
+            score += 384;
         }
         return score;
     }
@@ -1647,7 +1662,50 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     private static boolean isDeclaredFragment(Chain chain) {
         return chain != null && chain.constructionPlan() != null
                 && !chain.constructionPlan().isEmpty()
-                && chain.hops().stream().anyMatch(hop -> "fragment".equals(hop.reason()));
+                && isFragmentChain(chain);
+    }
+
+    private static boolean isFragmentChain(Chain chain) {
+        return chain != null && chain.hops().stream().anyMatch(hop -> hop != null
+                && ("fragment".equals(hop.reason())
+                || (hop.reason() != null && hop.reason().startsWith("fragment-activation-"))));
+    }
+
+    private static boolean isTypedNestedDeserializationFront(Chain chain) {
+        if (chain == null || !"DESERIALIZE".equalsIgnoreCase(chain.category())
+                || !"readObject".equals(chain.sinkMethod())) {
+            return false;
+        }
+        if (!"java/io/ObjectInput".equals(chain.sinkClass())
+                && !"java/io/ObjectInputStream".equals(chain.sinkClass())) {
+            return false;
+        }
+        return chain.hops().stream().anyMatch(hop -> hop != null && hop.reason() != null
+                && hop.reason().startsWith("fragment-activation-"));
+    }
+
+    /**
+     * A declarative fragment may require one concrete activation mechanism.  The marker is
+     * carried by the fragment hops so the immutable Chain model does not need a second mutable
+     * rule side table.  Older fragments have no marker and retain their unrestricted behavior.
+     */
+    private static boolean activationAllows(Chain chain, String activation) {
+        if (chain == null || activation == null || activation.isBlank()) {
+            return false;
+        }
+        String required = null;
+        for (ChainHop hop : chain.hops()) {
+            if (hop == null || hop.reason() == null
+                    || !hop.reason().startsWith("fragment-activation-")) {
+                continue;
+            }
+            String value = hop.reason().substring("fragment-activation-".length());
+            if (required != null && !required.equals(value)) {
+                return false;
+            }
+            required = value;
+        }
+        return required == null || required.equals(activation);
     }
 
     private List<Chain> candidateBacks(FrontFeatures features, List<Chain> publicEntries,
@@ -1681,7 +1739,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
 
         // 1. INVOKE 桥：前段 sink 是 Method.invoke → 可调任意公共方法
         if (features.invoke()
-                && isPublicEntry(back)) {
+                && isPublicEntry(back)
+                && activationAllows(back, "invoke")) {
             return Bridge.INVOKE;
         }
 
@@ -1700,7 +1759,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         }
 
         // 4. DESER 桥：前段 sink 是二次反序列化 → 其产物字节流再被反序列化，触发后段机制入口
-        if (features.deserialize() && isPublicEntry(back)) {
+        if (features.deserialize() && isPublicEntry(back)
+                && activationAllows(back, "deserialize")) {
             return Bridge.DESER;
         }
 

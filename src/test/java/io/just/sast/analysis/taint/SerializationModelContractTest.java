@@ -17,6 +17,10 @@ class SerializationModelContractTest {
         assertTrue(SerializationModel.isOisRead("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;"));
         assertTrue(SerializationModel.isOisRead("java/io/ObjectInputStream", "readUnshared", "()Ljava/lang/Object;"));
         assertTrue(SerializationModel.isOisRead("java/io/ObjectInputStream", "readFields", "()Ljava/io/ObjectInputStream$GetField;"));
+        assertTrue(SerializationModel.isOisRead("java/io/ObjectInput", "readObject", "()Ljava/lang/Object;"),
+                "SignedObject#getObject invokes the ObjectInput interface, not only ObjectInputStream");
+        assertFalse(SerializationModel.isOisRead("java/io/ObjectInput", "readFields",
+                "()Ljava/io/ObjectInputStream$GetField;"));
         assertFalse(SerializationModel.isOisRead("java/io/ObjectInputStream", "writeObject", "()V"));
         assertFalse(SerializationModel.isOisRead(null, null, null));
     }

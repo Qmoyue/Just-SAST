@@ -378,6 +378,46 @@ class ApplicationEntryIndexContractTest {
     }
 
     @Test
+    void typedDependencyContinuationMayEndAtIndexedIntermediateCapability() {
+        String inputDescriptor = "()Ljava/lang/Object;";
+        String signedObject = "java/security/SignedObject";
+        String objectInput = "java/io/ObjectInput";
+        Graph graph = new Graph();
+        graph.methodNode(APP, "handle", "()V", false);
+        graph.methodNode(signedObject, "getObject", inputDescriptor, false);
+        Node readObject = graph.addCallNode(objectInput, "readObject", inputDescriptor,
+                "INTERFACE", null, 0, signedObject, "getObject", inputDescriptor);
+        Node inputMethod = graph.methodNode(objectInput, "readObject", inputDescriptor, true);
+        graph.addEdge(readObject, inputMethod, EdgeType.INVOKES, "INTERFACE");
+        graph.freeze();
+
+        Rule.SinkRule capability = new Rule.SinkRule("object-input-read", "DESERIALIZE", "HIGH",
+                new Rule.CallMatcher(Match.of(objectInput), Match.of("readObject"),
+                        Match.of(inputDescriptor)), List.of(Rule.TaintedPos.Receiver.INSTANCE),
+                Rule.SinkRole.CAPABILITY);
+        Rule.MagicEntryRule entry = new Rule.MagicEntryRule("app-handler", "http",
+                new Rule.MethodMatcher(Match.of("handle"), Match.of("()V"), false),
+                null, "lifecycle");
+        RuleSet ruleSet = new RuleSet(List.of(capability), List.of(entry), List.of(), List.of(), List.of());
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(ruleSet, new ClassHierarchy(Map.of(), null)), Set.of(APP), true);
+
+        ApplicationEntryIndex.ProducerCandidate candidate =
+                new ApplicationEntryIndex.ProducerCandidate("signed-second", "DESERIALIZE", "HIGH",
+                        signedObject, "getObject", inputDescriptor, "secondDeserialization",
+                        objectInput, "readObject", inputDescriptor, "CAPABILITY", null, true);
+        ApplicationEntryIndex.ProducerAdmissionDecision decision = index.producerAdmission(candidate);
+
+        assertEquals(ApplicationEntryIndex.ProducerAdmissionStatus.BRIDGE_CONTINUATION,
+                decision.status(), decision.toString());
+        assertEquals(ApplicationEntryIndex.CandidateAdmissionStatus.TERMINAL_IMPACT_IS_INTERMEDIATE,
+                decision.candidate().status());
+        assertEquals(ApplicationEntryIndex.MaterializationPolicy.EAGER_BRIDGE,
+                decision.materializationPolicy());
+        assertTrue(decision.retainForComposition());
+    }
+
+    @Test
     void producerMaterializationPolicyMatrixKeepsRoutingAxesClosed() {
         ApplicationEntryIndex.ProducerCandidate candidate =
                 new ApplicationEntryIndex.ProducerCandidate("rule", "category", "HIGH",

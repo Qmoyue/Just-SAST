@@ -4,6 +4,7 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.FindingState;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.blackboard.VerificationSummary;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -106,6 +107,44 @@ class ConciseReportContractTest {
         assertTrue(json.contains("\"field_owner\":\"app/Holder\""));
         assertTrue(json.contains("\"arg_ordinal\":0"));
         assertTrue(markdown.contains("declared by `app/Holder`"));
+    }
+
+    @Test
+    void reportUsesTheSharedSemanticRankingOrder(@TempDir Path temp) throws Exception {
+        ObjectGraphPlan genericPlan = new ObjectGraphPlan(
+                List.of(new ObjectGraphPlan.Node("entry", "app/Entry",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of())), List.of());
+        Chain generic = new Chain("RULE-generic", "COMMAND_EXEC", "HIGH", "app/Entry",
+                "readObject", "deserialize", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "call", "()V", null)), 0,
+                "()V", "TERMINAL", genericPlan);
+        Chain nested = new Chain("RULE-nested", "CODE_EXEC", "HIGH", "app/Entry",
+                "deserialize", "deserialize", "app/Terminal", "run", List.of(
+                new ChainHop("app/Entry", "deserialize", "java/lang/reflect/Method", "invoke",
+                        HopKind.DIRECT_CALL, null, "call", "()V", null),
+                new ChainHop("java/security/SignedObject", "getObject", "java/io/ObjectInputStream", "<init>",
+                        HopKind.DIRECT_CALL, null, "fragment-activation-invoke", "()V", null),
+                new ChainHop("java/io/ObjectInputStream", "<init>", "java/io/ObjectInput", "readObject",
+                        HopKind.DIRECT_CALL, null, "fragment-activation-invoke",
+                        "()Ljava/lang/Object;", null),
+                new ChainHop("java/io/ObjectInput", "readObject", "app/Callback", "hashCode",
+                        HopKind.DIRECT_CALL, null, "bridge-deser", "()V", null),
+                new ChainHop("app/Callback", "hashCode", "app/Terminal", "run",
+                        HopKind.DIRECT_CALL, null, "fragment-activation-deserialize", "()V", null)), 0,
+                "()V", "TERMINAL");
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(generic, nested), Map.of(), Map.of(), null);
+
+        Path output = temp.resolve("ranking");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                ScanStatistics.empty());
+        String json = Files.readString(output.resolve("report.json"));
+        int chains = json.indexOf("\"chains\":[");
+        int nestedRank = json.indexOf("semantic=TYPED_NESTED_DESERIALIZATION", chains);
+        int genericRank = json.indexOf("semantic=ORDINARY_CHAIN", chains);
+        assertTrue(chains >= 0 && nestedRank > chains && genericRank > nestedRank,
+                "concise report must preserve ChainRanking semantic order");
     }
 
     private static Chain chain() {

@@ -13,6 +13,11 @@ import io.just.sast.blackboard.RunProduct;
 import io.just.sast.config.Rule;
 import io.just.sast.config.RuleSchemaV2;
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.InsnFact;
+import io.just.sast.model.MethodInfo;
+import io.just.sast.model.MethodRef;
+import io.just.sast.model.Op;
+import io.just.sast.model.TypeRef;
 import io.just.sast.util.ChainMaterializer;
 import io.just.sast.util.JustLogger;
 
@@ -119,17 +124,15 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
             if (hopClassMap == null) {
                 continue;
             }
-            String entryMethod = switch (frag.entryKind()) {
-                case "proxyInvoke" -> "invoke";
-                case "hashCode" -> "hashCode";
-                case "toString" -> "toString";
-                case "equals" -> "equals";
-                case "readResolve" -> "readResolve";
-                default -> "readObject";
-            };
+            String entryMethod = declaredEntryMethod(frag);
+            String materializedEntryDescriptor = declaredEntryDescriptor(frag, entryClass,
+                    entryMethod);
+            if (!entryEndpointIsAdmissible(frag, entryClass, entryMethod,
+                    materializedEntryDescriptor)) {
+                continue;
+            }
             Rule.SinkRule rule = sinkRule.get();
             String materializedSinkDescriptor = sinkDescriptor == null ? "" : sinkDescriptor;
-            String materializedEntryDescriptor = entryDescriptor(entryClass, entryMethod);
             List<Rule.HopSpec> fragmentHops = List.copyOf(frag.hops());
             Map<String, String> resolvedHopClasses = Map.copyOf(hopClassMap);
             int expectedHopCount = fragmentHops.size() + 2;
@@ -144,11 +147,13 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
                 if (fragmentHops.isEmpty()) {
                     return null;
                 }
+                String fragmentReason = "any".equals(frag.activation())
+                        ? "fragment" : "fragment-activation-" + frag.activation();
                 Rule.HopSpec last = fragmentHops.get(fragmentHops.size() - 1);
                 List<ChainHop> hops = new ArrayList<>(expectedHopCount);
                 hops.add(new ChainHop(resolvedHopClasses.getOrDefault(last.cls(), last.cls()),
                         last.method(), sinkOwner, frag.sinkName(), HopKind.DIRECT_CALL, null,
-                        "fragment", materializedSinkDescriptor, null));
+                        fragmentReason, materializedSinkDescriptor, null));
                 String prevClass = resolvedHopClasses.getOrDefault(last.cls(), last.cls());
                 String prevMethod = last.method();
                 for (int i = fragmentHops.size() - 2; i >= 0; i--) {
@@ -156,12 +161,12 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
                     hops.add(new ChainHop(resolvedHopClasses.getOrDefault(hop.cls(), hop.cls()),
                             hop.method(), prevClass, prevMethod,
                             hop.field() != null ? HopKind.FIELD_FLOW : HopKind.DIRECT_CALL,
-                            hop.field(), "fragment", "", null));
+                            hop.field(), fragmentReason, "", null));
                     prevClass = resolvedHopClasses.getOrDefault(hop.cls(), hop.cls());
                     prevMethod = hop.method();
                 }
                 hops.add(new ChainHop(entryClass, entryMethod, prevClass, prevMethod,
-                        HopKind.DIRECT_CALL, null, "fragment", "", null));
+                        HopKind.DIRECT_CALL, null, fragmentReason, "", null));
                 hops.add(new ChainHop(entryClass, entryMethod, entryClass, entryMethod,
                         HopKind.ENTRY, null, frag.entryKind(), materializedEntryDescriptor, null));
                 if (hops.size() != expectedHopCount) {
@@ -178,6 +183,90 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
             }
         }
         JustLogger.info("片段知识源：合成 {} 条", produced);
+    }
+
+    private String declaredEntryMethod(Rule.FragmentRule fragment) {
+        if (fragment.entryMethod() != null && !fragment.entryMethod().isBlank()) {
+            return fragment.entryMethod();
+        }
+        return switch (fragment.entryKind()) {
+            case "proxyInvoke" -> "invoke";
+            case "hashCode" -> "hashCode";
+            case "toString" -> "toString";
+            case "equals" -> "equals";
+            case "readResolve" -> "readResolve";
+            default -> "readObject";
+        };
+    }
+
+    private String declaredEntryDescriptor(Rule.FragmentRule fragment, String owner,
+                                            String method) {
+        if (fragment.entryDescriptor() != null && !fragment.entryDescriptor().isBlank()) {
+            return fragment.entryDescriptor();
+        }
+        return entryDescriptor(owner, method);
+    }
+
+    /**
+     * A secondary-deserialization fragment is admitted only from the actual method body.  The
+     * rule names the endpoint, but the class model must still prove an ObjectInputStream
+     * allocation and an ObjectInput/ObjectInputStream.readObject call.  This keeps a public
+     * method with a suggestive name from becoming a nested stream merely by declaration.
+     */
+    private boolean entryEndpointIsAdmissible(Rule.FragmentRule fragment, String owner,
+                                               String methodName, String descriptor) {
+        if (!"secondDeserialization".equals(fragment.entryKind())) {
+            return true;
+        }
+        ClassInfo info = bb.hierarchy().classInfo(owner);
+        if (info == null || descriptor == null || descriptor.isBlank()) {
+            return false;
+        }
+        MethodInfo method = info.method(methodName, descriptor);
+        return method != null && containsNestedObjectInputRead(method);
+    }
+
+    private boolean containsNestedObjectInputRead(MethodInfo method) {
+        boolean allocatesObjectInputStream = false;
+        boolean readsObject = false;
+        for (InsnFact instruction : method.instructions()) {
+            if (instruction == null) {
+                continue;
+            }
+            if (instruction.op() == Op.NEW && instruction.operands().size() == 1
+                    && instruction.operands().get(0) instanceof TypeRef type
+                    && isObjectInputStreamType(type.descriptor())) {
+                allocatesObjectInputStream = true;
+            }
+            if (instruction.op().isInvoke() && instruction.operands().size() == 1
+                    && instruction.operands().get(0) instanceof MethodRef ref
+                    && isObjectInputType(ref.owner()) && "readObject".equals(ref.name())) {
+                readsObject = true;
+            }
+        }
+        return allocatesObjectInputStream && readsObject;
+    }
+
+    private boolean isObjectInputStreamType(String ownerOrDescriptor) {
+        String owner = normalizeType(ownerOrDescriptor);
+        return "java/io/ObjectInputStream".equals(owner)
+                || bb.hierarchy().isSubtypeOf(owner, "java/io/ObjectInputStream");
+    }
+
+    private boolean isObjectInputType(String owner) {
+        return "java/io/ObjectInput".equals(owner)
+                || "java/io/ObjectInputStream".equals(owner)
+                || bb.hierarchy().isSubtypeOf(owner, "java/io/ObjectInput");
+    }
+
+    private static String normalizeType(String value) {
+        if (value == null) {
+            return "";
+        }
+        if (value.startsWith("L") && value.endsWith(";")) {
+            return value.substring(1, value.length() - 1);
+        }
+        return value;
     }
 
     /** 精确命中 → 唯一后缀命中。结构相似而非同名的类不能作为片段锚点，避免误合成。 */

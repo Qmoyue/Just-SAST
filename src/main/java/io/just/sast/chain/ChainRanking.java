@@ -20,7 +20,8 @@ import java.util.Set;
 public final class ChainRanking {
 
     /** Stable, reportable ranking factors. Lower values are preferred except staticScore. */
-    public record Evidence(int dynamicRank, int sinkRoleRank, int constructionRank,
+    public record Evidence(int dynamicRank, int sinkRoleRank, int semanticRank,
+                           int constructionRank,
                            int sinkPrecisionRank, int entryRank, int unresolvedHops,
                            int incompleteness, int pathLength, int staticScore,
                            int precisionRank,
@@ -30,7 +31,7 @@ public final class ChainRanking {
                         int sinkPrecisionRank, int entryRank, int unresolvedHops,
                         int incompleteness, int pathLength, int staticScore,
                         String explanation) {
-            this(dynamicRank, sinkRoleRank, constructionRank, sinkPrecisionRank, entryRank,
+            this(dynamicRank, sinkRoleRank, 2, constructionRank, sinkPrecisionRank, entryRank,
                     unresolvedHops, incompleteness, pathLength, staticScore, 99, explanation);
         }
 
@@ -71,10 +72,16 @@ public final class ChainRanking {
                 evidence(right, notes, verification, constructible));
     }
 
-    private static int compareEvidence(Chain left, Chain right, Evidence a, Evidence b) {
+    /** Compare two already-materialized evidence tuples using the product ordering. */
+    public static int compareEvidence(Evidence a, String leftKey, Evidence b, String rightKey) {
+        if (a == null || b == null) {
+            throw new IllegalArgumentException("ranking evidence must not be null");
+        }
         int result = Integer.compare(a.dynamicRank(), b.dynamicRank());
         if (result != 0) return result;
         result = Integer.compare(a.sinkRoleRank(), b.sinkRoleRank());
+        if (result != 0) return result;
+        result = Integer.compare(a.semanticRank(), b.semanticRank());
         if (result != 0) return result;
         result = Integer.compare(a.constructionRank(), b.constructionRank());
         if (result != 0) return result;
@@ -96,14 +103,18 @@ public final class ChainRanking {
         if (result != 0) return result;
         result = Integer.compare(a.pathLength(), b.pathLength());
         if (result != 0) return result;
-        return safeKey(left).compareTo(safeKey(right));
+        return (leftKey == null ? "" : leftKey).compareTo(rightKey == null ? "" : rightKey);
+    }
+
+    private static int compareEvidence(Chain left, Chain right, Evidence a, Evidence b) {
+        return compareEvidence(a, safeKey(left), b, safeKey(right));
     }
 
     public static Evidence evidence(Chain chain, Map<String, List<String>> notes,
                                     Map<String, VerificationSummary.ChainResult> verification,
                                     Set<String> constructible) {
         if (chain == null) {
-            return new Evidence(9, 9, 9, 9, 9, Integer.MAX_VALUE, Integer.MAX_VALUE,
+            return new Evidence(9, 9, 9, 9, 9, 9, Integer.MAX_VALUE, Integer.MAX_VALUE,
                     Integer.MAX_VALUE, Integer.MIN_VALUE, 99, "null-candidate");
         }
         List<String> chainNotes = notes == null ? List.of()
@@ -126,6 +137,7 @@ public final class ChainRanking {
             dynamic = Math.max(dynamic, ConfidenceScorer.DYNAMIC_NEGATIVE_OR_UNTESTABLE);
         }
         int sinkRole = chain.terminalSink() ? 0 : 1;
+        int semantic = semanticRank(chain);
         boolean isConstructible = constructible != null && constructible.contains(chain.key())
                 || chainNotes.stream().anyMatch("verify:constructible"::equals);
         boolean hasDeclaredPlan = chain.constructionPlan() != null
@@ -145,6 +157,7 @@ public final class ChainRanking {
             case "hashCode", "equals", "compareTo", "compare", "toString", "proxyInvoke" -> 2;
             default -> 3;
         };
+        ChainPrecision.Assessment precision = ChainPrecision.assess(chain, chainNotes, result);
         int incomplete = 0;
         for (String note : chainNotes) {
             if (note != null && (note.startsWith("degrade:") || note.contains("CAP")
@@ -155,9 +168,12 @@ public final class ChainRanking {
         if (hasDeclaredPlan && !declaredPlanValid) {
             incomplete++;
         }
-        ChainPrecision.Assessment precision = ChainPrecision.assess(chain, chainNotes, result);
+        if (!"COMPLETE".equals(precision.completeness())) {
+            incomplete++;
+        }
         String explanation = "dynamic=" + (status.isBlank() ? "NOT_SELECTED" : status)
                 + ";sink_role=" + chain.sinkRole()
+                + ";semantic=" + semanticLabel(semantic)
                 + ";construction=" + (isConstructible ? "CONSTRUCTIBLE"
                 : declaredPlanValid ? "DECLARED_PLAN"
                 : hasDeclaredPlan ? "PLAN_PARTIAL"
@@ -168,9 +184,49 @@ public final class ChainRanking {
                 + ";incompleteness=" + incomplete
                 + ";path_length=" + chain.hops().size()
                 + ";precision=" + precision.compact();
-        return new Evidence(dynamic, sinkRole, construction, sinkPrecision, entry,
+        return new Evidence(dynamic, sinkRole, semantic, construction, sinkPrecision, entry,
                 chain.unresolvedHops(), incomplete, chain.hops().size(),
                 rankFeatures.totalScore(), precision.rank(), explanation);
+    }
+
+    /**
+     * Prefer a complete, typed nested-deserialization bridge over an otherwise more convenient
+     * generic construction variant.  The evidence is intentionally made only from immutable
+     * hop reasons: it does not know a benchmark, a package, a rule id, or a gadget name.
+     */
+    private static int semanticRank(Chain chain) {
+        boolean invokeActivation = false;
+        boolean deserializeActivation = false;
+        boolean nestedBridge = false;
+        for (var hop : chain.hops()) {
+            if (hop == null || hop.reason() == null) {
+                continue;
+            }
+            String reason = hop.reason();
+            if ("fragment-activation-invoke".equals(reason)) {
+                invokeActivation = true;
+            } else if ("fragment-activation-deserialize".equals(reason)) {
+                deserializeActivation = true;
+            } else if ("bridge-deser".equals(reason)
+                    || reason.startsWith("bridge-second-deserialization")) {
+                nestedBridge = true;
+            }
+        }
+        if (invokeActivation && deserializeActivation && nestedBridge) {
+            return 0;
+        }
+        if (invokeActivation && nestedBridge) {
+            return 1;
+        }
+        return 2;
+    }
+
+    private static String semanticLabel(int rank) {
+        return switch (rank) {
+            case 0 -> "TYPED_NESTED_DESERIALIZATION";
+            case 1 -> "NESTED_DESERIALIZATION_PARTIAL";
+            default -> "ORDINARY_CHAIN";
+        };
     }
 
     private static String safeKey(Chain chain) {

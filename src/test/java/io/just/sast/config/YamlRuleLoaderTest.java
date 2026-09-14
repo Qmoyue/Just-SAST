@@ -93,6 +93,64 @@ class YamlRuleLoaderTest {
     }
 
     @Test
+    void signedObjectFragmentKeepsExplicitEndpointAndActivationMetadata() throws IOException {
+        RuleSet set = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+
+        Rule.FragmentRule fragment = set.fragments().stream()
+                .filter(candidate -> "FRAG-SIGNEDOBJECT-SECOND-DESERIALIZE".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        assertEquals("java/security/SignedObject", fragment.entryClass());
+        assertEquals("secondDeserialization", fragment.entryKind());
+        assertEquals("getObject", fragment.entryMethod());
+        assertEquals("()Ljava/lang/Object;", fragment.entryDescriptor());
+        assertEquals("invoke", fragment.activation());
+        assertEquals("java/io/ObjectInput", fragment.sinkOwner());
+        assertEquals("readObject", fragment.sinkName());
+        assertEquals("()Ljava/lang/Object;", fragment.sinkDescriptor());
+        assertEquals("java/io/ObjectInputStream", fragment.hops().get(0).cls());
+
+        Rule.SinkRule inputSink = set.sinks().stream()
+                .filter(candidate -> "JUST-SINK-OBJECTINPUT-READOBJECT".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        assertEquals(Rule.SinkRole.CAPABILITY, inputSink.role());
+        assertEquals("java/io/ObjectInput", inputSink.call().ownerType());
+        assertEquals("()Ljava/lang/Object;", inputSink.call().descriptor().pattern());
+    }
+
+    @Test
+    void romeTerminalFragmentsKeepDistinctCallbackRoots() throws IOException {
+        RuleSet set = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+
+        Rule.FragmentRule equals = set.fragments().stream()
+                .filter(candidate -> "FRAG-ROME-EQUALS-TEMPLATE".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        Rule.FragmentRule hashCode = set.fragments().stream()
+                .filter(candidate -> "FRAG-ROME-HASHCODE-TEMPLATE".equals(candidate.id()))
+                .findFirst().orElseThrow();
+
+        assertEquals("equals", equals.entryKind());
+        assertEquals("hashCode", hashCode.entryKind());
+        assertEquals(2, equals.hops().size());
+        assertEquals(equals.hops(), hashCode.hops());
+        assertEquals("com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                equals.sinkOwner());
+        assertEquals("newTransformer", equals.sinkName());
+        assertEquals("deserialize", equals.activation());
+        assertEquals("deserialize", hashCode.activation());
+
+        Rule.FragmentRule callback = set.fragments().stream()
+                .filter(candidate -> "FRAG-ROME".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        Rule.FragmentRule template = set.fragments().stream()
+                .filter(candidate -> "FRAG-ROME-TEMPLATE".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        assertEquals("deserialize", callback.activation());
+        assertEquals("deserialize", template.activation());
+    }
+
+    @Test
     void privateAccessAndSafeConfigParsed() throws IOException {
         String yaml = """
                 rules:

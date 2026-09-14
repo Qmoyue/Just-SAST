@@ -43,7 +43,8 @@ public final class YamlRuleLoader {
     private static final Set<String> SOURCE_KEYS = Set.of("id", "kind", "bridge", "match", "safe-config", "tainted");
     private static final Set<String> MODEL_KEYS = Set.of("id", "kind", "match", "actions");
     private static final Set<String> FRAGMENT_KEYS = Set.of("id", "kind", "entryClass", "entryKind",
-            "sinkOwner", "sinkName", "sinkDescriptor", "hops", "construction");
+            "entryMethod", "entryDescriptor", "activation", "sinkOwner", "sinkName",
+            "sinkDescriptor", "hops", "construction");
     private static final Set<String> CALL_KEYS = Set.of("owner", "name", "descriptor");
     private static final Set<String> METHOD_KEYS = Set.of("name", "descriptor", "access");
     private static final Set<String> CLASS_KEYS = Set.of("implements");
@@ -517,6 +518,9 @@ public final class YamlRuleLoader {
     private Rule.FragmentRule parseFragment(String id, Map<?, ?> ruleMap) throws IOException {
         String entryClass = str(ruleMap, "entryClass");
         String entryKind = str(ruleMap, "entryKind");
+        String entryMethod = str(ruleMap, "entryMethod");
+        String entryDescriptor = str(ruleMap, "entryDescriptor");
+        String activation = str(ruleMap, "activation");
         String sinkOwner = str(ruleMap, "sinkOwner");
         String sinkName = str(ruleMap, "sinkName");
         String sinkDescriptor = str(ruleMap, "sinkDescriptor");
@@ -540,7 +544,8 @@ public final class YamlRuleLoader {
         }
         ObjectGraphPlan constructionPlan = parseConstructionPlan(id, ruleMap.get("construction"));
         return new Rule.FragmentRule(id, entryClass, entryKind == null ? "readObject" : entryKind,
-                List.copyOf(hops), sinkOwner, sinkName, sinkDescriptor, constructionPlan);
+                List.copyOf(hops), sinkOwner, sinkName, sinkDescriptor, entryMethod,
+                entryDescriptor, activation, constructionPlan);
     }
 
     /**

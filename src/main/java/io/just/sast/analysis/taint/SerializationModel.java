@@ -69,8 +69,12 @@ public final class SerializationModel {
 
     /** Classify an OIS read call without depending on graph/node classes. */
     public static boolean isOisRead(String owner, String name, String descriptor) {
-        if (!"java/io/ObjectInputStream".equals(owner) || name == null) {
+        if (name == null || (!"java/io/ObjectInputStream".equals(owner)
+                && !"java/io/ObjectInput".equals(owner))) {
             return false;
+        }
+        if ("java/io/ObjectInput".equals(owner)) {
+            return "readObject".equals(name);
         }
         return "readObject".equals(name) || "readUnshared".equals(name)
                 || "readFields".equals(name);

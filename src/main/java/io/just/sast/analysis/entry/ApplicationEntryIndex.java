@@ -1218,12 +1218,26 @@ public final class ApplicationEntryIndex {
         boolean entryForward = entryForwardMethods.contains(entryKey);
         boolean bindingCallback = isApplicationBindingCallback(owner, name, descriptor);
         boolean bindingTarget = isApplicationBindingTarget(owner, name, descriptor);
+        TerminalDecision terminal = resolvedTerminal == null
+                ? terminalAdmission(sinkOwner, sinkName, sinkDescriptor) : resolvedTerminal;
         if (!applicationScopeKnown) {
             return new CandidateAdmissionDecision(CandidateAdmissionStatus.APPLICATION_SCOPE_UNKNOWN,
                     entryKey, sinkOwner, sinkName, sinkDescriptor, entryForward, false,
                     continuationEvidence);
         }
         if (!isApplicationOwner(owner) && !bindingTarget) {
+            // A dependency fragment that ends at a typed capability is not an application
+            // root, but it is still a legitimate continuation participant.  Preserve the
+            // intermediate classification so producerAdmission can route it to the bridge
+            // store; otherwise a SignedObject/ObjectInput or equivalent nested boundary is
+            // rejected before composition ever sees its immutable endpoint.
+            if (continuationEvidence
+                    && terminal.status() == TerminalStatus.INTERMEDIATE_ONLY) {
+                return new CandidateAdmissionDecision(
+                        CandidateAdmissionStatus.TERMINAL_IMPACT_IS_INTERMEDIATE, entryKey,
+                        sinkOwner, sinkName, sinkDescriptor, entryForward, false,
+                        true);
+            }
             return new CandidateAdmissionDecision(
                     CandidateAdmissionStatus.APPLICATION_ENTRY_NOT_IN_CHAIN, entryKey,
                     sinkOwner, sinkName, sinkDescriptor, entryForward, false,
@@ -1236,8 +1250,6 @@ public final class ApplicationEntryIndex {
                     sinkOwner, sinkName, sinkDescriptor, false, false,
                     continuationEvidence);
         }
-        TerminalDecision terminal = resolvedTerminal == null
-                ? terminalAdmission(sinkOwner, sinkName, sinkDescriptor) : resolvedTerminal;
         if (terminal.status() == TerminalStatus.NOT_INDEXED) {
             return new CandidateAdmissionDecision(
                     CandidateAdmissionStatus.TERMINAL_IMPACT_NOT_INDEXED, entryKey,

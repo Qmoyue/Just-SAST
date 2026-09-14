@@ -3,11 +3,11 @@ package io.just.sast.report;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.FindingState;
+import io.just.sast.chain.ChainRanking;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
@@ -42,10 +42,15 @@ public final class ConciseReportWriter {
             List<FindingOutputReader.Finding> findings) {
         List<FindingOutputReader.Finding> ordered = new ArrayList<>(
                 findings == null ? List.of() : findings);
-        ordered.sort(Comparator.comparing(FindingOutputReader.Finding::exported).reversed()
-                .thenComparing((FindingOutputReader.Finding finding) ->
-                        finding.ranking().staticScore(), Comparator.reverseOrder())
-                .thenComparing(FindingOutputReader.Finding::id));
+        ordered.sort((left, right) -> {
+            int result = Boolean.compare(right.exported(), left.exported());
+            if (result != 0) {
+                return result;
+            }
+            result = ChainRanking.compareEvidence(left.ranking(), left.chain().key(),
+                    right.ranking(), right.chain().key());
+            return result != 0 ? result : left.id().compareTo(right.id());
+        });
         return List.copyOf(ordered);
     }
 

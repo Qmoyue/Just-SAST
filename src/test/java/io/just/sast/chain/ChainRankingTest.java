@@ -68,6 +68,50 @@ class ChainRankingTest {
     }
 
     @Test
+    void typedNestedDeserializationEvidencePrecedesGenericDeclaredConstruction() {
+        ObjectGraphPlan genericPlan = new ObjectGraphPlan(
+                List.of(new ObjectGraphPlan.Node("entry", "app/Entry",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of())), List.of());
+        Chain generic = new Chain("RULE-generic", "COMMAND_EXEC", "HIGH", "app/Entry",
+                "readObject", "deserialize", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "call", "()V", null)), 0,
+                "()V", "TERMINAL", genericPlan);
+        Chain typed = new Chain("RULE-typed", "CODE_EXEC", "HIGH", "app/Entry",
+                "deserialize", "deserialize", "app/Terminal", "run", List.of(
+                new ChainHop("app/Entry", "deserialize", "java/lang/reflect/Method", "invoke",
+                        HopKind.DIRECT_CALL, null, "call", "()V", null),
+                new ChainHop("java/security/SignedObject", "getObject", "java/io/ObjectInputStream", "<init>",
+                        HopKind.DIRECT_CALL, null, "fragment-activation-invoke", "()V", null),
+                new ChainHop("java/io/ObjectInputStream", "<init>", "java/io/ObjectInput", "readObject",
+                        HopKind.DIRECT_CALL, null, "fragment-activation-invoke", "()Ljava/lang/Object;", null),
+                new ChainHop("java/io/ObjectInput", "readObject", "app/Callback", "hashCode",
+                        HopKind.DIRECT_CALL, null, "bridge-deser", "()V", null),
+                new ChainHop("app/Callback", "hashCode", "app/Terminal", "run",
+                        HopKind.DIRECT_CALL, null, "fragment-activation-deserialize", "()V", null)), 0,
+                "()V", "TERMINAL");
+
+        assertTrue(ChainRanking.compare(typed, generic, Map.of(), Map.of(), Set.of()) < 0);
+        ChainRanking.Evidence evidence = ChainRanking.evidence(typed, Map.of(), Map.of(), Set.of());
+        assertEquals(0, evidence.semanticRank());
+        assertTrue(evidence.explanation().contains("semantic=TYPED_NESTED_DESERIALIZATION"));
+    }
+
+    @Test
+    void precisionIncompleteCandidateCannotOutrankACompletePeer() {
+        Chain complete = chain("complete", "TERMINAL");
+        Chain incomplete = new Chain("RULE-incomplete", "COMMAND_EXEC", "HIGH", "app/Entry",
+                "readObject", "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
+                        HopKind.VIRTUAL_DISPATCH, null, "serialized-proxy-interface", "()V", null)), 0,
+                "()V", "TERMINAL");
+
+        assertTrue(ChainRanking.compare(complete, incomplete, Map.of(), Map.of(), Set.of()) < 0);
+        assertTrue(ChainRanking.evidence(incomplete, Map.of(), Map.of(), Set.of()).incompleteness()
+                > ChainRanking.evidence(complete, Map.of(), Map.of(), Set.of()).incompleteness());
+    }
+
+    @Test
     void malformedDeclaredPlanDoesNotReceiveConstructibleRank() {
         ObjectGraphPlan partial = new ObjectGraphPlan(
                 List.of(new ObjectGraphPlan.Node("entry", "app/Entry",
