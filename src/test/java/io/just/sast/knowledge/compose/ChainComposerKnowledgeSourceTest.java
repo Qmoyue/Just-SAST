@@ -424,6 +424,153 @@ class ChainComposerKnowledgeSourceTest {
     }
 
     @Test
+    void sourceHostedCapabilityKeepsItsRootSlotForContinuation(@TempDir Path temp) throws Exception {
+        Path target = temp.resolve("target.jar");
+        Set<String> classEntries = new java.util.LinkedHashSet<>(Set.of(
+                "app/Host.class", "app/CapabilityKey.class", "app/TerminalKey.class"));
+        for (int i = 0; i < 70; i++) {
+            classEntries.add("app/Noise" + String.format("%03d.class", i));
+        }
+        writePrimaryClasses(target, classEntries);
+
+        String invokeDescriptor = "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;";
+        String runtimeDescriptor = "(Ljava/lang/String;)Ljava/lang/Process;";
+        Rule.SinkRule invoke = new Rule.SinkRule("reflective-invoke", "REFLECTIVE_INVOKE",
+                "HIGH", new Rule.CallMatcher(Match.of("java/lang/reflect/Method"),
+                Match.of("invoke"), Match.of(invokeDescriptor)), List.of(),
+                Rule.SinkRole.CAPABILITY);
+        Rule.SinkRule runtime = new Rule.SinkRule("runtime-exec", "CODE_EXEC", "CRITICAL",
+                new Rule.CallMatcher(Match.of("java/lang/Runtime"), Match.of("exec"),
+                        Match.of(runtimeDescriptor)), List.of(), Rule.SinkRole.TERMINAL);
+        Rule.MagicEntryRule applicationEntry = new Rule.MagicEntryRule("app-source", "source",
+                new Rule.MethodMatcher(Match.of("deserialize"), Match.of("()V"), false), null,
+                "deserialize");
+        RuleSet rules = new RuleSet(List.of(invoke, runtime), List.of(applicationEntry),
+                List.of(), List.of(), List.of());
+
+        Graph graph = new Graph();
+        graph.methodNode("app/Host", "deserialize", "()V", false);
+        graph.methodNode("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;",
+                true);
+        Node sourceCall = graph.addCallNode("java/io/ObjectInputStream", "readObject",
+                "()Ljava/lang/Object;", "VIRTUAL", null, 0,
+                "app/Host", "deserialize", "()V");
+        graph.addEdge(sourceCall,
+                graph.findMethodNode("java/io/ObjectInputStream", "readObject",
+                        "()Ljava/lang/Object;"), EdgeType.INVOKES, "VIRTUAL");
+
+        graph.methodNode("dep/Continuation", "toString", "()Ljava/lang/String;", false);
+        Node continuationCall = graph.addCallNode("dep/Continuation", "toString",
+                "()Ljava/lang/String;", "VIRTUAL", null, 0,
+                "app/Host", "deserialize", "()V");
+        graph.addEdge(continuationCall,
+                graph.findMethodNode("dep/Continuation", "toString", "()Ljava/lang/String;"),
+                EdgeType.INVOKES, "VIRTUAL");
+        graph.methodNode("java/lang/Runtime", "exec", runtimeDescriptor, true);
+        Node runtimeCall = graph.addCallNode("java/lang/Runtime", "exec", runtimeDescriptor,
+                "VIRTUAL", null, 0, "dep/Continuation", "toString", "()Ljava/lang/String;");
+        graph.addEdge(runtimeCall,
+                graph.findMethodNode("java/lang/Runtime", "exec", runtimeDescriptor),
+                EdgeType.INVOKES, "VIRTUAL");
+
+        String classForNameDescriptor = "(Ljava/lang/String;)Ljava/lang/Class;";
+        for (int i = 0; i < 70; i++) {
+            String noiseOwner = "app/Noise" + String.format("%03d", i);
+            graph.methodNode(noiseOwner, "deserialize", "()V", false);
+        }
+
+        graph.methodNode("app/CapabilityKey", "hashCode", "()I", false);
+        Node invokeCall = graph.addCallNode("java/lang/reflect/Method", "invoke",
+                invokeDescriptor, "VIRTUAL", null, 0,
+                "app/CapabilityKey", "hashCode", "()I");
+        graph.methodNode("java/lang/reflect/Method", "invoke", invokeDescriptor, true);
+        graph.addEdge(invokeCall,
+                graph.findMethodNode("java/lang/reflect/Method", "invoke", invokeDescriptor),
+                EdgeType.INVOKES, "VIRTUAL");
+        graph.methodNode("app/TerminalKey", "toString", "()Ljava/lang/String;", false);
+        graph.freeze();
+
+        Set<String> applicationOwners = new java.util.LinkedHashSet<>(Set.of(
+                "app/Host", "app/CapabilityKey", "app/TerminalKey"));
+        for (int i = 0; i < 70; i++) {
+            applicationOwners.add("app/Noise" + String.format("%03d", i));
+        }
+
+        Blackboard blackboard = new Blackboard(graph,
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
+                new Blackboard.ScanInputs(target, List.of(), false, true, 20, null, 0,
+                        false, false, false, null,
+                        applicationOwners, true));
+
+        Chain capability = new Chain("z-capability", "REFLECTIVE_INVOKE", "HIGH",
+                "app/CapabilityKey", "hashCode", "hashCode", "java/lang/reflect/Method",
+                "invoke", List.of(
+                new ChainHop("app/CapabilityKey", "hashCode", "java/lang/reflect/Method",
+                        "invoke", HopKind.DIRECT_CALL, null, "direct", invokeDescriptor, null),
+                new ChainHop("app/CapabilityKey", "hashCode", "app/CapabilityKey", "hashCode",
+                        HopKind.ENTRY, null, "hashCode", "()I", null)), 0,
+                invokeDescriptor, "CAPABILITY");
+        Chain terminalVariant = new Chain("a-terminal", "CODE_EXEC", "CRITICAL",
+                "app/TerminalKey", "toString", "toString", "java/lang/Runtime", "exec",
+                List.of(
+                new ChainHop("app/TerminalKey", "toString", "java/util/HashMap", "put",
+                        HopKind.DIRECT_CALL, null, "container", "", null),
+                new ChainHop("app/TerminalKey", "toString", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "direct", runtimeDescriptor, null),
+                new ChainHop("app/TerminalKey", "toString", "app/TerminalKey", "toString",
+                        HopKind.ENTRY, null, "toString", "()Ljava/lang/String;", null)), 0,
+                runtimeDescriptor, "TERMINAL");
+        Chain continuation = new Chain("runtime-exec", "CODE_EXEC", "CRITICAL",
+                "dep/Continuation", "toString", "toString", "java/lang/Runtime", "exec",
+                List.of(
+                new ChainHop("dep/Continuation", "toString", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "direct", runtimeDescriptor, null),
+                new ChainHop("dep/Continuation", "toString", "dep/Continuation", "toString",
+                        HopKind.ENTRY, null, "toString", "()Ljava/lang/String;", null)), 0,
+                runtimeDescriptor, "TERMINAL");
+        for (int i = 0; i < 70; i++) {
+            String noiseOwner = "app/Noise" + String.format("%03d", i);
+            blackboard.addChain(new Chain("class-for-name-" + i, "CODE_EXEC", "HIGH",
+                    noiseOwner, "deserialize", "deserialize", "java/lang/Class", "forName",
+                    List.of(
+                            new ChainHop(noiseOwner, "deserialize", "java/util/HashMap", "put",
+                                    HopKind.DIRECT_CALL, null, "container",
+                                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", null),
+                            new ChainHop(noiseOwner, "deserialize", "java/lang/Class", "forName",
+                                    HopKind.DIRECT_CALL, null, "direct", classForNameDescriptor, null),
+                            new ChainHop(noiseOwner, "deserialize", noiseOwner, "deserialize",
+                                    HopKind.ENTRY, null, "deserialize", "()V", null)), 0,
+                    classForNameDescriptor, "CAPABILITY"));
+        }
+        ApplicationEntryIndex.ProducerCandidate capabilityCandidate =
+                new ApplicationEntryIndex.ProducerCandidate(
+                        capability.ruleId(), capability.category(), capability.severity(),
+                        capability.entryClass(), capability.entryMethod(), "()I",
+                        capability.entryKind(), capability.sinkClass(), capability.sinkMethod(),
+                        capability.sinkDescriptor(), capability.sinkRole(), capability.sinkRisk(),
+                        true);
+        assertEquals(ApplicationEntryIndex.ProducerAdmissionStatus.BRIDGE_CONTINUATION,
+                blackboard.applicationEntryIndex().producerAdmission(capabilityCandidate).status());
+        assertTrue(blackboard.addSolverCandidate(capabilityCandidate, () -> capability));
+        assertTrue(blackboard.compositionInputsLazy().bridgeContinuations().stream()
+                        .anyMatch(chain -> chain.key().equals(capability.key())));
+        blackboard.addChain(terminalVariant);
+        blackboard.addChain(continuation);
+
+        new ChainComposerKnowledgeSource().onEvent(blackboard,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertTrue(blackboard.chains().stream().anyMatch(chain ->
+                        "app/Host".equals(chain.entryClass())
+                                && "java/lang/Runtime".equals(chain.sinkClass())
+                                && chain.hops().stream().anyMatch(hop ->
+                                "bridge-invoke".equals(hop.reason())
+                                        && "dep/Continuation".equals(hop.toOwner()))),
+                "capability source-hosted prefix must remain available for terminal continuation");
+    }
+
+    @Test
     void primaryArtifactPriorityIsRecomputedForAReusedEvent(@TempDir Path temp) throws Exception {
         Path target = temp.resolve("target.jar");
         writePrimaryClasses(target, Set.of("app/OldPriority.class"));
@@ -484,6 +631,10 @@ class ChainComposerKnowledgeSourceTest {
              JarOutputStream jar = new JarOutputStream(output)) {
             jar.putNextEntry(new JarEntry("app/Host.class"));
             jar.closeEntry();
+            jar.putNextEntry(new JarEntry("app/Gadget.class"));
+            jar.closeEntry();
+            jar.putNextEntry(new JarEntry("app/Gadget2.class"));
+            jar.closeEntry();
             jar.putNextEntry(new JarEntry("dep/Host.class"));
             jar.closeEntry();
         }
@@ -519,7 +670,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph, hierarchy,
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
                 new Blackboard.ScanInputs(target, List.of(), false, false, 0, null, 0,
-                        false, false, false, null, Set.of("app/Host"), true));
+                        false, false, false, null,
+                        Set.of("app/Host", "app/Gadget", "app/Gadget2"), true));
         bb.addChain(chain("T-APP", "CODE_EXEC", "app/Gadget", "hashCode",
                 "java/lang/Runtime", "exec"));
         bb.addChain(chain("T-APP-2", "CODE_EXEC", "app/Gadget2", "hashCode",

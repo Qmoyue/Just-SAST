@@ -175,6 +175,14 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if ("source".equals(chain.entryKind()) || "deserialize".equals(chain.entryKind())) {
             score += 16;
         }
+        // A capability is a continuation frontier, not a completed product.  When several
+        // source-host variants share one application root, selecting a terminal variant first
+        // can consume the one-per-root slot and hide the capability that still needs an
+        // INVOKE/DESER bridge.  Keep continuation endpoints ahead of terminal variants while
+        // retaining deterministic ordering among endpoints of the same semantic kind.
+        if ("CAPABILITY".equalsIgnoreCase(chain.sinkRole())) {
+            score += 2_048;
+        }
         if (chain.unresolvedHops() == 0) {
             score += 4;
         }
@@ -220,7 +228,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         List<Chain> compatibilityInputs = applicationScoped ? List.of()
                 : initialInputs.compatibilityAll();
         List<Chain> chains = new ArrayList<>(applicationScoped
-                ? initialInputs.applicationChains() : compatibilityInputs);
+                ? applicationFrontInputs(initialInputs) : compatibilityInputs);
         // The composition budget is a semantic safety bound, not a product top-k.  Spend its
         // first slots on chains that already have an application execution root so a dependency
         // gadget cannot exhaust the frontier before the application prefix is joined.  The
@@ -322,7 +330,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (bb.graph() != null && sourceComposed > 0) {
             Blackboard.CompositionInputs refreshedInputs = bb.compositionInputsLazy();
             List<Chain> refreshed = applicationScoped
-                    ? refreshedInputs.applicationChains() : refreshedInputs.compatibilityAll();
+                    ? applicationFrontInputs(refreshedInputs) : refreshedInputs.compatibilityAll();
             // Keep the same direct-add compatibility boundary as the initial pass.  Solver
             // suffixes normally live in the typed continuation stores, while older callers may
             // still publish a dependency suffix through addChain before this follow-up round.
@@ -349,6 +357,27 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     private boolean defaultApplicationCompositionScope(Blackboard target) {
         return target != null && target.applicationEntryIndex() != null
                 && target.applicationEntryIndex().applicationScopeKnown();
+    }
+
+    /**
+     * Project the two stores that can own an application prefix without materializing the
+     * dependency suffix store.  A capability that still needs an INVOKE/DESER bridge is a
+     * legitimate application frontier even when the solver keeps it in the bridge store; the
+     * final {@link #isApplicationFront(Blackboard, Chain)} admission still rejects dependency
+     * owners and unreachable helpers.
+     */
+    private List<Chain> applicationFrontInputs(Blackboard.CompositionInputs inputs) {
+        if (inputs == null) {
+            return List.of();
+        }
+        Map<String, Chain> unique = new java.util.TreeMap<>();
+        if (inputs.applicationChains() != null) {
+            inputs.applicationChains().forEach(chain -> unique.putIfAbsent(chain.key(), chain));
+        }
+        if (inputs.bridgeContinuations() != null) {
+            inputs.bridgeContinuations().forEach(chain -> unique.putIfAbsent(chain.key(), chain));
+        }
+        return List.copyOf(unique.values());
     }
 
     /** Avoid materializing any deferred suffix when the current application frontier has no
@@ -396,7 +425,12 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                             || features.template() || features.jndiRmi() || features.jdbc();
                 })
                 .sorted(java.util.Comparator
-                        .comparingInt((Chain chain) -> applicationFrontPriority(target, chain)).reversed()
+                        .comparingInt((Chain chain) -> frontBridgePriority(
+                                frontFeaturesCached(target, chain, frontFeaturesCache)))
+                        .reversed()
+                        .thenComparing(java.util.Comparator
+                                .comparingInt((Chain chain) -> applicationFrontPriority(target, chain))
+                                .reversed())
                         .thenComparing(Chain::key))
                 .toList();
         List<Chain> fronts = selectApplicationFronts(eligibleFronts);
@@ -540,6 +574,32 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             return "<null>";
         }
         return chain.entryClass() + "#" + chain.entryMethod() + entryDescriptor(chain);
+    }
+
+    /**
+     * Order frontiers by the typed bridge they can actually consume.  A capability role alone
+     * is too broad: a large class-loading/trigger frontier can still crowd out an INVOKE
+     * frontier that has a public-entry continuation.  This rank is semantic and independent of
+     * artifact names; the existing provenance/risk score remains the tie breaker within a
+     * bridge family.
+     */
+    private static int frontBridgePriority(FrontFeatures features) {
+        if (features == null) {
+            return 0;
+        }
+        if (features.invoke()) {
+            return 6;
+        }
+        if (features.deserialize()) {
+            return 5;
+        }
+        if (features.jndiRmi() || features.jdbc()) {
+            return 4;
+        }
+        if (features.template()) {
+            return 3;
+        }
+        return features.triggerContainer() == null ? 0 : 2;
     }
 
     private record ComposedDepth(Chain chain, int depth) {
@@ -1087,8 +1147,14 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             return List.of();
         }
         Map<String, Chain> unique = new java.util.TreeMap<>();
-        addTriggerInputs(unique, inputs.applicationChains());
-        addTriggerInputs(unique, inputs.bridgeContinuations());
+        // The application store may still contain direct addChain compatibility data.  In a
+        // known application scope only its application-owned trigger roots belong to this
+        // store's source-host projection; dependency callbacks have a separate typed bridge
+        // owner and are admitted from bridgeContinuations below.  Without this boundary a
+        // dependency trigger manually published through the compatibility API can masquerade
+        // as an application source-host root and consume the same finite scheduling budget.
+        addTriggerInputs(unique, inputs.applicationChains(), target, true);
+        addTriggerInputs(unique, inputs.bridgeContinuations(), target, false);
         // In a known application scope a dependency trigger is only an intermediate runtime
         // mechanism, never an application object identity.  The serialized element callback
         // candidates live in the kernel store until a real application OIS host consumes them.
@@ -1096,7 +1162,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         // ConcurrentHashMap/Boot callback pairs in the demo application report.
         if (target == null || target.applicationEntryIndex() == null
                 || !target.applicationEntryIndex().applicationScopeKnown()) {
-            addTriggerInputs(unique, inputs.dependencySuffixes());
+            addTriggerInputs(unique, inputs.dependencySuffixes(), target, false);
         }
         if (target != null && target.applicationEntryIndex() != null
                 && target.applicationEntryIndex().applicationScopeKnown()) {
@@ -1126,12 +1192,16 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         return List.copyOf(unique.values());
     }
 
-    private void addTriggerInputs(Map<String, Chain> unique, List<Chain> candidates) {
+    private void addTriggerInputs(Map<String, Chain> unique, List<Chain> candidates,
+                                  Blackboard target, boolean applicationStore) {
         if (candidates == null) {
             return;
         }
         for (Chain chain : candidates) {
-            if (isTriggerEntry(chain.entryKind())) {
+            if (isTriggerEntry(chain.entryKind())
+                    && (!applicationStore || target == null || target.applicationEntryIndex() == null
+                    || !target.applicationEntryIndex().applicationScopeKnown()
+                    || target.applicationEntryIndex().isApplicationOwner(chain.entryClass()))) {
                 unique.putIfAbsent(chain.key(), chain);
             }
         }
