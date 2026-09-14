@@ -1,6 +1,8 @@
 package io.just.sast.chain;
 
 import io.just.sast.blackboard.Chain;
+import io.just.sast.blackboard.ChainHop;
+import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.VerificationSummary;
 
 import java.util.Comparator;
@@ -23,7 +25,8 @@ public final class ChainRanking {
     public record Evidence(int dynamicRank, int sinkRoleRank, int semanticRank,
                            int constructionRank,
                            int sinkPrecisionRank, int entryRank, int unresolvedHops,
-                           int incompleteness, int pathLength, int staticScore,
+                           int incompleteness, int compactTerminalRank, int pathPreferenceRank,
+                           int pathLength, int staticScore,
                            int precisionRank,
                            String explanation) {
         /** Compatibility constructor for consumers compiled against the previous tuple. */
@@ -32,7 +35,8 @@ public final class ChainRanking {
                         int incompleteness, int pathLength, int staticScore,
                         String explanation) {
             this(dynamicRank, sinkRoleRank, 2, constructionRank, sinkPrecisionRank, entryRank,
-                    unresolvedHops, incompleteness, pathLength, staticScore, 99, explanation);
+                    unresolvedHops, incompleteness, 1, 1, pathLength, staticScore, 99,
+                    explanation);
         }
 
         public Evidence {
@@ -95,18 +99,29 @@ public final class ChainRanking {
         if (result != 0) return result;
         result = Integer.compare(a.unresolvedHops(), b.unresolvedHops());
         if (result != 0) return result;
-        result = Integer.compare(a.incompleteness(), b.incompleteness());
+        // A declaration-backed one-hop terminal is an exact usable endpoint.  It outranks a
+        // longer generic suffix without knowing a class, package, rule id, or benchmark name.
+        result = Integer.compare(a.compactTerminalRank(), b.compactTerminalRank());
         if (result != 0) return result;
-        result = Integer.compare(b.staticScore(), a.staticScore());
-        if (result != 0) return result;
-        // Precision is a confidence tie-break after semantic risk/entry coverage.  A
-        // declared reflective sink must not make a compact high-severity deserialization
-        // candidate lose its finite verification slot to a long generic plumbing path merely
-        // because the latter has no reflection obligation.
-        result = Integer.compare(a.precisionRank(), b.precisionRank());
-        if (result != 0) return result;
-        result = Integer.compare(a.pathLength(), b.pathLength());
-        if (result != 0) return result;
+        // A semantic bridge or an obviously disconnected component is where static search most
+        // often appends decorative suffixes.  Prefer the shorter representative for that pair,
+        // while keeping the historical static-evidence ordering for ordinary connected paths.
+        boolean shortestFirst = a.pathPreferenceRank() == 0 || b.pathPreferenceRank() == 0;
+        if (shortestFirst) {
+            result = Integer.compare(a.precisionRank(), b.precisionRank());
+            if (result != 0) return result;
+            result = Integer.compare(a.pathLength(), b.pathLength());
+            if (result != 0) return result;
+            result = Integer.compare(b.staticScore(), a.staticScore());
+            if (result != 0) return result;
+        } else {
+            result = Integer.compare(b.staticScore(), a.staticScore());
+            if (result != 0) return result;
+            result = Integer.compare(a.precisionRank(), b.precisionRank());
+            if (result != 0) return result;
+            result = Integer.compare(a.pathLength(), b.pathLength());
+            if (result != 0) return result;
+        }
         return (leftKey == null ? "" : leftKey).compareTo(rightKey == null ? "" : rightKey);
     }
 
@@ -119,7 +134,7 @@ public final class ChainRanking {
                                     Set<String> constructible) {
         if (chain == null) {
             return new Evidence(9, 9, 9, 9, 9, 9, Integer.MAX_VALUE, Integer.MAX_VALUE,
-                    Integer.MAX_VALUE, Integer.MIN_VALUE, 99, "null-candidate");
+                    1, 1, Integer.MAX_VALUE, Integer.MIN_VALUE, 99, "null-candidate");
         }
         List<String> chainNotes = notes == null ? List.of()
                 : notes.getOrDefault(chain.key(), List.of());
@@ -175,6 +190,9 @@ public final class ChainRanking {
         if (!"COMPLETE".equals(precision.completeness())) {
             incomplete++;
         }
+        int compactTerminal = isCompactDeclaredTerminal(chain) ? 0 : 1;
+        int disconnectedHops = disconnectedEvidenceHops(chain);
+        int pathPreference = disconnectedHops > 0 || hasSemanticContinuation(chain) ? 0 : 1;
         String explanation = "dynamic=" + (status.isBlank() ? "NOT_SELECTED" : status)
                 + ";sink_role=" + chain.sinkRole()
                 + ";semantic=" + semanticLabel(semantic)
@@ -186,11 +204,123 @@ public final class ChainRanking {
                 + ";entry_direction=" + (entry == 0 ? "DESERIALIZE_CALLBACK" : chain.entryKind())
                 + ";unresolved=" + chain.unresolvedHops()
                 + ";incompleteness=" + incomplete
+                + ";compact_terminal="
+                + (compactTerminal == 0 ? "DECLARED_MINIMAL" : "NO")
+                + ";path_preference="
+                + (pathPreference == 0 ? "SHORTEST_BRIDGE_OR_DISCONNECT" : "STATIC_EVIDENCE")
+                + ";disconnected_hops=" + disconnectedHops
                 + ";path_length=" + chain.hops().size()
                 + ";precision=" + precision.compact();
         return new Evidence(dynamic, sinkRole, semantic, construction, sinkPrecision, entry,
-                chain.unresolvedHops(), incomplete, chain.hops().size(),
-                rankFeatures.totalScore(), precision.rank(), explanation);
+                chain.unresolvedHops(), incomplete, compactTerminal, pathPreference,
+                chain.hops().size(), rankFeatures.totalScore(), precision.rank(), explanation);
+    }
+
+    /**
+     * A direct declared fragment has no unresolved gadget suffix: its construction plan, sink,
+     * entry and single ENTRY hop all describe the same callable endpoint.  This is a structural
+     * rank, not a class-name exception, so every rule can benefit from the same minimal-chain
+     * policy.
+     */
+    private static boolean isCompactDeclaredTerminal(Chain chain) {
+        if (chain == null || !chain.terminalSink()
+                || !"reflectiveTarget".equals(chain.entryKind())
+                || chain.constructionPlan() == null
+                || !chain.constructionPlan().shapeSummary().valid()
+                || chain.hops().size() != 1) {
+            return false;
+        }
+        ChainHop hop = chain.hops().get(0);
+        return hop != null && hop.kind() == HopKind.ENTRY
+                && sameText(chain.entryClass(), chain.sinkClass())
+                && sameText(chain.entryMethod(), chain.sinkMethod())
+                && !chain.sinkDescriptor().isBlank()
+                && sameText(hop.desc(), chain.sinkDescriptor())
+                && hop.reason() != null
+                && hop.reason().startsWith("fragment-activation-invoke");
+    }
+
+    private static boolean hasSemanticContinuation(Chain chain) {
+        return chain != null && chain.hops().stream().anyMatch(hop -> hop != null
+                && hop.reason() != null
+                && (hop.reason().startsWith("bridge-")
+                || hop.reason().equals("fragment")
+                || hop.reason().startsWith("fragment-activation-")));
+    }
+
+    /**
+     * Do not reward an isolated direct/field component that is not connected to the declared
+     * application entry.  UNKNOWN/disconnected evidence remains visible in the candidate, but
+     * it cannot inflate the score used to select the representative chain.
+     */
+    private static int disconnectedEvidenceHops(Chain chain) {
+        if (chain == null || chain.hops().size() < 2
+                || isBlank(chain.entryClass()) || isBlank(chain.entryMethod())) {
+            return 0;
+        }
+        List<ChainHop> hops = chain.hops();
+        boolean[] connected = new boolean[hops.size()];
+        boolean seeded = false;
+        for (int i = 0; i < hops.size(); i++) {
+            ChainHop hop = hops.get(i);
+            if (hop == null || hop.kind() == HopKind.ENTRY) {
+                continue;
+            }
+            if (sameMethod(hop.fromOwner(), hop.fromName(), chain.entryClass(), chain.entryMethod())
+                    || sameMethod(hop.toOwner(), hop.toName(), chain.entryClass(),
+                    chain.entryMethod())) {
+                connected[i] = true;
+                seeded = true;
+            }
+        }
+        if (!seeded) {
+            return 0;
+        }
+        boolean changed;
+        do {
+            changed = false;
+            for (int i = 0; i + 1 < hops.size(); i++) {
+                ChainHop left = hops.get(i);
+                ChainHop right = hops.get(i + 1);
+                if (left == null || right == null || left.kind() == HopKind.ENTRY
+                        || right.kind() == HopKind.ENTRY
+                        || !adjacentMethods(left, right)) {
+                    continue;
+                }
+                if (connected[i] != connected[i + 1]) {
+                    connected[i] = true;
+                    connected[i + 1] = true;
+                    changed = true;
+                }
+            }
+        } while (changed);
+        int disconnected = 0;
+        for (int i = 0; i < hops.size(); i++) {
+            ChainHop hop = hops.get(i);
+            if (hop != null && !connected[i]
+                    && (hop.kind() == HopKind.DIRECT_CALL || hop.kind() == HopKind.FIELD_FLOW)) {
+                disconnected++;
+            }
+        }
+        return disconnected;
+    }
+
+    private static boolean adjacentMethods(ChainHop left, ChainHop right) {
+        return sameMethod(left.toOwner(), left.toName(), right.fromOwner(), right.fromName())
+                || sameMethod(left.fromOwner(), left.fromName(), right.toOwner(), right.toName());
+    }
+
+    private static boolean sameMethod(String leftOwner, String leftName,
+                                      String rightOwner, String rightName) {
+        return sameText(leftOwner, rightOwner) && sameText(leftName, rightName);
+    }
+
+    private static boolean sameText(String left, String right) {
+        return left != null && right != null && left.equals(right);
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     /**

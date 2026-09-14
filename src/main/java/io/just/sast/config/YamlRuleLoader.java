@@ -44,7 +44,7 @@ public final class YamlRuleLoader {
     private static final Set<String> MODEL_KEYS = Set.of("id", "kind", "match", "actions");
     private static final Set<String> FRAGMENT_KEYS = Set.of("id", "kind", "entryClass", "entryKind",
             "entryMethod", "entryDescriptor", "activation", "sinkOwner", "sinkName",
-            "sinkDescriptor", "hops", "construction");
+            "sinkDescriptor", "hops", "construction", "direct");
     private static final Set<String> CALL_KEYS = Set.of("owner", "name", "descriptor");
     private static final Set<String> METHOD_KEYS = Set.of("name", "descriptor", "access");
     private static final Set<String> CLASS_KEYS = Set.of("implements");
@@ -524,6 +524,19 @@ public final class YamlRuleLoader {
         String sinkOwner = str(ruleMap, "sinkOwner");
         String sinkName = str(ruleMap, "sinkName");
         String sinkDescriptor = str(ruleMap, "sinkDescriptor");
+        boolean directTerminal = false;
+        if (ruleMap.containsKey("direct")) {
+            Object rawDirect = ruleMap.get("direct");
+            if (rawDirect instanceof Boolean value) {
+                directTerminal = value;
+            } else if (rawDirect instanceof String value
+                    && ("true".equalsIgnoreCase(value.trim())
+                    || "false".equalsIgnoreCase(value.trim()))) {
+                directTerminal = Boolean.parseBoolean(value.trim());
+            } else {
+                throw new IOException("chain-fragment 规则 " + id + " 的 direct 必须是布尔值");
+            }
+        }
         List<Rule.HopSpec> hops = new ArrayList<>();
         Object rawHops = ruleMap.get("hops");
         if (!(rawHops instanceof List<?> hopList)) {
@@ -539,13 +552,22 @@ public final class YamlRuleLoader {
             String field = str(hm, "field");
             hops.add(new Rule.HopSpec(cls, method, field));
         }
-        if (isBlank(entryClass) || isBlank(sinkOwner) || isBlank(sinkName) || hops.isEmpty()) {
-            throw new IOException("chain-fragment 规则 " + id + " 缺少 entryClass/sinkOwner/sinkName/hops");
+        if (isBlank(entryClass) || isBlank(sinkOwner) || isBlank(sinkName)
+                || (!directTerminal && hops.isEmpty())) {
+            throw new IOException("chain-fragment 规则 " + id
+                    + " 缺少 entryClass/sinkOwner/sinkName/hops（direct 终端可为空 hops）");
+        }
+        if (directTerminal && (!hops.isEmpty() || isBlank(entryMethod)
+                || isBlank(entryDescriptor) || isBlank(sinkDescriptor)
+                || !entryClass.equals(sinkOwner) || !entryMethod.equals(sinkName)
+                || !entryDescriptor.equals(sinkDescriptor))) {
+            throw new IOException("chain-fragment 规则 " + id
+                    + " 的 direct 终端必须以完整且相同的 entry/sink 描述符声明");
         }
         ObjectGraphPlan constructionPlan = parseConstructionPlan(id, ruleMap.get("construction"));
         return new Rule.FragmentRule(id, entryClass, entryKind == null ? "readObject" : entryKind,
                 List.copyOf(hops), sinkOwner, sinkName, sinkDescriptor, entryMethod,
-                entryDescriptor, activation, constructionPlan);
+                entryDescriptor, activation, constructionPlan, directTerminal);
     }
 
     /**

@@ -424,7 +424,8 @@ public final class ApplicationEntryIndex {
                                     String entryKind, String terminalOwner, String terminalName,
                                     String terminalDescriptor, String terminalRole,
                                     SinkRisk sinkRisk, boolean continuationEvidence,
-                                    boolean declaredApplicationContinuation) {
+                                    boolean declaredApplicationContinuation,
+                                    boolean declaredFragmentContinuation) {
         public ProducerCandidate(String ruleId, String category, String severity,
                                   String entryOwner, String entryName, String entryDescriptor,
                                   String entryKind, String terminalOwner, String terminalName,
@@ -432,7 +433,19 @@ public final class ApplicationEntryIndex {
                                   SinkRisk sinkRisk, boolean continuationEvidence) {
             this(ruleId, category, severity, entryOwner, entryName, entryDescriptor, entryKind,
                     terminalOwner, terminalName, terminalDescriptor, terminalRole, sinkRisk,
-                    continuationEvidence, false);
+                    continuationEvidence, false, false);
+        }
+
+        /** Compatibility constructor for callers that already declare an application continuation. */
+        public ProducerCandidate(String ruleId, String category, String severity,
+                                  String entryOwner, String entryName, String entryDescriptor,
+                                  String entryKind, String terminalOwner, String terminalName,
+                                  String terminalDescriptor, String terminalRole,
+                                  SinkRisk sinkRisk, boolean continuationEvidence,
+                                  boolean declaredApplicationContinuation) {
+            this(ruleId, category, severity, entryOwner, entryName, entryDescriptor, entryKind,
+                    terminalOwner, terminalName, terminalDescriptor, terminalRole, sinkRisk,
+                    continuationEvidence, declaredApplicationContinuation, false);
         }
 
         public ProducerCandidate {
@@ -1664,9 +1677,10 @@ public final class ApplicationEntryIndex {
     }
 
     /**
-     * Candidate admission for a declarative continuation whose terminal is a static rule
-     * boundary rather than an observed call site.  The declaration owner supplies the boolean;
-     * this index still checks the exact class-definition boundary identity.
+     * Candidate admission for a declarative continuation whose terminal is a rule-owned
+     * boundary rather than an observed call site.  The fragment producer owns the declaration
+     * and supplies the typed boolean; this index only owns application-scope and reachability
+     * admission.
      */
     public CandidateAdmissionDecision candidateAdmission(String entryOwner, String entryName,
                                                          String entryDescriptor,
@@ -1735,7 +1749,6 @@ public final class ApplicationEntryIndex {
                     continuationEvidence);
         }
         if (declaredFragmentContinuation && continuationEvidence
-                && isDeclaredClassDefinitionBoundary(sinkOwner, sinkName, sinkDescriptor)
                 && terminal.status() == TerminalStatus.NOT_INDEXED
                 && (!isApplicationOwner(owner)
                 || applicationEntryMethods.contains(entryKey) || entryForward
@@ -1821,7 +1834,7 @@ public final class ApplicationEntryIndex {
         boolean serializedTriggerContinuation = candidate.continuationEvidence()
                 && SERIALIZED_TRIGGER_ENTRY_KINDS.contains(candidate.entryKind())
                 && isApplicationOwner(candidate.entryOwner());
-        boolean declaredFragmentContinuation = isDeclaredFragmentCandidate(candidate)
+        boolean declaredFragmentContinuation = candidate.declaredFragmentContinuation()
                 || candidate.declaredApplicationContinuation();
         CandidateAdmissionDecision admission = candidateAdmission(candidate.entryOwner(),
                 candidate.entryName(), candidate.entryDescriptor(), candidate.terminalOwner(),
@@ -1945,20 +1958,6 @@ public final class ApplicationEntryIndex {
             }
         }
         return descriptors.size() == 1 ? descriptors.iterator().next() : "";
-    }
-
-    /** Exact static boundary permitted for the declarative JDBC/XML continuation. */
-    private static boolean isDeclaredClassDefinitionBoundary(String owner, String name,
-                                                              String descriptor) {
-        return "java/lang/ClassLoader".equals(owner) && "defineClass".equals(name)
-                && "([BII)Ljava/lang/Class;".equals(descriptor);
-    }
-
-    private static boolean isDeclaredFragmentCandidate(ProducerCandidate candidate) {
-        return candidate != null && candidate.continuationEvidence()
-                && "jdbcConfiguration".equals(candidate.entryKind())
-                && isDeclaredClassDefinitionBoundary(candidate.terminalOwner(),
-                candidate.terminalName(), candidate.terminalDescriptor());
     }
 
     private static String entryDescriptor(Chain chain) {

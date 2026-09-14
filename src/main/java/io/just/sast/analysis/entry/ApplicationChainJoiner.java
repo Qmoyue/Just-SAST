@@ -341,6 +341,12 @@ public final class ApplicationChainJoiner {
             }
             BridgeEvidence.Kind kind = "bridge-jdbc_xml".equals(hop.reason())
                     ? BridgeEvidence.Kind.CONFIGURATION : bridgeKind(hop.reason());
+            // Source/callback markers describe the first deserialization boundary and the
+            // callback dispatch that follows it; neither is a second protocol bridge. Keep
+            // them in the chain hops, but do not turn an UNKNOWN marker into typed evidence.
+            if (kind == BridgeEvidence.Kind.UNKNOWN) {
+                continue;
+            }
             addBridge(bridges, kind, siteAtom.id(), terminal.id(),
                     hop.reason());
         }
@@ -429,7 +435,8 @@ public final class ApplicationChainJoiner {
             if (hop == null) {
                 continue;
             }
-            if (bridgeKind(hop.reason()) != BridgeEvidence.Kind.UNKNOWN) {
+            if (bridgeKind(hop.reason()) != BridgeEvidence.Kind.UNKNOWN
+                    || isSourceDeserializeMarker(hop.reason())) {
                 return true;
             }
             if (hop.kind() == HopKind.ENTRY && index.isApplicationOwner(hop.fromOwner())
@@ -438,6 +445,11 @@ public final class ApplicationChainJoiner {
             }
         }
         return false;
+    }
+
+    private static boolean isSourceDeserializeMarker(String reason) {
+        return reason != null && ("bridge-source-deserialize".equals(reason)
+                || reason.startsWith("bridge-source-"));
     }
 
     private static EntryMatch findApplicationEntry(ApplicationEntryIndex index, Graph graph,
@@ -1008,8 +1020,9 @@ public final class ApplicationChainJoiner {
             return BridgeEvidence.Kind.JNDI_RMI;
         }
         if (value.contains("jdbc") || value.contains("driver")) return BridgeEvidence.Kind.JDBC_DRIVER;
-        if (value.contains("second") || value.contains("remote") || value.contains("response")
-                || value.contains("deser") || value.contains("bridge-source-deserialize")) {
+        if ("bridge-deser".equals(value)
+                || "secondary-deserialization".equals(value)
+                || value.startsWith("bridge-second-deserialization")) {
             return BridgeEvidence.Kind.SECOND_DESERIALIZATION;
         }
         if (value.contains("reflect") || value.contains("invoke")) {

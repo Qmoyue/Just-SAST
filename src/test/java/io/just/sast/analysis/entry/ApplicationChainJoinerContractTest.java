@@ -716,6 +716,41 @@ class ApplicationChainJoinerContractTest {
     }
 
     @Test
+    void firstDeserializeSourceMarkerIsNotASecondDeserializeBridge() {
+        Graph graph = new Graph();
+        graph.methodNode(APP, "handle", "()V", false);
+        graph.methodNode(GADGET, "trigger", "()V", false);
+        Node runtime = graph.methodNode(RUNTIME, "exec", SINK_DESC, true);
+        Node exec = graph.addCallNode(RUNTIME, "exec", SINK_DESC, "VIRTUAL", null, 0,
+                GADGET, "trigger", "()V");
+        graph.addEdge(exec, runtime, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(APP), true);
+        Chain firstDeserialize = new Chain("bridge-source-deserialize", "COMMAND", "HIGH",
+                APP, "handle", "http", RUNTIME, "exec", List.of(
+                new ChainHop(APP, "handle", APP, "handle", HopKind.ENTRY,
+                        null, "http", "()V", null),
+                new ChainHop(APP, "handle", GADGET, "trigger", HopKind.DIRECT_CALL,
+                        null, "bridge-source-deserialize", "()V", 0),
+                new ChainHop(GADGET, "trigger", RUNTIME, "exec", HopKind.DIRECT_CALL,
+                        null, "terminal", SINK_DESC, 0)), 0, SINK_DESC, "TERMINAL");
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(firstDeserialize), true, "A".repeat(64), Set.of());
+
+        assertEquals(1, evidence.joinCount());
+        Set<BridgeEvidence.Kind> bridgeKinds = evidence.graph().nodes().stream()
+                .filter(BridgeEvidence.class::isInstance)
+                .map(BridgeEvidence.class::cast)
+                .map(BridgeEvidence::kind)
+                .collect(java.util.stream.Collectors.toSet());
+        assertFalse(bridgeKinds.contains(BridgeEvidence.Kind.SECOND_DESERIALIZATION));
+    }
+
+    @Test
     void registeredCxfServiceJoinRetainsConfigurationAndSecondDeserializeBridges() {
         Graph graph = serviceGraph(true);
         RuleEngine engine = new RuleEngine(serviceRules(), new ClassHierarchy(Map.of(), null));

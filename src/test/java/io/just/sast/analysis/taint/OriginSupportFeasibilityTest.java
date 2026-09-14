@@ -266,8 +266,12 @@ class OriginSupportFeasibilityTest {
         assertEquals(Set.of("fixture/Element"),
                 support.deserializedContainerElementTypes(methodInfo),
                 "only a concrete serializable CHECKCAST of Iterator.next must bind an OIS element");
+        assertTrue(support.hasDeserializedContainerElementAccess(methodInfo),
+                "the iterator result must be recognized as a standard-container element access");
         assertEquals(Set.of(), support.deserializedContainerElementTypes(directMethodInfo),
                 "a direct OIS.readObject CHECKCAST is not a container-element provenance proof");
+        assertFalse(support.hasDeserializedContainerElementAccess(directMethodInfo),
+                "a direct/root-object OIS result must not be classified as a container-element access");
     }
 
     @Test

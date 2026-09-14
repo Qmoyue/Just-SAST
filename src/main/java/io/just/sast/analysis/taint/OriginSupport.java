@@ -1162,6 +1162,41 @@ public final class OriginSupport {
         return orderedStrings(types);
     }
 
+    /**
+     * Whether this method actually consumes an element produced by a standard container view
+     * of one ObjectInputStream result.
+     *
+     * <p>This is intentionally separate from {@link #deserializedContainerElementTypes}: a
+     * root object deserialization has no concrete element type to bind, but it is still a
+     * valid serialization callback boundary.  Composition may apply the concrete element
+     * gate only when this fact is true; otherwise a direct/root-object callback would be
+     * mistaken for an untyped container and disappear from the trigger frontier.</p>
+     */
+    public boolean hasDeserializedContainerElementAccess(MethodInfo host) {
+        if (host == null || host.instructions().isEmpty()) {
+            return false;
+        }
+        ForwardOrigins.Result result = origins.compute(host);
+        for (ForwardOrigins.State state : result.stateBefore().values()) {
+            if (state == null) {
+                continue;
+            }
+            for (ForwardOrigins.Slot slot : state.stack()) {
+                if (slot != null && deserializedContainerElementOrigin(slot.origins(), host,
+                        result, new HashSet<>(), 0)) {
+                    return true;
+                }
+            }
+            for (Set<ValueOrigin> origins : state.locals()) {
+                if (deserializedContainerElementOrigin(origins, host, result, new HashSet<>(),
+                        0)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private boolean concreteSerializableType(String type) {
         if (type == null || type.isBlank() || isJdk(type)
                 || !hierarchy.isSerializable(type)) {

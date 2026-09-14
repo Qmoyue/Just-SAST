@@ -378,6 +378,42 @@ class ApplicationEntryIndexContractTest {
     }
 
     @Test
+    void declaredTemplateFragmentMayCrossAnUnindexedStaticTerminal() {
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(fixture(),
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of(APP), true);
+        String templateDescriptor = "()Ljavax/xml/transform/Transformer;";
+        ApplicationEntryIndex.ProducerCandidate declared =
+                new ApplicationEntryIndex.ProducerCandidate("templates-fragment", "CODE_EXEC",
+                        "HIGH", "javax/swing/event/EventListenerList", "toString",
+                        "()Ljava/lang/String;", "toString",
+                        "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                        "newTransformer", templateDescriptor, "TERMINAL",
+                        io.just.sast.blackboard.SinkRisk.HIGH_RISK_TERMINAL, true, false, true);
+
+        ApplicationEntryIndex.ProducerAdmissionDecision decision =
+                index.producerAdmission(declared);
+
+        assertEquals(ApplicationEntryIndex.ProducerAdmissionStatus.BRIDGE_CONTINUATION,
+                decision.status(), decision.toString());
+        assertEquals(ApplicationEntryIndex.CandidateAdmissionStatus.DECLARED_FRAGMENT_CONTINUATION,
+                decision.candidate().status());
+        assertEquals(ApplicationEntryIndex.MaterializationPolicy.EAGER_BRIDGE,
+                decision.materializationPolicy());
+        assertEquals(ApplicationEntryIndex.TerminalStatus.NOT_INDEXED, decision.terminal().status());
+
+        ApplicationEntryIndex.ProducerCandidate undeclared =
+                new ApplicationEntryIndex.ProducerCandidate("templates-fragment", "CODE_EXEC",
+                        "HIGH", "javax/swing/event/EventListenerList", "toString",
+                        "()Ljava/lang/String;", "toString",
+                        "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                        "newTransformer", templateDescriptor, "TERMINAL",
+                        io.just.sast.blackboard.SinkRisk.HIGH_RISK_TERMINAL, true);
+        assertEquals(ApplicationEntryIndex.ProducerAdmissionStatus.REJECTED,
+                index.producerAdmission(undeclared).status());
+    }
+
+    @Test
     void typedDependencyContinuationMayEndAtIndexedIntermediateCapability() {
         String inputDescriptor = "()Ljava/lang/Object;";
         String signedObject = "java/security/SignedObject";

@@ -135,20 +135,34 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
             String materializedSinkDescriptor = sinkDescriptor == null ? "" : sinkDescriptor;
             List<Rule.HopSpec> fragmentHops = List.copyOf(frag.hops());
             Map<String, String> resolvedHopClasses = Map.copyOf(hopClassMap);
-            int expectedHopCount = fragmentHops.size() + 2;
+            int expectedHopCount = frag.directTerminal() ? 1 : fragmentHops.size() + 2;
             boolean continuation = ApplicationEntryIndex.hasTypedContinuationEvidence(frag.entryKind())
                     || (!RuleSchemaV2.isTerminalSink(rule)
                     && !RuleSchemaV2.bridgesFor(rule).isEmpty());
+            boolean declaredFragmentContinuation = frag.constructionPlan() != null
+                    && frag.constructionPlan().shapeSummary().valid()
+                    && RuleSchemaV2.isTerminalSink(rule);
             ApplicationEntryIndex.ProducerCandidate candidate = new ApplicationEntryIndex.ProducerCandidate(
                     rule.id(), rule.category(), rule.severity(), entryClass, entryMethod,
                     materializedEntryDescriptor, frag.entryKind(), sinkOwner, frag.sinkName(),
-                    materializedSinkDescriptor, rule.role().name(), rule.sinkRisk(), continuation);
+                    materializedSinkDescriptor, rule.role().name(), rule.sinkRisk(),
+                    continuation || declaredFragmentContinuation, false,
+                    declaredFragmentContinuation);
             Supplier<Chain> materializer = () -> {
-                if (fragmentHops.isEmpty()) {
+                if (fragmentHops.isEmpty() && !frag.directTerminal()) {
                     return null;
                 }
                 String fragmentReason = "any".equals(frag.activation())
                         ? "fragment" : "fragment-activation-" + frag.activation();
+                if (frag.directTerminal()) {
+                    List<ChainHop> directHops = List.of(new ChainHop(entryClass, entryMethod,
+                            entryClass, entryMethod, HopKind.ENTRY, null, fragmentReason,
+                            materializedEntryDescriptor, null));
+                    return new Chain(rule.id(), rule.category(), rule.severity(),
+                            entryClass, entryMethod, frag.entryKind(), sinkOwner, frag.sinkName(),
+                            directHops, 0, materializedSinkDescriptor, rule.role().name(),
+                            frag.constructionPlan(), rule.sinkRisk());
+                }
                 Rule.HopSpec last = fragmentHops.get(fragmentHops.size() - 1);
                 List<ChainHop> hops = new ArrayList<>(expectedHopCount);
                 hops.add(new ChainHop(resolvedHopClasses.getOrDefault(last.cls(), last.cls()),

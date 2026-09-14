@@ -188,12 +188,13 @@ public sealed interface Rule {
     record FragmentRule(String id, String entryClass, String entryKind,
                         List<HopSpec> hops, String sinkOwner, String sinkName,
                         String sinkDescriptor, String entryMethod, String entryDescriptor,
-                        String activation, ObjectGraphPlan constructionPlan) implements Rule {
+                        String activation, ObjectGraphPlan constructionPlan,
+                        boolean directTerminal) implements Rule {
         /** 兼容旧的程序化规则构造；YAML 可用 sinkDescriptor 消除重载歧义。 */
         public FragmentRule(String id, String entryClass, String entryKind,
                             List<HopSpec> hops, String sinkOwner, String sinkName) {
             this(id, entryClass, entryKind, hops, sinkOwner, sinkName,
-                    null, null, null, null, null);
+                    null, null, null, null, null, false);
         }
 
         /** Compatibility constructor for fragment rules without an object-shape plan. */
@@ -201,7 +202,7 @@ public sealed interface Rule {
                             List<HopSpec> hops, String sinkOwner, String sinkName,
                             String sinkDescriptor) {
             this(id, entryClass, entryKind, hops, sinkOwner, sinkName,
-                    sinkDescriptor, null, null, null, null);
+                    sinkDescriptor, null, null, null, null, false);
         }
 
         /** Compatibility constructor for fragment rules with an object-shape plan. */
@@ -209,7 +210,7 @@ public sealed interface Rule {
                             List<HopSpec> hops, String sinkOwner, String sinkName,
                             String sinkDescriptor, ObjectGraphPlan constructionPlan) {
             this(id, entryClass, entryKind, hops, sinkOwner, sinkName,
-                    sinkDescriptor, null, null, null, constructionPlan);
+                    sinkDescriptor, null, null, null, constructionPlan, false);
         }
 
         public FragmentRule {
@@ -221,12 +222,26 @@ public sealed interface Rule {
             sinkDescriptor = sinkDescriptor == null ? "" : sinkDescriptor.trim();
             entryMethod = entryMethod == null ? "" : entryMethod.trim();
             entryDescriptor = entryDescriptor == null ? "" : entryDescriptor.trim();
+            hops = hops == null ? List.of() : List.copyOf(hops);
             activation = activation == null || activation.isBlank() ? "any"
                     : activation.trim().toLowerCase(java.util.Locale.ROOT);
             if (!Set.of("any", "invoke", "deserialize", "trigger", "template", "jndi", "jdbc")
                     .contains(activation)) {
                 throw new IllegalArgumentException("fragment activation must be any/invoke/deserialize/"
                         + "trigger/template/jndi/jdbc: " + activation);
+            }
+            if (directTerminal) {
+                if (!hops.isEmpty()) {
+                    throw new IllegalArgumentException("direct fragment must not declare intermediate hops");
+                }
+                if (entryMethod.isBlank() || entryDescriptor.isBlank()
+                        || !entryClass.equals(sinkOwner) || !entryMethod.equals(sinkName)
+                        || !entryDescriptor.equals(sinkDescriptor)) {
+                    throw new IllegalArgumentException(
+                            "direct fragment entry must exactly equal its terminal descriptor");
+                }
+            } else if (hops.isEmpty()) {
+                throw new IllegalArgumentException("non-direct fragment must declare hops");
             }
             constructionPlan = constructionPlan == null || constructionPlan.isEmpty()
                     ? null : constructionPlan;

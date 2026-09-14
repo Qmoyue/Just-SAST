@@ -128,6 +128,55 @@ class ChainRankingTest {
     }
 
     @Test
+    void shortestCompleteChainWinsOverLongerDecorativeSuffix() {
+        Chain shortChain = new Chain("RULE-short", "CODE_EXEC", "HIGH", "app/Entry",
+                "handle", "source", "terminal/Target", "run", List.of(
+                new ChainHop("app/Entry", "handle", "terminal/Target", "run",
+                        HopKind.DIRECT_CALL, null, "bridge", "()V", null)), 0,
+                "()V", "TERMINAL");
+        Chain longChain = new Chain("RULE-long", "CODE_EXEC", "HIGH", "app/Entry",
+                "handle", "source", "terminal/Target", "run", List.of(
+                new ChainHop("dep/A", "a", "dep/B", "b", HopKind.DIRECT_CALL,
+                        null, "decorative", "()V", null),
+                new ChainHop("dep/B", "b", "dep/C", "c", HopKind.DIRECT_CALL,
+                        null, "decorative", "()V", null),
+                new ChainHop("app/Entry", "handle", "terminal/Target", "run",
+                        HopKind.DIRECT_CALL, null, "bridge", "()V", null)), 0,
+                "()V", "TERMINAL");
+
+        assertTrue(ChainRanking.compare(shortChain, longChain, Map.of(), Map.of(), Set.of()) < 0);
+    }
+
+    @Test
+    void declaredCompactTerminalPrecedesLongerConnectedSuffix() {
+        ObjectGraphPlan compactPlan = new ObjectGraphPlan(
+                List.of(new ObjectGraphPlan.Node("entry", "lib/Target",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of())), List.of());
+        Chain compact = new Chain("RULE-compact", "CODE_EXEC", "HIGH", "lib/Target",
+                "activate", "reflectiveTarget", "lib/Target", "activate", List.of(
+                new ChainHop("lib/Target", "activate", "lib/Target", "activate",
+                        HopKind.ENTRY, null, "fragment-activation-invoke", "()V", null)), 0,
+                "()V", "TERMINAL", compactPlan);
+
+        ObjectGraphPlan connectedPlan = new ObjectGraphPlan(
+                List.of(new ObjectGraphPlan.Node("entry", "app/Entry",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of())), List.of());
+        Chain connected = new Chain("RULE-connected", "CODE_EXEC", "HIGH", "app/Entry",
+                "handle", "reflectiveTarget", "lib/Target", "activate", List.of(
+                new ChainHop("app/Entry", "handle", "dep/Mid", "go",
+                        HopKind.DIRECT_CALL, null, "bridge", "()V", null),
+                new ChainHop("dep/Mid", "go", "lib/Target", "activate",
+                        HopKind.DIRECT_CALL, null, "bridge", "()V", null),
+                new ChainHop("app/Entry", "handle", "app/Entry", "handle",
+                        HopKind.ENTRY, null, "reflectiveTarget", "()V", null)), 0,
+                "()V", "TERMINAL", connectedPlan);
+
+        assertEquals(0, ChainRanking.evidence(compact, Map.of(), Map.of(), Set.of())
+                .compactTerminalRank());
+        assertTrue(ChainRanking.compare(compact, connected, Map.of(), Map.of(), Set.of()) < 0);
+    }
+
+    @Test
     void malformedDeclaredPlanDoesNotReceiveConstructibleRank() {
         ObjectGraphPlan partial = new ObjectGraphPlan(
                 List.of(new ObjectGraphPlan.Node("entry", "app/Entry",

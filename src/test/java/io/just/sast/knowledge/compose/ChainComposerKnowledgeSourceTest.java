@@ -44,6 +44,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** 链组装契约：DESER 桥（前段 sink 为二次反序列化 → 后段机制入口）。 */
 class ChainComposerKnowledgeSourceTest {
 
+    private static final String EVENT_LISTENER_LIST = "javax/swing/event/EventListenerList";
+    private static final String UNDO_MANAGER = "javax/swing/undo/UndoManager";
+    private static final String VECTOR = "java/util/Vector";
+    private static final String JACKSON_POJONODE = "com/fasterxml/jackson/databind/node/POJONode";
+    private static final String SPRING_AOP_PROXY =
+            "org/springframework/aop/framework/JdkDynamicAopProxy";
+    private static final String TEMPLATES = "javax/xml/transform/Templates";
+    private static final String TEMPLATES_IMPL =
+            "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl";
+
     private static Chain chain(String ruleId, String category, String entryClass, String entryKind,
                                String sinkClass, String sinkMethod) {
         ChainHop hop = new ChainHop(entryClass, "e", entryClass, "e", HopKind.ENTRY, null, entryKind, "", null);
@@ -177,6 +187,124 @@ class ChainComposerKnowledgeSourceTest {
                         .anyMatch(h -> "bridge-invoke".equals(h.reason())
                                 && "dep/Callback".equals(h.toOwner()))),
                 "a generic Method.invoke capability must not invent a serialization callback");
+    }
+
+    @Test
+    void invokeCanSelectActivationAgnosticDeclaredFragment() {
+        Chain invokeFront = chain("T-INVOKE", "REFLECTION", "app/Front", "lifecycle",
+                "java/lang/reflect/Method", "invoke");
+        Chain fragment = new Chain("template-fragment", "CODE_EXEC", "HIGH",
+                "dep/Entry", "toString", "toString", "dep/Terminal", "newTransformer",
+                List.of(
+                        new ChainHop("dep/Entry", "toString", "dep/Terminal", "newTransformer",
+                                HopKind.DIRECT_CALL, null, "fragment", "()V", null),
+                        new ChainHop("dep/Entry", "toString", "dep/Entry", "toString",
+                                HopKind.ENTRY, null, "toString", "()Ljava/lang/String;", null)),
+                0, "()V", "TERMINAL");
+        Blackboard bb = new Blackboard(new io.just.sast.cpg.graph.Graph(),
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
+                Blackboard.ScanInputs.fastDefault(java.nio.file.Path.of(".")));
+        bb.addChain(invokeFront);
+        bb.addChain(fragment);
+
+        new ChainComposerKnowledgeSource().onEvent(bb,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertTrue(bb.chains().stream().anyMatch(c -> c.hops().stream()
+                        .anyMatch(h -> "bridge-invoke".equals(h.reason())
+                                && "dep/Entry".equals(h.toOwner()))),
+                "an activation-agnostic declared fragment must remain reusable by Method.invoke");
+    }
+
+    @Test
+    void invokeCanSelectUnindexedTemplatesObjectGraphFragment() {
+        Blackboard bb = deferredPolicyBlackboard();
+        String invokeDescriptor =
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;";
+        Chain invokeFront = new Chain("invoke-front", "REFLECTIVE_INVOKE", "HIGH",
+                "app/Entry", "handle", "lifecycle", "java/lang/reflect/Method", "invoke",
+                List.of(
+                        new ChainHop("app/Entry", "handle", "java/lang/reflect/Method", "invoke",
+                                HopKind.DIRECT_CALL, null, "direct", invokeDescriptor, null),
+                        new ChainHop("app/Entry", "handle", "app/Entry", "handle",
+                                HopKind.ENTRY, null, "lifecycle", "()V", null)), 0,
+                invokeDescriptor, "CAPABILITY");
+        Chain template = declaredTemplatesFragment();
+        bb.addChain(invokeFront);
+        bb.addChain(template);
+
+        new ChainComposerKnowledgeSource().onEvent(bb,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertTrue(bb.chains().stream().anyMatch(chain ->
+                        "app/Entry".equals(chain.entryClass())
+                                && TEMPLATES_IMPL.equals(chain.sinkClass())
+                                && chain.hops().stream().anyMatch(hop ->
+                                "bridge-invoke".equals(hop.reason()))),
+                "a valid declared Templates fragment must be selectable even without an observed "
+                        + "newTransformer call: " + bb.chains().stream().map(Chain::key).toList());
+    }
+
+    @Test
+    void deserializationDrivenInvokePrefersMinimalTemplatesTerminal() {
+        Blackboard bb = deferredPolicyBlackboard();
+        String invokeDescriptor =
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;";
+        Chain provenFront = new Chain("invoke-front-proven", "REFLECTIVE_INVOKE", "HIGH",
+                "app/Entry", "handle", "lifecycle", "java/lang/reflect/Method", "invoke",
+                List.of(
+                        new ChainHop("app/Entry", "handle", "java/io/ObjectInputStream",
+                                "readObject", HopKind.DIRECT_CALL, null,
+                                "bridge-source-deserialize", "()Ljava/lang/Object;", null),
+                        new ChainHop("java/io/ObjectInputStream", "readObject", "app/Callback",
+                                "hashCode", HopKind.VIRTUAL_DISPATCH, null,
+                                "bridge-trigger-src", "()I", null),
+                        new ChainHop("app/Callback", "hashCode", "app/Callback",
+                                "hashCode", HopKind.FIELD_FLOW, "object", "serialized-trigger",
+                                "", null),
+                        new ChainHop("app/Entry", "handle", "app/Entry", "handle",
+                                HopKind.ENTRY, null, "lifecycle", "()V", null)), 0,
+                invokeDescriptor, "CAPABILITY");
+        Chain direct = declaredDirectTemplatesFragment();
+        bb.addChain(provenFront);
+        bb.addChain(direct);
+
+        new ChainComposerKnowledgeSource().onEvent(bb,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        List<Chain> selected = bb.chains().stream()
+                .filter(chain -> "app/Entry".equals(chain.entryClass())
+                        && TEMPLATES_IMPL.equals(chain.sinkClass())
+                        && chain.hops().stream().anyMatch(hop ->
+                        "bridge-invoke".equals(hop.reason())))
+                .toList();
+        assertEquals(1, selected.size(), "minimal terminal should produce one admitted path");
+        assertEquals(provenFront.hops().size() + 1, selected.get(0).hops().size(),
+                "direct endpoint must not add the long object-graph suffix");
+    }
+
+    @Test
+    void unprovenInvokeCannotSelectMinimalTemplatesTerminal() {
+        Blackboard bb = deferredPolicyBlackboard();
+        String invokeDescriptor =
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;";
+        Chain unprovenFront = new Chain("invoke-front-unproven", "REFLECTIVE_INVOKE", "HIGH",
+                "app/Entry", "handle", "lifecycle", "java/lang/reflect/Method", "invoke",
+                List.of(new ChainHop("app/Entry", "handle", "app/Entry", "handle",
+                        HopKind.ENTRY, null, "lifecycle", "()V", null)), 0,
+                invokeDescriptor, "CAPABILITY");
+        bb.addChain(unprovenFront);
+        bb.addChain(declaredDirectTemplatesFragment());
+
+        new ChainComposerKnowledgeSource().onEvent(bb,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertFalse(bb.chains().stream().anyMatch(chain ->
+                        TEMPLATES_IMPL.equals(chain.sinkClass())
+                                && chain.hops().stream().anyMatch(hop ->
+                                "bridge-invoke".equals(hop.reason()))),
+                "a standalone reflective capability must not reach the direct terminal");
     }
 
     @Test
@@ -1524,5 +1652,59 @@ class ChainComposerKnowledgeSourceTest {
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
                 new Blackboard.ScanInputs(Path.of("."), List.of(), false, false, 0, null, 0,
                         false, false, false, null, Set.of(appOwner), true));
+    }
+
+    private static Chain declaredTemplatesFragment() {
+        String sinkDescriptor = "()Ljavax/xml/transform/Transformer;";
+        List<ChainHop> hops = List.of(
+                new ChainHop(TEMPLATES, "getOutputProperties", TEMPLATES_IMPL,
+                        "newTransformer", HopKind.DIRECT_CALL, null, "fragment", sinkDescriptor,
+                        null),
+                new ChainHop(SPRING_AOP_PROXY, "invoke", TEMPLATES, "getOutputProperties",
+                        HopKind.DIRECT_CALL, null, "fragment", "", null),
+                new ChainHop(JACKSON_POJONODE, "toString", SPRING_AOP_PROXY, "invoke",
+                        HopKind.DIRECT_CALL, null, "fragment", "", null),
+                new ChainHop(VECTOR, "toString", JACKSON_POJONODE, "toString",
+                        HopKind.DIRECT_CALL, null, "fragment", "", null),
+                new ChainHop(UNDO_MANAGER, "toString", VECTOR, "toString",
+                        HopKind.DIRECT_CALL, null, "fragment", "", null),
+                new ChainHop(EVENT_LISTENER_LIST, "toString", UNDO_MANAGER, "toString",
+                        HopKind.DIRECT_CALL, null, "fragment", "", null),
+                new ChainHop(EVENT_LISTENER_LIST, "toString", EVENT_LISTENER_LIST, "toString",
+                        HopKind.ENTRY, null, "toString", "()Ljava/lang/String;", null));
+        return new Chain("templates-fragment", "CODE_EXEC", "HIGH", EVENT_LISTENER_LIST,
+                "toString", "toString", TEMPLATES_IMPL, "newTransformer", hops, 0,
+                sinkDescriptor, "TERMINAL", declaredTemplatesPlan());
+    }
+
+    private static Chain declaredDirectTemplatesFragment() {
+        String descriptor = "()Ljavax/xml/transform/Transformer;";
+        return new Chain("templates-direct-fragment", "CODE_EXEC", "HIGH", TEMPLATES_IMPL,
+                "newTransformer", "reflectiveTarget", TEMPLATES_IMPL, "newTransformer",
+                List.of(new ChainHop(TEMPLATES_IMPL, "newTransformer", TEMPLATES_IMPL,
+                        "newTransformer", HopKind.ENTRY, null,
+                        "fragment-activation-invoke", descriptor, null)), 0, descriptor,
+                "TERMINAL", new ObjectGraphPlan(List.of(new ObjectGraphPlan.Node("entry",
+                        TEMPLATES_IMPL, ObjectGraphPlan.NodeKind.ALLOCATE, List.of())), List.of()));
+    }
+
+    private static ObjectGraphPlan declaredTemplatesPlan() {
+        return new ObjectGraphPlan(List.of(
+                new ObjectGraphPlan.Node("entry", EVENT_LISTENER_LIST,
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("undo", UNDO_MANAGER,
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("edits", VECTOR,
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("node", JACKSON_POJONODE,
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("templates", TEMPLATES_IMPL,
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("proxy", TEMPLATES,
+                        ObjectGraphPlan.NodeKind.REFLECTIVE_PROXY,
+                        List.of(ObjectGraphPlan.Value.ref("templates"),
+                                new ObjectGraphPlan.Value(ObjectGraphPlan.ValueKind.STRING,
+                                        "getOutputProperties")))
+        ), List.of());
     }
 }

@@ -1071,6 +1071,28 @@ rules:
         - { owner: node, field: _value, values: [{ ref: proxy }] }
         - { owner: templates, field: _name, values: [{ string: "just-safe-template" }] }
 
+  # The shortest reusable TemplatesImpl endpoint.  It is an explicit terminal receiver,
+  # not a payload: the only construction fact is a bounded allocation/field shape.  The
+  # composer admits it only after a deserialization-driven Method.invoke prefix has already
+  # proved the callback and receiver-capability boundary.
+  - id: FRAG-JDK-TEMPLATESIMPL-DIRECT
+    kind: chain-fragment
+    entryClass: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"
+    entryKind: reflectiveTarget
+    entryMethod: newTransformer
+    entryDescriptor: "()Ljavax/xml/transform/Transformer;"
+    activation: invoke
+    direct: true
+    hops: []
+    sinkOwner: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"
+    sinkName: newTransformer
+    sinkDescriptor: "()Ljavax/xml/transform/Transformer;"
+    construction:
+      nodes:
+        - { id: entry, type: "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl", kind: allocate }
+      fields:
+        - { owner: entry, field: _name, values: [{ string: "just-safe-template" }] }
+
   # ---- XXE / 任意文件读 / native 加载 / ProcessImpl / SSRF / 表达式解析 ----
 
   - id: JUST-SINK-XXE-DOCUMENTBUILDER

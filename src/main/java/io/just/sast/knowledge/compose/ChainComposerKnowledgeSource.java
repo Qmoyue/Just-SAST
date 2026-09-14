@@ -97,7 +97,6 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             "readObject", "readResolve", "readObjectNoData", "readExternal", "validateObject");
     private static final List<String> TRIGGER_ENTRY_KINDS = List.of(
             "hashCode", "equals", "compareTo", "compare", "toString");
-
     /** 桥接类型。 */
     enum Bridge { INVOKE, TRIGGER, TEMPLATE, DESER, JNDI_RMI, JDBC_XML }
 
@@ -260,7 +259,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                         continuationAdmissionCache, initialBackDemand)
                 : chains;
         List<Chain> publicEntries = defaultBackCandidates.stream()
-                .filter(ChainComposerKnowledgeSource::isPublicEntry)
+                .filter(chain -> isPublicEntry(chain) || isDeclaredDirectFragment(chain))
                 .sorted(java.util.Comparator
                         .comparingInt((Chain chain) -> terminalBackPriority(chain)).reversed()
                         .thenComparing(Chain::key))
@@ -341,7 +340,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                             continuationAdmissionCache,
                             hasApplicationBackDemand(bb, refreshed, frontFeaturesCache)) : refreshed;
             List<Chain> refreshedPublicEntries = refreshedBacks.stream()
-                    .filter(ChainComposerKnowledgeSource::isPublicEntry)
+                    .filter(chain -> isPublicEntry(chain) || isDeclaredDirectFragment(chain))
                     .sorted(java.util.Comparator
                             .comparingInt((Chain chain) -> terminalBackPriority(chain)).reversed()
                             .thenComparing(Chain::key))
@@ -435,7 +434,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                                 .reversed())
                         .thenComparing(Chain::key))
                 .toList();
-        List<Chain> fronts = selectApplicationFronts(eligibleFronts);
+        List<Chain> fronts = selectApplicationFronts(target, eligibleFronts, frontFeaturesCache);
         if (fronts.isEmpty()) {
             return 0;
         }
@@ -544,16 +543,39 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
      * root, which is precisely how a generated source-hosted prefix can disappear from the
      * continuation pass.
      */
-    private List<Chain> selectApplicationFronts(List<Chain> eligible) {
+    private List<Chain> selectApplicationFronts(Blackboard target, List<Chain> eligible,
+                                                Map<String, FrontFeatures> frontFeaturesCache) {
         if (eligible == null || eligible.isEmpty()) {
             return List.of();
         }
         List<Chain> selected = new ArrayList<>(Math.min(MAX_APPLICATION_PRIORITY_FRONTS,
                 eligible.size()));
+        // Preserve one representative for every typed bridge family before filling the
+        // bounded frontier by root/quality order.  A high-volume INVOKE or DESER family must
+        // not consume all reserved slots before a JDBC/JNDI continuation gets a chance to
+        // meet its declarative suffix.  The family is a semantic capability axis, not an
+        // artifact or rule-name special case.
+        for (String family : List.of("jdbc", "jndi", "deserialize", "invoke", "template",
+                "trigger")) {
+            for (Chain chain : eligible) {
+                if (!selected.contains(chain)
+                        && supportsBridgeFamily(target, chain, family, frontFeaturesCache)) {
+                    selected.add(chain);
+                    break;
+                }
+            }
+            if (selected.size() >= MAX_APPLICATION_PRIORITY_FRONTS) {
+                break;
+            }
+        }
         Set<String> roots = new LinkedHashSet<>();
         for (Chain chain : eligible) {
             if (selected.size() >= MAX_APPLICATION_PRIORITY_FRONTS) {
                 break;
+            }
+            if (selected.contains(chain)) {
+                roots.add(applicationRootKey(chain));
+                continue;
             }
             if (roots.add(applicationRootKey(chain))) {
                 selected.add(chain);
@@ -569,6 +591,20 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             }
         }
         return List.copyOf(selected);
+    }
+
+    private boolean supportsBridgeFamily(Blackboard target, Chain chain, String family,
+                                         Map<String, FrontFeatures> frontFeaturesCache) {
+        FrontFeatures features = frontFeaturesCached(target, chain, frontFeaturesCache);
+        return switch (family) {
+            case "jdbc" -> features.jdbc();
+            case "jndi" -> features.jndiRmi();
+            case "deserialize" -> features.deserialize();
+            case "invoke" -> features.invoke();
+            case "template" -> features.template();
+            case "trigger" -> features.triggerContainer() != null;
+            default -> false;
+        };
     }
 
     private static String applicationRootKey(Chain chain) {
@@ -643,7 +679,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                                                      terminalAdmissionCache,
                                              Map<ContinuationAdmissionKey, Boolean>
                                                      continuationAdmissionCache) {
-        if (chain == null || (!isPublicEntry(chain) && !isJdbcXmlFragment(chain))
+        if (chain == null || (!isPublicEntry(chain) && !isDeclaredContinuationFragment(chain)
+                && !isDeclaredDirectFragment(chain))
                 || target == null || target.applicationEntryIndex() == null) {
             return false;
         }
@@ -651,8 +688,11 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (!index.applicationScopeKnown() || index.isApplicationOwner(chain.entryClass())) {
             return false;
         }
-        if (isJdbcXmlFragment(chain)) {
-            return chain.unresolvedHops() == 0 && activationAllows(chain, "jdbc");
+        if (isDeclaredContinuationFragment(chain)) {
+            return true;
+        }
+        if (isDeclaredDirectFragment(chain)) {
+            return chain.unresolvedHops() == 0 && activationAllows(chain, "invoke");
         }
         var decision = terminalAdmission(index, chain, terminalAdmissionCache);
         if (decision.admitted()) {
@@ -672,7 +712,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         ApplicationEntryIndex index = target.applicationEntryIndex();
         ApplicationEntryIndex.ProducerCandidate candidate = deferred.candidate();
         if (!index.applicationScopeKnown() || index.isApplicationOwner(candidate.entryOwner())
-                || !isPublicEntry(candidate.entryKind())) {
+                || (!isPublicEntry(candidate.entryKind())
+                && !isDeclaredDirectCandidate(candidate))) {
             return false;
         }
         ApplicationEntryIndex.TerminalDecision decision = terminalAdmission(index,
@@ -1076,13 +1117,25 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 // They cannot satisfy the typed element proof, but they also cannot be used as
                 // production evidence; retain their historical bounded composition behavior.
                 // A real loaded host, by contrast, must pass the concrete element gate.
-                if (hostMethod != null) {
+                // Root-object OIS callbacks do not have a container element to bind, so they
+                // retain the serialization mechanism frontier.  Apply the type gate only
+                // after the immutable provenance layer has proved a standard-container
+                // element access; otherwise a direct HashMap/HashCode callback is erased.
+                if (hostMethod != null && target.originSupport()
+                        .hasDeserializedContainerElementAccess(hostMethod)) {
                     Set<String> elementTypes = target.originSupport()
                             .deserializedContainerElementTypes(hostMethod);
-                    applicable = triggerChains.stream()
-                            .filter(chain -> triggerMatchesDeserializedElement(target, chain,
-                                    elementTypes))
-                            .toList();
+                    // A proven container read with no concrete CHECKCAST is still a real
+                    // deserialization boundary; its element type is UNKNOWN, not negative
+                    // evidence.  Apply the bounded type filter only when the provenance layer
+                    // has an actual finite type set.  This keeps typed pruning useful without
+                    // erasing externally assembled Serializable/Proxy containers.
+                    if (!elementTypes.isEmpty()) {
+                        applicable = triggerChains.stream()
+                                .filter(chain -> triggerMatchesDeserializedElement(target, chain,
+                                        elementTypes))
+                                .toList();
+                    }
                 }
             }
             triggerChainsByHost.put(host.getKey(), applicable);
@@ -1362,12 +1415,14 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (hopCount < 0 || hopCount > MAX_HOPS || hopMaterializer == null) {
             return null;
         }
+        boolean declaredFragmentContinuation = isDeclaredStaticFragmentTerminal(back);
         ApplicationEntryIndex.ProducerCandidate candidate =
                 new ApplicationEntryIndex.ProducerCandidate(back.ruleId(), back.category(),
                         back.severity(), hostOwner, hostMethod, hostDescriptor, hostEntryKind,
                         back.sinkClass(), back.sinkMethod(), back.sinkDescriptor(),
                         back.sinkRole(), back.sinkRisk(),
-                        continuationEvidence);
+                        continuationEvidence, declaredFragmentContinuation,
+                        declaredFragmentContinuation);
         Supplier<Chain> materializer = () -> {
             List<ChainHop> hops = hopMaterializer.get();
             if (hops == null || hops.size() != hopCount || hops.size() > MAX_HOPS) {
@@ -1829,50 +1884,55 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     }
 
     /**
-     * Exact declarative boundary for the JDBC master XML continuation.  A generic fragment
-     * marker is insufficient: the entry, two XML lifecycle hops, inherited ClassLoader sink,
-     * activation and shape declaration must agree before this fragment can be paired with a
-     * JDBC driver prefix.
+     * A rule-owned static continuation is admitted by its declaration, not by a class-name
+     * branch in the composer.  The fragment must carry a bounded valid construction shape,
+     * resolve all declared hops, and end in a terminal sink role.  Its activation axis is
+     * consumed by the semantic bridge that selects it (invoke, JDBC, deserialize, and so on).
      */
-    private static boolean isJdbcXmlFragment(Chain chain) {
+    private static boolean isDeclaredContinuationFragment(Chain chain) {
+        return isDeclaredFragment(chain)
+                && chain.unresolvedHops() == 0
+                && chain.constructionPlan().shapeSummary().valid()
+                && chain.terminalSink()
+                && chain.sinkClass() != null && !chain.sinkClass().isBlank()
+                && chain.sinkMethod() != null && !chain.sinkMethod().isBlank();
+    }
+
+    /** Exact minimal receiver endpoint; unlike a generic public entry it is invoke-only. */
+    private static boolean isDeclaredDirectFragment(Chain chain) {
         if (!isDeclaredFragment(chain)
-                || !"jdbcConfiguration".equals(chain.entryKind())
-                || !"org/springframework/context/support/FileSystemXmlApplicationContext"
-                .equals(chain.entryClass())
-                || !"<init>".equals(chain.entryMethod())
-                || !"(Ljava/lang/String;)V".equals(entryDescriptor(chain))
-                || !"java/lang/ClassLoader".equals(chain.sinkClass())
-                || !"defineClass".equals(chain.sinkMethod())
-                || !"([BII)Ljava/lang/Class;".equals(chain.sinkDescriptor())
-                || !activationAllows(chain, "jdbc")
+                || !"reflectiveTarget".equals(chain.entryKind())
+                || !chain.entryClass().equals(chain.sinkClass())
+                || !chain.entryMethod().equals(chain.sinkMethod())
+                || !chain.sinkDescriptor().equals(entryDescriptor(chain))
+                || chain.hops().size() != 1
+                || chain.hops().get(0).kind() != HopKind.ENTRY
+                || !activationAllows(chain, "invoke")
+                || chain.constructionPlan() == null
                 || !chain.constructionPlan().shapeSummary().valid()) {
             return false;
         }
-        Set<String> types = new HashSet<>();
-        chain.constructionPlan().nodes().forEach(node -> {
-            if (node != null) {
-                types.add(node.type());
-            }
-        });
-        return types.contains("org/springframework/context/support/FileSystemXmlApplicationContext")
-                && types.contains("org/springframework/beans/factory/config/MethodInvokingFactoryBean")
-                && types.contains("javax/management/loading/MLet")
-                && hasHop(chain,
-                "org/springframework/context/support/FileSystemXmlApplicationContext", "<init>",
-                "org/springframework/beans/factory/config/MethodInvokingFactoryBean",
-                "afterPropertiesSet")
-                && hasHop(chain,
-                "org/springframework/beans/factory/config/MethodInvokingFactoryBean",
-                "afterPropertiesSet", "javax/management/loading/MLet", "defineClass")
-                && hasHop(chain, "javax/management/loading/MLet", "defineClass",
-                "java/lang/ClassLoader", "defineClass");
+        return chain.constructionPlan().nodes().stream().anyMatch(node -> node != null
+                && "entry".equals(node.id()) && chain.entryClass().equals(node.type()));
     }
 
-    private static boolean hasHop(Chain chain, String fromOwner, String fromName,
-                                  String toOwner, String toName) {
-        return chain != null && chain.hops().stream().anyMatch(hop -> hop != null
-                && fromOwner.equals(hop.fromOwner()) && fromName.equals(hop.fromName())
-                && toOwner.equals(hop.toOwner()) && toName.equals(hop.toName()));
+    /**
+     * Deferred candidates expose only endpoint metadata.  Keep a declaration-backed direct
+     * endpoint in the demand frontier without pretending that the endpoint itself is an
+     * application entry; the later semantic bridge still requires the proven source/callback
+     * facts from the application front.
+     */
+    private static boolean isDeclaredDirectCandidate(
+            ApplicationEntryIndex.ProducerCandidate candidate) {
+        return candidate != null && candidate.declaredFragmentContinuation()
+                && "reflectiveTarget".equals(candidate.entryKind())
+                && candidate.entryOwner().equals(candidate.terminalOwner())
+                && candidate.entryName().equals(candidate.terminalName())
+                && candidate.entryDescriptor().equals(candidate.terminalDescriptor());
+    }
+
+    private static boolean isDeclaredStaticFragmentTerminal(Chain chain) {
+        return isDeclaredContinuationFragment(chain) || isDeclaredDirectFragment(chain);
     }
 
     private static boolean isFragmentChain(Chain chain) {
@@ -1980,16 +2040,23 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         String backEntry = back.entryClass() + "." + back.entryMethod();
 
         // 1. INVOKE 桥：前段 sink 是 Method.invoke → 可调任意公共方法
+        // The direct Templates endpoint is narrower than that generic rule: the front must
+        // carry both the deserialization source and serialized-container callback facts, so a
+        // standalone reflective capability cannot manufacture an impact chain.
+        if (features.invoke() && isDeclaredDirectFragment(back)
+                && isDeserializationDrivenInvokeFront(front)
+                && activationAllows(back, "invoke")) {
+            return Bridge.INVOKE;
+        }
         if (features.invoke()
                 && isPublicEntry(back)
                 && activationAllows(back, "invoke")
                 && (!isSerializationCallbackEntry(back)
                 || hasExplicitFragmentActivation(back, "invoke"))
-                // A declarative fragment with no invoke activation is a reusable object
-                // graph, not proof that this particular Method value/receiver selects it.
-                // Ordinary bytecode-derived public methods remain valid invoke targets; a
-                // fragment must state the activation axis explicitly to cross this bridge.
-                && (!isFragmentChain(back) || hasExplicitFragmentActivation(back, "invoke"))) {
+                // activationAllows rejects a fragment that explicitly declares another axis;
+                // an unmarked fragment is the rule's reusable, activation-agnostic object
+                // graph and remains eligible for a typed public-method bridge.
+                ) {
             return Bridge.INVOKE;
         }
 
@@ -2025,11 +2092,30 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         // JDBC connect selects an implementation whose configuration may instantiate a
         // declarative XML context.  The fragment is accepted only when its exact static
         // class-definition boundary and bounded object shape were materialized above.
-        if (features.jdbc() && isJdbcXmlFragment(back)) {
+        if (features.jdbc() && isDeclaredContinuationFragment(back)
+                && activationAllows(back, "jdbc")) {
             return Bridge.JDBC_XML;
         }
-
         return null;
+    }
+
+    private static boolean isDeserializationDrivenInvokeFront(Chain front) {
+        if (front == null) {
+            return false;
+        }
+        boolean source = false;
+        boolean callback = false;
+        for (ChainHop hop : front.hops()) {
+            if (hop == null || hop.reason() == null) {
+                continue;
+            }
+            String reason = hop.reason();
+            source |= "bridge-source-deserialize".equals(reason)
+                    || reason.startsWith("bridge-source-");
+            callback |= "bridge-trigger-src".equals(reason)
+                    || reason.startsWith("serialized-trigger");
+        }
+        return source && callback;
     }
 
     private static boolean isPublicEntry(String entryKind) {
@@ -2150,12 +2236,15 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (front == null || back == null || materializer == null) {
             return null;
         }
+        boolean declaredFragmentContinuation = isDeclaredStaticFragmentTerminal(back);
         ApplicationEntryIndex.ProducerCandidate candidate =
                 new ApplicationEntryIndex.ProducerCandidate(back.ruleId(), back.category(),
                         back.severity(), front.entryClass(), front.entryMethod(),
                         entryDescriptor(front), front.entryKind(), back.sinkClass(),
                         back.sinkMethod(), back.sinkDescriptor(), back.sinkRole(),
-                        back.sinkRisk(), true, declaredApplicationContinuation);
+                        back.sinkRisk(), true,
+                        declaredApplicationContinuation || declaredFragmentContinuation,
+                        declaredFragmentContinuation);
         return new ComposedProducer(candidate, materializer);
     }
 

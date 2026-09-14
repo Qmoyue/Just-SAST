@@ -10,6 +10,7 @@ import io.just.sast.blackboard.KnowledgeSource;
 import io.just.sast.blackboard.Phase;
 import io.just.sast.blackboard.RunProduct;
 import io.just.sast.chain.ConfidenceScorer;
+import io.just.sast.analysis.entry.ApplicationEntryIndex;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Node;
@@ -105,7 +106,8 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         // 类型传播强化（U3）解锁的深度上限以此门控制洪水
         int deep = 0;
         for (Chain chain : bb.reportChains()) {
-            if (bb.calibrationOf(chain.key()) != null || chain.hops().size() <= 14) {
+            if (bb.calibrationOf(chain.key()) != null || chain.hops().size() <= 14
+                    || hasExternalApplicationEntry(chain)) {
                 continue;
             }
             long fieldFlows = chain.hops().stream()
@@ -160,6 +162,38 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         }
         JustLogger.info("链剪枝：无触发拒绝 {}，机制内部类 {}，机制去重 {}（共 {} 条）",
                 noTrigger, machinery, dedup, bb.reportChains().size());
+    }
+
+    /**
+     * The deep-shape heuristic is a noise filter, not an application-entry proof.  Once the
+     * immutable entry index has an exact external-control fact for the chain's declared entry,
+     * that fact must survive calibration even when a callback path is long or proxy-heavy.
+     * Otherwise a valid framework/application boundary is silently erased before the joiner can
+     * attach its site, registration and terminal evidence.  The check is exact-signature and
+     * scope-owned; it does not infer an entry from a class name or from a free-form note.
+     */
+    private boolean hasExternalApplicationEntry(Chain chain) {
+        return hasExternalApplicationEntry(bb == null ? null : bb.applicationEntryIndex(), chain);
+    }
+
+    static boolean hasExternalApplicationEntry(ApplicationEntryIndex index, Chain chain) {
+        if (chain == null) {
+            return false;
+        }
+        if (index == null || !index.applicationScopeKnown()) {
+            return false;
+        }
+        String descriptor = entryDescriptor(chain);
+        if (descriptor.isBlank()) {
+            return false;
+        }
+        String entryKey = methodKey(chain.entryClass(), chain.entryMethod(), descriptor);
+        return index.isExternalEntryMethod(entryKey);
+    }
+
+    private static String methodKey(String owner, String name, String descriptor) {
+        return (owner == null ? "" : owner) + "#" + (name == null ? "" : name)
+                + (descriptor == null ? "" : descriptor);
     }
 
     // ---- 触发上下文 ----

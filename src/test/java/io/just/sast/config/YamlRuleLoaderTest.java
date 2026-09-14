@@ -574,6 +574,22 @@ class YamlRuleLoaderTest {
     }
 
     @Test
+    void defaultRulesCarryExplicitMinimalTemplatesTerminal() throws Exception {
+        RuleSet rules = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+        Rule.FragmentRule fragment = rules.fragments().stream()
+                .filter(rule -> "FRAG-JDK-TEMPLATESIMPL-DIRECT".equals(rule.id()))
+                .findFirst().orElseThrow();
+        assertTrue(fragment.directTerminal());
+        assertTrue(fragment.hops().isEmpty());
+        assertEquals("reflectiveTarget", fragment.entryKind());
+        assertEquals(fragment.entryClass(), fragment.sinkOwner());
+        assertEquals(fragment.entryMethod(), fragment.sinkName());
+        assertEquals(fragment.entryDescriptor(), fragment.sinkDescriptor());
+        assertTrue(fragment.constructionPlan().shapeSummary().valid());
+    }
+
+    @Test
     void ruleSetLintReportsOverlapAndOverlyBroadMatchersWithoutChangingLoadSemantics() {
         Rule.CallMatcher exact = new Rule.CallMatcher(Match.of("a/B"), Match.of("run"), null);
         Rule.SinkRule first = new Rule.SinkRule("FIRST", "CODE_EXEC", "HIGH", exact,
