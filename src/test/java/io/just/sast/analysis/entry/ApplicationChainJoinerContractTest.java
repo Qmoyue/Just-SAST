@@ -7,6 +7,7 @@ import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.BridgeEvidence;
 import io.just.sast.blackboard.EvidenceAtom;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.config.Match;
 import io.just.sast.config.Rule;
 import io.just.sast.config.RuleEngine;
@@ -217,6 +218,77 @@ class ApplicationChainJoinerContractTest {
                 node.nodeKind().name().equals("PROTOCOL_BRIDGE")));
         assertEquals(io.just.sast.blackboard.FindingState.ChainProgress.IMPACT_CHAIN_COMPLETE,
                 evidence.states().get(chain.key()).chainProgress());
+    }
+
+    @Test
+    void typedJacksonJndiReplyRetainsTransportObjectGraphAndTerminalEvidence() {
+        Graph graph = jacksonReplyGraph();
+        RuleEngine engine = new RuleEngine(jacksonReplyRules(),
+                new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/Servlet"), true);
+        Chain chain = jacksonReplyChain(true);
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(chain), true, "A".repeat(64), Set.of());
+
+        assertEquals(1, evidence.joinCount(), evidence.decisions().toString());
+        var join = evidence.joins().values().iterator().next();
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.ValueFlow.PROTOCOL_REPLY,
+                join.valueFlow());
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.ObjectIdentity.SERIALIZED_ROUND_TRIP,
+                join.objectIdentity());
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.CallbackSemantics.PROTOCOL_REENTRY,
+                join.callbackSemantics());
+        Set<BridgeEvidence.Kind> bridgeKinds = evidence.graph().nodes().stream()
+                .filter(BridgeEvidence.class::isInstance)
+                .map(BridgeEvidence.class::cast)
+                .map(BridgeEvidence::kind)
+                .collect(java.util.stream.Collectors.toSet());
+        assertTrue(bridgeKinds.contains(BridgeEvidence.Kind.JNDI_RMI));
+        assertTrue(bridgeKinds.contains(BridgeEvidence.Kind.REMOTE_RESPONSE_DESERIALIZATION));
+        String json = evidence.graph().toCanonicalJson();
+        assertTrue(json.contains("\"binding_framework\":\"Jackson\""), json);
+        assertTrue(json.contains("\"protocol_reply\":\"RMI_SERIALIZED_OBJECT\""), json);
+        assertTrue(json.contains("\"object_graph_construction\":\"DECLARED_SHAPE\""), json);
+        assertTrue(json.contains("object_graph_path"), json);
+    }
+
+    @Test
+    void composedJacksonLookupWithoutTypedReplyIsRejected() {
+        Graph graph = jacksonReplyGraph();
+        RuleEngine engine = new RuleEngine(jacksonReplyRules(),
+                new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/Servlet"), true);
+        Chain lookupOnly = jacksonReplyChain(false);
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(lookupOnly), true, "A".repeat(64), Set.of());
+
+        assertEquals(0, evidence.joinCount());
+        assertEquals("RMI_REPLY_NOT_PROVEN", evidence.decisions().get(lookupOnly.key()));
+    }
+
+    @Test
+    void isolatedObjectGraphFragmentCannotCreateApplicationJoin() {
+        Graph graph = jacksonReplyGraph();
+        RuleEngine engine = new RuleEngine(jacksonReplyRules(),
+                new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/Servlet"), true);
+        Chain complete = jacksonReplyChain(true);
+        Chain isolated = new Chain("isolated-fragment", complete.category(), complete.severity(),
+                "javax/swing/event/EventListenerList", "toString", "toString",
+                complete.sinkClass(), complete.sinkMethod(), complete.hops(),
+                complete.unresolvedHops(), complete.sinkDescriptor(), complete.sinkRole(),
+                complete.constructionPlan());
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(isolated), true, "A".repeat(64), Set.of());
+
+        assertEquals(0, evidence.joinCount());
+        assertEquals("APPLICATION_ENTRY_NOT_IN_CHAIN", evidence.decisions().get(isolated.key()));
     }
 
     @Test
@@ -744,6 +816,128 @@ class ApplicationChainJoinerContractTest {
                 new Rule.CallMatcher(Match.of(SECONDARY), Match.of("decode"),
                         Match.of(SECONDARY_DESC)), null, List.of(new Rule.TaintedPos.Arg(0)));
         return new RuleSet(List.of(sink), List.of(), List.of(secondary), List.of(), List.of());
+    }
+
+    private static RuleSet jacksonReplyRules() {
+        String sinkDescriptor = "()Ljavax/xml/transform/Transformer;";
+        Rule.SinkRule sink = new Rule.SinkRule("templates-terminal", "CODE_EXEC", "HIGH",
+                new Rule.CallMatcher(Match.of(
+                        "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"),
+                        Match.of("newTransformer"), Match.of(sinkDescriptor)),
+                List.of(Rule.TaintedPos.Receiver.INSTANCE), Rule.SinkRole.TERMINAL);
+        Rule.SourceRule source = new Rule.SourceRule("jackson-read", "deserialize",
+                new Rule.CallMatcher(Match.of("com/fasterxml/jackson/databind/ObjectMapper"),
+                        Match.of("readValue"), Match.of(
+                                "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;")), null);
+        return new RuleSet(List.of(sink), List.of(), List.of(source), List.of(), List.of());
+    }
+
+    private static Graph jacksonReplyGraph() {
+        String servlet = "fixture/app/Servlet";
+        String servletDescriptor =
+                "(Ljavax/servlet/http/HttpServletRequest;Ljavax/servlet/http/HttpServletResponse;)V";
+        String target = "fixture/app/User";
+        String setterDescriptor = "(Ljava/lang/String;)V";
+        String bindingDescriptor = "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;";
+        String sinkDescriptor = "()Ljavax/xml/transform/Transformer;";
+
+        Graph graph = new Graph();
+        Node entry = graph.methodNode(servlet, "doGet", servletDescriptor, false);
+        entry.propsNote("methodAccess", Modifier.PROTECTED);
+        entry.propsNote("classSuperName", "javax/servlet/http/HttpServlet");
+        Node mapper = graph.methodNode("com/fasterxml/jackson/databind/ObjectMapper",
+                "readValue", bindingDescriptor, true);
+        Node binding = graph.addCallNode("com/fasterxml/jackson/databind/ObjectMapper",
+                "readValue", bindingDescriptor, "VIRTUAL", null, 0, servlet, "doGet",
+                servletDescriptor);
+        binding.propsNote("classLiteralHints", List.of(target));
+        graph.addEdge(binding, mapper, EdgeType.INVOKES, "VIRTUAL");
+        graph.methodNode(target, "setUrl", setterDescriptor, false);
+        Node templates = graph.methodNode(
+                "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                "newTransformer", sinkDescriptor, true);
+        Node terminal = graph.addCallNode(
+                "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl", "newTransformer",
+                sinkDescriptor, "VIRTUAL", null, 0, target, "setUrl", setterDescriptor);
+        graph.addEdge(terminal, templates, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+        return graph;
+    }
+
+    private static Chain jacksonReplyChain(boolean completeShape) {
+        String target = "fixture/app/User";
+        String setterDescriptor = "(Ljava/lang/String;)V";
+        String sinkDescriptor = "()Ljavax/xml/transform/Transformer;";
+        List<ChainHop> hops = new java.util.ArrayList<>();
+        if (completeShape) {
+            hops.add(new ChainHop("javax/xml/transform/Templates", "getOutputProperties",
+                    "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                    "newTransformer", HopKind.DIRECT_CALL, null, "fragment", sinkDescriptor, 0));
+            hops.add(new ChainHop("org/springframework/aop/framework/JdkDynamicAopProxy", "invoke",
+                    "javax/xml/transform/Templates", "getOutputProperties", HopKind.DIRECT_CALL,
+                    null, "fragment", "", 0));
+            hops.add(new ChainHop("com/fasterxml/jackson/databind/node/POJONode", "toString",
+                    "org/springframework/aop/framework/JdkDynamicAopProxy", "invoke",
+                    HopKind.DIRECT_CALL, null, "fragment", "", 0));
+            hops.add(new ChainHop("java/util/Vector", "toString",
+                    "com/fasterxml/jackson/databind/node/POJONode", "toString",
+                    HopKind.DIRECT_CALL, null, "fragment", "", 0));
+            hops.add(new ChainHop("javax/swing/undo/UndoManager", "toString",
+                    "java/util/Vector", "toString", HopKind.DIRECT_CALL, null, "fragment", "", 0));
+            hops.add(new ChainHop("javax/swing/event/EventListenerList", "toString",
+                    "javax/swing/undo/UndoManager", "toString", HopKind.DIRECT_CALL, null,
+                    "fragment", "", 0));
+            hops.add(new ChainHop("javax/naming/InitialContext", "lookup",
+                    "javax/swing/event/EventListenerList", "toString", HopKind.DIRECT_CALL, null,
+                    "bridge-jndi_rmi", "", 0));
+        } else {
+            hops.add(new ChainHop("javax/naming/InitialContext", "lookup",
+                    "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                    "newTransformer", HopKind.DIRECT_CALL, null, "bridge-jndi_rmi",
+                    sinkDescriptor, 0));
+        }
+        hops.add(new ChainHop(target, "setUrl", target, "setUrl", HopKind.ENTRY, null,
+                "framework-bean-input", setterDescriptor, null));
+        return new Chain(completeShape ? "typed-rmi-reply" : "lookup-only-rmi",
+                "CODE_EXEC", "HIGH", target, "setUrl", "deserialize",
+                "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl", "newTransformer",
+                hops, 0, sinkDescriptor, "TERMINAL", completeShape ? jacksonReplyPlan() : null);
+    }
+
+    private static ObjectGraphPlan jacksonReplyPlan() {
+        return new ObjectGraphPlan(List.of(
+                new ObjectGraphPlan.Node("entry", "javax/swing/event/EventListenerList",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("undo", "javax/swing/undo/UndoManager",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("edits", "java/util/Vector",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("node", "com/fasterxml/jackson/databind/node/POJONode",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("templates",
+                        "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
+                new ObjectGraphPlan.Node("proxy", "javax/xml/transform/Templates",
+                        ObjectGraphPlan.NodeKind.REFLECTIVE_PROXY,
+                        List.of(ObjectGraphPlan.Value.ref("templates"),
+                                new ObjectGraphPlan.Value(ObjectGraphPlan.ValueKind.STRING,
+                                        "getOutputProperties")))
+        ), List.of(
+                new ObjectGraphPlan.FieldAssignment("entry", "listenerList", List.of(
+                        ObjectGraphPlan.Value.classValue("java/lang/Class"),
+                        ObjectGraphPlan.Value.ref("undo"))),
+                new ObjectGraphPlan.FieldAssignment("undo", "edits",
+                        List.of(ObjectGraphPlan.Value.ref("edits"))),
+                new ObjectGraphPlan.FieldAssignment("edits", "elementData",
+                        List.of(ObjectGraphPlan.Value.ref("node"))),
+                new ObjectGraphPlan.FieldAssignment("edits", "elementCount",
+                        List.of(new ObjectGraphPlan.Value(ObjectGraphPlan.ValueKind.INT, "1"))),
+                new ObjectGraphPlan.FieldAssignment("node", "_value",
+                        List.of(ObjectGraphPlan.Value.ref("proxy"))),
+                new ObjectGraphPlan.FieldAssignment("templates", "_name",
+                        List.of(new ObjectGraphPlan.Value(ObjectGraphPlan.ValueKind.STRING,
+                                "just-safe-template")))
+        ));
     }
 
     private static Graph serviceGraph(boolean registerEndpoint) {

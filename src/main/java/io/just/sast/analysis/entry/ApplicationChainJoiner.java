@@ -13,6 +13,7 @@ import io.just.sast.blackboard.EvidenceNode;
 import io.just.sast.blackboard.FindingState;
 import io.just.sast.blackboard.GadgetSegmentId;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.blackboard.SinkRisk;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Edge;
@@ -42,6 +43,20 @@ import java.util.TreeSet;
 public final class ApplicationChainJoiner {
 
     private static final int MAX_JOINED_CHAINS = 50_000;
+    private static final String JACKSON_MAPPER = "com/fasterxml/jackson/databind/ObjectMapper";
+    private static final String JNDI_INITIAL_CONTEXT = "javax/naming/InitialContext";
+    private static final String JNDI_CONTEXT = "javax/naming/Context";
+    private static final String JNDI_PREFIX = "javax/naming/";
+    private static final String SPRING_JNDI_PREFIX = "org/springframework/jndi/";
+    private static final String EVENT_LISTENER_LIST = "javax/swing/event/EventListenerList";
+    private static final String UNDO_MANAGER = "javax/swing/undo/UndoManager";
+    private static final String VECTOR = "java/util/Vector";
+    private static final String JACKSON_POJONODE = "com/fasterxml/jackson/databind/node/POJONode";
+    private static final String SPRING_AOP_PROXY =
+            "org/springframework/aop/framework/JdkDynamicAopProxy";
+    private static final String TEMPLATES = "javax/xml/transform/Templates";
+    private static final String TEMPLATES_IMPL =
+            "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl";
 
     private ApplicationChainJoiner() {
     }
@@ -208,34 +223,45 @@ public final class ApplicationChainJoiner {
         }
         ApplicationEntryIndex.DeserializeSite site = entryMatch.bindingSite() != null
                 ? entryMatch.bindingSite() : findSite(index, entryKey, chainMethods);
+        BridgeProfile bridgeProfile = bridgeProfile(chain, site);
+        if (bridgeProfile.composedJndi() && bridgeProfile.jacksonBinding()
+                && !bridgeProfile.remoteReply()) {
+            return Decision.rejected("RMI_REPLY_NOT_PROVEN");
+        }
         if (entryMatch.typedBinding()) {
             entryAttributes.put("binding_target_type", chain.entryClass());
             entryAttributes.put("binding_site_call_id", Long.toString(site.callId()));
             entryAttributes.put("binding_site_host", site.hostMethodKey());
         }
+        addBridgeProfileAttributes(entryAttributes, bridgeProfile);
         EvidenceAtom entry = EvidenceAtom.of(EvidenceAtom.Kind.APPLICATION_ENTRY, "UNKNOWN",
                 ownerOf(entryKey), memberOf(entryKey), entryMatch.path().isEmpty()
                         ? "INDEX_APPLICATION_ENTRY" : entryMatch.typedBinding()
                         ? "INDEX_TYPED_BINDING_ENTRY" : "INDEX_APPLICATION_CALL_PREFIX",
                 entryAttributes);
-        EvidenceAtom siteAtom = siteAtom(site, entryKey, chain, entryMatch);
+        EvidenceAtom siteAtom = siteAtom(site, entryKey, chain, entryMatch, bridgeProfile);
         GadgetSegmentId segmentId = dependencySegmentId(index, chain, dependencyOwner);
+        Map<String, String> dependencyAttributes = new TreeMap<>();
+        dependencyAttributes.put("segment_id", segmentId.value());
+        dependencyAttributes.put("sink", chain.sinkClass() + "#" + chain.sinkMethod());
+        dependencyAttributes.put("descriptor", chain.sinkDescriptor());
+        addBridgeProfileAttributes(dependencyAttributes, bridgeProfile);
         EvidenceAtom dependency = EvidenceAtom.of(EvidenceAtom.Kind.DEPENDENCY_SEGMENT,
                 "UNKNOWN", dependencyOwner, chain.sinkMethod(), "CHAIN_DEPENDENCY_SUFFIX",
-                Map.of("segment_id", segmentId.value(), "sink", chain.sinkClass() + "#"
-                        + chain.sinkMethod(), "descriptor", chain.sinkDescriptor()));
+                dependencyAttributes);
         EvidenceAtom terminal = EvidenceAtom.of(EvidenceAtom.Kind.TERMINAL_IMPACT, "UNKNOWN",
                 chain.sinkClass(), chain.sinkMethod(), "INDEX_TERMINAL_IMPACT",
                 Map.of("descriptor", chain.sinkDescriptor(), "risk", chain.sinkRisk().name()));
 
         ApplicationChainId chainId = ApplicationChainId.fromCanonical("chain", chain.key());
-        EntryChainJoinEvidence.ValueFlow flow = valueFlow(chain, entryMatch);
+        EntryChainJoinEvidence.ValueFlow flow = valueFlow(chain, entryMatch, bridgeProfile);
         EntryChainJoinEvidence.ObjectIdentity identity = flow == EntryChainJoinEvidence.ValueFlow.PROTOCOL_REPLY
                 ? EntryChainJoinEvidence.ObjectIdentity.SERIALIZED_ROUND_TRIP
                 : flow == EntryChainJoinEvidence.ValueFlow.DIRECT_VALUE
                 ? EntryChainJoinEvidence.ObjectIdentity.SAME_OBJECT
                 : EntryChainJoinEvidence.ObjectIdentity.DERIVED_OBJECT;
-        EntryChainJoinEvidence.CallbackSemantics callback = callbackSemantics(chain, site);
+        EntryChainJoinEvidence.CallbackSemantics callback = callbackSemantics(chain, site,
+                bridgeProfile);
         EntryChainJoinEvidence.RuntimeTypeProof runtimeType = entryMatch.typedBinding()
                 ? EntryChainJoinEvidence.RuntimeTypeProof.EXACT
                 : chain.unresolvedHops() == 0
@@ -279,6 +305,14 @@ public final class ApplicationChainJoiner {
             }
             addBridge(bridges, bridgeKind(hop.reason()), siteAtom.id(), terminal.id(),
                     hop.reason());
+        }
+        // A composed JNDI/RMI hop is the transport boundary.  The returned serialized object
+        // is a second, typed evidence edge only when the same chain also carries the Jackson
+        // target binding and the complete declarative callback shape.  This keeps lookup-only
+        // and isolated fragment candidates from becoming an application reply finding.
+        if (bridgeProfile.remoteReply()) {
+            addBridge(bridges, BridgeEvidence.Kind.REMOTE_RESPONSE_DESERIALIZATION,
+                    siteAtom.id(), terminal.id(), "RMI_SERIALIZED_REPLY");
         }
         List<String> bridgeIds = bridges.stream().map(BridgeEvidence::id).sorted().toList();
         EntryChainJoinEvidence join = EntryChainJoinEvidence.of(chainId, entry.id(), siteAtom.id(),
@@ -651,9 +685,10 @@ public final class ApplicationChainJoiner {
     }
 
     private static EvidenceAtom siteAtom(ApplicationEntryIndex.DeserializeSite site,
-                                         String entryKey, Chain chain, EntryMatch match) {
+                                         String entryKey, Chain chain, EntryMatch match,
+                                         BridgeProfile bridgeProfile) {
         EvidenceAtom.Kind kind = site == null ? EvidenceAtom.Kind.DESERIALIZATION_SITE
-                : siteKind(site.bridge());
+                : siteKind(site.bridge(), match != null && match.typedBinding());
         String owner = site == null ? ownerOf(entryKey) : site.owner();
         String member = site == null ? memberOf(entryKey) : site.name() + site.descriptor();
         String evidenceCode = site == null ? "APPLICATION_CALLBACK_ENTRY"
@@ -674,6 +709,7 @@ public final class ApplicationChainJoiner {
                 attributes.put("join_kind", "TYPED_BINDING_TARGET");
             }
         }
+        addBridgeProfileAttributes(attributes, bridgeProfile);
         return EvidenceAtom.of(kind, "UNKNOWN", owner, member, evidenceCode, attributes);
     }
 
@@ -805,10 +841,14 @@ public final class ApplicationChainJoiner {
                 && expectedName != null && expectedName.equals(name);
     }
 
-    private static EntryChainJoinEvidence.ValueFlow valueFlow(Chain chain, EntryMatch entryMatch) {
+    private static EntryChainJoinEvidence.ValueFlow valueFlow(Chain chain, EntryMatch entryMatch,
+                                                              BridgeProfile bridgeProfile) {
         // A graph-only caller prefix proves control reachability, not that the exact external
         // value survives parameter/field conversion.  Keep the axis UNKNOWN until a typed
         // value-flow fact or protocol bridge establishes that relation.
+        if (bridgeProfile.remoteReply()) {
+            return EntryChainJoinEvidence.ValueFlow.PROTOCOL_REPLY;
+        }
         if (entryMatch != null && entryMatch.typedBinding()) {
             return EntryChainJoinEvidence.ValueFlow.CALLBACK_ARGUMENT;
         }
@@ -816,10 +856,9 @@ public final class ApplicationChainJoiner {
             return EntryChainJoinEvidence.ValueFlow.UNKNOWN;
         }
         for (ChainHop hop : chain.hops()) {
-            String reason = hop.reason() == null ? ""
-                    : hop.reason().toLowerCase(java.util.Locale.ROOT);
-            if (reason.contains("jndi") || reason.contains("rmi") || reason.contains("jdbc")
-                    || reason.contains("second") || reason.contains("deserialize")) {
+            BridgeEvidence.Kind kind = bridgeKind(hop.reason());
+            if (kind == BridgeEvidence.Kind.REMOTE_RESPONSE_DESERIALIZATION
+                    || kind == BridgeEvidence.Kind.SECOND_DESERIALIZATION) {
                 return EntryChainJoinEvidence.ValueFlow.PROTOCOL_REPLY;
             }
             if (hop.kind() == HopKind.FIELD_FLOW) {
@@ -845,7 +884,11 @@ public final class ApplicationChainJoiner {
     }
 
     private static EntryChainJoinEvidence.CallbackSemantics callbackSemantics(
-            Chain chain, ApplicationEntryIndex.DeserializeSite site) {
+            Chain chain, ApplicationEntryIndex.DeserializeSite site,
+            BridgeProfile bridgeProfile) {
+        if (bridgeProfile.remoteReply()) {
+            return EntryChainJoinEvidence.CallbackSemantics.PROTOCOL_REENTRY;
+        }
         if (site != null && site.bridge() != null && !site.bridge().isBlank()) {
             String bridge = site.bridge().toLowerCase(java.util.Locale.ROOT);
             if (bridge.contains("reflect")) return EntryChainJoinEvidence.CallbackSemantics.REFLECTION_DISPATCH;
@@ -861,11 +904,12 @@ public final class ApplicationChainJoiner {
         return EntryChainJoinEvidence.CallbackSemantics.FRAMEWORK_LIFECYCLE;
     }
 
-    private static EvidenceAtom.Kind siteKind(String bridge) {
+    private static EvidenceAtom.Kind siteKind(String bridge, boolean typedBinding) {
         String value = bridge == null ? "" : bridge.toLowerCase(java.util.Locale.ROOT);
         if (value.contains("lookup") || value.contains("jdbc") || value.contains("jndi")) {
             return EvidenceAtom.Kind.LOOKUP_SITE;
         }
+        if (typedBinding) return EvidenceAtom.Kind.BINDING_SITE;
         if (value.contains("config")) return EvidenceAtom.Kind.CONFIG_SITE;
         if (value.contains("bind") || value.contains("bean")) return EvidenceAtom.Kind.BINDING_SITE;
         return EvidenceAtom.Kind.DESERIALIZATION_SITE;
@@ -873,6 +917,12 @@ public final class ApplicationChainJoiner {
 
     private static BridgeEvidence.Kind bridgeKind(String reason) {
         String value = reason == null ? "" : reason.toLowerCase(java.util.Locale.ROOT);
+        if ((value.contains("rmi") && value.contains("response"))
+                || value.contains("remote-response")
+                || value.contains("response-deserialization")
+                || value.contains("serialized-reply")) {
+            return BridgeEvidence.Kind.REMOTE_RESPONSE_DESERIALIZATION;
+        }
         if (value.contains("jndi") || value.contains("rmi") || value.contains("lookup")) {
             return BridgeEvidence.Kind.JNDI_RMI;
         }
@@ -885,6 +935,135 @@ public final class ApplicationChainJoiner {
             return BridgeEvidence.Kind.REFLECTION;
         }
         return BridgeEvidence.Kind.UNKNOWN;
+    }
+
+    /**
+     * Typed cross-stage facts for the Jackson/JNDI/RMI/object-graph shape.  The profile is
+     * deliberately derived from an indexed binding site, an explicit composition marker and
+     * the declarative plan/path itself; it never uses the application name, artifact path or
+     * a free-form report note as a bridge substitute.
+     */
+    private static BridgeProfile bridgeProfile(Chain chain,
+                                               ApplicationEntryIndex.DeserializeSite site) {
+        boolean jacksonBinding = site != null && JACKSON_MAPPER.equals(site.owner())
+                && "readValue".equals(site.name())
+                && "deserialize".equalsIgnoreCase(site.bridge())
+                && !site.targetTypes().isEmpty();
+        boolean jndiLookup = hasJndiLookup(chain);
+        boolean composedJndi = hasReason(chain, "bridge-jndi_rmi");
+        boolean declaredObjectGraph = hasDeclaredObjectGraph(chain);
+        boolean explicitResponse = hasExplicitResponseBridge(chain);
+        boolean remoteReply = jndiLookup && (explicitResponse
+                || composedJndi && jacksonBinding && declaredObjectGraph);
+        return new BridgeProfile(jacksonBinding, jndiLookup, composedJndi,
+                declaredObjectGraph, remoteReply);
+    }
+
+    private static boolean hasReason(Chain chain, String expected) {
+        if (chain == null || expected == null || expected.isBlank()) {
+            return false;
+        }
+        return chain.hops().stream().anyMatch(hop -> hop != null && expected.equals(hop.reason()));
+    }
+
+    private static boolean hasExplicitResponseBridge(Chain chain) {
+        if (chain == null) {
+            return false;
+        }
+        return chain.hops().stream().anyMatch(hop ->
+                bridgeKind(hop == null ? null : hop.reason())
+                        == BridgeEvidence.Kind.REMOTE_RESPONSE_DESERIALIZATION);
+    }
+
+    private static boolean hasJndiLookup(Chain chain) {
+        if (chain == null) {
+            return false;
+        }
+        return chain.hops().stream().anyMatch(hop -> hop != null
+                && (isJndiLookupMethod(hop.fromOwner(), hop.fromName())
+                || isJndiLookupMethod(hop.toOwner(), hop.toName())));
+    }
+
+    private static boolean isJndiLookupMethod(String owner, String name) {
+        if (!"lookup".equals(name) || owner == null || owner.isBlank()) {
+            return false;
+        }
+        return JNDI_INITIAL_CONTEXT.equals(owner) || JNDI_CONTEXT.equals(owner)
+                || owner.startsWith(JNDI_PREFIX) || owner.startsWith(SPRING_JNDI_PREFIX);
+    }
+
+    /** Validate the known callback shape without constructing or loading any target object. */
+    private static boolean hasDeclaredObjectGraph(Chain chain) {
+        if (chain == null || chain.constructionPlan() == null
+                || !chain.constructionPlan().shapeSummary().valid()) {
+            return false;
+        }
+        ObjectGraphPlan plan = chain.constructionPlan();
+        Set<String> types = new HashSet<>();
+        boolean reflectiveProxy = false;
+        for (ObjectGraphPlan.Node node : plan.nodes()) {
+            if (node == null) {
+                continue;
+            }
+            types.add(node.type());
+            reflectiveProxy |= node.kind() == ObjectGraphPlan.NodeKind.REFLECTIVE_PROXY
+                    && TEMPLATES.equals(node.type());
+        }
+        if (!(types.contains(EVENT_LISTENER_LIST) && types.contains(UNDO_MANAGER)
+                && types.contains(VECTOR) && types.contains(JACKSON_POJONODE)
+                && types.contains(TEMPLATES) && types.contains(TEMPLATES_IMPL)
+                && reflectiveProxy)) {
+            return false;
+        }
+        return hasHop(chain, EVENT_LISTENER_LIST, "toString", UNDO_MANAGER, "toString")
+                && hasHop(chain, UNDO_MANAGER, "toString", VECTOR, "toString")
+                && hasHop(chain, VECTOR, "toString", JACKSON_POJONODE, "toString")
+                && hasHop(chain, JACKSON_POJONODE, "toString", SPRING_AOP_PROXY, "invoke")
+                && hasHop(chain, SPRING_AOP_PROXY, "invoke", TEMPLATES, "getOutputProperties")
+                && hasHop(chain, TEMPLATES, "getOutputProperties", TEMPLATES_IMPL,
+                "newTransformer");
+    }
+
+    private static boolean hasHop(Chain chain, String fromOwner, String fromName,
+                                  String toOwner, String toName) {
+        return chain != null && chain.hops().stream().anyMatch(hop -> hop != null
+                && fromOwner.equals(hop.fromOwner()) && fromName.equals(hop.fromName())
+                && toOwner.equals(hop.toOwner()) && toName.equals(hop.toName()));
+    }
+
+    private static void addBridgeProfileAttributes(Map<String, String> attributes,
+                                                   BridgeProfile profile) {
+        if (attributes == null || profile == null) {
+            return;
+        }
+        if (profile.jacksonBinding()) {
+            attributes.put("binding_framework", "Jackson");
+            attributes.put("binding_operation", "ObjectMapper.readValue");
+        }
+        if (profile.jndiLookup()) {
+            attributes.put("lookup_protocol", "JNDI");
+        }
+        if (profile.composedJndi()) {
+            attributes.put("transport_bridge", "JNDI_RMI");
+        }
+        if (profile.remoteReply()) {
+            attributes.put("protocol_reply", "RMI_SERIALIZED_OBJECT");
+            attributes.put("reply_deserialization", "JAVA_OBJECT_STREAM");
+        }
+        if (profile.declaredObjectGraph()) {
+            attributes.put("object_graph_construction", "DECLARED_SHAPE");
+            attributes.put("object_graph_path", EVENT_LISTENER_LIST + ".toString->"
+                    + UNDO_MANAGER + ".toString->" + VECTOR + ".toString->"
+                    + JACKSON_POJONODE + ".toString->" + SPRING_AOP_PROXY + ".invoke->"
+                    + TEMPLATES + ".getOutputProperties->" + TEMPLATES_IMPL
+                    + ".newTransformer");
+            attributes.put("terminal_boundary", TEMPLATES_IMPL + ".newTransformer");
+        }
+    }
+
+    private record BridgeProfile(boolean jacksonBinding, boolean jndiLookup,
+                                 boolean composedJndi, boolean declaredObjectGraph,
+                                 boolean remoteReply) {
     }
 
     private static FindingState.Risk risk(SinkRisk sinkRisk) {
