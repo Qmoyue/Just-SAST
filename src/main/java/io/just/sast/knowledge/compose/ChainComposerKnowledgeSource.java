@@ -93,6 +93,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             "readObject", "readResolve", "readObjectNoData", "readExternal",
             "hashCode", "equals", "compareTo", "compare", "toString",
             "proxyInvoke", "validateObject", "secondDeserialization");
+    private static final Set<String> SERIALIZATION_CALLBACK_ENTRY_KINDS = Set.of(
+            "readObject", "readResolve", "readObjectNoData", "readExternal", "validateObject");
     private static final List<String> TRIGGER_ENTRY_KINDS = List.of(
             "hashCode", "equals", "compareTo", "compare", "toString");
 
@@ -1063,6 +1065,28 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                         .thenComparingInt(chain -> chain.hops().size())
                         .thenComparing(Chain::key))
                 .toList();
+        Map<String, List<Chain>> triggerChainsByHost = new HashMap<>();
+        for (Map.Entry<String, DeserHost> host : hosts) {
+            DeserHost hostRef = host.getValue();
+            List<Chain> applicable = triggerChains;
+            if (isObjectInputStreamFrame(target, hostRef)) {
+                var hostMethod = target.originSupport().methodOf(hostRef.owner(),
+                        hostRef.method(), hostRef.descriptor());
+                // Graph-only compatibility callers do not carry method bytecode/CFG facts.
+                // They cannot satisfy the typed element proof, but they also cannot be used as
+                // production evidence; retain their historical bounded composition behavior.
+                // A real loaded host, by contrast, must pass the concrete element gate.
+                if (hostMethod != null) {
+                    Set<String> elementTypes = target.originSupport()
+                            .deserializedContainerElementTypes(hostMethod);
+                    applicable = triggerChains.stream()
+                            .filter(chain -> triggerMatchesDeserializedElement(target, chain,
+                                    elementTypes))
+                            .toList();
+                }
+            }
+            triggerChainsByHost.put(host.getKey(), applicable);
+        }
         // The source-host product is bounded by design. A lexical host order lets a large
         // dependency surface consume the whole first round before an application-defined
         // deserialization boundary gets a chance to attach a fragment. Put primary-artifact
@@ -1087,9 +1111,14 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 // Advance the trigger frontier by round and host index.  Each host gets one
                 // new deterministic pair per round; unlike the former inner retry loop this
                 // cannot rescan the whole trigger list for every host in every round.
-                int backIndex = Math.floorMod(round + hostIndex, triggerChains.size());
-                Chain back = triggerChains.get(backIndex);
                 DeserHost hostRef = host.getValue();
+                List<Chain> applicableTriggers = triggerChainsByHost.getOrDefault(host.getKey(),
+                        List.of());
+                if (applicableTriggers.isEmpty()) {
+                    continue;
+                }
+                int backIndex = Math.floorMod(round + hostIndex, applicableTriggers.size());
+                Chain back = applicableTriggers.get(backIndex);
                 String hostClass = hostRef.owner();
                 String hostMethod = hostRef.method();
                 // 防环：后段入口类不得就是宿主自身（宿主内自触发无源语义）
@@ -1132,6 +1161,38 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             target.markIncomplete("COMPOSITION_SOURCE_CHAIN_CAP:" + MAX_COMPOSED);
         }
         return composed;
+    }
+
+    private boolean isObjectInputStreamFrame(Blackboard target, DeserHost host) {
+        if (target == null || host == null || host.frameOwner() == null) {
+            return false;
+        }
+        return target.ruleEngine().isSubtypeOf(host.frameOwner(),
+                "java/io/ObjectInputStream")
+                && ("readObject".equals(host.frameMethod())
+                || "readUnshared".equals(host.frameMethod())
+                || "readFields".equals(host.frameMethod()));
+    }
+
+    private boolean triggerMatchesDeserializedElement(Blackboard target, Chain chain,
+                                                      Set<String> elementTypes) {
+        if (target == null || chain == null || elementTypes == null || elementTypes.isEmpty()
+                || chain.entryClass() == null || isPlatformOwner(chain.entryClass())) {
+            return false;
+        }
+        for (String elementType : elementTypes) {
+            if (elementType != null && (elementType.equals(chain.entryClass())
+                    || target.hierarchy().isSubtypeOf(elementType, chain.entryClass()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isPlatformOwner(String owner) {
+        return owner != null && (owner.startsWith("java/") || owner.startsWith("javax/")
+                || owner.startsWith("sun/") || owner.startsWith("jdk/")
+                || owner.startsWith("com/sun/"));
     }
 
     /**
@@ -1857,6 +1918,35 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         return required == null || required.equals(activation);
     }
 
+    private static boolean hasExplicitFragmentActivation(Chain chain, String activation) {
+        if (chain == null || activation == null || activation.isBlank()) {
+            return false;
+        }
+        String marker = "fragment-activation-" + activation;
+        return chain.hops().stream().anyMatch(hop -> hop != null && marker.equals(hop.reason()));
+    }
+
+    /**
+     * A serialization callback is entered by the serialization mechanism, not by an
+     * arbitrary reflective Method value. The fallback invoke bridge has no receiver/name
+     * identity, so accepting these entries would turn a generic Method.invoke capability into
+     * an unrelated deserialization suffix. A declared fragment may opt in explicitly when its
+     * contract really models a reflective selection of that callback.
+     */
+    private static boolean isSerializationCallbackEntry(Chain chain) {
+        if (chain == null || !SERIALIZATION_CALLBACK_ENTRY_KINDS.contains(chain.entryKind())) {
+            return false;
+        }
+        String descriptor = entryDescriptor(chain);
+        return switch (chain.entryKind()) {
+            case "readObject" -> "(Ljava/io/ObjectInputStream;)V".equals(descriptor);
+            case "readExternal" -> "(Ljava/io/ObjectInput;)V".equals(descriptor);
+            case "readResolve" -> "()Ljava/lang/Object;".equals(descriptor);
+            case "readObjectNoData", "validateObject" -> "()V".equals(descriptor);
+            default -> false;
+        };
+    }
+
     private List<Chain> candidateBacks(FrontFeatures features, List<Chain> publicEntries,
                                        List<Chain> triggerEntries, List<Chain> templateEntries,
                                        List<Chain> fragmentEntries) {
@@ -1892,7 +1982,14 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         // 1. INVOKE 桥：前段 sink 是 Method.invoke → 可调任意公共方法
         if (features.invoke()
                 && isPublicEntry(back)
-                && activationAllows(back, "invoke")) {
+                && activationAllows(back, "invoke")
+                && (!isSerializationCallbackEntry(back)
+                || hasExplicitFragmentActivation(back, "invoke"))
+                // A declarative fragment with no invoke activation is a reusable object
+                // graph, not proof that this particular Method value/receiver selects it.
+                // Ordinary bytecode-derived public methods remain valid invoke targets; a
+                // fragment must state the activation axis explicitly to cross this bridge.
+                && (!isFragmentChain(back) || hasExplicitFragmentActivation(back, "invoke"))) {
             return Bridge.INVOKE;
         }
 

@@ -154,6 +154,8 @@ public final class OriginSupport {
     private static final int SERIALIZED_PROXY_INTERFACE_SITE_CAP = 4096;
     private static final int JDK_SERIALIZATION_CALLBACK_CAP = 128;
     private static final int JDK_CALLBACK_TRIGGER_SEARCH_CAP = 256;
+    /** Maximum provenance depth when proving a collection element came from one OIS result. */
+    private static final int DESERIALIZED_ELEMENT_PROOF_DEPTH = 8;
     private static final Set<String> JDK_SERIALIZATION_ENTRY_KINDS = Set.of(
             "readObject", "readObjectNoData", "readResolve", "readExternal", "validateObject");
     /**
@@ -1120,6 +1122,150 @@ public final class OriginSupport {
         return directDeserializationReceiver(call, host, result, new HashSet<>());
     }
 
+    /**
+     * Return the concrete serializable classes explicitly consumed from a deserialized
+     * standard-container element in one host method.
+     *
+     * <p>This is an immutable provenance fact for composition, not a payload parser or an
+     * object-graph guess.  The proof requires all of the following bytecode facts: an element
+     * producing container operation ({@code Iterator.next}/{@code List.get}/an entry getter),
+     * a bounded forward relation for that result, an exact OIS result behind the container
+     * or one of its standard views, and a concrete {@code CHECKCAST} to a serializable class.
+     * A direct {@code (Dog) readObject()} therefore does not qualify, and a raw collection with
+     * no concrete element cast remains unknown.  This keeps source-host trigger composition
+     * attached to an actual element type instead of pairing every OIS host with every
+     * dependency/JDK lifecycle fragment.</p>
+     */
+    public Set<String> deserializedContainerElementTypes(MethodInfo host) {
+        if (host == null || host.instructions().isEmpty()) {
+            return Set.of();
+        }
+        ForwardOrigins.Result result = origins.compute(host);
+        Set<String> types = new LinkedHashSet<>();
+        for (InsnFact instruction : host.instructions()) {
+            if (instruction.op() != Op.CHECKCAST || instruction.typeRef() == null) {
+                continue;
+            }
+            String type = internalClassName(instruction.typeRef().descriptor());
+            if (!concreteSerializableType(type)) {
+                continue;
+            }
+            ForwardOrigins.State before = result.stateBefore().get(instruction.offset());
+            if (before == null || before.stack().isEmpty()
+                    || !deserializedContainerElementOrigin(
+                    before.stack().get(before.stack().size() - 1).origins(), host, result,
+                    new HashSet<>(), 0)) {
+                continue;
+            }
+            types.add(type);
+        }
+        return orderedStrings(types);
+    }
+
+    private boolean concreteSerializableType(String type) {
+        if (type == null || type.isBlank() || isJdk(type)
+                || !hierarchy.isSerializable(type)) {
+            return false;
+        }
+        ClassInfo info = hierarchy.classInfo(type);
+        return info != null && !info.isInterface();
+    }
+
+    private boolean deserializedContainerElementOrigin(Set<ValueOrigin> values, MethodInfo host,
+                                                       ForwardOrigins.Result result,
+                                                       Set<ValueOrigin> visiting, int depth) {
+        if (values == null || values.isEmpty()) {
+            return false;
+        }
+        for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
+            if (deserializedContainerElementOrigin(value, host, result, visiting, depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean deserializedContainerElementOrigin(ValueOrigin value, MethodInfo host,
+                                                       ForwardOrigins.Result result,
+                                                       Set<ValueOrigin> visiting, int depth) {
+        if (value == null || result == null || depth > DESERIALIZED_ELEMENT_PROOF_DEPTH
+                || !visiting.add(value)) {
+            return false;
+        }
+        try {
+            if (!(value instanceof ValueOrigin.CallResult callResult)
+                    || callResult.callNodeId() < 0) {
+                return false;
+            }
+            Node producer = callNodes.get(callResult.callNodeId());
+            if (!isContainerElementProducer(producer)) {
+                return false;
+            }
+            Set<ValueOrigin> parents = result.containerElements().get(value);
+            if (parents == null || parents.isEmpty()) {
+                return false;
+            }
+            for (ValueOrigin parent : ValueOriginOrder.sorted(parents)) {
+                if (directDeserializationOrigin(parent, host, result, new HashSet<>())
+                        || deserializedContainerParent(parent, host, result, visiting, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            visiting.remove(value);
+        }
+    }
+
+    private boolean deserializedContainerParent(ValueOrigin value, MethodInfo host,
+                                                 ForwardOrigins.Result result,
+                                                 Set<ValueOrigin> visiting, int depth) {
+        if (value == null || result == null || depth > DESERIALIZED_ELEMENT_PROOF_DEPTH
+                || !visiting.add(value)) {
+            return false;
+        }
+        try {
+            if (directDeserializationOrigin(value, host, result, new HashSet<>())) {
+                return true;
+            }
+            Set<ValueOrigin> parents = result.containerElements().get(value);
+            if (parents == null || parents.isEmpty()) {
+                return false;
+            }
+            for (ValueOrigin parent : ValueOriginOrder.sorted(parents)) {
+                if (deserializedContainerParent(parent, host, result, visiting, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            visiting.remove(value);
+        }
+    }
+
+    private static boolean isContainerElementProducer(Node producer) {
+        if (producer == null) {
+            return false;
+        }
+        String owner = producer.owner();
+        String name = producer.name();
+        String descriptor = producer.descriptor();
+        if (("java/util/Iterator".equals(owner) || "java/util/ListIterator".equals(owner))
+                && ("next".equals(name) || "previous".equals(name))
+                && "()Ljava/lang/Object;".equals(descriptor)) {
+            return true;
+        }
+        if ("java/util/List".equals(owner) && "get".equals(name)
+                && "(I)Ljava/lang/Object;".equals(descriptor)) {
+            return true;
+        }
+        return "java/util/Map$Entry".equals(owner)
+                && ("getKey".equals(name) || "getValue".equals(name))
+                && "()Ljava/lang/Object;".equals(descriptor)
+                || "java/util/Enumeration".equals(owner) && "nextElement".equals(name)
+                && "()Ljava/lang/Object;".equals(descriptor);
+    }
+
     private boolean directDeserializationReceiver(Node call, MethodInfo host,
                                                   ForwardOrigins.Result result,
                                                   Set<ValueOrigin> visiting) {
@@ -1140,7 +1286,7 @@ public final class OriginSupport {
         try {
             if (value instanceof ValueOrigin.CallResult callResult) {
                 Node producer = callNodes.get(callResult.callNodeId());
-                return isOisRead(producer);
+                return isObjectInputStreamRead(producer);
             }
             if (!(value instanceof ValueOrigin.Insn instruction)
                     || instruction.offset() < 0
@@ -6515,6 +6661,15 @@ public final class OriginSupport {
     /** ObjectInputStream 读调用（反序列化数据源，无条件可控）。 */
     public static boolean isOisRead(Node call) {
         return call != null && SerializationModel.isOisRead(call.owner(), call.name(), call.descriptor());
+    }
+
+    private boolean isObjectInputStreamRead(Node call) {
+        if (isOisRead(call)) {
+            return true;
+        }
+        return call != null && ruleEngine.isSubtypeOf(call.owner(), "java/io/ObjectInputStream")
+                && ("readObject".equals(call.name()) || "readUnshared".equals(call.name())
+                || "readFields".equals(call.name()));
     }
 
     /** 指令按值消耗的栈条目数（cat-2 值亦为单条目，条目数 = 值数）。 */

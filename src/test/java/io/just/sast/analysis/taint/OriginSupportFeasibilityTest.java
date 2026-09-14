@@ -212,6 +212,65 @@ class OriginSupportFeasibilityTest {
     }
 
     @Test
+    void deserializedContainerElementTypesRequireIteratorElementProvenance() {
+        MethodNode method = new MethodNode(Modifier.PUBLIC, "run", "()V", null, null);
+        method.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;", false));
+        method.instructions.add(new TypeInsnNode(Op.CHECKCAST.code(), "java/util/Collection"));
+        method.instructions.add(new VarInsnNode(Op.ASTORE.code(), 1));
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Collection",
+                "iterator", "()Ljava/util/Iterator;", true));
+        method.instructions.add(new VarInsnNode(Op.ASTORE.code(), 2));
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 2));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Iterator",
+                "next", "()Ljava/lang/Object;", true));
+        method.instructions.add(new TypeInsnNode(Op.CHECKCAST.code(), "fixture/Element"));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        MethodInfo methodInfo = extract("fixture/DeserializeHost", method);
+        ClassInfo host = new ClassInfo(methodInfo.owner(), "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(methodInfo), List.of());
+        MethodNode directMethod = new MethodNode(Modifier.PUBLIC, "direct", "()V", null, null);
+        directMethod.instructions.add(new InsnNode(Op.ACONST_NULL.code()));
+        directMethod.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;", false));
+        directMethod.instructions.add(new TypeInsnNode(Op.CHECKCAST.code(), "fixture/Element"));
+        directMethod.instructions.add(new InsnNode(Op.POP.code()));
+        directMethod.instructions.add(new InsnNode(Op.RETURN.code()));
+        MethodInfo directMethodInfo = extract("fixture/DirectDeserializeHost", directMethod);
+        ClassInfo directHost = new ClassInfo(directMethodInfo.owner(), "java/lang/Object",
+                List.of(), Modifier.PUBLIC, List.of(directMethodInfo), List.of());
+        ClassInfo collectionType = new ClassInfo("java/util/Collection", "java/lang/Object",
+                List.of(), Modifier.PUBLIC | Modifier.INTERFACE, List.of(), List.of());
+        ClassInfo iteratorType = new ClassInfo("java/util/Iterator", "java/lang/Object",
+                List.of(), Modifier.PUBLIC | Modifier.INTERFACE, List.of(), List.of());
+        ClassInfo serializable = new ClassInfo("java/io/Serializable", "java/lang/Object",
+                List.of(), Modifier.PUBLIC | Modifier.INTERFACE, List.of(), List.of());
+        ClassInfo element = new ClassInfo("fixture/Element", "java/lang/Object",
+                List.of("java/io/Serializable"), Modifier.PUBLIC, List.of(), List.of());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host,
+                directHost.internalName(), directHost,
+                collectionType.internalName(), collectionType,
+                iteratorType.internalName(), iteratorType,
+                serializable.internalName(), serializable,
+                element.internalName(), element), List.of(), 6, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
+
+        assertEquals(Set.of("fixture/Element"),
+                support.deserializedContainerElementTypes(methodInfo),
+                "only a concrete serializable CHECKCAST of Iterator.next must bind an OIS element");
+        assertEquals(Set.of(), support.deserializedContainerElementTypes(directMethodInfo),
+                "a direct OIS.readObject CHECKCAST is not a container-element provenance proof");
+    }
+
+    @Test
     void zeroArgumentReflectiveLookupRecoversEmptyClassArrayDescriptor() throws Exception {
         MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "run", "()V", null, null);
         method.instructions.add(new LdcInsnNode(Type.getObjectType("fixture/Target")));

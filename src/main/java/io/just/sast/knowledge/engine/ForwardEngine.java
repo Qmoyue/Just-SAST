@@ -5613,10 +5613,12 @@ public final class ForwardEngine {
 
     /**
      * Conservative reflection fallback: when Class/receiver metadata is not statically
-     * recoverable, enumerate only methods that are already represented by a configured
-     * sink call in this graph.  This preserves the rule boundary and avoids a whole-world
-     * method search; the resulting chain carries one unresolved hop so callers can see that
-     * exact receiver/signature proof is unavailable.
+     * recoverable, enumerate only methods already represented by a configured sink call or
+     * sink declaration in this graph. This preserves the rule boundary and avoids a
+     * whole-world method search; the resulting chain carries one unresolved hop so callers
+     * can see that exact receiver/signature proof is unavailable. A declaration-only target
+     * matters for JDK terminals whose method body is selected into the slice without an
+     * ordinary call site to that same terminal (for example a reflective Templates method).
      */
     private List<MethodInfo> unresolvedReflectiveTargets(String name, String descriptor) {
         String key = String.valueOf(name) + "|" + String.valueOf(descriptor);
@@ -5641,6 +5643,27 @@ public final class ForwardEngine {
             }
             if (unique.size() >= 32) {
                 break;
+            }
+        }
+        if (unique.size() < 32) {
+            for (Node candidate : bb.graph().nodesOfType(NodeType.METHOD)) {
+                if (name != null && !name.equals(candidate.name())) {
+                    continue;
+                }
+                if (descriptor != null && !sameParameters(candidate.descriptor(), descriptor)) {
+                    continue;
+                }
+                if (!methodMatchesSink(candidate.owner(), candidate.name(), candidate.descriptor())) {
+                    continue;
+                }
+                MethodInfo target = support.methodOf(candidate.owner(), candidate.name(),
+                        candidate.descriptor());
+                if (target != null) {
+                    unique.putIfAbsent(OriginSupport.methodKey(target), target);
+                }
+                if (unique.size() >= 32) {
+                    break;
+                }
             }
         }
         List<MethodInfo> result = List.copyOf(unique.values());

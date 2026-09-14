@@ -153,6 +153,33 @@ class ChainComposerKnowledgeSourceTest {
     }
 
     @Test
+    void invokeCannotSelectSerializationCallbackWithoutExplicitActivation() {
+        Chain invokeFront = chain("T-INVOKE", "REFLECTION", "app/Front", "lifecycle",
+                "java/lang/reflect/Method", "invoke");
+        Chain callback = new Chain("T-CALLBACK", "CODE_EXEC", "HIGH", "dep/Callback",
+                "readObject", "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("dep/Callback", "readObject", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "direct", "(Ljava/lang/String;)V", null),
+                new ChainHop("dep/Callback", "readObject", "dep/Callback", "readObject",
+                        HopKind.ENTRY, null, "readObject", "(Ljava/io/ObjectInputStream;)V",
+                        null)), 0, "(Ljava/lang/String;)V", "TERMINAL");
+        Blackboard bb = new Blackboard(new io.just.sast.cpg.graph.Graph(),
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
+                Blackboard.ScanInputs.fastDefault(java.nio.file.Path.of(".")));
+        bb.addChain(invokeFront);
+        bb.addChain(callback);
+
+        new ChainComposerKnowledgeSource().onEvent(bb,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertFalse(bb.chains().stream().anyMatch(c -> c.hops().stream()
+                        .anyMatch(h -> "bridge-invoke".equals(h.reason())
+                                && "dep/Callback".equals(h.toOwner()))),
+                "a generic Method.invoke capability must not invent a serialization callback");
+    }
+
+    @Test
     void repeatedCompositionEventsKeepTheSameTypedFrontier() {
         Chain front = chain("T-DESER", "DESERIALIZE", "java/security/SignedObject", "readObject",
                 "java/security/SignedObject", "getObject");
