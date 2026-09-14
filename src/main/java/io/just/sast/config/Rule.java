@@ -223,10 +223,10 @@ public sealed interface Rule {
             entryDescriptor = entryDescriptor == null ? "" : entryDescriptor.trim();
             activation = activation == null || activation.isBlank() ? "any"
                     : activation.trim().toLowerCase(java.util.Locale.ROOT);
-            if (!Set.of("any", "invoke", "deserialize", "trigger", "template", "jndi")
+            if (!Set.of("any", "invoke", "deserialize", "trigger", "template", "jndi", "jdbc")
                     .contains(activation)) {
                 throw new IllegalArgumentException("fragment activation must be any/invoke/deserialize/"
-                        + "trigger/template/jndi: " + activation);
+                        + "trigger/template/jndi/jdbc: " + activation);
             }
             constructionPlan = constructionPlan == null || constructionPlan.isEmpty()
                     ? null : constructionPlan;

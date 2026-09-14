@@ -124,6 +124,31 @@ class YamlRuleLoaderTest {
     }
 
     @Test
+    void jdbcFragmentKeepsDeclarativeClassDefinitionBoundary() throws IOException {
+        RuleSet set = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+
+        Rule.FragmentRule fragment = set.fragments().stream()
+                .filter(candidate -> "FRAG-JDBC-SPRING-XML-CLASS-DEFINITION".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        assertEquals("org/springframework/context/support/FileSystemXmlApplicationContext",
+                fragment.entryClass());
+        assertEquals("jdbcConfiguration", fragment.entryKind());
+        assertEquals("<init>", fragment.entryMethod());
+        assertEquals("(Ljava/lang/String;)V", fragment.entryDescriptor());
+        assertEquals("jdbc", fragment.activation());
+        assertEquals("java/lang/ClassLoader", fragment.sinkOwner());
+        assertEquals("([BII)Ljava/lang/Class;", fragment.sinkDescriptor());
+        assertEquals(List.of("org/springframework/beans/factory/config/MethodInvokingFactoryBean",
+                "javax/management/loading/MLet"),
+                fragment.hops().stream().map(Rule.HopSpec::cls).toList());
+        assertEquals(List.of("org/springframework/context/support/FileSystemXmlApplicationContext",
+                "org/springframework/beans/factory/config/MethodInvokingFactoryBean",
+                "javax/management/loading/MLet"),
+                fragment.constructionPlan().nodes().stream().map(node -> node.type()).toList());
+    }
+
+    @Test
     void romeTerminalFragmentsKeepDistinctCallbackRoots() throws IOException {
         RuleSet set = new YamlRuleLoader().load(Files.newInputStream(
                 Path.of("src/main/resources/rules/default-rules.yaml")));

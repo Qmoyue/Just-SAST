@@ -274,6 +274,15 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
         if (owners.contains(name)) {
             return name;
         }
+        if (name != null && bb.hierarchy().classInfo(name) != null
+                && owners.stream().anyMatch(owner -> owner != null
+                && bb.hierarchy().isSubtypeOf(owner, name))) {
+            // A declarative fragment may name an inherited API on a concrete anchor type.  The
+            // CPG only has method owners for materialized declarations, so the hierarchy is the
+            // authoritative existence check for a class such as MLet whose defineClass method is
+            // inherited from ClassLoader.  No call is executed or widened from this fact.
+            return name;
+        }
         String[] parts = name.split("/");
         String simpleName = parts[parts.length - 1];
         String suffix = "/" + simpleName;
@@ -327,13 +336,9 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
     }
 
     private String entryDescriptor(String owner, String name) {
-        ClassInfo ci = bb.hierarchy().classInfo(owner);
-        if (ci != null) {
-            for (var method : ci.methods()) {
-                if (method.name().equals(name)) {
-                    return method.descriptor();
-                }
-            }
+        String unique = ApplicationEntryIndex.uniqueMethodDescriptor(bb.graph(), owner, name);
+        if (!unique.isBlank()) {
+            return unique;
         }
         return switch (name) {
             case "hashCode" -> "()I";

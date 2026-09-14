@@ -99,6 +99,15 @@ class RuleSchemaV2ContractTest {
         assertTrue(jdbc.semantics().bridge().contains(RuleSchemaV2.Bridge.JDBC_DRIVER));
         assertTrue(jdbc.semantics().terminal().isEmpty());
 
+        RuleSchemaV2.Definition jdbcXml = catalog.rules().stream()
+                .filter(rule -> "FRAG-JDBC-SPRING-XML-CLASS-DEFINITION".equals(rule.id()))
+                .findFirst().orElseThrow();
+        assertTrue(jdbcXml.semantics().bridge().contains(RuleSchemaV2.Bridge.JDBC_DRIVER));
+        assertTrue(jdbcXml.semantics().bridge().contains(RuleSchemaV2.Bridge.CONFIGURATION));
+        assertTrue(jdbcXml.semantics().boundary().contains(RuleSchemaV2.Boundary.CONFIGURATION));
+        assertTrue(jdbcXml.semantics().terminal().contains(
+                RuleSchemaV2.Terminal.CLASS_DEFINITION));
+
         RuleSchemaV2.Definition http = catalog.rules().stream()
                 .filter(rule -> "JUST-SINK-SSRF-HTTPURLCONNECT".equals(rule.id()))
                 .findFirst().orElseThrow();

@@ -188,6 +188,95 @@ class DemandDrivenProgramSliceContractTest {
                 "the source-host method, not only its constructor, must survive method pruning");
     }
 
+    @Test
+    void selectsConcreteJdbcImplementationsAndTheirBoundedDispatchClosure() {
+        String appOwner = "app/ConnectionServlet";
+        String connectDescriptor =
+                "(Ljava/lang/String;Ljava/util/Properties;)Ljava/sql/Connection;";
+        ClassInfo app = new ClassInfo(appOwner, "javax/servlet/http/HttpServlet", List.of(),
+                Modifier.PUBLIC, List.of(method(appOwner, "doGet", "()V", Modifier.PUBLIC,
+                        new InsnFact(0, Op.INVOKEVIRTUAL, List.of(new MethodRef(
+                                "java/net/URLClassLoader", "loadClass",
+                                "(Ljava/lang/String;)Ljava/lang/Class;"))),
+                        new InsnFact(1, Op.INVOKEVIRTUAL, List.of(new MethodRef(
+                                "java/lang/Class", "newInstance", "()Ljava/lang/Object;"))),
+                        new InsnFact(2, Op.INVOKEINTERFACE, List.of(new MethodRef(
+                                "java/sql/Driver", "connect", connectDescriptor))))),
+                List.of());
+        ClassInfo driver = new ClassInfo("vendor/Driver", "java/lang/Object",
+                List.of("java/sql/Driver"), Modifier.PUBLIC,
+                List.of(method("vendor/Driver", "connect", connectDescriptor, Modifier.PUBLIC,
+                        new InsnFact(0, Op.INVOKEVIRTUAL, List.of(new MethodRef(
+                                "vendor/ConnectionFactory", "open", "()V"))))), List.of());
+        ClassInfo abstractFactory = new ClassInfo("vendor/ConnectionFactory", "java/lang/Object",
+                List.of(), Modifier.PUBLIC | Modifier.ABSTRACT,
+                List.of(method("vendor/ConnectionFactory", "open", "()V",
+                        Modifier.PUBLIC | Modifier.ABSTRACT)), List.of());
+        ClassInfo concreteFactory = new ClassInfo("vendor/impl/ConnectionFactoryImpl",
+                "vendor/ConnectionFactory", List.of(), Modifier.PUBLIC,
+                List.of(method("vendor/impl/ConnectionFactoryImpl", "open", "()V",
+                        Modifier.PUBLIC, new InsnFact(0, Op.INVOKESTATIC, List.of(new MethodRef(
+                                "vendor/SocketFactoryFactory", "getSocketFactory", "()V"))))),
+                List.of());
+        ClassInfo socketFactory = new ClassInfo("vendor/SocketFactoryFactory", "java/lang/Object",
+                List.of(), Modifier.PUBLIC,
+                List.of(method("vendor/SocketFactoryFactory", "getSocketFactory", "()V",
+                        Modifier.PUBLIC, new InsnFact(0, Op.INVOKESTATIC, List.of(new MethodRef(
+                                "vendor/ObjectFactory", "instantiate", "()V"))))), List.of());
+        ClassInfo objectFactory = new ClassInfo("vendor/ObjectFactory", "java/lang/Object",
+                List.of(), Modifier.PUBLIC,
+                List.of(method("vendor/ObjectFactory", "instantiate", "()V", Modifier.PUBLIC)),
+                List.of());
+        ClassInfo notDriver = new ClassInfo("vendor/NotDriver", "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(method("vendor/NotDriver", "connect", connectDescriptor,
+                        Modifier.PUBLIC)), List.of());
+        Map<String, ClassInfo> classes = new LinkedHashMap<>();
+        for (ClassInfo info : List.of(app, driver, abstractFactory, concreteFactory,
+                socketFactory, objectFactory, notDriver)) {
+            classes.put(info.internalName(), info);
+        }
+
+        DemandDrivenProgramSlice.Result result = DemandDrivenProgramSlice.select(
+                new LoadResult(classes, List.of(), classes.size(), 61), Set.of(appOwner),
+                RuleSet.EMPTY);
+
+        assertTrue(result.applied());
+        assertTrue(result.load().classes().keySet().containsAll(Set.of(
+                driver.internalName(), abstractFactory.internalName(),
+                concreteFactory.internalName(), socketFactory.internalName(),
+                objectFactory.internalName())),
+                "a dynamic Driver boundary must retain its concrete driver and bounded helper path");
+        assertFalse(result.load().classes().containsKey(notDriver.internalName()),
+                "a same-signature class without java.sql.Driver identity is not a driver candidate");
+    }
+
+    @Test
+    void connectOnlyDoesNotPromoteEveryLoadedJdbcDriver() {
+        String appOwner = "app/ConnectOnlyServlet";
+        String connectDescriptor =
+                "(Ljava/lang/String;Ljava/util/Properties;)Ljava/sql/Connection;";
+        ClassInfo app = new ClassInfo(appOwner, "javax/servlet/http/HttpServlet", List.of(),
+                Modifier.PUBLIC, List.of(method(appOwner, "doGet", "()V", Modifier.PUBLIC,
+                        new InsnFact(0, Op.INVOKEINTERFACE, List.of(new MethodRef(
+                                "java/sql/Driver", "connect", connectDescriptor))))),
+                List.of());
+        ClassInfo driver = new ClassInfo("vendor/Driver", "java/lang/Object",
+                List.of("java/sql/Driver"), Modifier.PUBLIC,
+                List.of(method("vendor/Driver", "connect", connectDescriptor, Modifier.PUBLIC)),
+                List.of());
+        Map<String, ClassInfo> classes = new LinkedHashMap<>();
+        classes.put(app.internalName(), app);
+        classes.put(driver.internalName(), driver);
+
+        DemandDrivenProgramSlice.Result result = DemandDrivenProgramSlice.select(
+                new LoadResult(classes, List.of(), classes.size(), 61), Set.of(appOwner),
+                RuleSet.EMPTY);
+
+        assertTrue(result.applied());
+        assertFalse(result.load().classes().containsKey(driver.internalName()),
+                "Driver.connect alone is an intermediate boundary, not a dynamic driver proof");
+    }
+
     private static ClassInfo cls(String name, List<MethodInfo> methods) {
         return new ClassInfo(name, "java/lang/Object", List.of(), 0, methods, List.of());
     }

@@ -47,6 +47,16 @@ public final class DemandDrivenProgramSlice {
     public static final int MAX_SELECTED_CLASSES = 8_192;
     /** Limit recursive dependency expansion; application and capability roots start at depth 0. */
     public static final int MAX_REFERENCE_DEPTH = 4;
+    /** Keep dynamic JDBC driver discovery finite without treating a driver jar as a full root. */
+    private static final int MAX_JDBC_REFERENCE_DEPTH = 8;
+    private static final int MAX_JDBC_DISPATCH_TARGETS = 4;
+    private static final String JDBC_DRIVER = "java/sql/Driver";
+    private static final String JDBC_CONNECT_DESCRIPTOR =
+            "(Ljava/lang/String;Ljava/util/Properties;)Ljava/sql/Connection;";
+    private static final String JDBC_LOAD_CLASS_DESCRIPTOR =
+            "(Ljava/lang/String;)Ljava/lang/Class;";
+    private static final String JDBC_CLASS_NEW_INSTANCE_DESCRIPTOR =
+            "()Ljava/lang/Object;";
 
     private DemandDrivenProgramSlice() {
     }
@@ -142,6 +152,13 @@ public final class DemandDrivenProgramSlice {
         Set<String> sourceBridgeHosts = applicationBoundary
                 ? sourceBridgeHostClasses(available, ruleSet)
                 : Set.of();
+        // URLClassLoader/Class.newInstance followed by Driver.connect is a bounded dynamic
+        // selection boundary.  The class name is still a runtime value, so the scanner must not
+        // choose one driver by name; it retains only concrete implementations of java.sql.Driver
+        // from the explicitly loaded input artifacts and follows their bytecode call closure.
+        Set<String> jdbcDriverClasses = applicationBoundary
+                ? jdbcDriverImplementationClasses(available, application)
+                : Set.of();
 
         // Application classes remain roots so the application artifact is represented in the
         // graph.  Dependency callback/fragment classes are never independent roots: they must
@@ -210,6 +227,18 @@ public final class DemandDrivenProgramSlice {
             selectedDepth.merge(entry.getKey(), entry.getValue(), Math::min);
             rounds = Math.max(rounds, entry.getValue() + 1);
         }
+        MethodSelection jdbcDriverSelection = jdbcDriverMethodClosure(jdbcDriverClasses,
+                available);
+        mergeMethodSelection(selectedMethods, jdbcDriverSelection.methods());
+        for (Map.Entry<String, Integer> entry : jdbcDriverSelection.classDepth().entrySet()) {
+            if (selectedDepth.size() >= MAX_SELECTED_CLASSES
+                    && !selectedDepth.containsKey(entry.getKey())) {
+                capped = true;
+                break;
+            }
+            selectedDepth.merge(entry.getKey(), entry.getValue(), Math::min);
+            rounds = Math.max(rounds, entry.getValue() + 1);
+        }
 
         // Preserve the frontend's deterministic insertion order.  Sorting the selection itself
         // would change method/node IDs for old consumers even though the semantic set is equal.
@@ -250,6 +279,9 @@ public final class DemandDrivenProgramSlice {
 
         LinkedHashSet<String> reasons = new LinkedHashSet<>(input.completenessReasons());
         reasons.add("DEPENDENCY_DEMAND_SLICE_APPLIED");
+        if (!jdbcDriverClasses.isEmpty()) {
+            reasons.add("JDBC_DRIVER_IMPLEMENTATIONS_SELECTED:" + jdbcDriverClasses.size());
+        }
         if (methodsPruned) {
             reasons.add("DEPENDENCY_METHOD_DEMAND_SLICE_APPLIED");
         }
@@ -668,6 +700,224 @@ public final class DemandDrivenProgramSlice {
             }
         }
         return new MethodSelection(classDepth, selectedMethods);
+    }
+
+    /**
+     * Select only the concrete JDBC implementations that a dynamic application driver boundary
+     * can choose.  This is intentionally based on the bytecode type contract, not a driver name,
+     * package, artifact id or benchmark answer.  The caller already supplies the complete
+     * target/dependency load, so excluding application classes keeps this an explicit
+     * dependency fact rather than a new application root.
+     */
+    private static Set<String> jdbcDriverImplementationClasses(
+            Map<String, ClassInfo> available, Set<String> application) {
+        if (available == null || available.isEmpty() || application == null
+                || application.isEmpty() || !hasDynamicJdbcDriverSelection(application, available)) {
+            return Set.of();
+        }
+        Set<String> result = new TreeSet<>();
+        for (ClassInfo info : available.values()) {
+            if (info == null || info.isInterface()
+                    || application.contains(info.internalName())
+                    || info.method("connect", JDBC_CONNECT_DESCRIPTOR) == null) {
+                continue;
+            }
+            if (isSubtype(info.internalName(), JDBC_DRIVER, available)) {
+                result.add(info.internalName());
+            }
+        }
+        return Set.copyOf(result);
+    }
+
+    /**
+     * Recognize the exact dynamic driver-selection shape used by an application.  It is a
+     * finite static fact: no class is loaded and no value is evaluated.  Requiring all three
+     * operations in order prevents an unrelated JDBC sink from retaining every driver on the
+     * class path.
+     */
+    private static boolean hasDynamicJdbcDriverSelection(Set<String> application,
+                                                          Map<String, ClassInfo> available) {
+        if (application == null || available == null) {
+            return false;
+        }
+        for (String owner : new TreeSet<>(application)) {
+            ClassInfo info = available.get(owner);
+            if (info == null) {
+                continue;
+            }
+            for (MethodInfo method : info.methods()) {
+                int load = -1;
+                int instantiate = -1;
+                int connect = -1;
+                for (int offset = 0; offset < method.instructions().size(); offset++) {
+                    InsnFact instruction = method.instructions().get(offset);
+                    for (Object operand : instruction.operands()) {
+                        if (!(operand instanceof MethodRef ref)) {
+                            continue;
+                        }
+                        if (load < 0 && ("java/net/URLClassLoader".equals(ref.owner())
+                                || "java/lang/ClassLoader".equals(ref.owner()))
+                                && "loadClass".equals(ref.name())
+                                && JDBC_LOAD_CLASS_DESCRIPTOR.equals(ref.descriptor())) {
+                            load = offset;
+                        } else if (instantiate < 0 && load >= 0
+                                && "java/lang/Class".equals(ref.owner())
+                                && "newInstance".equals(ref.name())
+                                && JDBC_CLASS_NEW_INSTANCE_DESCRIPTOR.equals(ref.descriptor())) {
+                            instantiate = offset;
+                        } else if (connect < 0 && instantiate >= 0
+                                && JDBC_DRIVER.equals(ref.owner())
+                                && "connect".equals(ref.name())
+                                && JDBC_CONNECT_DESCRIPTOR.equals(ref.descriptor())) {
+                            connect = offset;
+                        }
+                    }
+                }
+                if (load >= 0 && instantiate > load && connect > instantiate) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Bounded direct bytecode closure rooted at concrete Driver.connect implementations. */
+    private static MethodSelection jdbcDriverMethodClosure(Set<String> roots,
+                                                            Map<String, ClassInfo> available) {
+        Map<String, Integer> classDepth = new TreeMap<>();
+        Map<String, Set<String>> selectedMethods = new TreeMap<>();
+        if (roots == null || roots.isEmpty() || available == null || available.isEmpty()) {
+            return new MethodSelection(classDepth, selectedMethods);
+        }
+        Map<String, List<MethodInfo>> methodsByOwner = new HashMap<>();
+        for (ClassInfo info : available.values()) {
+            if (info != null) {
+                methodsByOwner.put(info.internalName(), info.methods());
+            }
+        }
+        Map<String, List<String>> directSubtypes = jdbcDirectSubtypes(available);
+        Deque<MethodWork> work = new ArrayDeque<>();
+        Set<String> seenMethods = new HashSet<>();
+        for (String owner : new TreeSet<>(roots)) {
+            ClassInfo info = available.get(owner);
+            if (info == null) {
+                continue;
+            }
+            MethodInfo connect = info.method("connect", JDBC_CONNECT_DESCRIPTOR);
+            if (connect != null) {
+                work.addLast(new MethodWork(connect, 0));
+            }
+        }
+        while (!work.isEmpty()) {
+            MethodWork current = work.removeFirst();
+            MethodInfo method = current.method();
+            String methodKey = method.owner() + "#" + method.name() + method.descriptor();
+            if (!seenMethods.add(methodKey)) {
+                continue;
+            }
+            selectedMethods.computeIfAbsent(method.owner(), ignored -> new TreeSet<>())
+                    .add(methodKey);
+            classDepth.merge(method.owner(), current.depth(), Math::min);
+            if (current.depth() >= MAX_JDBC_REFERENCE_DEPTH || isPlatformType(method.owner())) {
+                continue;
+            }
+            for (InsnFact instruction : method.instructions()) {
+                for (Object operand : instruction.operands()) {
+                    if (!(operand instanceof MethodRef ref)) {
+                        continue;
+                    }
+                    List<MethodInfo> targets = jdbcMethodTargets(ref, available,
+                            methodsByOwner, directSubtypes);
+                    for (MethodInfo target : targets) {
+                        work.addLast(new MethodWork(target, current.depth() + 1));
+                    }
+                }
+            }
+        }
+        return new MethodSelection(classDepth, selectedMethods);
+    }
+
+    /**
+     * Resolve only the dispatch shape needed by the JDBC closure.  Abstract/interface calls
+     * need their loaded concrete targets to expose an implementation body; ordinary class calls
+     * stay exact so a common Object/collection call cannot fan out across the dependency set.
+     */
+    private static List<MethodInfo> jdbcMethodTargets(MethodRef ref,
+                                                       Map<String, ClassInfo> available,
+                                                       Map<String, List<MethodInfo>> methodsByOwner,
+                                                       Map<String, List<String>> directSubtypes) {
+        if (ref == null || available == null || methodsByOwner == null) {
+            return List.of();
+        }
+        List<MethodInfo> result = new ArrayList<>();
+        for (MethodInfo method : methodsByOwner.getOrDefault(ref.owner(), List.of())) {
+            if (ref.name().equals(method.name()) && ref.descriptor().equals(method.descriptor())) {
+                result.add(method);
+            }
+        }
+        ClassInfo declaredOwner = available.get(ref.owner());
+        MethodInfo declaredMethod = declaredOwner == null ? null
+                : declaredOwner.method(ref.name(), ref.descriptor());
+        boolean dispatch = declaredOwner != null && (declaredOwner.isInterface()
+                || java.lang.reflect.Modifier.isAbstract(declaredOwner.access())
+                || (declaredMethod != null
+                && java.lang.reflect.Modifier.isAbstract(declaredMethod.access())));
+        if (dispatch) {
+            Deque<String> work = new ArrayDeque<>();
+            Set<String> seen = new HashSet<>();
+            work.add(ref.owner());
+            while (!work.isEmpty() && result.size() < MAX_JDBC_DISPATCH_TARGETS) {
+                String owner = work.removeFirst();
+                if (!seen.add(owner)) {
+                    continue;
+                }
+                for (String child : directSubtypes.getOrDefault(owner, List.of())) {
+                    ClassInfo candidate = available.get(child);
+                    if (candidate == null) {
+                        continue;
+                    }
+                    if (!candidate.isInterface()) {
+                        MethodInfo method = candidate.method(ref.name(), ref.descriptor());
+                        if (method != null) {
+                            result.add(method);
+                            if (result.size() >= MAX_JDBC_DISPATCH_TARGETS) {
+                                break;
+                            }
+                        }
+                    }
+                    work.addLast(child);
+                }
+            }
+        }
+        return result.stream()
+                .distinct()
+                .sorted(java.util.Comparator.comparing(MethodInfo::owner)
+                        .thenComparing(MethodInfo::name)
+                        .thenComparing(MethodInfo::descriptor))
+                .toList();
+    }
+
+    /** Deterministic direct subtype index used only by the bounded JDBC closure. */
+    private static Map<String, List<String>> jdbcDirectSubtypes(Map<String, ClassInfo> available) {
+        Map<String, Set<String>> mutable = new TreeMap<>();
+        for (ClassInfo info : available.values()) {
+            if (info == null || info.internalName() == null) {
+                continue;
+            }
+            if (info.superName() != null && !info.superName().isBlank()) {
+                mutable.computeIfAbsent(info.superName(), ignored -> new TreeSet<>())
+                        .add(info.internalName());
+            }
+            for (String interfaceName : info.interfaces()) {
+                if (interfaceName != null && !interfaceName.isBlank()) {
+                    mutable.computeIfAbsent(interfaceName, ignored -> new TreeSet<>())
+                            .add(info.internalName());
+                }
+            }
+        }
+        Map<String, List<String>> result = new TreeMap<>();
+        mutable.forEach((owner, children) -> result.put(owner, List.copyOf(children)));
+        return result;
     }
 
     private static void mergeMethodSelection(Map<String, Set<String>> destination,

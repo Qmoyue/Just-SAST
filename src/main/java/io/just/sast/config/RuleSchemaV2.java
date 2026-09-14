@@ -373,8 +373,13 @@ public final class RuleSchemaV2 {
         }
         Rule.FragmentRule fragment = (Rule.FragmentRule) rule;
         Capability capability = capabilityFor("", fragment.sinkOwner(), fragment.sinkName());
+        boolean jdbcConfiguration = "jdbc".equals(fragment.activation())
+                || "jdbcConfiguration".equals(fragment.entryKind());
+        Set<Bridge> bridge = jdbcConfiguration
+                ? Set.of(Bridge.JDBC_DRIVER, Bridge.CONFIGURATION) : Set.of();
+        Boundary boundary = jdbcConfiguration ? Boundary.CONFIGURATION : Boundary.CAPABILITY;
         return new Definition(fragment.id(), RuleKind.CHAIN_FRAGMENT, "", "",
-                new Semantics(Set.of(capability), Set.of(), Set.of(Boundary.CAPABILITY),
+                new Semantics(Set.of(capability), bridge, Set.of(boundary),
                         Set.of(terminalFor("", fragment.sinkOwner(), fragment.sinkName())), Set.of(),
                         Set.of(Filter.NONE), Set.of(callbackFor(fragment.entryKind()))));
     }

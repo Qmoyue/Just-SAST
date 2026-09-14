@@ -883,6 +883,28 @@ rules:
     sinkName: readObject
     sinkDescriptor: "()Ljava/lang/Object;"
 
+  # JDBC master: the selected driver reads socketFactory properties and may instantiate the
+  # configured Spring XML context.  The XML side is a declarative class-definition boundary;
+  # it is never executed by Just and is joined only after the JDBC driver bridge is proven.
+  - id: FRAG-JDBC-SPRING-XML-CLASS-DEFINITION
+    kind: chain-fragment
+    entryClass: "org/springframework/context/support/FileSystemXmlApplicationContext"
+    entryKind: jdbcConfiguration
+    entryMethod: "<init>"
+    entryDescriptor: "(Ljava/lang/String;)V"
+    activation: jdbc
+    hops:
+      - { class: "org/springframework/beans/factory/config/MethodInvokingFactoryBean", method: "afterPropertiesSet" }
+      - { class: "javax/management/loading/MLet", method: "defineClass" }
+    sinkOwner: "java/lang/ClassLoader"
+    sinkName: defineClass
+    sinkDescriptor: "([BII)Ljava/lang/Class;"
+    construction:
+      nodes:
+        - { id: context, type: "org/springframework/context/support/FileSystemXmlApplicationContext", kind: allocate }
+        - { id: factory, type: "org/springframework/beans/factory/config/MethodInvokingFactoryBean", kind: allocate }
+        - { id: loader, type: "javax/management/loading/MLet", kind: allocate }
+
   - id: FRAG-SPRING1
     kind: chain-fragment
     entryClass: "org/springframework/core/SerializableTypeWrapper$MethodInvokeTypeProvider"

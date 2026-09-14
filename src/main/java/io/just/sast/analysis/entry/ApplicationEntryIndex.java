@@ -306,7 +306,9 @@ public final class ApplicationEntryIndex {
         TERMINAL_IMPACT_NOT_INDEXED,
         TERMINAL_IMPACT_IS_INTERMEDIATE,
         TERMINAL_NOT_REVERSE_REACHABLE,
-        ENTRY_NOT_IN_TERMINAL_DEMAND
+        ENTRY_NOT_IN_TERMINAL_DEMAND,
+        /** A rule-declared configuration fragment reaches a static class-definition boundary. */
+        DECLARED_FRAGMENT_CONTINUATION
     }
 
     /**
@@ -331,7 +333,8 @@ public final class ApplicationEntryIndex {
         }
 
         public boolean admitted() {
-            return status == CandidateAdmissionStatus.ADMITTED;
+            return status == CandidateAdmissionStatus.ADMITTED
+                    || status == CandidateAdmissionStatus.DECLARED_FRAGMENT_CONTINUATION;
         }
 
         public String reasonCode() {
@@ -420,7 +423,18 @@ public final class ApplicationEntryIndex {
                                     String entryOwner, String entryName, String entryDescriptor,
                                     String entryKind, String terminalOwner, String terminalName,
                                     String terminalDescriptor, String terminalRole,
-                                    SinkRisk sinkRisk, boolean continuationEvidence) {
+                                    SinkRisk sinkRisk, boolean continuationEvidence,
+                                    boolean declaredApplicationContinuation) {
+        public ProducerCandidate(String ruleId, String category, String severity,
+                                  String entryOwner, String entryName, String entryDescriptor,
+                                  String entryKind, String terminalOwner, String terminalName,
+                                  String terminalDescriptor, String terminalRole,
+                                  SinkRisk sinkRisk, boolean continuationEvidence) {
+            this(ruleId, category, severity, entryOwner, entryName, entryDescriptor, entryKind,
+                    terminalOwner, terminalName, terminalDescriptor, terminalRole, sinkRisk,
+                    continuationEvidence, false);
+        }
+
         public ProducerCandidate {
             ruleId = text(ruleId);
             category = text(category);
@@ -1646,7 +1660,24 @@ public final class ApplicationEntryIndex {
                                                          String terminalDescriptor,
                                                          boolean continuationEvidence) {
         return candidateAdmission(entryOwner, entryName, entryDescriptor, terminalOwner,
-                terminalName, terminalDescriptor, continuationEvidence, null, false);
+                terminalName, terminalDescriptor, continuationEvidence, null, false, false);
+    }
+
+    /**
+     * Candidate admission for a declarative continuation whose terminal is a static rule
+     * boundary rather than an observed call site.  The declaration owner supplies the boolean;
+     * this index still checks the exact class-definition boundary identity.
+     */
+    public CandidateAdmissionDecision candidateAdmission(String entryOwner, String entryName,
+                                                         String entryDescriptor,
+                                                         String terminalOwner,
+                                                         String terminalName,
+                                                         String terminalDescriptor,
+                                                         boolean continuationEvidence,
+                                                         boolean declaredFragmentContinuation) {
+        return candidateAdmission(entryOwner, entryName, entryDescriptor, terminalOwner,
+                terminalName, terminalDescriptor, continuationEvidence, null, false,
+                declaredFragmentContinuation);
     }
 
     /** Internal admission path allowing a producer to reuse its already-resolved terminal. */
@@ -1658,7 +1689,8 @@ public final class ApplicationEntryIndex {
                                                           boolean continuationEvidence,
                                                           TerminalDecision resolvedTerminal) {
         return candidateAdmission(entryOwner, entryName, entryDescriptor, terminalOwner,
-                terminalName, terminalDescriptor, continuationEvidence, resolvedTerminal, false);
+                terminalName, terminalDescriptor, continuationEvidence, resolvedTerminal, false,
+                false);
     }
 
     /** Internal trigger admission may cross the ordinary entry slice only after typed OIS evidence. */
@@ -1670,6 +1702,21 @@ public final class ApplicationEntryIndex {
                                                           boolean continuationEvidence,
                                                           TerminalDecision resolvedTerminal,
                                                           boolean serializedTriggerContinuation) {
+        return candidateAdmission(entryOwner, entryName, entryDescriptor, terminalOwner,
+                terminalName, terminalDescriptor, continuationEvidence, resolvedTerminal,
+                serializedTriggerContinuation, false);
+    }
+
+    /** Internal admission path for the bounded declaration-backed continuation axis. */
+    private CandidateAdmissionDecision candidateAdmission(String entryOwner, String entryName,
+                                                          String entryDescriptor,
+                                                          String terminalOwner,
+                                                          String terminalName,
+                                                          String terminalDescriptor,
+                                                          boolean continuationEvidence,
+                                                          TerminalDecision resolvedTerminal,
+                                                          boolean serializedTriggerContinuation,
+                                                          boolean declaredFragmentContinuation) {
         String owner = entryOwner == null ? "" : entryOwner;
         String name = entryName == null ? "" : entryName;
         String descriptor = entryDescriptor == null ? "" : entryDescriptor;
@@ -1686,6 +1733,16 @@ public final class ApplicationEntryIndex {
             return new CandidateAdmissionDecision(CandidateAdmissionStatus.APPLICATION_SCOPE_UNKNOWN,
                     entryKey, sinkOwner, sinkName, sinkDescriptor, entryForward, false,
                     continuationEvidence);
+        }
+        if (declaredFragmentContinuation && continuationEvidence
+                && isDeclaredClassDefinitionBoundary(sinkOwner, sinkName, sinkDescriptor)
+                && terminal.status() == TerminalStatus.NOT_INDEXED
+                && (!isApplicationOwner(owner)
+                || applicationEntryMethods.contains(entryKey) || entryForward
+                || bindingTarget)) {
+            return new CandidateAdmissionDecision(
+                    CandidateAdmissionStatus.DECLARED_FRAGMENT_CONTINUATION, entryKey,
+                    sinkOwner, sinkName, sinkDescriptor, entryForward, false, true);
         }
         if (!isApplicationOwner(owner) && !bindingTarget) {
             // A dependency fragment that ends at a typed capability is not an application
@@ -1764,16 +1821,26 @@ public final class ApplicationEntryIndex {
         boolean serializedTriggerContinuation = candidate.continuationEvidence()
                 && SERIALIZED_TRIGGER_ENTRY_KINDS.contains(candidate.entryKind())
                 && isApplicationOwner(candidate.entryOwner());
+        boolean declaredFragmentContinuation = isDeclaredFragmentCandidate(candidate)
+                || candidate.declaredApplicationContinuation();
         CandidateAdmissionDecision admission = candidateAdmission(candidate.entryOwner(),
                 candidate.entryName(), candidate.entryDescriptor(), candidate.terminalOwner(),
                 candidate.terminalName(), candidate.terminalDescriptor(),
-                candidate.continuationEvidence(), terminal, serializedTriggerContinuation);
+                candidate.continuationEvidence(), terminal, serializedTriggerContinuation,
+                declaredFragmentContinuation);
         if (!applicationScopeKnown) {
             return new ProducerAdmissionDecision(ProducerAdmissionStatus.KERNEL_ONLY,
                     admission, terminal, candidate.continuationEvidence());
         }
         if (admission.admitted() && serializedTriggerContinuation) {
             return new ProducerAdmissionDecision(ProducerAdmissionStatus.BRIDGE_CONTINUATION,
+                    admission, terminal, true);
+        }
+        if (admission.status() == CandidateAdmissionStatus.DECLARED_FRAGMENT_CONTINUATION) {
+            ProducerAdmissionStatus route = candidate.declaredApplicationContinuation()
+                    ? ProducerAdmissionStatus.APPLICATION_CHAIN
+                    : ProducerAdmissionStatus.BRIDGE_CONTINUATION;
+            return new ProducerAdmissionDecision(route,
                     admission, terminal, true);
         }
         if (admission.admitted()) {
@@ -1858,6 +1925,40 @@ public final class ApplicationEntryIndex {
             }
         }
         return false;
+    }
+
+    /**
+     * Return a descriptor only when the graph contains exactly one overload for the owner/name
+     * pair.  A name-only lookup is not a method fact: overloaded framework constructors and
+     * callbacks must remain unresolved until a rule or an ENTRY hop supplies the signature.
+     */
+    public static String uniqueMethodDescriptor(Graph graph, String owner, String name) {
+        if (graph == null || owner == null || owner.isBlank()
+                || name == null || name.isBlank()) {
+            return "";
+        }
+        Set<String> descriptors = new TreeSet<>();
+        for (Node method : graph.nodesOfType(NodeType.METHOD)) {
+            if (method != null && owner.equals(method.owner()) && name.equals(method.name())
+                    && method.descriptor() != null && !method.descriptor().isBlank()) {
+                descriptors.add(method.descriptor());
+            }
+        }
+        return descriptors.size() == 1 ? descriptors.iterator().next() : "";
+    }
+
+    /** Exact static boundary permitted for the declarative JDBC/XML continuation. */
+    private static boolean isDeclaredClassDefinitionBoundary(String owner, String name,
+                                                              String descriptor) {
+        return "java/lang/ClassLoader".equals(owner) && "defineClass".equals(name)
+                && "([BII)Ljava/lang/Class;".equals(descriptor);
+    }
+
+    private static boolean isDeclaredFragmentCandidate(ProducerCandidate candidate) {
+        return candidate != null && candidate.continuationEvidence()
+                && "jdbcConfiguration".equals(candidate.entryKind())
+                && isDeclaredClassDefinitionBoundary(candidate.terminalOwner(),
+                candidate.terminalName(), candidate.terminalDescriptor());
     }
 
     private static String entryDescriptor(Chain chain) {

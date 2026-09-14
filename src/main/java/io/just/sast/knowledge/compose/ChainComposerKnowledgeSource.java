@@ -97,7 +97,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             "hashCode", "equals", "compareTo", "compare", "toString");
 
     /** 桥接类型。 */
-    enum Bridge { INVOKE, TRIGGER, TEMPLATE, DESER, JNDI_RMI }
+    enum Bridge { INVOKE, TRIGGER, TEMPLATE, DESER, JNDI_RMI, JDBC_XML }
 
     private record DeserHost(String owner, String method, String descriptor,
                              String frameOwner, String frameMethod, String frameDescriptor) {
@@ -113,7 +113,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     }
 
     private record FrontFeatures(boolean invoke, String triggerContainer,
-                                 boolean template, boolean deserialize, boolean jndiRmi) {
+                                 boolean template, boolean deserialize, boolean jndiRmi,
+                                 boolean jdbc) {
     }
 
     @Override
@@ -268,7 +269,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 publicEntries.size(), triggerEntries.size(), templateEntries.size());
 
         int composed = composeApplicationPriority(bb, defaultFronts, publicEntries,
-                frontFeaturesCache);
+                fragmentEntries, frontFeaturesCache);
         for (Chain front : defaultFronts) {
             if (composed >= MAX_COMPOSED) {
                 bb.markIncomplete("COMPOSITION_CHAIN_CAP:" + MAX_COMPOSED);
@@ -276,7 +277,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             }
             FrontFeatures features = frontFeaturesCached(bb, front, frontFeaturesCache);
             if (!features.invoke() && features.triggerContainer() == null
-                    && !features.template() && !features.deserialize() && !features.jndiRmi()) {
+                    && !features.template() && !features.deserialize() && !features.jndiRmi()
+                    && !features.jdbc()) {
                 continue;
             }
             // Only inspect chains that can satisfy at least one bridge precondition.  This
@@ -334,8 +336,11 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                             .comparingInt((Chain chain) -> terminalBackPriority(chain)).reversed()
                             .thenComparing(Chain::key))
                     .toList();
-            postSourceApplication = composeApplicationPriority(bb, refreshed, refreshedPublicEntries,
-                    frontFeaturesCache);
+            List<Chain> refreshedFragmentEntries = refreshedBacks.stream()
+                    .filter(ChainComposerKnowledgeSource::isDeclaredFragment)
+                    .toList();
+            postSourceApplication = composeApplicationPriority(bb, refreshed,
+                    refreshedPublicEntries, refreshedFragmentEntries, frontFeaturesCache);
         }
         JustLogger.info("链组装：语义桥接产链 {} 条（源宿主容器触发 {} 条，源宿主后应用续接 {} 条）",
                 composed, sourceComposed, postSourceApplication);
@@ -357,7 +362,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         for (Chain front : fronts) {
             FrontFeatures features = frontFeaturesCached(target, front, frontFeaturesCache);
             if (features.invoke() || features.deserialize() || features.triggerContainer() != null
-                    || features.template() || features.jndiRmi()) {
+                    || features.template() || features.jndiRmi() || features.jdbc()) {
                 return true;
             }
         }
@@ -377,6 +382,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
      */
     private int composeApplicationPriority(Blackboard target, List<Chain> chains,
                                            List<Chain> publicEntries,
+                                           List<Chain> fragmentEntries,
                                            Map<String, FrontFeatures> frontFeaturesCache) {
         if (chains == null || chains.isEmpty() || publicEntries == null || publicEntries.isEmpty()) {
             return 0;
@@ -387,7 +393,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                     FrontFeatures features = frontFeaturesCached(target, chain, frontFeaturesCache);
                     return features.invoke() || features.deserialize()
                             || features.triggerContainer() != null
-                            || features.template() || features.jndiRmi();
+                            || features.template() || features.jndiRmi() || features.jdbc();
                 })
                 .sorted(java.util.Comparator
                         .comparingInt((Chain chain) -> applicationFrontPriority(target, chain)).reversed()
@@ -397,7 +403,14 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (fronts.isEmpty()) {
             return 0;
         }
-        List<Chain> backs = publicEntries.stream()
+        Set<Chain> allBacks = new LinkedHashSet<>();
+        if (publicEntries != null) {
+            allBacks.addAll(publicEntries);
+        }
+        if (fragmentEntries != null) {
+            allBacks.addAll(fragmentEntries);
+        }
+        List<Chain> backs = allBacks.stream()
                 .sorted(java.util.Comparator
                         .comparingInt((Chain chain) -> applicationBackPriority(chain)).reversed()
                         .thenComparing(Chain::key))
@@ -568,13 +581,16 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                                                      terminalAdmissionCache,
                                              Map<ContinuationAdmissionKey, Boolean>
                                                      continuationAdmissionCache) {
-        if (chain == null || !isPublicEntry(chain)
+        if (chain == null || (!isPublicEntry(chain) && !isJdbcXmlFragment(chain))
                 || target == null || target.applicationEntryIndex() == null) {
             return false;
         }
         var index = target.applicationEntryIndex();
         if (!index.applicationScopeKnown() || index.isApplicationOwner(chain.entryClass())) {
             return false;
+        }
+        if (isJdbcXmlFragment(chain)) {
+            return chain.unresolvedHops() == 0 && activationAllows(chain, "jdbc");
         }
         var decision = terminalAdmission(index, chain, terminalAdmissionCache);
         if (decision.admitted()) {
@@ -1616,7 +1632,8 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                 triggerContainerOnPath(front),
                 onPath(front, "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl"),
                 "DESERIALIZE".equals(front.category()),
-                isJndiRmiBridge(target, front));
+                isJndiRmiBridge(target, front),
+                isJdbcDriverBridge(target, front));
     }
 
     /**
@@ -1629,7 +1646,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     private FrontFeatures frontFeaturesCached(Blackboard target, Chain front,
                                               Map<String, FrontFeatures> cache) {
         if (front == null) {
-            return new FrontFeatures(false, null, false, false, false);
+            return new FrontFeatures(false, null, false, false, false, false);
         }
         if (cache == null || front.key() == null || front.key().isBlank()) {
             return frontFeatures(target, front);
@@ -1659,10 +1676,72 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         return result;
     }
 
+    /** JDBC connect/getConnection is an intermediate protocol boundary, never a terminal. */
+    private boolean isJdbcDriverBridge(Blackboard target, Chain front) {
+        if (front == null || target == null) {
+            return false;
+        }
+        Rule.SinkRule sink = target.rules().sinks().stream()
+                .filter(rule -> rule != null && rule.id().equals(front.ruleId()))
+                .findFirst().orElseGet(() -> target.ruleEngine()
+                        .matchingSink(front.sinkClass(), front.sinkMethod(), front.sinkDescriptor())
+                        .orElse(null));
+        return sink != null && RuleSchemaV2.bridgesFor(sink)
+                .contains(RuleSchemaV2.Bridge.JDBC_DRIVER)
+                && !RuleSchemaV2.isTerminalSink(sink);
+    }
+
     private static boolean isDeclaredFragment(Chain chain) {
         return chain != null && chain.constructionPlan() != null
                 && !chain.constructionPlan().isEmpty()
                 && isFragmentChain(chain);
+    }
+
+    /**
+     * Exact declarative boundary for the JDBC master XML continuation.  A generic fragment
+     * marker is insufficient: the entry, two XML lifecycle hops, inherited ClassLoader sink,
+     * activation and shape declaration must agree before this fragment can be paired with a
+     * JDBC driver prefix.
+     */
+    private static boolean isJdbcXmlFragment(Chain chain) {
+        if (!isDeclaredFragment(chain)
+                || !"jdbcConfiguration".equals(chain.entryKind())
+                || !"org/springframework/context/support/FileSystemXmlApplicationContext"
+                .equals(chain.entryClass())
+                || !"<init>".equals(chain.entryMethod())
+                || !"(Ljava/lang/String;)V".equals(entryDescriptor(chain))
+                || !"java/lang/ClassLoader".equals(chain.sinkClass())
+                || !"defineClass".equals(chain.sinkMethod())
+                || !"([BII)Ljava/lang/Class;".equals(chain.sinkDescriptor())
+                || !activationAllows(chain, "jdbc")
+                || !chain.constructionPlan().shapeSummary().valid()) {
+            return false;
+        }
+        Set<String> types = new HashSet<>();
+        chain.constructionPlan().nodes().forEach(node -> {
+            if (node != null) {
+                types.add(node.type());
+            }
+        });
+        return types.contains("org/springframework/context/support/FileSystemXmlApplicationContext")
+                && types.contains("org/springframework/beans/factory/config/MethodInvokingFactoryBean")
+                && types.contains("javax/management/loading/MLet")
+                && hasHop(chain,
+                "org/springframework/context/support/FileSystemXmlApplicationContext", "<init>",
+                "org/springframework/beans/factory/config/MethodInvokingFactoryBean",
+                "afterPropertiesSet")
+                && hasHop(chain,
+                "org/springframework/beans/factory/config/MethodInvokingFactoryBean",
+                "afterPropertiesSet", "javax/management/loading/MLet", "defineClass")
+                && hasHop(chain, "javax/management/loading/MLet", "defineClass",
+                "java/lang/ClassLoader", "defineClass");
+    }
+
+    private static boolean hasHop(Chain chain, String fromOwner, String fromName,
+                                  String toOwner, String toName) {
+        return chain != null && chain.hops().stream().anyMatch(hop -> hop != null
+                && fromOwner.equals(hop.fromOwner()) && fromName.equals(hop.fromName())
+                && toOwner.equals(hop.toOwner()) && toName.equals(hop.toName()));
     }
 
     private static boolean isFragmentChain(Chain chain) {
@@ -1728,6 +1807,9 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (features.jndiRmi()) {
             candidates.addAll(fragmentEntries);
         }
+        if (features.jdbc()) {
+            candidates.addAll(fragmentEntries);
+        }
         return candidates.isEmpty() ? List.of() : List.copyOf(candidates);
     }
 
@@ -1771,6 +1853,13 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (features.jndiRmi() && isDeclaredFragment(back)
                 && isPublicEntry(back) && back.unresolvedHops() == 0) {
             return Bridge.JNDI_RMI;
+        }
+
+        // JDBC connect selects an implementation whose configuration may instantiate a
+        // declarative XML context.  The fragment is accepted only when its exact static
+        // class-definition boundary and bounded object shape were materialized above.
+        if (features.jdbc() && isJdbcXmlFragment(back)) {
+            return Bridge.JDBC_XML;
         }
 
         return null;
@@ -1879,11 +1968,18 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (bridge == null) {
             return null;
         }
-        return composedProducer(front, back, () -> compose(front, back, bridge));
+        return composedProducer(front, back, () -> compose(front, back, bridge),
+                bridge == Bridge.JDBC_XML);
     }
 
     private ComposedProducer composedProducer(Chain front, Chain back,
                                               Supplier<Chain> materializer) {
+        return composedProducer(front, back, materializer, false);
+    }
+
+    private ComposedProducer composedProducer(Chain front, Chain back,
+                                              Supplier<Chain> materializer,
+                                              boolean declaredApplicationContinuation) {
         if (front == null || back == null || materializer == null) {
             return null;
         }
@@ -1892,7 +1988,7 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                         back.severity(), front.entryClass(), front.entryMethod(),
                         entryDescriptor(front), front.entryKind(), back.sinkClass(),
                         back.sinkMethod(), back.sinkDescriptor(), back.sinkRole(),
-                        back.sinkRisk(), true);
+                        back.sinkRisk(), true, declaredApplicationContinuation);
         return new ComposedProducer(candidate, materializer);
     }
 

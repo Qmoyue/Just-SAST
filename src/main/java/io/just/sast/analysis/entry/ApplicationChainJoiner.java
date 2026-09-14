@@ -18,6 +18,7 @@ import io.just.sast.blackboard.SinkRisk;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.Node;
+import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.Descriptor;
 
 import java.util.ArrayList;
@@ -31,6 +32,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.function.Predicate;
 
 /**
  * Builds the first typed application-chain join product.
@@ -57,6 +59,23 @@ public final class ApplicationChainJoiner {
     private static final String TEMPLATES = "javax/xml/transform/Templates";
     private static final String TEMPLATES_IMPL =
             "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl";
+    private static final String JDBC_CONNECT_DESCRIPTOR =
+            "(Ljava/lang/String;Ljava/util/Properties;)Ljava/sql/Connection;";
+    private static final String JDBC_LOAD_CLASS_DESCRIPTOR =
+            "(Ljava/lang/String;)Ljava/lang/Class;";
+    private static final String JDBC_CLASS_NEW_INSTANCE_DESCRIPTOR =
+            "()Ljava/lang/Object;";
+    private static final String JDBC_INIT_CONFIG_DESCRIPTOR =
+            "(Ljava/util/Properties;)Ljava/util/Properties;";
+    private static final String JDBC_LOAD_CONFIG_DESCRIPTOR =
+            "(Ljava/lang/String;Ljava/util/Properties;)Ljava/util/Properties;";
+    private static final String JDBC_SOCKET_FACTORY_DESCRIPTOR =
+            "(Ljava/util/Properties;)Ljavax/net/SocketFactory;";
+    private static final String JDBC_UNTYPED_FACTORY_DESCRIPTOR =
+            "(Ljava/lang/String;Ljava/util/Properties;ZLjava/lang/String;)Ljava/lang/Object;";
+    private static final String JDBC_TYPED_FACTORY_DESCRIPTOR_PREFIX =
+            "(Ljava/lang/Class;Ljava/lang/String;Ljava/util/Properties;";
+    private static final int MAX_JDBC_REACHABLE_METHODS = 4_096;
 
     private ApplicationChainJoiner() {
     }
@@ -105,7 +124,7 @@ public final class ApplicationChainJoiner {
         Map<String, List<String>> callTargetCache = new HashMap<>();
         for (Chain chain : ordered) {
             ApplicationEntryIndex.CandidateAdmissionDecision admission =
-                    candidateAdmission(index, chain);
+                    candidateAdmission(index, graph, chain);
             admissionDecisions.put(chain.key(), admission.status());
             if (!admission.admitted()) {
                 decisions.put(chain.key(), admission.reasonCode());
@@ -138,16 +157,17 @@ public final class ApplicationChainJoiner {
     }
 
     private static ApplicationEntryIndex.CandidateAdmissionDecision candidateAdmission(
-            ApplicationEntryIndex index, Chain chain) {
+            ApplicationEntryIndex index, Graph graph, Chain chain) {
         if (chain == null) {
             return new ApplicationEntryIndex.CandidateAdmissionDecision(
                     ApplicationEntryIndex.CandidateAdmissionStatus.APPLICATION_ENTRY_NOT_IN_CHAIN,
                     "", "", "", "", false, false, false);
         }
-        String descriptor = entryDescriptor(chain);
+        String descriptor = entryDescriptor(graph, chain);
         boolean continuation = hasSemanticContinuation(index, chain);
         return index.candidateAdmission(chain.entryClass(), chain.entryMethod(), descriptor,
-                chain.sinkClass(), chain.sinkMethod(), chain.sinkDescriptor(), continuation);
+                chain.sinkClass(), chain.sinkMethod(), chain.sinkDescriptor(), continuation,
+                isDeclaredJdbcXmlChain(chain));
     }
 
     private static Decision decide(ApplicationEntryIndex index, Graph graph, Chain chain,
@@ -171,19 +191,25 @@ public final class ApplicationChainJoiner {
             return Decision.rejected("SECOND_DESERIALIZATION_NOT_IN_CHAIN");
         }
         Set<String> chainMethods = chainMethodIdentities(chain);
+        boolean declaredJdbcTerminal = isDeclaredJdbcXmlChain(chain);
         ApplicationEntryIndex.TerminalDecision terminalDecision = index.terminalAdmission(
                 chain.sinkClass(), chain.sinkMethod(), chain.sinkDescriptor());
         if (terminalDecision.status() == ApplicationEntryIndex.TerminalStatus.INTERMEDIATE_ONLY
-                || (!terminalDecision.admitted() && !chain.terminalSink())) {
+                || (!terminalDecision.admitted() && !declaredJdbcTerminal)) {
             return Decision.rejected(terminalDecision.reasonCode());
         }
         String terminalHostKey = terminalDecision.hostMethodKey();
         boolean continuationEvidence = entryMatch.typedBinding()
                 || hasSemanticContinuation(index, chain);
-        ApplicationEntryIndex.DemandDecision demand = index.demandAdmission(entryKey,
-                terminalHostKey, continuationEvidence);
-        if (!demand.admitted()) {
-            return Decision.rejected(demand.reasonCode());
+        if (!declaredJdbcTerminal) {
+            ApplicationEntryIndex.DemandDecision demand = index.demandAdmission(entryKey,
+                    terminalHostKey, continuationEvidence);
+            if (!demand.admitted()) {
+                return Decision.rejected(demand.reasonCode());
+            }
+        } else if (!index.isApplicationEntryMethod(entryKey)
+                && !index.isEntryForwardReachable(entryKey)) {
+            return Decision.rejected("ENTRY_NOT_FORWARD_REACHABLE");
         }
         String dependencyOwner = dependencyOwner(index, chain);
         if (dependencyOwner == null) {
@@ -223,10 +249,19 @@ public final class ApplicationChainJoiner {
         }
         ApplicationEntryIndex.DeserializeSite site = entryMatch.bindingSite() != null
                 ? entryMatch.bindingSite() : findSite(index, entryKey, chainMethods);
-        BridgeProfile bridgeProfile = bridgeProfile(chain, site);
+        if (declaredJdbcTerminal) {
+            // Generic accepted-prefix binding may select an application class that is not the
+            // JDBC request DTO.  The JDBC proof needs the exact Jackson call in the composed
+            // application's own host method, not an unrelated framework binding site.
+            site = jdbcApplicationSite(index, chain, site);
+        }
+        BridgeProfile bridgeProfile = bridgeProfile(chain, site, graph);
         if (bridgeProfile.composedJndi() && bridgeProfile.jacksonBinding()
                 && !bridgeProfile.remoteReply()) {
             return Decision.rejected("RMI_REPLY_NOT_PROVEN");
+        }
+        if (bridgeProfile.jdbcConfiguration() && !bridgeProfile.jdbcComplete()) {
+            return Decision.rejected("JDBC_XML_BRIDGE_NOT_PROVEN");
         }
         if (entryMatch.typedBinding()) {
             entryAttributes.put("binding_target_type", chain.entryClass());
@@ -250,7 +285,8 @@ public final class ApplicationChainJoiner {
                 "UNKNOWN", dependencyOwner, chain.sinkMethod(), "CHAIN_DEPENDENCY_SUFFIX",
                 dependencyAttributes);
         EvidenceAtom terminal = EvidenceAtom.of(EvidenceAtom.Kind.TERMINAL_IMPACT, "UNKNOWN",
-                chain.sinkClass(), chain.sinkMethod(), "INDEX_TERMINAL_IMPACT",
+                chain.sinkClass(), chain.sinkMethod(), declaredJdbcTerminal
+                        ? "DECLARED_CLASS_DEFINITION_BOUNDARY" : "INDEX_TERMINAL_IMPACT",
                 Map.of("descriptor", chain.sinkDescriptor(), "risk", chain.sinkRisk().name()));
 
         ApplicationChainId chainId = ApplicationChainId.fromCanonical("chain", chain.key());
@@ -303,8 +339,16 @@ public final class ApplicationChainJoiner {
             if (hop.reason() == null || !hop.reason().startsWith("bridge-")) {
                 continue;
             }
-            addBridge(bridges, bridgeKind(hop.reason()), siteAtom.id(), terminal.id(),
+            BridgeEvidence.Kind kind = "bridge-jdbc_xml".equals(hop.reason())
+                    ? BridgeEvidence.Kind.CONFIGURATION : bridgeKind(hop.reason());
+            addBridge(bridges, kind, siteAtom.id(), terminal.id(),
                     hop.reason());
+        }
+        if (bridgeProfile.jdbcComplete()) {
+            addBridge(bridges, BridgeEvidence.Kind.JDBC_DRIVER, siteAtom.id(), terminal.id(),
+                    "JDBC_DRIVER_CONCRETE_DISPATCH");
+            addBridge(bridges, BridgeEvidence.Kind.CONFIGURATION, siteAtom.id(), terminal.id(),
+                    "JDBC_XML_FILE_CONTEXT_CLASS_DEFINITION");
         }
         // A composed JNDI/RMI hop is the transport boundary.  The returned serialized object
         // is a second, typed evidence edge only when the same chain also carries the Jackson
@@ -321,7 +365,7 @@ public final class ApplicationChainJoiner {
         FindingState state = new FindingState(
                 index.isExternalEntryMethod(entryKey) ? FindingState.EntryStatus.EXTERNAL_ENTRY
                         : FindingState.EntryStatus.APPLICATION_ENTRY,
-                chain.unresolvedHops() == 0 && terminalDecision.admitted()
+                chain.unresolvedHops() == 0 && (terminalDecision.admitted() || declaredJdbcTerminal)
                         ? FindingState.ChainProgress.IMPACT_CHAIN_COMPLETE
                         : FindingState.ChainProgress.DEPENDENCY_JOINED,
                 construction == EntryChainJoinEvidence.ConstructionConstraint.SAT
@@ -407,13 +451,7 @@ public final class ApplicationChainJoiner {
             return typedBinding;
         }
         Set<String> candidates = new TreeSet<>();
-        String entryDescriptor = "";
-        for (ChainHop hop : chain.hops()) {
-            if (hop.kind() == HopKind.ENTRY && hop.desc() != null) {
-                entryDescriptor = hop.desc();
-                break;
-            }
-        }
+        String entryDescriptor = entryDescriptor(graph, chain);
         if (!entryDescriptor.isBlank()) {
             candidates.add(methodKey(chain.entryClass(), chain.entryMethod(), entryDescriptor));
         }
@@ -473,13 +511,13 @@ public final class ApplicationChainJoiner {
                                                     Chain chain, Set<String> allowedMethods,
                                                     Map<String, List<String>> callTargetCache) {
         if (index == null || chain == null || chain.entryClass() == null
-                || chain.entryMethod() == null || !callbackAcceptsValue(chain)) {
+                || chain.entryMethod() == null || !callbackAcceptsValue(graph, chain)) {
             return null;
         }
         List<ApplicationEntryIndex.DeserializeSite> sites = index.typedBindingSitesForTarget(
                 chain.entryClass());
         String chainEntryKey = methodKey(chain.entryClass(), chain.entryMethod(),
-                entryDescriptor(chain));
+                entryDescriptor(graph, chain));
         for (ApplicationEntryIndex.DeserializeSite site : sites) {
             String host = site.hostMethodKey();
             if (index.isExternalEntryMethod(host) || index.isApplicationEntryMethod(host)) {
@@ -509,8 +547,8 @@ public final class ApplicationChainJoiner {
         return null;
     }
 
-    private static boolean callbackAcceptsValue(Chain chain) {
-        String descriptor = entryDescriptor(chain);
+    private static boolean callbackAcceptsValue(Graph graph, Chain chain) {
+        String descriptor = entryDescriptor(graph, chain);
         if (descriptor == null || descriptor.isBlank()) {
             return false;
         }
@@ -652,6 +690,31 @@ public final class ApplicationChainJoiner {
                 .min(Comparator.comparingLong(ApplicationEntryIndex.DeserializeSite::callId)
                         .thenComparing(ApplicationEntryIndex.DeserializeSite::hostMethodKey))
                 .orElse(null);
+    }
+
+    /** Resolve the exact Jackson binding site carried by the application-side JDBC host. */
+    private static ApplicationEntryIndex.DeserializeSite jdbcApplicationSite(
+            ApplicationEntryIndex index, Chain chain,
+            ApplicationEntryIndex.DeserializeSite preferred) {
+        if (index == null || chain == null) {
+            return null;
+        }
+        String host = methodKey(chain.entryClass(), chain.entryMethod(), entryDescriptor(chain));
+        if (preferred != null && host.equals(preferred.hostMethodKey())
+                && JACKSON_MAPPER.equals(preferred.owner())
+                && "readValue".equals(preferred.name())
+                && "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;"
+                .equals(preferred.descriptor()) && !preferred.targetTypes().isEmpty()) {
+            return preferred;
+        }
+        return index.applicationInputSites().stream()
+                .filter(site -> host.equals(site.hostMethodKey()))
+                .filter(site -> JACKSON_MAPPER.equals(site.owner()))
+                .filter(site -> "readValue".equals(site.name()))
+                .filter(site -> "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;"
+                        .equals(site.descriptor()))
+                .filter(site -> !site.targetTypes().isEmpty())
+                .findFirst().orElse(null);
     }
 
     private static void addMember(Set<String> members, String methodKey) {
@@ -825,8 +888,20 @@ public final class ApplicationChainJoiner {
         });
     }
 
-    private static String entryDescriptor(Chain chain) {
+    private static String entryDescriptor(Graph graph, Chain chain) {
         if (chain == null) return "";
+        String descriptor = entryDescriptor(chain);
+        if (!descriptor.isBlank()) {
+            return descriptor;
+        }
+        return ApplicationEntryIndex.uniqueMethodDescriptor(graph, chain.entryClass(),
+                chain.entryMethod());
+    }
+
+    private static String entryDescriptor(Chain chain) {
+        if (chain == null) {
+            return "";
+        }
         for (ChainHop hop : chain.hops()) {
             if (hop.kind() == HopKind.ENTRY && hop.desc() != null && !hop.desc().isBlank()) {
                 return hop.desc();
@@ -848,6 +923,9 @@ public final class ApplicationChainJoiner {
         // value-flow fact or protocol bridge establishes that relation.
         if (bridgeProfile.remoteReply()) {
             return EntryChainJoinEvidence.ValueFlow.PROTOCOL_REPLY;
+        }
+        if (bridgeProfile.jdbcComplete()) {
+            return EntryChainJoinEvidence.ValueFlow.DERIVED_VALUE;
         }
         if (entryMatch != null && entryMatch.typedBinding()) {
             return EntryChainJoinEvidence.ValueFlow.CALLBACK_ARGUMENT;
@@ -887,6 +965,9 @@ public final class ApplicationChainJoiner {
             Chain chain, ApplicationEntryIndex.DeserializeSite site,
             BridgeProfile bridgeProfile) {
         if (bridgeProfile.remoteReply()) {
+            return EntryChainJoinEvidence.CallbackSemantics.PROTOCOL_REENTRY;
+        }
+        if (bridgeProfile.jdbcComplete()) {
             return EntryChainJoinEvidence.CallbackSemantics.PROTOCOL_REENTRY;
         }
         if (site != null && site.bridge() != null && !site.bridge().isBlank()) {
@@ -944,7 +1025,8 @@ public final class ApplicationChainJoiner {
      * a free-form report note as a bridge substitute.
      */
     private static BridgeProfile bridgeProfile(Chain chain,
-                                               ApplicationEntryIndex.DeserializeSite site) {
+                                               ApplicationEntryIndex.DeserializeSite site,
+                                               Graph graph) {
         boolean jacksonBinding = site != null && JACKSON_MAPPER.equals(site.owner())
                 && "readValue".equals(site.name())
                 && "deserialize".equalsIgnoreCase(site.bridge())
@@ -955,8 +1037,16 @@ public final class ApplicationChainJoiner {
         boolean explicitResponse = hasExplicitResponseBridge(chain);
         boolean remoteReply = jndiLookup && (explicitResponse
                 || composedJndi && jacksonBinding && declaredObjectGraph);
+        boolean jdbcConfiguration = isDeclaredJdbcXmlChain(chain);
+        JdbcApplicationProof applicationProof = jdbcConfiguration
+                ? jdbcApplicationProof(graph, site) : JdbcApplicationProof.missing();
+        JdbcDriverProof driverProof = jdbcConfiguration && applicationProof.sequence()
+                ? jdbcDriverProof(graph, applicationProof.hostMethodKey())
+                : JdbcDriverProof.missing();
         return new BridgeProfile(jacksonBinding, jndiLookup, composedJndi,
-                declaredObjectGraph, remoteReply);
+                declaredObjectGraph, remoteReply, jdbcConfiguration,
+                applicationProof.sequence(), driverProof.configuration(),
+                driverProof.driverOwners());
     }
 
     private static boolean hasReason(Chain chain, String expected) {
@@ -1031,6 +1121,268 @@ public final class ApplicationChainJoiner {
                 && toOwner.equals(hop.toOwner()) && toName.equals(hop.toName()));
     }
 
+    /** Exact declarative JDBC/XML boundary, including the shape plan and static API hops. */
+    private static boolean isDeclaredJdbcXmlChain(Chain chain) {
+        if (chain == null || !"java/lang/ClassLoader".equals(chain.sinkClass())
+                || !"defineClass".equals(chain.sinkMethod())
+                || !"([BII)Ljava/lang/Class;".equals(chain.sinkDescriptor())
+                || !chain.terminalSink()
+                || chain.constructionPlan() == null
+                || !chain.constructionPlan().shapeSummary().valid()) {
+            return false;
+        }
+        String xmlContext = "org/springframework/context/support/FileSystemXmlApplicationContext";
+        boolean fragment = "jdbcConfiguration".equals(chain.entryKind())
+                && xmlContext.equals(chain.entryClass())
+                && "<init>".equals(chain.entryMethod())
+                && "(Ljava/lang/String;)V".equals(entryDescriptor(chain));
+        boolean composed = !fragment
+                && hasReason(chain, "bridge-jdbc_xml")
+                && hasHop(chain, "java/sql/Driver", "connect", xmlContext, "<init>");
+        if (!fragment && !composed) {
+            return false;
+        }
+        boolean activated = chain.hops().stream().anyMatch(hop -> hop != null
+                && "fragment-activation-jdbc".equals(hop.reason()));
+        if (!activated) {
+            return false;
+        }
+        Set<String> types = new HashSet<>();
+        chain.constructionPlan().nodes().forEach(node -> {
+            if (node != null) {
+                types.add(node.type());
+            }
+        });
+        return types.contains(xmlContext)
+                && types.contains("org/springframework/beans/factory/config/MethodInvokingFactoryBean")
+                && types.contains("javax/management/loading/MLet")
+                && hasHop(chain, xmlContext, "<init>",
+                "org/springframework/beans/factory/config/MethodInvokingFactoryBean",
+                "afterPropertiesSet")
+                && hasHop(chain,
+                "org/springframework/beans/factory/config/MethodInvokingFactoryBean",
+                "afterPropertiesSet", "javax/management/loading/MLet", "defineClass")
+                && hasHop(chain, "javax/management/loading/MLet", "defineClass",
+                "java/lang/ClassLoader", "defineClass");
+    }
+
+    /** Typed application-side JDBC sequence recovered from one exact binding host. */
+    private static JdbcApplicationProof jdbcApplicationProof(
+            Graph graph, ApplicationEntryIndex.DeserializeSite site) {
+        if (graph == null || site == null || !JACKSON_MAPPER.equals(site.owner())
+                || !"readValue".equals(site.name())
+                || !"(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;"
+                .equals(site.descriptor()) || site.targetTypes().isEmpty()) {
+            return JdbcApplicationProof.missing();
+        }
+        List<Node> calls = graph.callsOfMethod(site.hostMethodKey());
+        Node binding = graph.node(site.callId());
+        if (binding == null || !calls.contains(binding)
+                || !JACKSON_MAPPER.equals(binding.owner())
+                || !"readValue".equals(binding.name())
+                || !site.descriptor().equals(binding.descriptor())) {
+            return JdbcApplicationProof.missing();
+        }
+        Set<String> targetOwners = targetTypeClosure(graph, site.targetTypes());
+        if (!hasMethod(graph, targetOwners, "setDriver", "(Ljava/lang/String;)V")
+                || !hasMethod(graph, targetOwners, "getDriver", "()Ljava/lang/String;")
+                || !hasMethod(graph, targetOwners, "getJdbc", "()Ljava/lang/String;")) {
+            return JdbcApplicationProof.missing();
+        }
+        int bindingIndex = indexOfCall(calls, call -> call == binding);
+        int jdbcIndex = indexOfCall(calls, call -> targetOwners.contains(call.owner())
+                && "getJdbc".equals(call.name())
+                && "()Ljava/lang/String;".equals(call.descriptor()));
+        int validationIndex = indexOfCall(calls, call -> site.hostMethodKey()
+                .startsWith(call.methodOwner() + "#")
+                && call.methodOwner().equals(site.hostMethodKey().substring(0,
+                site.hostMethodKey().indexOf('#')))
+                && "validateJdbcUrl".equals(call.name())
+                && "(Ljava/lang/String;)V".equals(call.descriptor()));
+        int driverIndex = indexOfCall(calls, call -> targetOwners.contains(call.owner())
+                && "getDriver".equals(call.name())
+                && "()Ljava/lang/String;".equals(call.descriptor()));
+        int loadIndex = indexOfCall(calls, call ->
+                ("java/net/URLClassLoader".equals(call.owner())
+                        || "java/lang/ClassLoader".equals(call.owner()))
+                        && "loadClass".equals(call.name())
+                        && JDBC_LOAD_CLASS_DESCRIPTOR.equals(call.descriptor()));
+        int newInstanceIndex = indexOfCall(calls, call ->
+                "java/lang/Class".equals(call.owner())
+                        && "newInstance".equals(call.name())
+                        && JDBC_CLASS_NEW_INSTANCE_DESCRIPTOR.equals(call.descriptor()));
+        int connectIndex = indexOfCall(calls, call -> "java/sql/Driver".equals(call.owner())
+                && "connect".equals(call.name())
+                && JDBC_CONNECT_DESCRIPTOR.equals(call.descriptor()));
+        boolean ordered = bindingIndex >= 0 && bindingIndex < jdbcIndex
+                && jdbcIndex < validationIndex && validationIndex < driverIndex
+                && driverIndex < loadIndex && loadIndex < newInstanceIndex
+                && newInstanceIndex < connectIndex;
+        return ordered ? new JdbcApplicationProof(true, site.hostMethodKey())
+                : JdbcApplicationProof.missing();
+    }
+
+    private static Set<String> targetTypeClosure(Graph graph, List<String> targetTypes) {
+        Set<String> owners = new TreeSet<>();
+        if (targetTypes != null) {
+            targetTypes.stream().filter(value -> value != null && !value.isBlank())
+                    .forEach(owners::add);
+        }
+        boolean changed;
+        do {
+            changed = false;
+            for (Node method : graph.nodesOfType(NodeType.METHOD)) {
+                if (method == null || !owners.contains(method.owner())) {
+                    continue;
+                }
+                Object superName = method.note("classSuperName");
+                if (superName != null && !superName.toString().isBlank()) {
+                    changed |= owners.add(superName.toString());
+                }
+            }
+        } while (changed);
+        return Set.copyOf(owners);
+    }
+
+    private static boolean hasMethod(Graph graph, Set<String> owners, String name,
+                                     String descriptor) {
+        return graph != null && owners != null && owners.stream().anyMatch(owner ->
+                graph.findMethodNode(owner, name, descriptor) != null);
+    }
+
+    private static int indexOfCall(List<Node> calls, Predicate<Node> predicate) {
+        if (calls == null || predicate == null) {
+            return -1;
+        }
+        for (int i = 0; i < calls.size(); i++) {
+            Node call = calls.get(i);
+            if (call != null && predicate.test(call)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** Concrete driver dispatch and its exact configuration path, all from static graph edges. */
+    private static JdbcDriverProof jdbcDriverProof(Graph graph, String applicationHost) {
+        if (graph == null || applicationHost == null || applicationHost.isBlank()) {
+            return JdbcDriverProof.missing();
+        }
+        Set<String> owners = new TreeSet<>();
+        for (Node call : graph.callsOfMethod(applicationHost)) {
+            if (!"java/sql/Driver".equals(call.owner()) || !"connect".equals(call.name())
+                    || !JDBC_CONNECT_DESCRIPTOR.equals(call.descriptor())) {
+                continue;
+            }
+            for (Edge edge : call.out()) {
+                Node target = edge.to();
+                if (target == null || target.type() != NodeType.METHOD
+                        || "java/sql/Driver".equals(target.owner())
+                        || !"connect".equals(target.name())
+                        || !JDBC_CONNECT_DESCRIPTOR.equals(target.descriptor())) {
+                    continue;
+                }
+                String driverKey = methodKey(target.owner(), target.name(), target.descriptor());
+                boolean initConfig = hasReachableCall(graph, driverKey, candidate ->
+                        target.owner().equals(candidate.owner())
+                                && "initJDBCCONF".equals(candidate.name())
+                                && JDBC_INIT_CONFIG_DESCRIPTOR.equals(candidate.descriptor()));
+                boolean loadConfig = hasReachableCall(graph, driverKey, candidate ->
+                target.owner().equals(candidate.owner())
+                        && "loadPropertyFiles".equals(candidate.name())
+                                && JDBC_LOAD_CONFIG_DESCRIPTOR.equals(candidate.descriptor()));
+                boolean fileInput = hasReachableCall(graph, driverKey, candidate ->
+                        "java/io/FileInputStream".equals(candidate.owner())
+                                && "<init>".equals(candidate.name())
+                                && "(Ljava/io/File;)V".equals(candidate.descriptor()));
+                boolean propertiesLoad = hasReachableCall(graph, driverKey, candidate ->
+                        "java/util/Properties".equals(candidate.owner())
+                                && "load".equals(candidate.name())
+                                && "(Ljava/io/InputStream;)V".equals(candidate.descriptor()));
+                boolean socketFactory = hasReachableCall(graph, driverKey, candidate ->
+                        candidate.owner() != null
+                                && candidate.owner().endsWith("/SocketFactoryFactory")
+                                && "getSocketFactory".equals(candidate.name())
+                                && JDBC_SOCKET_FACTORY_DESCRIPTOR.equals(candidate.descriptor()));
+                boolean untypedFactory = hasReachableCall(graph, driverKey, candidate ->
+                        candidate.owner() != null
+                                && candidate.owner().endsWith("/ObjectFactory")
+                                && "instantiate".equals(candidate.name())
+                                && JDBC_UNTYPED_FACTORY_DESCRIPTOR.equals(candidate.descriptor()));
+                boolean typedFactory = hasReachableCall(graph, driverKey, candidate ->
+                        candidate.owner() != null
+                                && candidate.owner().endsWith("/ObjectFactory")
+                                && "instantiate".equals(candidate.name())
+                                && candidate.descriptor() != null
+                                && candidate.descriptor().startsWith(
+                                JDBC_TYPED_FACTORY_DESCRIPTOR_PREFIX));
+                if (initConfig && loadConfig && fileInput && propertiesLoad && socketFactory
+                        && untypedFactory && !typedFactory) {
+                    owners.add(target.owner());
+                }
+            }
+        }
+        return owners.isEmpty() ? JdbcDriverProof.missing()
+                : new JdbcDriverProof(true, String.join(",", owners));
+    }
+
+    /** Bounded reachability over actual CALL→METHOD edges; it never invokes target code. */
+    private static boolean hasReachableCall(Graph graph, String startMethod,
+                                            Predicate<Node> predicate) {
+        if (graph == null || startMethod == null || startMethod.isBlank() || predicate == null) {
+            return false;
+        }
+        Set<String> visited = new HashSet<>();
+        ArrayDeque<String> work = new ArrayDeque<>();
+        work.add(startMethod);
+        while (!work.isEmpty() && visited.size() < MAX_JDBC_REACHABLE_METHODS) {
+            String current = work.removeFirst();
+            if (!visited.add(current)) {
+                continue;
+            }
+            for (Node call : graph.callsOfMethod(current)) {
+                if (call != null && predicate.test(call)) {
+                    return true;
+                }
+                if (call == null) {
+                    continue;
+                }
+                for (Edge edge : call.out()) {
+                    if (!isCallEdge(edge) || edge.to() == null
+                            || edge.to().type() != NodeType.METHOD) {
+                        continue;
+                    }
+                    String next = methodKey(edge.to().owner(), edge.to().name(),
+                            edge.to().descriptor());
+                    if (!visited.contains(next)) {
+                        work.addLast(next);
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private record JdbcApplicationProof(boolean sequence, String hostMethodKey) {
+        private JdbcApplicationProof {
+            hostMethodKey = hostMethodKey == null ? "" : hostMethodKey;
+        }
+
+        private static JdbcApplicationProof missing() {
+            return new JdbcApplicationProof(false, "");
+        }
+    }
+
+    private record JdbcDriverProof(boolean configuration, String driverOwners) {
+        private JdbcDriverProof {
+            driverOwners = driverOwners == null ? "" : driverOwners;
+        }
+
+        private static JdbcDriverProof missing() {
+            return new JdbcDriverProof(false, "");
+        }
+    }
+
     private static void addBridgeProfileAttributes(Map<String, String> attributes,
                                                    BridgeProfile profile) {
         if (attributes == null || profile == null) {
@@ -1050,6 +1402,18 @@ public final class ApplicationChainJoiner {
             attributes.put("protocol_reply", "RMI_SERIALIZED_OBJECT");
             attributes.put("reply_deserialization", "JAVA_OBJECT_STREAM");
         }
+        if (profile.jdbcConfiguration()) {
+            attributes.put("jdbc_configuration", "DECLARED_XML_CLASS_DEFINITION");
+            attributes.put("jdbc_application_sequence", Boolean.toString(
+                    profile.jdbcApplicationSequence()));
+            attributes.put("jdbc_driver_configuration", Boolean.toString(
+                    profile.jdbcDriverConfiguration()));
+            if (!profile.jdbcDriverOwners().isBlank()) {
+                attributes.put("jdbc_driver_owners", profile.jdbcDriverOwners());
+            }
+            attributes.put("jdbc_terminal_boundary",
+                    "java/lang/ClassLoader#defineClass([BII)Ljava/lang/Class;");
+        }
         if (profile.declaredObjectGraph()) {
             attributes.put("object_graph_construction", "DECLARED_SHAPE");
             attributes.put("object_graph_path", EVENT_LISTENER_LIST + ".toString->"
@@ -1063,7 +1427,17 @@ public final class ApplicationChainJoiner {
 
     private record BridgeProfile(boolean jacksonBinding, boolean jndiLookup,
                                  boolean composedJndi, boolean declaredObjectGraph,
-                                 boolean remoteReply) {
+                                 boolean remoteReply, boolean jdbcConfiguration,
+                                 boolean jdbcApplicationSequence,
+                                 boolean jdbcDriverConfiguration,
+                                 String jdbcDriverOwners) {
+        private BridgeProfile {
+            jdbcDriverOwners = jdbcDriverOwners == null ? "" : jdbcDriverOwners;
+        }
+
+        private boolean jdbcComplete() {
+            return jdbcConfiguration && jdbcApplicationSequence && jdbcDriverConfiguration;
+        }
     }
 
     private static FindingState.Risk risk(SinkRisk sinkRisk) {
