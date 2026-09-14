@@ -826,10 +826,12 @@ public final class ApplicationChainJoiner {
         }
         if (value.contains("jdbc") || value.contains("driver")) return BridgeEvidence.Kind.JDBC_DRIVER;
         if (value.contains("second") || value.contains("remote") || value.contains("response")
-                || value.contains("bridge-source-deserialize")) {
+                || value.contains("deser") || value.contains("bridge-source-deserialize")) {
             return BridgeEvidence.Kind.SECOND_DESERIALIZATION;
         }
-        if (value.contains("reflect")) return BridgeEvidence.Kind.REFLECTION;
+        if (value.contains("reflect") || value.contains("invoke")) {
+            return BridgeEvidence.Kind.REFLECTION;
+        }
         return BridgeEvidence.Kind.UNKNOWN;
     }
 

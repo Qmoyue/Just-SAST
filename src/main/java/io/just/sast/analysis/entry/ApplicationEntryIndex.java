@@ -713,7 +713,7 @@ public final class ApplicationEntryIndex {
         List<DeserializeSite> sites = new ArrayList<>();
         Map<String, Boolean> sourceHosts = new HashMap<>();
         Map<String, DeserializeHost> deserializeHosts = new TreeMap<>();
-        Set<String> siteHosts = new TreeSet<>();
+        Set<String> bindingSiteHosts = new TreeSet<>();
         Set<String> acceptedTypePrefixes = acceptedTypePrefixes(graph);
         List<String> acceptedApplicationTypes = owners.stream()
                 .filter(owner -> acceptedTypePrefixes.stream().anyMatch(owner::startsWith))
@@ -743,7 +743,6 @@ public final class ApplicationEntryIndex {
             if (deserializeHost != null) {
                 deserializeHosts.putIfAbsent(deserializeHost.hostMethodKey(), deserializeHost);
             }
-            siteHosts.add(host);
             Node hostNode = methods.get(host);
             // Java visibility is not an external-control proof.  A public service/helper that
             // happens to call ObjectInputStream is still an application-internal site; the
@@ -790,7 +789,7 @@ public final class ApplicationEntryIndex {
                 continue;
             }
             String host = methodKey(method.owner(), method.name(), method.descriptor());
-            if (!siteHosts.add(host)) {
+            if (!bindingSiteHosts.add(host)) {
                 continue;
             }
             List<String> declaredBindingTypes = referenceParameterTypes(method.descriptor());

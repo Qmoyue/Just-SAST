@@ -4,6 +4,7 @@ import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
+import io.just.sast.blackboard.BridgeEvidence;
 import io.just.sast.blackboard.EvidenceAtom;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.config.Match;
@@ -594,6 +595,52 @@ class ApplicationChainJoinerContractTest {
 
         assertEquals(1, evidence.joinCount());
         assertEquals("JOINED", evidence.decisions().get(composed.key()));
+    }
+
+    @Test
+    void normalizedBridgeReasonsAdmitApplicationJoinAndRetainTypedKinds() {
+        Graph graph = new Graph();
+        graph.methodNode(APP, "handle", "()V", false);
+        graph.methodNode(GADGET, "trigger", "()V", false);
+        Node runtime = graph.methodNode(RUNTIME, "exec", SINK_DESC, true);
+        Node exec = graph.addCallNode(RUNTIME, "exec", SINK_DESC, "VIRTUAL", null, 0,
+                GADGET, "trigger", "()V");
+        graph.addEdge(exec, runtime, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(APP), true);
+        Chain reflection = new Chain("bridge-reflection", "COMMAND", "HIGH", APP, "handle",
+                "http", RUNTIME, "exec", List.of(
+                new ChainHop(APP, "handle", APP, "handle", HopKind.ENTRY,
+                        null, "http", "()V", null),
+                new ChainHop(APP, "handle", GADGET, "trigger", HopKind.DIRECT_CALL,
+                        null, "bridge-invoke", "()V", 0),
+                new ChainHop(GADGET, "trigger", RUNTIME, "exec", HopKind.DIRECT_CALL,
+                        null, "terminal", SINK_DESC, 0)), 0, SINK_DESC, "TERMINAL");
+        Chain secondDeserialize = new Chain("bridge-second-deserialize", "COMMAND", "HIGH",
+                APP, "handle", "http", RUNTIME, "exec", List.of(
+                new ChainHop(APP, "handle", APP, "handle", HopKind.ENTRY,
+                        null, "http", "()V", null),
+                new ChainHop(APP, "handle", GADGET, "trigger", HopKind.DIRECT_CALL,
+                        null, "bridge-deser", "()V", 0),
+                new ChainHop(GADGET, "trigger", RUNTIME, "exec", HopKind.DIRECT_CALL,
+                        null, "terminal", SINK_DESC, 0)), 0, SINK_DESC, "TERMINAL");
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(reflection, secondDeserialize), true, "A".repeat(64), Set.of());
+
+        assertEquals(2, evidence.joinCount());
+        assertEquals("JOINED", evidence.decisions().get(reflection.key()));
+        assertEquals("JOINED", evidence.decisions().get(secondDeserialize.key()));
+        Set<BridgeEvidence.Kind> bridgeKinds = evidence.graph().nodes().stream()
+                .filter(BridgeEvidence.class::isInstance)
+                .map(BridgeEvidence.class::cast)
+                .map(BridgeEvidence::kind)
+                .collect(java.util.stream.Collectors.toSet());
+        assertTrue(bridgeKinds.contains(BridgeEvidence.Kind.REFLECTION));
+        assertTrue(bridgeKinds.contains(BridgeEvidence.Kind.SECOND_DESERIALIZATION));
     }
 
     @Test

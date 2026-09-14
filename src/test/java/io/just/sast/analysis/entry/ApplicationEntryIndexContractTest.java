@@ -214,6 +214,44 @@ class ApplicationEntryIndexContractTest {
     }
 
     @Test
+    void bindingSiteIsRetainedWhenTheSameControllerMethodReadsTheObject() {
+        String controller = "fixture/app/Controller";
+        String methodKey = controller + "#accept(Ljava/lang/String;)V";
+        Graph graph = new Graph();
+        Node endpoint = graph.methodNode(controller, "accept", "(Ljava/lang/String;)V", false);
+        endpoint.propsNote("methodAccess", Modifier.PUBLIC);
+        endpoint.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        endpoint.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PostMapping;"));
+        Node ois = graph.methodNode("java/io/ObjectInputStream", "readObject",
+                "()Ljava/lang/Object;", true);
+        Node read = graph.addCallNode("java/io/ObjectInputStream", "readObject",
+                "()Ljava/lang/Object;", "VIRTUAL", null, 12, controller, "accept",
+                "(Ljava/lang/String;)V");
+        graph.addEdge(read, ois, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of(controller), true);
+
+        assertEquals(2, index.deserializeSites().size(),
+                "a controller method can expose both its framework binding and its Kryo/OIS site");
+        assertTrue(index.deserializeSites().stream().anyMatch(site ->
+                methodKey.equals(site.hostMethodKey())
+                        && "builtin:ois-read".equals(site.ruleId())));
+        assertTrue(index.deserializeSites().stream().anyMatch(site ->
+                methodKey.equals(site.hostMethodKey())
+                        && "builtin:framework-binding".equals(site.ruleId())
+                        && site.bridge().equals("framework-binding")));
+        assertEquals(2, index.applicationInputSitesForMember(controller, "accept").size());
+        assertEquals(1, index.typedBindingSites().stream()
+                .filter(site -> methodKey.equals(site.hostMethodKey())
+                        && "builtin:framework-binding".equals(site.ruleId())).count());
+    }
+
+    @Test
     void knownScopeExcludesDependencyOnlyDeserializeRootFromLegacyClosure() {
         Graph graph = new Graph();
         Node dependencyEntry = graph.methodNode(GADGET, "readObject", "()V", false);
