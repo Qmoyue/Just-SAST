@@ -147,6 +147,14 @@ public final class ApplicationChainJoiner {
             return Decision.rejected("APPLICATION_ENTRY_NOT_IN_CHAIN");
         }
         String entryKey = entryMatch.applicationEntryKey();
+        boolean frameworkService = index.isFrameworkServiceMethod(entryKey);
+        if (frameworkService && !index.isRegisteredServiceMethod(entryKey)) {
+            return Decision.rejected("SERVICE_ENDPOINT_NOT_REGISTERED");
+        }
+        if (frameworkService && index.hasApplicationObjectInputStreamSite(entryKey)
+                && !index.hasSecondaryDeserializationHop(chain.hops())) {
+            return Decision.rejected("SECOND_DESERIALIZATION_NOT_IN_CHAIN");
+        }
         Set<String> chainMethods = chainMethodIdentities(chain);
         ApplicationEntryIndex.TerminalDecision terminalDecision = index.terminalAdmission(
                 chain.sinkClass(), chain.sinkMethod(), chain.sinkDescriptor());
@@ -182,6 +190,21 @@ public final class ApplicationChainJoiner {
             // The path is a bounded list of canonical method keys, not a renderer note.  It is
             // part of the atom identity so a changed call prefix cannot reuse an old join ID.
             entryAttributes.put("entry_prefix_path", String.join("->", entryMatch.path()));
+        }
+        List<ApplicationEntryIndex.ServiceEndpoint> serviceEndpoints =
+                index.serviceEndpointsFor(entryKey);
+        EntryChainJoinEvidence.FilterDominance filterDominance =
+                index.filterDominanceFor(entryKey);
+        if (!serviceEndpoints.isEmpty()) {
+            ApplicationEntryIndex.ServiceEndpoint endpoint = serviceEndpoints.get(0);
+            entryAttributes.put("service_protocol", endpoint.protocol());
+            entryAttributes.put("service_publish_path", endpoint.publishPath());
+            entryAttributes.put("service_configuration_method",
+                    endpoint.configurationMethodKey());
+            entryAttributes.put("service_registration", "EndpointImpl.publish");
+            entryAttributes.put("filter_dominance", filterDominance.name());
+            entryAttributes.put("filter_control_count",
+                    Integer.toString(index.filterControls().size()));
         }
         ApplicationEntryIndex.DeserializeSite site = entryMatch.bindingSite() != null
                 ? entryMatch.bindingSite() : findSite(index, entryKey, chainMethods);
@@ -231,22 +254,36 @@ public final class ApplicationChainJoiner {
         List<BridgeEvidence> bridges = new ArrayList<>();
         if (site != null) {
             BridgeEvidence.Kind kind = bridgeKind(site.bridge());
-            if (kind != BridgeEvidence.Kind.UNKNOWN) {
-                bridges.add(BridgeEvidence.of(kind, siteAtom.id(), terminal.id(),
-                        site.bridge(), BridgeEvidence.Status.PARTIAL));
+            // The first ObjectInputStream/source boundary is the site itself, not a second
+            // protocol bridge.  The secondary bridge below is emitted only from the indexed
+            // tainted source hop, so a generic "deserialize" label cannot self-promote into a
+            // nested-deserialization claim.
+            if (kind != BridgeEvidence.Kind.UNKNOWN
+                    && !"builtin:ois-read".equals(site.ruleId())
+                    && !"deserialize".equalsIgnoreCase(site.bridge())) {
+                addBridge(bridges, kind, siteAtom.id(), terminal.id(), site.bridge());
             }
+        }
+        if (!serviceEndpoints.isEmpty()) {
+            ApplicationEntryIndex.ServiceEndpoint endpoint = serviceEndpoints.get(0);
+            addBridge(bridges, BridgeEvidence.Kind.CONFIGURATION, siteAtom.id(), terminal.id(),
+                    endpoint.protocol() + ":" + endpoint.publishPath());
+        }
+        if (index.hasSecondaryDeserializationHop(chain.hops())) {
+            addBridge(bridges, BridgeEvidence.Kind.SECOND_DESERIALIZATION, siteAtom.id(),
+                    terminal.id(), "secondary-deserialization");
         }
         for (ChainHop hop : chain.hops()) {
             if (hop.reason() == null || !hop.reason().startsWith("bridge-")) {
                 continue;
             }
-            bridges.add(BridgeEvidence.of(bridgeKind(hop.reason()), siteAtom.id(), terminal.id(),
-                    hop.reason(), BridgeEvidence.Status.PARTIAL));
+            addBridge(bridges, bridgeKind(hop.reason()), siteAtom.id(), terminal.id(),
+                    hop.reason());
         }
         List<String> bridgeIds = bridges.stream().map(BridgeEvidence::id).sorted().toList();
         EntryChainJoinEvidence join = EntryChainJoinEvidence.of(chainId, entry.id(), siteAtom.id(),
                 segmentId, flow, identity, callback, runtimeType, compatibility,
-                EntryChainJoinEvidence.FilterDominance.UNKNOWN, construction, bridgeIds);
+                filterDominance, construction, bridgeIds);
         FindingState state = new FindingState(
                 index.isExternalEntryMethod(entryKey) ? FindingState.EntryStatus.EXTERNAL_ENTRY
                         : FindingState.EntryStatus.APPLICATION_ENTRY,
@@ -283,6 +320,21 @@ public final class ApplicationChainJoiner {
                     "BRIDGE_TO_DEPENDENCY_SUFFIX"));
         }
         return new Decision("JOINED", join, state, localNodes.values().stream().toList(), localEdges);
+    }
+
+    private static void addBridge(List<BridgeEvidence> bridges, BridgeEvidence.Kind kind,
+                                  String fromAtomId, String toAtomId, String protocol) {
+        if (kind == null || protocol == null || protocol.isBlank()) {
+            return;
+        }
+        boolean present = bridges.stream().anyMatch(existing -> existing.kind() == kind
+                && existing.fromAtomId().equals(fromAtomId)
+                && existing.toAtomId().equals(toAtomId)
+                && existing.protocol().equals(protocol));
+        if (!present) {
+            bridges.add(BridgeEvidence.of(kind, fromAtomId, toAtomId, protocol,
+                    BridgeEvidence.Status.PARTIAL));
+        }
     }
 
     /**

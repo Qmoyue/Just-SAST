@@ -3,6 +3,7 @@ package io.just.sast.analysis.entry;
 import io.just.sast.analysis.taint.SerializationModel;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
+import io.just.sast.blackboard.EntryChainJoinEvidence;
 import io.just.sast.blackboard.FindingState;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.SinkRisk;
@@ -48,7 +49,7 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 3;
+    public static final int MODEL_VERSION = 4;
     private static final int MAX_SLICE_METHODS = 100_000;
     private static final String FRAMEWORK_ENTRY_RULE = "builtin:framework-entry";
     private static final String FRAMEWORK_BINDING_RULE = "builtin:framework-binding";
@@ -106,6 +107,30 @@ public final class ApplicationEntryIndex {
             if (externalControlProven && status != FindingState.EntryStatus.EXTERNAL_ENTRY) {
                 throw new IllegalArgumentException("external control requires EXTERNAL_ENTRY");
             }
+        }
+    }
+
+    /** Immutable CXF endpoint registration fact recovered from application bytecode. */
+    public record ServiceEndpoint(String configurationMethodKey, String serviceMethodKey,
+                                  String protocol, String publishPath) {
+        public ServiceEndpoint {
+            configurationMethodKey = requireText(configurationMethodKey,
+                    "configurationMethodKey");
+            serviceMethodKey = requireText(serviceMethodKey, "serviceMethodKey");
+            protocol = requireText(protocol, "protocol");
+            publishPath = requireText(publishPath, "publishPath");
+        }
+    }
+
+    /** Immutable route-control fact from a concrete Servlet Filter implementation. */
+    public record FilterControl(String methodKey, String pathPrefix, String blockedPath,
+                                String blockedMethod, boolean remoteAddressGuard,
+                                boolean passThrough, boolean pathNormalization) {
+        public FilterControl {
+            methodKey = requireText(methodKey, "methodKey");
+            pathPrefix = pathPrefix == null ? "" : pathPrefix.trim();
+            blockedPath = blockedPath == null ? "" : blockedPath.trim();
+            blockedMethod = blockedMethod == null ? "" : blockedMethod.trim();
         }
     }
 
@@ -453,6 +478,12 @@ public final class ApplicationEntryIndex {
     private final List<DeserializeSite> typedBindingSites;
     private final Map<String, List<DeserializeSite>> typedBindingSitesByTarget;
     private final Map<String, List<DeserializeSite>> applicationInputSitesByMember;
+    private final List<ServiceEndpoint> serviceEndpoints;
+    private final Map<String, List<ServiceEndpoint>> serviceEndpointsByMethod;
+    private final List<FilterControl> filterControls;
+    private final Map<String, EntryChainJoinEvidence.FilterDominance> filterDominanceByService;
+    private final List<DeserializeSite> secondaryDeserializeSites;
+    private final Set<String> applicationObjectInputHosts;
     private final List<TerminalImpact> terminalImpacts;
     private final List<String> entryForwardSlice;
     private final List<String> sinkReverseSlice;
@@ -476,6 +507,8 @@ public final class ApplicationEntryIndex {
                                   List<ExecutionEntry> executionEntries,
                                   List<DeserializeSite> deserializeSites,
                                   List<DeserializeHost> deserializeHosts,
+                                  List<ServiceEndpoint> serviceEndpoints,
+                                  List<FilterControl> filterControls,
                                   List<TerminalImpact> terminalImpacts,
                                   List<String> entryForwardSlice,
                                   List<String> sinkReverseSlice,
@@ -502,6 +535,19 @@ public final class ApplicationEntryIndex {
                 .toList();
         this.typedBindingSitesByTarget = immutableBindingTargetIndex(this.typedBindingSites);
         this.applicationInputSitesByMember = immutableSiteMemberIndex(this.applicationInputSites);
+        this.serviceEndpoints = immutableServiceEndpoints(serviceEndpoints);
+        this.serviceEndpointsByMethod = immutableServiceEndpointIndex(this.serviceEndpoints);
+        this.filterControls = immutableFilterControls(filterControls);
+        this.filterDominanceByService = immutableFilterDominanceIndex(this.serviceEndpoints,
+                this.filterControls);
+        this.secondaryDeserializeSites = this.deserializeSites.stream()
+                .filter(ApplicationEntryIndex::isSecondaryDeserializeSite)
+                .toList();
+        this.applicationObjectInputHosts = immutableSorted(this.deserializeSites.stream()
+                .filter(ApplicationEntryIndex::isObjectInputStreamSite)
+                .filter(DeserializeSite::applicationOwned)
+                .map(DeserializeSite::hostMethodKey)
+                .collect(java.util.stream.Collectors.toSet()));
         this.terminalImpacts = List.copyOf(terminalImpacts);
         this.entryForwardSlice = List.copyOf(entryForwardSlice);
         this.sinkReverseSlice = List.copyOf(sinkReverseSlice);
@@ -631,6 +677,343 @@ public final class ApplicationEntryIndex {
         return Map.copyOf(result);
     }
 
+    /** Discover CXF endpoint registration from the constructor/publish call sequence. */
+    private static List<ServiceEndpoint> discoverServiceEndpoints(
+            Graph graph, List<ExecutionEntry> entries, Set<String> applicationOwners,
+            boolean applicationScopeKnown) {
+        if (graph == null || !applicationScopeKnown || applicationOwners.isEmpty()) {
+            return List.of();
+        }
+        Map<String, List<String>> serviceMethodsByOwner = new TreeMap<>();
+        for (ExecutionEntry entry : entries) {
+            if (entry.applicationOwned() && "framework-service".equals(entry.entryKind())) {
+                serviceMethodsByOwner.computeIfAbsent(entry.owner(), ignored -> new ArrayList<>())
+                        .add(entry.methodKey());
+            }
+        }
+        if (serviceMethodsByOwner.isEmpty()) {
+            return List.of();
+        }
+        serviceMethodsByOwner.values().forEach(values -> values.sort(String::compareTo));
+        List<ServiceEndpoint> result = new ArrayList<>();
+        for (Node method : graph.nodesOfType(NodeType.METHOD)) {
+            if (method == null || !applicationOwners.contains(method.owner())) {
+                continue;
+            }
+            String configurationMethod = methodKey(method.owner(), method.name(),
+                    method.descriptor());
+            List<Node> calls = new ArrayList<>(graph.callsOfMethod(configurationMethod));
+            calls.sort(Comparator.comparingLong(Node::id));
+            Set<String> constructedServiceOwners = new TreeSet<>();
+            boolean endpointConstructed = false;
+            for (Node call : calls) {
+                if (isApplicationServiceConstructor(call, serviceMethodsByOwner.keySet())) {
+                    constructedServiceOwners.add(call.owner());
+                }
+                if (isCxfEndpointConstructor(call)) {
+                    endpointConstructed = !constructedServiceOwners.isEmpty();
+                    continue;
+                }
+                if (!endpointConstructed || !isCxfEndpointPublish(call)) {
+                    continue;
+                }
+                String publishPath = firstPathLiteral(call);
+                if (!publishPath.isBlank()) {
+                    for (String serviceOwner : constructedServiceOwners) {
+                        for (String serviceMethod : serviceMethodsByOwner.getOrDefault(
+                                serviceOwner, List.of())) {
+                            result.add(new ServiceEndpoint(configurationMethod, serviceMethod,
+                                    "SOAP/CXF", publishPath));
+                        }
+                    }
+                }
+                endpointConstructed = false;
+            }
+        }
+        return immutableServiceEndpoints(result);
+    }
+
+    /** Discover only concrete Filter#doFilter control facts from application bytecode. */
+    private static List<FilterControl> discoverFilterControls(Graph graph,
+                                                               Set<String> applicationOwners,
+                                                               boolean applicationScopeKnown) {
+        if (graph == null || !applicationScopeKnown || applicationOwners.isEmpty()) {
+            return List.of();
+        }
+        List<FilterControl> result = new ArrayList<>();
+        for (Node method : graph.nodesOfType(NodeType.METHOD)) {
+            if (method == null || !applicationOwners.contains(method.owner())
+                    || !isFilterImplementation(method)
+                    || !isFilterMethodDescriptor(method.descriptor())
+                    || !"doFilter".equals(method.name())) {
+                continue;
+            }
+            String methodKey = methodKey(method.owner(), method.name(), method.descriptor());
+            List<Node> calls = new ArrayList<>(graph.callsOfMethod(methodKey));
+            calls.sort(Comparator.comparingLong(Node::id));
+            boolean requestUri = hasCall(calls, "javax/servlet/http/HttpServletRequest",
+                    "getRequestURI", "()Ljava/lang/String;")
+                    || hasCall(calls, "jakarta/servlet/http/HttpServletRequest",
+                    "getRequestURI", "()Ljava/lang/String;");
+            boolean requestMethod = hasCall(calls, "javax/servlet/http/HttpServletRequest",
+                    "getMethod", "()Ljava/lang/String;")
+                    || hasCall(calls, "jakarta/servlet/http/HttpServletRequest",
+                    "getMethod", "()Ljava/lang/String;");
+            boolean remoteAddress = hasCall(calls, "javax/servlet/http/HttpServletRequest",
+                    "getRemoteAddr", "()Ljava/lang/String;")
+                    || hasCall(calls, "jakarta/servlet/http/HttpServletRequest",
+                    "getRemoteAddr", "()Ljava/lang/String;");
+            boolean addressClassifier = remoteAddress && hasLocalStringBooleanCall(calls,
+                    method.owner());
+            boolean passThrough = hasCall(calls, "javax/servlet/FilterChain", "doFilter",
+                    "(Ljavax/servlet/ServletRequest;Ljavax/servlet/ServletResponse;)V")
+                    || hasCall(calls, "jakarta/servlet/FilterChain", "doFilter",
+                    "(Ljakarta/servlet/ServletRequest;Ljakarta/servlet/ServletResponse;)V");
+            String pathPrefix = firstPredicateLiteral(calls, "startsWith",
+                    "(Ljava/lang/String;)Z", true);
+            String blockedPath = firstPredicateLiteral(calls, "equals",
+                    "(Ljava/lang/Object;)Z", true);
+            String blockedMethod = firstPredicateLiteral(calls, "equalsIgnoreCase",
+                    "(Ljava/lang/String;)Z", false);
+            boolean normalized = hasLocalStringReturnCall(calls, method.owner());
+            if (!requestUri && !requestMethod && !remoteAddress && !passThrough) {
+                continue;
+            }
+            result.add(new FilterControl(methodKey, pathPrefix, blockedPath, blockedMethod,
+                    addressClassifier, passThrough, normalized));
+        }
+        return immutableFilterControls(result);
+    }
+
+    private static boolean isApplicationServiceConstructor(Node call,
+                                                            Set<String> serviceOwners) {
+        return call != null && "<init>".equals(call.name())
+                && serviceOwners.contains(call.owner());
+    }
+
+    private static boolean isCxfEndpointConstructor(Node call) {
+        return call != null && "org/apache/cxf/jaxws/EndpointImpl".equals(call.owner())
+                && "<init>".equals(call.name())
+                && "(Lorg/apache/cxf/Bus;Ljava/lang/Object;)V".equals(call.descriptor());
+    }
+
+    private static boolean isCxfEndpointPublish(Node call) {
+        return call != null && "org/apache/cxf/jaxws/EndpointImpl".equals(call.owner())
+                && "publish".equals(call.name())
+                && "(Ljava/lang/String;)V".equals(call.descriptor());
+    }
+
+    private static boolean isFilterImplementation(Node method) {
+        Object interfaces = method == null ? null : method.note("classInterfaces");
+        if (!(interfaces instanceof Iterable<?> values)) {
+            return false;
+        }
+        for (Object value : values) {
+            if ("javax/servlet/Filter".equals(String.valueOf(value))
+                    || "jakarta/servlet/Filter".equals(String.valueOf(value))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isFilterMethodDescriptor(String descriptor) {
+        return "(Ljavax/servlet/ServletRequest;Ljavax/servlet/ServletResponse;"
+                .concat("Ljavax/servlet/FilterChain;)V").equals(descriptor)
+                || "(Ljakarta/servlet/ServletRequest;Ljakarta/servlet/ServletResponse;"
+                .concat("Ljakarta/servlet/FilterChain;)V").equals(descriptor);
+    }
+
+    private static boolean hasCall(List<Node> calls, String owner, String name, String descriptor) {
+        return calls.stream().anyMatch(call -> owner.equals(call.owner())
+                && name.equals(call.name()) && descriptor.equals(call.descriptor()));
+    }
+
+    private static boolean hasLocalStringBooleanCall(List<Node> calls, String owner) {
+        return calls.stream().anyMatch(call -> owner.equals(call.owner())
+                && !"<init>".equals(call.name())
+                && "(Ljava/lang/String;)Z".equals(call.descriptor()));
+    }
+
+    private static boolean hasLocalStringReturnCall(List<Node> calls, String owner) {
+        return calls.stream().anyMatch(call -> owner.equals(call.owner())
+                && "(Ljava/lang/String;)Ljava/lang/String;".equals(call.descriptor())
+                && call.name().toLowerCase(java.util.Locale.ROOT).contains("normal"));
+    }
+
+    private static String firstPredicateLiteral(List<Node> calls, String name, String descriptor,
+                                                boolean path) {
+        for (Node call : calls) {
+            if (!"java/lang/String".equals(call.owner()) || !name.equals(call.name())
+                    || !descriptor.equals(call.descriptor())) {
+                continue;
+            }
+            String value = firstStringHint(call, path);
+            if (!value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    private static String firstPathLiteral(Node call) {
+        return firstStringHint(call, true);
+    }
+
+    private static String firstStringHint(Node call, boolean path) {
+        if (call == null) {
+            return "";
+        }
+        Object hints = call.note("stringLiteralHints");
+        if (!(hints instanceof Iterable<?> values)) {
+            return "";
+        }
+        for (Object value : values) {
+            if (value == null) {
+                continue;
+            }
+            String text = value.toString().trim();
+            if (text.isBlank() || text.length() > 256) {
+                continue;
+            }
+            if (path == text.startsWith("/")) {
+                return text;
+            }
+        }
+        return "";
+    }
+
+    private static List<ServiceEndpoint> immutableServiceEndpoints(
+            List<ServiceEndpoint> endpoints) {
+        if (endpoints == null || endpoints.isEmpty()) {
+            return List.of();
+        }
+        return endpoints.stream().filter(Objects::nonNull)
+                .sorted(Comparator.comparing(ServiceEndpoint::serviceMethodKey)
+                        .thenComparing(ServiceEndpoint::configurationMethodKey)
+                        .thenComparing(ServiceEndpoint::publishPath)
+                        .thenComparing(ServiceEndpoint::protocol))
+                .distinct().toList();
+    }
+
+    private static Map<String, List<ServiceEndpoint>> immutableServiceEndpointIndex(
+            List<ServiceEndpoint> endpoints) {
+        if (endpoints == null || endpoints.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, List<ServiceEndpoint>> grouped = new TreeMap<>();
+        for (ServiceEndpoint endpoint : endpoints) {
+            grouped.computeIfAbsent(endpoint.serviceMethodKey(), ignored -> new ArrayList<>())
+                    .add(endpoint);
+        }
+        Map<String, List<ServiceEndpoint>> result = new TreeMap<>();
+        grouped.forEach((key, values) -> result.put(key, List.copyOf(values)));
+        return Map.copyOf(result);
+    }
+
+    private static List<FilterControl> immutableFilterControls(List<FilterControl> controls) {
+        if (controls == null || controls.isEmpty()) {
+            return List.of();
+        }
+        return controls.stream().filter(Objects::nonNull)
+                .sorted(Comparator.comparing(FilterControl::methodKey)
+                        .thenComparing(FilterControl::pathPrefix)
+                        .thenComparing(FilterControl::blockedPath)
+                        .thenComparing(FilterControl::blockedMethod))
+                .distinct().toList();
+    }
+
+    private static Map<String, EntryChainJoinEvidence.FilterDominance>
+    immutableFilterDominanceIndex(List<ServiceEndpoint> endpoints,
+                                  List<FilterControl> controls) {
+        if (endpoints == null || endpoints.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, EntryChainJoinEvidence.FilterDominance> result = new TreeMap<>();
+        for (ServiceEndpoint endpoint : endpoints) {
+            EntryChainJoinEvidence.FilterDominance current = filterDominance(endpoint, controls);
+            EntryChainJoinEvidence.FilterDominance previous = result.get(endpoint.serviceMethodKey());
+            result.put(endpoint.serviceMethodKey(), mergeFilterDominance(previous, current));
+        }
+        return Map.copyOf(result);
+    }
+
+    private static EntryChainJoinEvidence.FilterDominance filterDominance(
+            ServiceEndpoint endpoint, List<FilterControl> controls) {
+        if (controls == null || controls.isEmpty()) {
+            return EntryChainJoinEvidence.FilterDominance.NOT_PRESENT;
+        }
+        for (FilterControl control : controls) {
+            String prefix = canonicalPath(control.pathPrefix());
+            String route = routePath(prefix, endpoint.publishPath());
+            if (prefix.isBlank() || route.isBlank()
+                    || !(route.equals(prefix) || route.startsWith(prefix + "/"))) {
+                continue;
+            }
+            String blockedPath = canonicalPath(control.blockedPath());
+            if (blockedPath.equals(route)) {
+                return EntryChainJoinEvidence.FilterDominance.DOMINATES;
+            }
+            if (!blockedPath.equals(prefix) || !control.passThrough()) {
+                continue;
+            }
+            String blockedMethod = control.blockedMethod();
+            if (blockedMethod.isBlank()) {
+                return EntryChainJoinEvidence.FilterDominance.DOES_NOT_DOMINATE;
+            }
+            if ("SOAP/CXF".equals(endpoint.protocol())
+                    && "GET".equalsIgnoreCase(blockedMethod)) {
+                return EntryChainJoinEvidence.FilterDominance.DOES_NOT_DOMINATE;
+            }
+            if ("SOAP/CXF".equals(endpoint.protocol())
+                    && "POST".equalsIgnoreCase(blockedMethod)) {
+                return EntryChainJoinEvidence.FilterDominance.DOMINATES;
+            }
+        }
+        return EntryChainJoinEvidence.FilterDominance.UNKNOWN;
+    }
+
+    private static EntryChainJoinEvidence.FilterDominance mergeFilterDominance(
+            EntryChainJoinEvidence.FilterDominance first,
+            EntryChainJoinEvidence.FilterDominance second) {
+        if (first == null) {
+            return second;
+        }
+        if (first == EntryChainJoinEvidence.FilterDominance.DOMINATES
+                || second == EntryChainJoinEvidence.FilterDominance.DOMINATES) {
+            return EntryChainJoinEvidence.FilterDominance.DOMINATES;
+        }
+        if (first == EntryChainJoinEvidence.FilterDominance.DOES_NOT_DOMINATE
+                || second == EntryChainJoinEvidence.FilterDominance.DOES_NOT_DOMINATE) {
+            return EntryChainJoinEvidence.FilterDominance.DOES_NOT_DOMINATE;
+        }
+        if (first == EntryChainJoinEvidence.FilterDominance.UNKNOWN
+                || second == EntryChainJoinEvidence.FilterDominance.UNKNOWN) {
+            return EntryChainJoinEvidence.FilterDominance.UNKNOWN;
+        }
+        return EntryChainJoinEvidence.FilterDominance.NOT_PRESENT;
+    }
+
+    private static String routePath(String prefix, String publishPath) {
+        if (prefix == null || prefix.isBlank() || publishPath == null
+                || publishPath.isBlank() || !publishPath.startsWith("/")) {
+            return "";
+        }
+        String base = canonicalPath(prefix);
+        if (base.isBlank() || "/".equals(base)) {
+            return canonicalPath(publishPath);
+        }
+        return canonicalPath(base + publishPath);
+    }
+
+    private static String canonicalPath(String value) {
+        if (value == null || value.isBlank() || !value.trim().startsWith("/")) {
+            return "";
+        }
+        String path = value.trim().replaceAll("/+$", "");
+        return path.isBlank() ? "/" : path;
+    }
+
     /**
      * Build a deterministic index.  {@code applicationOwners} contains internal class names
      * from the first (target) artifact, not dependency/JDK classes.
@@ -709,6 +1092,14 @@ public final class ApplicationEntryIndex {
                     FRAMEWORK_ENTRY_RULE, framework.entryKind(), status, owned,
                     owned && framework.externalControlProven()));
         }
+
+        // Endpoint registration and route filters are application facts, not entry-name
+        // heuristics.  Discover them once beside the entry index so the joiner can consume a
+        // stable projection instead of rescanning CXF/Servlet calls for every candidate.
+        List<ServiceEndpoint> serviceEndpoints = discoverServiceEndpoints(graph, entries,
+                owners, applicationScopeKnown);
+        List<FilterControl> filterControls = discoverFilterControls(graph, owners,
+                applicationScopeKnown);
 
         List<DeserializeSite> sites = new ArrayList<>();
         Map<String, Boolean> sourceHosts = new HashMap<>();
@@ -872,7 +1263,7 @@ public final class ApplicationEntryIndex {
             reasons.add("NO_ENTRY_TERMINAL_INTERSECTION");
         }
         return new ApplicationEntryIndex(applicationScopeKnown, hasDeserializeRoot, owners, entries, sites,
-                List.copyOf(deserializeHosts.values()), impacts,
+                List.copyOf(deserializeHosts.values()), serviceEndpoints, filterControls, impacts,
                 forward, reverse, List.copyOf(intersection), dependency, reasons,
                 bindingCallbacks);
     }
@@ -913,6 +1304,50 @@ public final class ApplicationEntryIndex {
 
     public List<ExecutionEntry> applicationEntries() {
         return applicationExecutionEntries;
+    }
+
+    /** Immutable application-owned CXF endpoint registrations. */
+    public List<ServiceEndpoint> serviceEndpoints() {
+        return serviceEndpoints;
+    }
+
+    /** Immutable endpoint registrations for one exact service operation. */
+    public List<ServiceEndpoint> serviceEndpointsFor(String serviceMethodKey) {
+        if (serviceMethodKey == null || serviceMethodKey.isBlank()) {
+            return List.of();
+        }
+        return serviceEndpointsByMethod.getOrDefault(serviceMethodKey, List.of());
+    }
+
+    /** Whether the exact method is a typed JAX-WS/CXF application service operation. */
+    public boolean isFrameworkServiceMethod(String methodKey) {
+        return executionEntries.stream().anyMatch(entry -> entry.applicationOwned()
+                && "framework-service".equals(entry.entryKind())
+                && entry.methodKey().equals(methodKey));
+    }
+
+    /** Whether a typed service operation is backed by a concrete EndpointImpl.publish call. */
+    public boolean isRegisteredServiceMethod(String methodKey) {
+        return !serviceEndpointsFor(methodKey).isEmpty();
+    }
+
+    /** Immutable application-owned route filters discovered from Filter#doFilter. */
+    public List<FilterControl> filterControls() {
+        return filterControls;
+    }
+
+    /** Closed filter result for a registered service operation; unknown remains explicit. */
+    public EntryChainJoinEvidence.FilterDominance filterDominanceFor(String serviceMethodKey) {
+        if (serviceMethodKey == null || serviceMethodKey.isBlank()) {
+            return EntryChainJoinEvidence.FilterDominance.UNKNOWN;
+        }
+        EntryChainJoinEvidence.FilterDominance result = filterDominanceByService.get(
+                serviceMethodKey);
+        if (result != null) {
+            return result;
+        }
+        return filterControls.isEmpty() ? EntryChainJoinEvidence.FilterDominance.NOT_PRESENT
+                : EntryChainJoinEvidence.FilterDominance.UNKNOWN;
     }
 
     /** Stable method keys for application-owned execution roots, including external sources. */
@@ -994,6 +1429,33 @@ public final class ApplicationEntryIndex {
     /** Immutable source-host projection used by composition and object-graph consumers. */
     public List<DeserializeHost> deserializeHosts() {
         return deserializeHosts;
+    }
+
+    /** Immutable secondary deserialization sources with an explicit tainted input argument. */
+    public List<DeserializeSite> secondaryDeserializeSites() {
+        return secondaryDeserializeSites;
+    }
+
+    /** Whether an application-owned method contains the first ObjectInputStream boundary. */
+    public boolean hasApplicationObjectInputStreamSite(String methodKey) {
+        return methodKey != null && applicationObjectInputHosts.contains(methodKey);
+    }
+
+    /** Whether a chain carries a typed non-OIS deserialization source hop. */
+    public boolean hasSecondaryDeserializationHop(List<ChainHop> hops) {
+        if (hops == null || secondaryDeserializeSites.isEmpty()) {
+            return false;
+        }
+        for (ChainHop hop : hops) {
+            if (hop == null) {
+                continue;
+            }
+            if (isSecondaryDeserializeMember(hop.fromOwner(), hop.fromName())
+                    || isSecondaryDeserializeMember(hop.toOwner(), hop.toName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Immutable application-owned external-input sites for repeated joiner hot reads. */
@@ -1551,6 +2013,25 @@ public final class ApplicationEntryIndex {
                 && !"serialize".equalsIgnoreCase(site.bridge());
     }
 
+    private static boolean isObjectInputStreamSite(DeserializeSite site) {
+        return site != null && ("builtin:ois-read".equals(site.ruleId())
+                || "java/io/ObjectInputStream".equals(site.owner()));
+    }
+
+    private static boolean isSecondaryDeserializeSite(DeserializeSite site) {
+        return site != null && !site.externalInput()
+                && "deserialize".equalsIgnoreCase(site.bridge())
+                && !isObjectInputStreamSite(site);
+    }
+
+    private boolean isSecondaryDeserializeMember(String owner, String name) {
+        if (owner == null || owner.isBlank() || name == null || name.isBlank()) {
+            return false;
+        }
+        return secondaryDeserializeSites.stream().anyMatch(site -> owner.equals(site.owner())
+                && name.equals(site.name()));
+    }
+
     private static boolean isTypedBindingBridge(String bridge) {
         String value = bridge == null ? "" : bridge.toLowerCase(java.util.Locale.ROOT);
         return value.contains("deserialize") || value.contains("bind")
@@ -1818,6 +2299,8 @@ public final class ApplicationEntryIndex {
             applicationOwners.forEach(value -> update(digest, "owner=" + value));
             executionEntries.forEach(value -> update(digest, "entry=" + value));
             deserializeSites.forEach(value -> update(digest, "site=" + value));
+            serviceEndpoints.forEach(value -> update(digest, "service=" + value));
+            filterControls.forEach(value -> update(digest, "filter=" + value));
             terminalImpacts.forEach(value -> update(digest, "impact=" + value));
             entryForwardSlice.forEach(value -> update(digest, "forward=" + value));
             sinkReverseSlice.forEach(value -> update(digest, "reverse=" + value));

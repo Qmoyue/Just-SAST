@@ -644,6 +644,63 @@ class ApplicationChainJoinerContractTest {
     }
 
     @Test
+    void registeredCxfServiceJoinRetainsConfigurationAndSecondDeserializeBridges() {
+        Graph graph = serviceGraph(true);
+        RuleEngine engine = new RuleEngine(serviceRules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(SERVICE, SERVICE_IMPL, CONFIG), true);
+        Chain chain = serviceChain(true);
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(chain), true, "A".repeat(64), Set.of());
+
+        assertEquals(1, evidence.joinCount(), evidence.decisions().toString());
+        assertEquals("JOINED", evidence.decisions().get(chain.key()));
+        var join = evidence.joins().values().iterator().next();
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.FilterDominance.NOT_PRESENT,
+                join.filterDominance());
+        Set<BridgeEvidence.Kind> bridgeKinds = evidence.graph().nodes().stream()
+                .filter(BridgeEvidence.class::isInstance)
+                .map(BridgeEvidence.class::cast)
+                .map(BridgeEvidence::kind)
+                .collect(java.util.stream.Collectors.toSet());
+        assertTrue(bridgeKinds.contains(BridgeEvidence.Kind.CONFIGURATION));
+        assertTrue(bridgeKinds.contains(BridgeEvidence.Kind.SECOND_DESERIALIZATION));
+        assertTrue(evidence.graph().toCanonicalJson().contains("EndpointImpl.publish"));
+    }
+
+    @Test
+    void serviceFirstDeserializeOnlyChainIsRejectedWithoutTypedSecondaryHop() {
+        Graph graph = serviceGraph(true);
+        RuleEngine engine = new RuleEngine(serviceRules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(SERVICE, SERVICE_IMPL, CONFIG), true);
+        Chain firstOnly = serviceChain(false);
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(firstOnly), true, "A".repeat(64), Set.of());
+
+        assertEquals(0, evidence.joinCount());
+        assertEquals("SECOND_DESERIALIZATION_NOT_IN_CHAIN",
+                evidence.decisions().get(firstOnly.key()));
+    }
+
+    @Test
+    void serviceChainWithoutEndpointRegistrationIsRejectedBeforeEvidenceJoin() {
+        Graph graph = serviceGraph(false);
+        RuleEngine engine = new RuleEngine(serviceRules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(SERVICE, SERVICE_IMPL, CONFIG), true);
+        Chain chain = serviceChain(true);
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(chain), true, "A".repeat(64), Set.of());
+
+        assertEquals(0, evidence.joinCount());
+        assertEquals("SERVICE_ENDPOINT_NOT_REGISTERED", evidence.decisions().get(chain.key()));
+    }
+
+    @Test
     void terminalHostMayBeProvedByChainMethodIdentityWhenTerminalHopIsOmitted() {
         Graph graph = fixture();
         RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
@@ -668,6 +725,93 @@ class ApplicationChainJoinerContractTest {
                         null, "entry", "()V", 0),
                 new ChainHop(GADGET, "trigger", RUNTIME, "exec", HopKind.DIRECT_CALL,
                         null, "direct", SINK_DESC, 0)), 0, SINK_DESC, "TERMINAL");
+    }
+
+    private static final String SERVICE = "fixture/app/Service";
+    private static final String SERVICE_IMPL = "fixture/app/ServiceImpl";
+    private static final String SERVICE_DESC = "([B)Ljava/lang/String;";
+    private static final String CONFIG = "fixture/app/CxfConfig";
+    private static final String GADGET_CALLBACK = "fixture/lib/Gadget";
+    private static final String SECONDARY = "fixture/lib/Deserializer";
+    private static final String SECONDARY_DESC = "([B)Ljava/lang/Object;";
+    private static final String OIS_DESC = "()Ljava/lang/Object;";
+
+    private static RuleSet serviceRules() {
+        Rule.SinkRule sink = new Rule.SinkRule("runtime-exec", "COMMAND", "CRITICAL",
+                new Rule.CallMatcher(Match.of(RUNTIME), Match.of("exec"), Match.of(SINK_DESC)),
+                List.of(), Rule.SinkRole.TERMINAL);
+        Rule.SourceRule secondary = new Rule.SourceRule("nested-deserialize", "deserialize",
+                new Rule.CallMatcher(Match.of(SECONDARY), Match.of("decode"),
+                        Match.of(SECONDARY_DESC)), null, List.of(new Rule.TaintedPos.Arg(0)));
+        return new RuleSet(List.of(sink), List.of(), List.of(secondary), List.of(), List.of());
+    }
+
+    private static Graph serviceGraph(boolean registerEndpoint) {
+        Graph graph = new Graph();
+        Node contract = graph.methodNode(SERVICE, "processTask", SERVICE_DESC, false);
+        contract.propsNote("methodAccess", Modifier.PUBLIC);
+        contract.propsNote("classAnnotationDescriptors", List.of("Ljavax/jws/WebService;"));
+        contract.propsNote("methodAnnotationDescriptors", List.of("Ljavax/jws/WebMethod;"));
+        Node implementation = graph.methodNode(SERVICE_IMPL, "processTask", SERVICE_DESC, false);
+        implementation.propsNote("methodAccess", Modifier.PUBLIC);
+        implementation.propsNote("classInterfaces", List.of(SERVICE));
+        graph.methodNode(CONFIG, "internalDataServiceEndpoint", "()Ljava/lang/Object;", false);
+        Node callback = graph.methodNode(GADGET_CALLBACK, "trigger", "()V", false);
+        Node secondaryMethod = graph.methodNode(SECONDARY, "decode", SECONDARY_DESC, true);
+        Node objectInput = graph.methodNode("java/io/ObjectInputStream", "readObject", OIS_DESC,
+                true);
+        Node runtime = graph.methodNode(RUNTIME, "exec", SINK_DESC, true);
+
+        Node read = graph.addCallNode("java/io/ObjectInputStream", "readObject", OIS_DESC,
+                "VIRTUAL", null, 0, SERVICE_IMPL, "processTask", SERVICE_DESC);
+        Node invokeCallback = graph.addCallNode(GADGET_CALLBACK, "trigger", "()V", "VIRTUAL",
+                null, 1, SERVICE_IMPL, "processTask", SERVICE_DESC);
+        Node second = graph.addCallNode(SECONDARY, "decode", SECONDARY_DESC, "VIRTUAL", null, 0,
+                GADGET_CALLBACK, "trigger", "()V");
+        Node terminal = graph.addCallNode(RUNTIME, "exec", SINK_DESC, "VIRTUAL", null, 1,
+                GADGET_CALLBACK, "trigger", "()V");
+        graph.addEdge(read, objectInput, EdgeType.INVOKES, "VIRTUAL");
+        graph.addEdge(invokeCallback, callback, EdgeType.INVOKES, "VIRTUAL");
+        graph.addEdge(second, secondaryMethod, EdgeType.INVOKES, "VIRTUAL");
+        graph.addEdge(terminal, runtime, EdgeType.INVOKES, "VIRTUAL");
+
+        Node serviceConstructor = graph.addCallNode(SERVICE_IMPL, "<init>", "()V", "SPECIAL",
+                null, 0, CONFIG, "internalDataServiceEndpoint", "()Ljava/lang/Object;");
+        graph.addEdge(serviceConstructor, implementation, EdgeType.INVOKES, "SPECIAL");
+        if (registerEndpoint) {
+            Node endpointConstructor = graph.addCallNode("org/apache/cxf/jaxws/EndpointImpl",
+                    "<init>", "(Lorg/apache/cxf/Bus;Ljava/lang/Object;)V", "SPECIAL", null, 1,
+                    CONFIG, "internalDataServiceEndpoint", "()Ljava/lang/Object;");
+            Node endpointType = graph.methodNode("org/apache/cxf/jaxws/EndpointImpl", "<init>",
+                    "(Lorg/apache/cxf/Bus;Ljava/lang/Object;)V", true);
+            graph.addEdge(endpointConstructor, endpointType, EdgeType.INVOKES, "SPECIAL");
+            Node publish = graph.addCallNode("org/apache/cxf/jaxws/EndpointImpl", "publish",
+                    "(Ljava/lang/String;)V", "VIRTUAL", null, 2, CONFIG,
+                    "internalDataServiceEndpoint", "()Ljava/lang/Object;");
+            publish.propsNote("stringLiteralHints", List.of("/DataSyncService"));
+            Node publishType = graph.methodNode("org/apache/cxf/jaxws/EndpointImpl", "publish",
+                    "(Ljava/lang/String;)V", true);
+            graph.addEdge(publish, publishType, EdgeType.INVOKES, "VIRTUAL");
+        }
+        graph.freeze();
+        return graph;
+    }
+
+    private static Chain serviceChain(boolean includeSecondary) {
+        List<ChainHop> hops = new java.util.ArrayList<>();
+        hops.add(new ChainHop(GADGET_CALLBACK, "trigger", RUNTIME, "exec",
+                HopKind.DIRECT_CALL, null, "terminal", SINK_DESC, 0));
+        if (includeSecondary) {
+            hops.add(new ChainHop(GADGET_CALLBACK, "trigger", SECONDARY, "decode",
+                    HopKind.DIRECT_CALL, null, "typed-secondary-deserialize", SECONDARY_DESC, 0));
+        }
+        hops.add(new ChainHop(SERVICE_IMPL, "processTask", GADGET_CALLBACK, "trigger",
+                HopKind.DIRECT_CALL, null, "callback", "()V", 0));
+        hops.add(new ChainHop(SERVICE_IMPL, "processTask", SERVICE_IMPL, "processTask",
+                HopKind.ENTRY, null, "framework-service", SERVICE_DESC, 0));
+        return new Chain(includeSecondary ? "cxf-secondary" : "cxf-first-only", "DESERIALIZE",
+                "HIGH", SERVICE_IMPL, "processTask", "framework-service", RUNTIME, "exec", hops,
+                0, SINK_DESC, "TERMINAL");
     }
 
     private static RuleSet rules() {

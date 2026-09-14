@@ -600,6 +600,61 @@ class ApplicationEntryIndexContractTest {
                         && site.bridge().equals("framework-binding")));
     }
 
+    @Test
+    void indexesCxfEndpointAndServletFilterFactsFromTypedBytecodeCalls() {
+        Graph graph = cxfFilterFixture("GET", true);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of("fixture/app/Service", "fixture/app/ServiceImpl",
+                        "fixture/app/CxfConfig", "fixture/app/AccessFilter"), true);
+
+        String serviceKey = "fixture/app/ServiceImpl#processTask([B)Ljava/lang/String;";
+        assertEquals(1, index.serviceEndpointsFor(serviceKey).size());
+        ApplicationEntryIndex.ServiceEndpoint endpoint =
+                index.serviceEndpointsFor(serviceKey).get(0);
+        assertEquals("fixture/app/CxfConfig#internalDataServiceEndpoint()Ljava/lang/Object;",
+                endpoint.configurationMethodKey());
+        assertEquals("SOAP/CXF", endpoint.protocol());
+        assertEquals("/DataSyncService", endpoint.publishPath());
+        assertTrue(index.isFrameworkServiceMethod(serviceKey));
+        assertTrue(index.isRegisteredServiceMethod(serviceKey));
+
+        assertEquals(1, index.filterControls().size());
+        ApplicationEntryIndex.FilterControl filter = index.filterControls().get(0);
+        assertEquals("/services", filter.pathPrefix());
+        assertEquals("/services", filter.blockedPath());
+        assertEquals("GET", filter.blockedMethod());
+        assertTrue(filter.remoteAddressGuard());
+        assertTrue(filter.passThrough());
+        assertTrue(filter.pathNormalization());
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.FilterDominance
+                        .DOES_NOT_DOMINATE,
+                index.filterDominanceFor(serviceKey));
+        assertThrows(UnsupportedOperationException.class, () -> index.serviceEndpoints().clear());
+        assertThrows(UnsupportedOperationException.class, () -> index.filterControls().clear());
+    }
+
+    @Test
+    void filterDominanceChangesOnlyWithObservedRouteControlFact() {
+        String serviceKey = "fixture/app/ServiceImpl#processTask([B)Ljava/lang/String;";
+        ApplicationEntryIndex blocked = ApplicationEntryIndex.build(cxfFilterFixture("POST", true),
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of("fixture/app/Service", "fixture/app/ServiceImpl",
+                        "fixture/app/CxfConfig", "fixture/app/AccessFilter"), true);
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.FilterDominance.DOMINATES,
+                blocked.filterDominanceFor(serviceKey));
+
+        ApplicationEntryIndex unregistered = ApplicationEntryIndex.build(
+                cxfFilterFixture("GET", false),
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of("fixture/app/Service", "fixture/app/ServiceImpl",
+                        "fixture/app/CxfConfig", "fixture/app/AccessFilter"), true);
+        assertTrue(unregistered.serviceEndpointsFor(serviceKey).isEmpty());
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.FilterDominance.UNKNOWN,
+                unregistered.filterDominanceFor(serviceKey),
+                "a filter fact cannot be attached to an unregistered endpoint");
+    }
+
     private static RuleSet rules() {
         Rule.SinkRule sink = new Rule.SinkRule("runtime-exec", "COMMAND", "CRITICAL",
                 new Rule.CallMatcher(Match.of("java/lang/Runtime"), Match.of("exec"),
@@ -609,6 +664,86 @@ class ApplicationEntryIndexContractTest {
                 new Rule.MethodMatcher(Match.of("handle"), Match.of("()V"), false),
                 null, "lifecycle");
         return new RuleSet(List.of(sink), List.of(entry), List.of(), List.of(), List.of());
+    }
+
+    private static Graph cxfFilterFixture(String blockedMethod, boolean registerEndpoint) {
+        String service = "fixture/app/Service";
+        String serviceImpl = "fixture/app/ServiceImpl";
+        String config = "fixture/app/CxfConfig";
+        String filter = "fixture/app/AccessFilter";
+        String serviceDescriptor = "([B)Ljava/lang/String;";
+        Graph graph = new Graph();
+
+        Node contract = graph.methodNode(service, "processTask", serviceDescriptor, false);
+        contract.propsNote("methodAccess", Modifier.PUBLIC);
+        contract.propsNote("classAnnotationDescriptors", List.of("Ljavax/jws/WebService;"));
+        contract.propsNote("methodAnnotationDescriptors", List.of("Ljavax/jws/WebMethod;"));
+        Node implementation = graph.methodNode(serviceImpl, "processTask", serviceDescriptor, false);
+        implementation.propsNote("methodAccess", Modifier.PUBLIC);
+        implementation.propsNote("classInterfaces", List.of(service));
+        graph.methodNode(config, "internalDataServiceEndpoint", "()Ljava/lang/Object;", false);
+        Node filterMethod = graph.methodNode(filter, "doFilter",
+                "(Ljavax/servlet/ServletRequest;Ljavax/servlet/ServletResponse;"
+                        + "Ljavax/servlet/FilterChain;)V", false);
+        filterMethod.propsNote("methodAccess", Modifier.PUBLIC);
+        filterMethod.propsNote("classInterfaces", List.of("javax/servlet/Filter"));
+
+        Node serviceConstructor = graph.addCallNode(serviceImpl, "<init>", "()V", "SPECIAL",
+                null, 0, config, "internalDataServiceEndpoint", "()Ljava/lang/Object;");
+
+        if (registerEndpoint) {
+            graph.addEdge(serviceConstructor, implementation, EdgeType.INVOKES, "SPECIAL");
+            Node endpointConstructor = graph.addCallNode("org/apache/cxf/jaxws/EndpointImpl", "<init>",
+                    "(Lorg/apache/cxf/Bus;Ljava/lang/Object;)V", "SPECIAL", null, 1, config,
+                    "internalDataServiceEndpoint", "()Ljava/lang/Object;");
+            graph.methodNode("org/apache/cxf/jaxws/EndpointImpl", "<init>",
+                    "(Lorg/apache/cxf/Bus;Ljava/lang/Object;)V", true);
+            graph.addEdge(endpointConstructor, graph.findMethodNode(
+                    "org/apache/cxf/jaxws/EndpointImpl", "<init>",
+                    "(Lorg/apache/cxf/Bus;Ljava/lang/Object;)V"), EdgeType.INVOKES, "SPECIAL");
+            Node publish = graph.addCallNode("org/apache/cxf/jaxws/EndpointImpl", "publish",
+                    "(Ljava/lang/String;)V", "VIRTUAL", null, 2, config,
+                    "internalDataServiceEndpoint", "()Ljava/lang/Object;");
+            publish.propsNote("stringLiteralHints", List.of("/DataSyncService"));
+            graph.methodNode("org/apache/cxf/jaxws/EndpointImpl", "publish",
+                    "(Ljava/lang/String;)V", true);
+            graph.addEdge(publish, graph.findMethodNode("org/apache/cxf/jaxws/EndpointImpl",
+                    "publish", "(Ljava/lang/String;)V"), EdgeType.INVOKES, "VIRTUAL");
+        }
+
+        addFilterCall(graph, "javax/servlet/http/HttpServletRequest", "getRequestURI",
+                "()Ljava/lang/String;", filter, filterMethod.descriptor(), 0, null);
+        addFilterCall(graph, "javax/servlet/http/HttpServletRequest", "getMethod",
+                "()Ljava/lang/String;", filter, filterMethod.descriptor(), 1, null);
+        addFilterCall(graph, "javax/servlet/http/HttpServletRequest", "getRemoteAddr",
+                "()Ljava/lang/String;", filter, filterMethod.descriptor(), 2, null);
+        addFilterCall(graph, filter, "isInternalAddress", "(Ljava/lang/String;)Z", filter,
+                filterMethod.descriptor(), 3, null);
+        Node prefix = addFilterCall(graph, "java/lang/String", "startsWith",
+                "(Ljava/lang/String;)Z", filter, filterMethod.descriptor(), 4, List.of("/services"));
+        Node blockedPath = addFilterCall(graph, "java/lang/String", "equals",
+                "(Ljava/lang/Object;)Z", filter, filterMethod.descriptor(), 5, List.of("/services"));
+        Node blockedVerb = addFilterCall(graph, "java/lang/String", "equalsIgnoreCase",
+                "(Ljava/lang/String;)Z", filter, filterMethod.descriptor(), 6,
+                List.of(blockedMethod));
+        addFilterCall(graph, "javax/servlet/FilterChain", "doFilter",
+                "(Ljavax/servlet/ServletRequest;Ljavax/servlet/ServletResponse;)V", filter,
+                filterMethod.descriptor(), 7, null);
+        addFilterCall(graph, filter, "normalizeUri", "(Ljava/lang/String;)Ljava/lang/String;",
+                filter, filterMethod.descriptor(), 8, null);
+        graph.freeze();
+        return graph;
+    }
+
+    private static Node addFilterCall(Graph graph, String owner, String name, String descriptor,
+                                      String hostOwner, String hostDescriptor, int offset,
+                                      List<String> stringHints) {
+        Node call = graph.addCallNode(owner, name, descriptor, "VIRTUAL", null, offset,
+                hostOwner, "doFilter", hostDescriptor);
+        if (stringHints != null) {
+            call.propsNote("stringLiteralHints", stringHints);
+        }
+        return call;
     }
 
     private static Graph fixture() {
