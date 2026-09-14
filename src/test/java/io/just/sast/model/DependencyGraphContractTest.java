@@ -115,6 +115,38 @@ class DependencyGraphContractTest {
         assertTrue(owner.applicationOwned());
     }
 
+    @Test
+    void completedArtifactBindsSelectedNodeWhenConflictHasTheSameCoordinate() {
+        String coordinate = "example:shared:1.0.0:jar:";
+        DependencyGraph.Node conflict = new DependencyGraph.Node("conflict",
+                new ArtifactProvenance("conflict.jar", ArtifactProvenance.Role.DEPENDENCY,
+                        "a".repeat(64), 10L),
+                DependencyGraph.Source.POM_DERIVED,
+                DependencyGraph.Deployment.DECLARED_ENVIRONMENT, "example", "shared", "1.0.0",
+                "jar", "", "maven:conflict", "", "", "", -1, "compile", false,
+                DependencyGraph.Resolution.CONFLICT, "winner=" + coordinate);
+        DependencyGraph.Node selected = new DependencyGraph.Node("selected",
+                new ArtifactProvenance("selected.jar", ArtifactProvenance.Role.DEPENDENCY,
+                        "b".repeat(64), 10L),
+                DependencyGraph.Source.POM_DERIVED,
+                DependencyGraph.Deployment.DECLARED_ENVIRONMENT, "example", "shared", "1.0.0",
+                "jar", "", "maven:selected", "", "", "", -1, "compile", false,
+                DependencyGraph.Resolution.SELECTED, "nearest-version");
+        DependencyGraph graph = new DependencyGraph(List.of(conflict, selected), List.of(), Map.of());
+        DependencyGraph.ArtifactBinding binding = new DependencyGraph.ArtifactBinding(coordinate,
+                new ArtifactProvenance(coordinate, ArtifactProvenance.Role.DEPENDENCY,
+                        "c".repeat(64), 10L),
+                DependencyGraph.Source.CACHE, "local-cache", 2);
+
+        DependencyGraph bound = graph.withCompletedArtifacts(List.of(binding));
+
+        assertEquals(DependencyGraph.Resolution.CONFLICT,
+                bound.node("conflict").orElseThrow().resolution());
+        assertEquals(DependencyGraph.Source.CACHE,
+                bound.node("selected").orElseThrow().source());
+        assertEquals(2, bound.node("selected").orElseThrow().inputIndex());
+    }
+
     private static DependencyGraph.Node node(String ref, ArtifactProvenance.Role role,
                                              DependencyGraph.Source source,
                                              DependencyGraph.Deployment deployment,

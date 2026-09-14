@@ -455,7 +455,7 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
             modelRequest.setProcessPlugins(false);
             modelRequest.setTwoPhaseBuilding(false);
             modelRequest.setLocationTracking(true);
-            modelRequest.setSystemProperties(new Properties());
+            modelRequest.setSystemProperties(modelSystemProperties());
             modelRequest.setUserProperties(new Properties());
             modelRequest.setActiveProfileIds(request.activeProfileIds());
             modelRequest.setInactiveProfileIds(List.of());
@@ -1103,6 +1103,37 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
         return active.stream()
                 .map(Profile::getId).filter(Objects::nonNull).filter(id -> !id.isBlank())
                 .distinct().toList();
+    }
+
+    /**
+     * Supply only the JVM/platform properties that Maven profile activation defines as
+     * system context.  Passing an empty set makes Maven's built-in JDK-activated profiles
+     * fail with "Failed to determine Java version"; passing the whole process property bag
+     * would make resolution depend on user-specific paths and credentials.  The scanner is
+     * hosted by the fixed JDK17 process, while --jdk-home remains a target-bytecode input.
+     */
+    private static Properties modelSystemProperties() {
+        Properties result = new Properties();
+        copySystemProperty(result, "java.version");
+        copySystemProperty(result, "java.specification.version");
+        copySystemProperty(result, "java.vendor");
+        copySystemProperty(result, "java.vendor.version");
+        copySystemProperty(result, "java.vm.name");
+        copySystemProperty(result, "java.vm.vendor");
+        copySystemProperty(result, "os.name");
+        copySystemProperty(result, "os.arch");
+        copySystemProperty(result, "os.version");
+        copySystemProperty(result, "file.separator");
+        copySystemProperty(result, "path.separator");
+        copySystemProperty(result, "line.separator");
+        return result;
+    }
+
+    private static void copySystemProperty(Properties target, String name) {
+        String value = System.getProperty(name);
+        if (value != null) {
+            target.setProperty(name, value);
+        }
     }
 
     private static List<DeclaredDependency> declaredDependencies(

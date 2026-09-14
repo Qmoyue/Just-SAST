@@ -284,15 +284,12 @@ public final class DependencyGraph {
         Set<String> matched = new LinkedHashSet<>();
         for (Node node : nodes.values()) {
             ArtifactBinding binding = byCoordinate.get(node.coordinate());
-            if (binding == null) {
-                replaced.add(node);
-                continue;
-            }
-            if (node.source() != Source.POM_DERIVED
+            if (binding == null
+                    || node.source() != Source.POM_DERIVED
                     || node.deployment() != Deployment.DECLARED_ENVIRONMENT
                     || node.resolution() != Resolution.SELECTED) {
-                throw new IllegalArgumentException("artifact binding target is not a selected POM node: "
-                        + node.coordinate());
+                replaced.add(node);
+                continue;
             }
             replaced.add(new Node(node.ref(), binding.provenance(), binding.source(),
                     node.deployment(), node.group(), node.name(), node.version(), node.type(),
