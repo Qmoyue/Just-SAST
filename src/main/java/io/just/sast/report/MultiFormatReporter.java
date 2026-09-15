@@ -3,6 +3,7 @@ package io.just.sast.report;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ConstructionSummary;
 import io.just.sast.blackboard.VerificationSummary;
+import io.just.sast.analysis.taint.FilterAnalysis;
 import io.just.sast.chain.ChainRanking;
 import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ConfidenceScorer;
@@ -182,7 +183,9 @@ public final class MultiFormatReporter {
             sb.append('"').append(escJson(status.getKey())).append("\":\"")
                     .append(escJson(status.getValue())).append('"');
         }
-        sb.append("},\"dynamic_verification\":");
+        sb.append("},\"filter_evidence\":");
+        appendFilterEvidenceJson(sb, stats.filterEvidence());
+        sb.append(",\"dynamic_verification\":");
         appendVerificationJson(sb, stats.dynamicVerification());
         sb.append("\n}\n");
         AtomicFiles.writeUtf8(layout.meta().resolve("scan-metadata.json"), sb.toString());
@@ -196,6 +199,34 @@ public final class MultiFormatReporter {
         appendRunDisclosure(run, stats.dynamicVerification());
         run.append("\n}\n");
         AtomicFiles.writeUtf8(layout.meta().resolve("run.json"), run.toString());
+    }
+
+    private static void appendFilterEvidenceJson(StringBuilder sb,
+                                                 List<FilterAnalysis.Evidence> evidence) {
+        sb.append('[');
+        if (evidence != null) {
+            for (int i = 0; i < evidence.size(); i++) {
+                if (i > 0) {
+                    sb.append(',');
+                }
+                FilterAnalysis.Evidence item = evidence.get(i);
+                sb.append('{')
+                        .append("\"kind\":\"").append(escJson(item.kind().name())).append('"')
+                        .append(",\"location\":\"").append(escJson(item.location())).append('"')
+                        .append(",\"status\":\"").append(escJson(item.status().name())).append('"')
+                        .append(",\"reason_code\":\"").append(escJson(item.reasonCode())).append('"')
+                        .append(",\"domain_digest\":\"").append(escJson(item.domainDigest())).append('"')
+                        .append(",\"semantic_digest\":\"").append(escJson(item.semanticDigest())).append('"')
+                        .append(",\"budget\":").append(item.budget())
+                        .append(",\"evaluated\":").append(item.evaluated())
+                        .append(",\"retained\":").append(item.retained())
+                        .append(",\"rejected\":").append(item.rejected())
+                        .append(",\"expanded\":").append(item.expanded())
+                        .append(",\"filter_cost_nanos\":").append(item.filterCostNanos())
+                        .append('}');
+            }
+        }
+        sb.append(']');
     }
 
     private static void appendVerificationJson(StringBuilder sb, VerificationSummary summary) {

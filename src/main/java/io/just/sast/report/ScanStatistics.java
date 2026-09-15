@@ -1,8 +1,10 @@
 package io.just.sast.report;
 
+import io.just.sast.analysis.taint.FilterAnalysis;
 import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.run.RunOutcome;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -17,7 +19,8 @@ public record ScanStatistics(
         VerificationSummary dynamicVerification, String chainProofCompleteness,
         String artifactHash, Map<String, String> metricStatus,
         Map<String, Map<String, Long>> metricNamespaces,
-        Map<String, String> metricNamespaceStatus) {
+        Map<String, String> metricNamespaceStatus,
+        List<FilterAnalysis.Evidence> filterEvidence) {
 
     /** Closed availability states for telemetry.  UNKNOWN is intentionally distinct from 0. */
     public enum MetricStatus {
@@ -43,6 +46,30 @@ public record ScanStatistics(
         metricStatus = sortedStatusMap(metricStatus);
         metricNamespaces = sortedNamespaceMap(metricNamespaces);
         metricNamespaceStatus = sortedStatusMap(metricNamespaceStatus);
+        filterEvidence = filterEvidence == null ? List.of() : filterEvidence.stream()
+                .filter(java.util.Objects::nonNull)
+                .sorted(Comparator.comparing((FilterAnalysis.Evidence value)
+                        -> value.kind().name())
+                        .thenComparing(FilterAnalysis.Evidence::location)
+                        .thenComparing(FilterAnalysis.Evidence::domainDigest))
+                .toList();
+    }
+
+    /** Compatibility constructor before hotspot evidence was part of the run snapshot. */
+    public ScanStatistics(int filesScanned, int classesLoaded, int diagnostics,
+                          int sinksMarked, int magicEntries, int chainsFound,
+                          long elapsedMs, long heapUsedMb, long heapPeakMb,
+                          String completeness, List<String> completenessReasons,
+                          Map<String, Long> phaseMs, Map<String, Long> metrics,
+                          String verification, VerificationSummary dynamicVerification,
+                          String chainProofCompleteness, String artifactHash,
+                          Map<String, String> metricStatus,
+                          Map<String, Map<String, Long>> metricNamespaces,
+                          Map<String, String> metricNamespaceStatus) {
+        this(filesScanned, classesLoaded, diagnostics, sinksMarked, magicEntries, chainsFound,
+                elapsedMs, heapUsedMb, heapPeakMb, completeness, completenessReasons, phaseMs,
+                metrics, verification, dynamicVerification, chainProofCompleteness, artifactHash,
+                metricStatus, metricNamespaces, metricNamespaceStatus, List.of());
     }
 
     /** 兼容旧扩展点和测试构造。 */
@@ -52,7 +79,7 @@ public record ScanStatistics(
         this(filesScanned, classesLoaded, diagnostics, sinksMarked, magicEntries, chainsFound,
                 elapsedMs, heapUsedMb, heapUsedMb, "UNKNOWN", List.of(), Map.of(), Map.of(),
                 "UNKNOWN", VerificationSummary.empty("UNKNOWN", 0), "UNKNOWN", "UNKNOWN",
-                Map.of(), Map.of(), Map.of());
+                Map.of(), Map.of(), Map.of(), List.of());
     }
 
     /** Compatibility constructor retained for callers that do not sample heap peak usage. */

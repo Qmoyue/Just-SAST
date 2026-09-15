@@ -1,5 +1,6 @@
 package io.just.sast.report;
 
+import io.just.sast.analysis.taint.FilterAnalysis;
 import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
@@ -92,7 +93,7 @@ class MultiFormatReporterTest {
                 Map.entry("network_download_wall_ms", 12L),
                 Map.entry("network_request_ms", 15L),
                 Map.entry("analysis_ms", 21L),
-                Map.entry("dynamic_filter_ms", 0L),
+                Map.entry("filter_ms", 0L),
                 Map.entry("report_ms", 5L),
                 Map.entry("total_wall_ms", 49L),
                 Map.entry("dependency_source_actual_application", 1L),
@@ -107,14 +108,21 @@ class MultiFormatReporterTest {
                 Map.entry("network_download_wall_ms", "OBSERVED"),
                 Map.entry("network_request_ms", "OBSERVED"),
                 Map.entry("analysis_ms", "OBSERVED"),
-                Map.entry("dynamic_filter_ms", "NOT_APPLICABLE"),
+                Map.entry("filter_ms", "NOT_APPLICABLE"),
                 Map.entry("report_ms", "OBSERVED"),
                 Map.entry("total_wall_ms", "OBSERVED"));
         ScanStatistics stats = new ScanStatistics(1, 1, 0, 1, 1, 1,
                 49L, 10L, 12L, "COMPLETE", List.of(),
                 Map.of("dependency_resolution", 8L, "analysis", 21L, "report", 5L),
                 metrics, "STATIC_ONLY", VerificationSummary.empty("STATIC_ONLY", 0),
-                "COMPLETE", "a".repeat(64), statuses, Map.of(), Map.of());
+                "COMPLETE", "a".repeat(64), statuses, Map.of(), Map.of(),
+                List.of(new FilterAnalysis.Evidence(
+                        FilterAnalysis.Kind.CFG_PATH,
+                        "app.Entry#readObject@12",
+                        FilterAnalysis.Status.PROVABLY_UNREACHABLE,
+                        "CFG_EXACT_PATH_UNREACHABLE",
+                        "b".repeat(64), "c".repeat(64), 4096,
+                        3L, 1L, 2L, 4L, 123L)));
 
         new MultiFormatReporter().writeMetadata(temp, stats);
         new ReportIndexWriter().write(ReportLayout.flat(temp), stats);
@@ -123,12 +131,16 @@ class MultiFormatReporterTest {
         String index = Files.readString(temp.resolve("index.md"));
         assertTrue(metadata.contains("\"dependency_resolution_ms\":8")
                         && metadata.contains("\"network_download_wall_ms\":12")
-                        && metadata.contains("\"dynamic_filter_ms\":0")
+                        && metadata.contains("\"filter_ms\":0")
                         && metadata.contains("\"total_wall_ms\":49")
-                        && metadata.contains("\"dynamic_filter_ms\":\"NOT_APPLICABLE\""),
+                        && metadata.contains("\"filter_ms\":\"NOT_APPLICABLE\"")
+                        && metadata.contains("\"filter_evidence\":[")
+                        && metadata.contains("\"domain_digest\":\"" + "b".repeat(64) + "\"")
+                        && metadata.contains("\"expanded\":4")
+                        && metadata.contains("\"filter_cost_nanos\":123"),
                 metadata);
         assertTrue(index.contains("| Dependency resolution | 8 ms (OBSERVED) |")
-                        && index.contains("| Dynamic filter | 0 ms (NOT_APPLICABLE) |")
+                        && index.contains("| Bounded filter | 0 ms (NOT_APPLICABLE) |")
                         && index.contains("actual_application=1")
                         && index.contains("pom_derived=4")
                         && index.contains("jdk=7"), index);

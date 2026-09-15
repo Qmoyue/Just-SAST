@@ -217,9 +217,9 @@ class ScanPipelineTest {
                 "a false String guard must retain the reachable sink path:\n" + findings);
         assertFalse(findings.contains("app/UnreachableGuard,readObject"),
                 "an exact true String guard must remove only its impossible sink path");
-        assertTrue(result.stats().metric("dynamic_filter_rejections", 0L) > 0L,
+        assertTrue(result.stats().metric("filter_rejections", 0L) > 0L,
                 "the report must expose that a bounded filter rejected a normal CFG edge");
-        assertTrue("OBSERVED".equals(result.stats().metricStatus("dynamic_filter_ms")),
+        assertTrue("OBSERVED".equals(result.stats().metricStatus("filter_ms")),
                 "the report must expose the filter sub-timing when the hotspot runs");
     }
 
@@ -1022,7 +1022,7 @@ class ScanPipelineTest {
                         && metadata.contains("\"dependency_resolution_ms\"")
                         && metadata.contains("\"network_download_wall_ms\"")
                         && metadata.contains("\"analysis_ms\"")
-                        && metadata.contains("\"dynamic_filter_ms\"")
+                        && metadata.contains("\"filter_ms\"")
                         && metadata.contains("\"report_ms\"")
                         && metadata.contains("\"total_wall_ms\"")
                         && metadata.contains("\"metric_status\""),
@@ -1042,7 +1042,7 @@ class ScanPipelineTest {
                         && index.contains("[Dynamic verification](verification/dynamic-verification.json)")
                         && index.contains("| Dependency resolution | ")
                         && index.contains("| Network download wall | ")
-                        && index.contains("| Dynamic filter | ")
+                        && index.contains("| Bounded filter | ")
                         && index.contains("| Total wall | ")
                         && index.contains("| Dependency sources | "),
                 "根索引必须暴露人类/agent 两条阅读入口：\n" + index);

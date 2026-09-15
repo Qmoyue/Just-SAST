@@ -651,7 +651,7 @@ public final class ScanPipeline {
                 io.just.sast.blackboard.VerificationSummary.empty("STATIC_ONLY", 0),
                 scanChainProofCompleteness,
                 targetArtifactHash, metricCapture.status(), metricCapture.namespaces(),
-                metricCapture.namespaceStatus());
+                metricCapture.namespaceStatus(), blackboard.originSupport().finiteFilterEvidence());
         multiFormatReporter.writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
         new io.just.sast.report.ConciseReportWriter().write(reportLayout,
@@ -1057,18 +1057,18 @@ public final class ScanPipeline {
                     dependencySourceCount(dependencyGraph, source));
         }
         metrics.put("analysis_ms", phaseMs.getOrDefault("analysis", -1L));
-        long dynamicFilterMs = blackboard.originSupport().finiteFilterMs();
-        long dynamicFilterEvaluations = blackboard.originSupport().finiteFilterEvaluations();
-        metrics.put("filter_ms", dynamicFilterMs);
-        metrics.put("dynamic_filter_ms", dynamicFilterMs);
-        metrics.put("dynamic_filter_evaluations", dynamicFilterEvaluations);
-        metrics.put("dynamic_filter_rejections", blackboard.originSupport().finiteFilterRejections());
-        metrics.put("dynamic_filter_cache_hits", blackboard.originSupport().finiteFilterCacheHits());
-        metrics.put("dynamic_filter_cache_misses", blackboard.originSupport().finiteFilterCacheMisses());
-        metrics.put("dynamic_filter_cache_size",
-                (long) blackboard.originSupport().finiteFilterCacheSize());
-        metrics.put("dynamic_filter_budget_exceeded",
-                blackboard.originSupport().constantProofBudgetExceeded() ? 1L : 0L);
+        long filterMs = blackboard.originSupport().finiteFilterMs();
+        long filterEvaluations = blackboard.originSupport().finiteFilterEvaluations();
+        metrics.put("filter_ms", filterMs);
+        metrics.put("filter_evaluations", filterEvaluations);
+        metrics.put("filter_retained", blackboard.originSupport().finiteFilterRetained());
+        metrics.put("filter_rejections", blackboard.originSupport().finiteFilterRejections());
+        metrics.put("filter_expanded", blackboard.originSupport().finiteFilterExpanded());
+        metrics.put("filter_unknown", blackboard.originSupport().finiteFilterUnknown());
+        metrics.put("filter_budget_exceeded", blackboard.originSupport().finiteFilterBudgetExceeded());
+        metrics.put("filter_cache_hits", blackboard.originSupport().finiteFilterCacheHits());
+        metrics.put("filter_cache_misses", blackboard.originSupport().finiteFilterCacheMisses());
+        metrics.put("filter_cache_size", (long) blackboard.originSupport().finiteFilterCacheSize());
         metrics.put("report_ms", phaseMs.getOrDefault("report", -1L));
         metrics.put("total_wall_ms", totalWallMs);
         addPassTelemetry(metrics, phaseMs, "frontend", "frontend", -1L);
@@ -1122,14 +1122,13 @@ public final class ScanPipeline {
                     "OBSERVED");
         }
         status.put("analysis_ms", phaseMs.containsKey("analysis") ? "OBSERVED" : "UNKNOWN");
-        String dynamicFilterStatus = dynamicFilterEvaluations == 0L
+        String filterStatus = filterEvaluations == 0L
                 ? "NOT_APPLICABLE" : "OBSERVED";
-        status.put("filter_ms", dynamicFilterStatus);
-        for (String name : List.of("dynamic_filter_ms", "dynamic_filter_evaluations",
-                "dynamic_filter_rejections", "dynamic_filter_cache_hits",
-                "dynamic_filter_cache_misses", "dynamic_filter_cache_size",
-                "dynamic_filter_budget_exceeded")) {
-            status.put(name, dynamicFilterStatus);
+        for (String name : List.of("filter_ms", "filter_evaluations", "filter_retained",
+                "filter_rejections", "filter_expanded", "filter_unknown",
+                "filter_budget_exceeded", "filter_cache_hits", "filter_cache_misses",
+                "filter_cache_size")) {
+            status.put(name, filterStatus);
         }
         status.put("report_ms", phaseMs.containsKey("report") ? "OBSERVED" : "UNKNOWN");
         status.put("total_wall_ms", "OBSERVED");
@@ -1190,19 +1189,16 @@ public final class ScanPipeline {
         analysis.put("representative_paths", -1L);
         analysis.put("forward_origin_cache_bytes_estimate",
                 blackboard.originSupport().forwardOriginCacheBytesEstimate());
-        analysis.put("filter_ms", dynamicFilterMs);
-        analysis.put("dynamic_filter_ms", dynamicFilterMs);
-        analysis.put("dynamic_filter_evaluations", dynamicFilterEvaluations);
-        analysis.put("dynamic_filter_rejections",
-                blackboard.originSupport().finiteFilterRejections());
-        analysis.put("dynamic_filter_cache_hits",
-                blackboard.originSupport().finiteFilterCacheHits());
-        analysis.put("dynamic_filter_cache_misses",
-                blackboard.originSupport().finiteFilterCacheMisses());
-        analysis.put("dynamic_filter_cache_size",
-                (long) blackboard.originSupport().finiteFilterCacheSize());
-        analysis.put("dynamic_filter_budget_exceeded",
-                blackboard.originSupport().constantProofBudgetExceeded() ? 1L : 0L);
+        analysis.put("filter_ms", filterMs);
+        analysis.put("filter_evaluations", filterEvaluations);
+        analysis.put("filter_retained", blackboard.originSupport().finiteFilterRetained());
+        analysis.put("filter_rejections", blackboard.originSupport().finiteFilterRejections());
+        analysis.put("filter_expanded", blackboard.originSupport().finiteFilterExpanded());
+        analysis.put("filter_unknown", blackboard.originSupport().finiteFilterUnknown());
+        analysis.put("filter_budget_exceeded", blackboard.originSupport().finiteFilterBudgetExceeded());
+        analysis.put("filter_cache_hits", blackboard.originSupport().finiteFilterCacheHits());
+        analysis.put("filter_cache_misses", blackboard.originSupport().finiteFilterCacheMisses());
+        analysis.put("filter_cache_size", (long) blackboard.originSupport().finiteFilterCacheSize());
         if (forward != null) {
             analysis.putAll(forward.asMetrics());
         } else {
