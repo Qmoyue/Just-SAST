@@ -2,6 +2,8 @@
 
 Just 是一个面向 Java JAR、WAR 和 class 目录的轻量级反序列化链扫描器。它从字节码中提取入口、字段、调用、控制流和 sink 事实，组合出可解释的候选链，并输出可供人工或工具继续处理的证据。
 
+本仓库正在按 V3 重构。下述最简参数、报告布局和四态筛选是本轮目标契约；CLI/help、旧输出清理及筛选证据仍在迁移，具体可用选项须核对当前构建的 `scan --help`。文档更新不代表这些迁移已验收。
+
 ## 工作流
 
 ```text
@@ -14,14 +16,15 @@ JAR / WAR / class 目录 + 可选依赖 + 目标 JDK
           CPG / CFG / 调用图 / 类型层次
                     │
                     ▼
-                 Blackboard
+          Blackboard
        规则、污点、框架语义、链组合与校准
                     │
                     ▼
-          规范化链结果与可选动态验证
+       分析过程中在高成本/高噪声位置有界筛选
                     │
                     ▼
-       CSV / JSON / SARIF / HTML / Markdown
+          同一规范报告快照
+             report.md/report.json
 ```
 
 ## 主要功能
@@ -31,19 +34,18 @@ JAR / WAR / class 目录 + 可选依赖 + 目标 JDK
 - 建立调用、控制流、异常、继承、字段、数组、容器元素、反射、代理和 lambda 关系。
 - 使用 forward/backward taint、对象图、source/sink 规则和链校准组合候选链。
 - 每条链保留 `rule_id`、entry、sink、逐跳 edge、字段依赖、校准状态和完整性原因。
-- 默认动态验证在 Windows Job Object 子 JVM 中运行。可证明的精确 sink/body 使用固定安全参数真实调用；高风险终点只确认到最终危险操作之前，并在报告中区分范围。
-- Windows Job Object 限制进程树、内存、进程数、CPU time、墙钟时间并在关闭时回收子进程；它是 process/resource containment，不声明完整文件系统或系统网络控制。
-- 默认 `scan` 使用 `verificationMode=AUTO`：静态分析完成后才进行轻量 prefix/boundary 验证。目标代码可能被加载或初始化，因此只适用于用户主动选择的本地/可信制品；Job Object 只有进程/资源 containment，不提供文件系统、网络、令牌或 syscall 隔离。验证失败时 fail-closed，不会在无 containment 时启动目标。
-- 兼容的 `SAFE_REAL`/`SAFE_EXEC` 仅表示 Just-owned 固定参数或 canary 适配器调用，结果带有失真，不能证明真实 exploit、RCE 或目标 sink 副作用。来源不明或潜在恶意 JAR 请使用 `--no-verify`。
+- 静态筛选只在高成本或高噪声位置求值 Just 自有的有限操作；它不加载、初始化、构造或调用目标代码。
+- 只有完整有限域证明的矛盾可以剪枝；UNKNOWN、预算耗尽和缺依赖均保留静态候选并在报告中说明。
+- 不使用 Job Object、SecurityManager、子 JVM、canary 或 payload 验证路径；资源风险由输入、图扩展、筛选和报告预算处理。
 - 通过 `KnowledgeSource`、Blackboard、YAML 规则和 ServiceLoader 扩展分析语义。
 
 ## 构建与运行
 
-需要 JDK 17+ 和 Maven 3.6+。
+主程序使用 JDK 17 和 Maven 3.6+。
 
 ```bash
 mvn package -DskipTests
-java -jar target/just-sast-0.2.0.jar scan \
+java -jar target/just-sast-0.2.0-shaded.jar scan \
   --jar app.jar \
   --jdk-home /path/to/jdk \
   --output just-out
@@ -52,7 +54,7 @@ java -jar target/just-sast-0.2.0.jar scan \
 补充依赖：
 
 ```bash
-java -jar target/just-sast-0.2.0.jar scan \
+java -jar target/just-sast-0.2.0-shaded.jar scan \
   --jar app.jar \
   --deps lib/a.jar,lib/b.jar \
   --output just-out
@@ -62,49 +64,40 @@ java -jar target/just-sast-0.2.0.jar scan \
 
 | 参数 | 作用 |
 | --- | --- |
-| `--jar=<path>` | 目标 JAR、WAR 或 class 目录 |
-| `--deps=<path,...>` | 补充依赖路径 |
-| `--jdk-home=<path>` | 目标 JDK；Java 8 使用 `rt.jar`，Java 9+ 使用 `jrt-fs` |
-| `--output=<path>` | 报告目录，默认 `just-out` |
-| `--rules=<path>` | 自定义 YAML 规则 |
-| `--verify-budget=<N>` | 动态验证规范化 finding 组预算，默认 `32`；显式值仍为硬上限 |
-| `--stats` | 输出阶段统计 |
-| `--fast` | 减少 JDK 运行库加载，适合快速预览 |
-| `--no-verify` | 只执行静态分析；不加载/初始化目标回调，适用于不可信制品 |
+| --jar | 目标 JAR、WAR 或 class 目录 |
+| --mode | component（默认）或真实 application 入口分析 |
+| --deps | 补充依赖路径 |
+| --pom | 显式 Maven 根 POM，只解析模型 |
+| --repository | 显式扩展 Maven 仓库，可重复 |
+| --offline | 禁止联网，只使用明确输入和完整缓存 |
+| --jdk-home | 目标 JDK；Java 8 使用 rt.jar，Java 9+ 使用实际 JRT/JDK 布局 |
+| --output | 报告目录，默认 just-out |
+| --rules | 自定义 YAML 规则 |
+| --overwrite | 显式允许替换既有输出目录 |
 
-完整扫描通常使用默认参数；`--fast` 和 `--no-verify` 会改变分析或动态验证范围。
+no-verify、verify-budget、safe-exec、safe-real-sink 和 require-os-isolation 已从目标契约退役，现存接口残留需在本轮清理，不应重新加入主扫描接口。动态测试已经删除，静态筛选不通过参数切换。
+stats、fast、baseline、suppressions 和 cache 只有在有独立消费者和测试后才作为高级工作流保留。
 
 ## 输出
 
 ```text
 just-out/
-├─ index.md
-├─ findings/       # 主发现及 CSV/JSON/SARIF/HTML/Markdown
-├─ verification/   # 动态状态与安全构造计划
-├─ evidence/       # 链、边、sink、校准和依赖证据
-└─ meta/           # 扫描身份、阶段统计和元数据
+├─ report.md       # 人和 agent 的主阅读入口
+└─ report.json     # 与 report.md 同源的机器入口
 ```
 
-`meta/run.json` 固定记录 `verificationMode`、`targetCodeExecutionPossible`、`targetCodeExecuted`、
-`resourceContainmentOnly`、文件/网络/令牌隔离能力、Job Object 后端和 fail-closed 状态。
+旧 verification、payload、动态信任边界和运行时隔离字段不是稳定报告接口。迁移期间若旧代码仍产生这些文件，它们只能作为待清理残留，不能作为能力证明或下游输入。
 
-动态状态含义：
+静态筛选状态：
 
 | 状态 | 含义 |
 | --- | --- |
-| `SINK_BLOCKED` | 真实前置链抵达精确 sink 边界，canary 阻断方法体 |
-| `PRE_SINK_CONFIRMED` | 高风险终点前的完整前置链已确认，最终危险调用未进入 |
-| `SINK_EXECUTED_SAFE` | Just-owned 固定参数下的精确 API/body 返回，带 `sink_distorted=true`；不代表真实危险副作用 |
-| `JNI_EXECUTED_SAFE` | Just 自有 native fixture 完成受约束的 load、callback 和正常返回；不代表目标 JAR 的 native load |
-| `CONCRETE_REACHED` | 运行到安全观察点，但未形成精确 sink 证据 |
-| `PARTIAL` | 只完成部分构造或触发 |
-| `TIMEOUT` | 达到动态时间预算 |
-| `UNTESTABLE` | 依赖、JDK、权限或 OS runner 能力不足 |
+| PROVABLY_UNREACHABLE | 有完整局部证明，可阻断对应路径 |
+| PROVEN_RETAINED | 有局部事实支持，保留路径但不证明完整链 |
+| UNKNOWN | 事实不足，保留候选并披露缺口 |
+| BUDGET_EXCEEDED | 有界求值停止，保留候选并披露完整性影响 |
 
-`payload.md/json` 只描述对象图、字段、触发和证据计划，不包含可直接投递的攻击字节流。Just 不输出 `RCE_CONFIRMED`。
-
-动态结果还会记录 `verification_scope`、`sink_risk`、`terminal_executed`、`stop_reason` 和
-`last_confirmed_stage`，用于区分边界 canary、高风险前置确认和安全终点闭环。
+UNKNOWN 和 BUDGET_EXCEEDED 不能作为拒绝理由，也不能被排名转换成 SAT。
 
 ## 扩展
 
@@ -112,15 +105,14 @@ just-out/
 
 ## 验证
 
-```bash
+~~~powershell
 mvn test
 mvn package -DskipTests
-```
+~~~
 
 架构约定见 [docs/architecture.md](docs/architecture.md)，需求契约见 [docs/requirements.md](docs/requirements.md)。
 
-推送形如 `vX.Y.Z` 的 tag，或手动运行 release workflow，会在 JDK17 上重新测试并构建主 JAR
-与目标 JDK 兼容验证器，生成 `SHA256SUMS` 和 GitHub 构建证明；发布前仍应由维护者检查变更和
-生成的 release notes。
+日常只做本地 commit，不 push/tag。最终发布由 Release 流程在同一提交上完成 Windows/JDK17
+校验、目标 JDK 兼容 smoke、SHA256、许可证和可用版本核对。
 
 许可证为 GPLv3，见 [LICENSE](LICENSE)。

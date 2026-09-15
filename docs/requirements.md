@@ -39,6 +39,14 @@ scan --jar <jar|war|class-dir>
 --repository允许重复；--offline禁止包括元数据解析在内的网络请求，只使用明确输入和缓存。预算/诊断等已有参数只在有实际用途且语义清楚时保留，help准确说明范围。
 这些是目标接口，不宣称当前CLI已经支持全部选项。
 
+主扫描接口不保留 no-verify、verify-budget、safe-exec、safe-real-sink 或
+require-os-isolation。动态测试已经退役；静态筛选由分析阶段统一决定，不用一个旧 verifier
+开关或独立验证预算切换。stats、fast、baseline、suppressions 和 cache 只有在有明确消费者、
+失败语义和回归测试后才能成为高级参数，不进入最简使用路径。
+
+每次显式 jdk-home 测试和报告必须记录解析后的绝对路径、目标 Java 版本、java.exe 摘要、
+JDK home/release 或实际运行库 digest；这只是目标字节码来源，不改变 Just 主程序的 JDK17。
+
 ## 4. 动态筛选与执行边界
 
 所有扫描选项不执行目标代码：不把目标加入可执行classloader，不初始化/构造/调用目标类，不反序列化攻击流，不启动目标进程，不访问目标漏洞终点。
@@ -46,7 +54,18 @@ scan --jar <jar|war|class-dir>
 只对已知值或完整穷尽且保留值间关联的有限域证明矛盾，UNKNOWN/预算/不支持不能否定静态候选；一个成功输入也不证明全链成立。
 已知操作异常必须尊重目标异常控制流，不能统一转换成false。工具内部错误直接暴露，不能catch-all后变UNKNOWN。
 不建设通用JVM解释器、外部SMT或目标执行沙箱。当前使用进程内有界求值；移除旧verifier、verify8、payload、canary、Job Object/SecurityManager及无消费者原生依赖。
-选择性复用旧字段/类型/构造约束、预算/确定性/证据和测试职责；每个热点用A/B证明降噪或成本收益和有效链保留，无收益不保留。
+筛选决策是封闭的 typed evidence：PROVABLY_UNREACHABLE 只表示该局部路径有完整矛盾证明；
+PROVEN_RETAINED 表示局部事实支持但不证明完整链；UNKNOWN 和 BUDGET_EXCEEDED 必须保留候选。
+未知或预算不得被排名转换为 SAT，也不得作为静态拒绝理由。
+每个热点记录筛选 kind、位置、reason、有限域/语义 digest、预算、评估数、保留数和拒绝数；
+预算属于具体 proof/site，不以一次全局耗尽标记污染所有后续候选。筛选 evidence 进入统一报告，
+不创建 verification 目录或第二套旁路 schema。
+筛选应尽量在高扇出展开前介入；无法精确裁剪时使用延迟组合、语义去重或未解析端点保留相关性，
+不能用少报候选冒充降噪。
+选择性复用旧字段/类型/构造约束、预算/确定性/证据和测试职责；每个热点用固定输入/规则/JDK
+做A/B，必须同时证明有效主链/重要变体保留以及筛选成本或审查负担收益，无收益不保留。
+泛化验收保留未用于调优的制品首次结果，再按通用根因修复；不将样本名称、路径、摘要或答案写入规则和求解控制。
+必要行为保护包括：完整相关域反证、非穷尽域保留、局部预算耗尽不影响其他热点、目标异常边、证据确定性、报告同源和目标不执行。旧动态测试按职责迁移，不能仅删除失败断言或用源码文本匹配代替行为测试。
 
 ## 5. 输出与耗时
 
@@ -55,6 +74,8 @@ Markdown按价值展示前10组代表链并列出其他候选概要；JSON保留
 报告提供精确方法签名/字节码位置、逐跳依据、对象字段连接、类型/控制/构造/过滤/JDK条件、依赖来源、关键假设与未解决点。没有源码行号则不捏造。
 展示限制、搜索预算、结果截断分别说明，不能静默少报或把片段计入完整链。默认不输出payload计划、verification目录或旧五格式。
 公共契约只保留 concise report、finding output、rules、input digest 和 evidence-graph telemetry；动态验证披露、运行信任边界和 v1/v2 shadow schema 已退役。动态筛选的局部状态属于分析结果与统一报告的一部分，不再创建第二套验证报告或旁路 schema。
+当前代码若仍生成旧 verification/payload 文件、verification phase 或动态信任边界文案，属于迁移残留，
+必须在P4.3/P5.1清理；它们不能写入 README、help、稳定缓存身份或下游消费契约。
 计时分别记录依赖解析、网络下载墙钟、静态analysis、report、total；dynamicFilter是analysis子耗时。并发请求时间总和单列，不能与墙钟混用或重复相加。下载时间不得混入扫描性能。
 首次有用结果以完整链可由消费者读取为准，不能用内存命中或旧缓存时间代替。
 
