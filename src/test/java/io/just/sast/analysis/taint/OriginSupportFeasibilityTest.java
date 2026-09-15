@@ -68,9 +68,21 @@ class OriginSupportFeasibilityTest {
                 "the bounded evaluator must expose that it inspected the conditional edges");
         assertTrue(support.finiteFilterRejections() > 0,
                 "the bounded evaluator must expose the rejected false edge");
+        List<FilterAnalysis.Evidence> evidence = support.finiteFilterEvidence();
+        assertEquals(1, evidence.size(),
+                "one conditional hotspot must produce one deterministic local evidence row");
+        assertEquals(FilterAnalysis.Kind.CFG_PATH, evidence.get(0).kind());
+        assertEquals(FilterAnalysis.Status.PROVABLY_UNREACHABLE, evidence.get(0).status());
+        assertTrue(evidence.get(0).location().contains("@"));
+        assertEquals(64, evidence.get(0).domainDigest().length());
+        assertTrue(evidence.get(0).evaluated() >= evidence.get(0).retained()
+                        + evidence.get(0).rejected(),
+                "edge accounting must not lose an evaluated edge");
         assertTrue(support.sinkPathProvablyUnreachable(method, guardedOffset));
         assertEquals(1L, support.finiteFilterCacheHits(),
                 "the method/offset proof identity must reuse the second query");
+        assertEquals(evidence, support.finiteFilterEvidence(),
+                "cache reuse must preserve byte-stable evidence");
     }
 
     @Test

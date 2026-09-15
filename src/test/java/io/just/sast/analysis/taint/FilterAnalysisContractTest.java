@@ -19,6 +19,7 @@ class FilterAnalysisContractTest {
         assertFalse(budget.rejectsPath());
         assertTrue(budget.isUnknown());
         assertFalse(kept.isUnknown());
+        assertEquals(FilterAnalysis.Status.PROVEN_RETAINED, kept.status());
         assertEquals("CFG_EXACT_PATH_UNREACHABLE", rejected.reasonCode());
     }
 
@@ -41,5 +42,22 @@ class FilterAnalysisContractTest {
         assertEquals(FilterAnalysis.Status.UNKNOWN, unknown.status());
         assertEquals("UNSUPPORTED_FILTER", unknown.reasonCode());
         assertTrue(unknown.preservesPath());
+    }
+
+    @Test
+    void allNonRejectingStatesPreserveCandidatesAndEvidenceIsClosed() {
+        assertTrue(FilterAnalysis.cfgPath(false, false, false).preservesPath());
+        assertEquals(FilterAnalysis.Status.UNKNOWN,
+                FilterAnalysis.cfgPath(false, false, false).status());
+        assertEquals(FilterAnalysis.Status.UNKNOWN,
+                FilterAnalysis.reflectiveInvocation(true).status());
+
+        FilterAnalysis.Evidence evidence = new FilterAnalysis.Evidence(
+                FilterAnalysis.Kind.CFG_PATH, "fixture/Host#run()V@3",
+                FilterAnalysis.Status.BUDGET_EXCEEDED, " budget ", "domain", "semantic",
+                4, 3, 2, 1, 5, 7);
+        assertEquals("BUDGET", evidence.reasonCode());
+        assertEquals("fixture/Host#run()V@3", evidence.location());
+        assertEquals(5L, evidence.expanded());
     }
 }

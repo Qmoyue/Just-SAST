@@ -42,7 +42,7 @@ public final class ForwardConstraintPropagation {
         if (decision.status() == FilterAnalysis.Status.PROVABLY_UNREACHABLE) {
             return new Decision(Status.BLOCKED, decision, decision.reasonCode());
         }
-        if (decision.status() == FilterAnalysis.Status.KEEP) {
+        if (decision.status() == FilterAnalysis.Status.PROVEN_RETAINED) {
             return new Decision(Status.PROPAGATE, decision, decision.reasonCode());
         }
         return new Decision(Status.UNKNOWN, decision, decision.reasonCode());

@@ -37,7 +37,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -225,16 +224,28 @@ public final class OriginSupport {
      * interprocedural parameter walk becomes exponential and can dominate the scan.
      */
     public static final int CONSTANT_PROOF_BUDGET = 4096;
-    private final Map<CfgProofKey, Boolean> sinkPathCache = new ConcurrentHashMap<>();
+    private final Map<CfgProofKey, CfgProofResult> sinkPathCache = new ConcurrentHashMap<>();
     private final ThreadLocal<ConstantProofContext> constantProof = new ThreadLocal<>();
-    private final AtomicBoolean constantProofBudgetExceeded = new AtomicBoolean();
     private final LongAdder finiteFilterNanos = new LongAdder();
     private final LongAdder finiteFilterEvaluations = new LongAdder();
+    private final LongAdder finiteFilterRetained = new LongAdder();
     private final LongAdder finiteFilterRejections = new LongAdder();
+    private final LongAdder finiteFilterExpanded = new LongAdder();
+    private final LongAdder finiteFilterUnknown = new LongAdder();
+    private final LongAdder finiteFilterBudgetExceeded = new LongAdder();
     private final LongAdder sinkPathCacheHits = new LongAdder();
     private final LongAdder sinkPathCacheMisses = new LongAdder();
 
-    private record CfgProofKey(String methodKey, int offset) {
+    private record CfgProofKey(String methodKey, int offset, String domainDigest,
+                               String semanticDigest) {
+    }
+
+    private record CfgProofResult(boolean unreachable, boolean proofCompleted,
+                                  boolean budgetExceeded,
+                                  List<FilterAnalysis.Evidence> evidence) {
+        private CfgProofResult {
+            evidence = evidence == null ? List.of() : List.copyOf(evidence);
+        }
     }
 
     private record ConstantFactKey(String methodKey, ValueOrigin value) {
@@ -244,9 +255,102 @@ public final class OriginSupport {
         private int remaining = CONSTANT_PROOF_BUDGET;
         private final Map<ConstantFactKey, Integer> facts = new HashMap<>();
         private final Set<ConstantFactKey> active = new HashSet<>();
+        private final Map<String, FilterEvidenceAccumulator> hotspots = new TreeMap<>();
+        private boolean budgetExceeded;
 
         private boolean consume() {
-            return remaining-- > 0;
+            if (remaining <= 0) {
+                budgetExceeded = true;
+                return false;
+            }
+            remaining--;
+            return true;
+        }
+
+        private void observe(MethodInfo method, InsnFact insn, boolean retained,
+                             boolean rejected, String reasonCode, long costNanos) {
+            FilterAnalysis.Kind kind = filterKind(insn);
+            if (kind == null) {
+                return;
+            }
+            String location = methodKey(method) + "@" + insn.offset();
+            String key = kind.name() + "|" + location;
+            FilterEvidenceAccumulator accumulator = hotspots.computeIfAbsent(key,
+                    ignored -> new FilterEvidenceAccumulator(kind, location,
+                            FilterAnalysis.domainDigest(kind, location, insn.op().name()),
+                            FilterAnalysis.SEMANTICS_DIGEST));
+            accumulator.observe(retained, rejected, reasonCode, costNanos);
+        }
+
+        private void expanded(MethodInfo method, InsnFact insn) {
+            FilterAnalysis.Kind kind = filterKind(insn);
+            if (kind == null) {
+                return;
+            }
+            String key = kind.name() + "|" + methodKey(method) + "@" + insn.offset();
+            FilterEvidenceAccumulator accumulator = hotspots.get(key);
+            if (accumulator != null) {
+                accumulator.expanded++;
+            }
+        }
+
+        private List<FilterAnalysis.Evidence> evidence() {
+            return hotspots.values().stream()
+                    .map(accumulator -> accumulator.toEvidence(budgetExceeded))
+                    .toList();
+        }
+    }
+
+    private static final class FilterEvidenceAccumulator {
+        private final FilterAnalysis.Kind kind;
+        private final String location;
+        private final String domainDigest;
+        private final String semanticDigest;
+        private long evaluated;
+        private long retained;
+        private long rejected;
+        private long expanded;
+        private long filterCostNanos;
+        private boolean unknown;
+        private String reasonCode = "FILTER_PATH_PRESERVED";
+
+        private FilterEvidenceAccumulator(FilterAnalysis.Kind kind, String location,
+                                          String domainDigest, String semanticDigest) {
+            this.kind = kind;
+            this.location = location;
+            this.domainDigest = domainDigest;
+            this.semanticDigest = semanticDigest;
+        }
+
+        private void observe(boolean kept, boolean blocked, String reason, long costNanos) {
+            evaluated++;
+            if (kept) {
+                retained++;
+            }
+            if (blocked) {
+                rejected++;
+            }
+            if (reason != null && !reason.isBlank()
+                    && !"FILTER_PATH_PRESERVED".equals(reason)) {
+                reasonCode = reason.trim().toUpperCase(java.util.Locale.ROOT);
+            }
+            if ("FILTER_PATH_UNKNOWN".equals(reason)
+                    || "CFG_BRANCH_UNKNOWN".equals(reason)) {
+                unknown = true;
+            }
+            filterCostNanos = safeAdd(filterCostNanos, Math.max(0L, costNanos));
+        }
+
+        private FilterAnalysis.Evidence toEvidence(boolean budgetExceeded) {
+            FilterAnalysis.Status status = budgetExceeded
+                    ? FilterAnalysis.Status.BUDGET_EXCEEDED
+                    : unknown ? FilterAnalysis.Status.UNKNOWN
+                    : rejected > 0L ? FilterAnalysis.Status.PROVABLY_UNREACHABLE
+                    : FilterAnalysis.Status.PROVEN_RETAINED;
+            String reason = budgetExceeded ? "CFG_PROOF_BUDGET_EXCEEDED" : reasonCode;
+            return new FilterAnalysis.Evidence(kind, location, status, reason, domainDigest,
+                    semanticDigest, CONSTANT_PROOF_BUDGET, evaluated, retained, rejected,
+                    expanded, filterCostNanos);
         }
     }
 
@@ -4060,12 +4164,23 @@ public final class OriginSupport {
     /** Same exact path proof when the caller already owns the method's forward result. */
     public boolean sinkPathProvablyUnreachable(MethodInfo method, int sinkOffset,
                                                ForwardOrigins.Result result) {
+        CfgProofResult proof = sinkPathProof(method, sinkOffset, result);
+        return proof.unreachable();
+    }
+
+    /** Compute one bounded proof and retain its complete local evidence under its site key. */
+    private CfgProofResult sinkPathProof(MethodInfo method, int sinkOffset,
+                                         ForwardOrigins.Result result) {
         if (method == null || sinkOffset < 0 || sinkOffset >= method.instructions().size()
                 || !hasPathProofFeature(method)) {
-            return false;
+            return new CfgProofResult(false, false, false, List.of());
         }
-        CfgProofKey proofKey = new CfgProofKey(methodKey(method), sinkOffset);
-        Boolean cached = sinkPathCache.get(proofKey);
+        String location = methodKey(method) + "@" + sinkOffset;
+        String domainDigest = FilterAnalysis.domainDigest(FilterAnalysis.Kind.CFG_PATH,
+                location, "CFG");
+        CfgProofKey proofKey = new CfgProofKey(methodKey(method), sinkOffset, domainDigest,
+                FilterAnalysis.SEMANTICS_DIGEST);
+        CfgProofResult cached = sinkPathCache.get(proofKey);
         if (cached != null) {
             sinkPathCacheHits.increment();
             return cached;
@@ -4076,7 +4191,9 @@ public final class OriginSupport {
         try {
             Cfg.Indexed cfg = cfg(method);
             if (result == null) {
-                return false;
+                CfgProofResult missing = new CfgProofResult(false, false, false, List.of());
+                sinkPathCache.putIfAbsent(proofKey, missing);
+                return missing;
             }
             int size = method.instructions().size();
             boolean[] canReachSink = new boolean[size];
@@ -4097,15 +4214,24 @@ public final class OriginSupport {
                         }
                         if (canReachSink[target]) {
                             canReachSink[source] = true;
+                            constantProof.get().expanded(method, method.insnAt(source));
+                            finiteFilterExpanded.increment();
                             changed = true;
                             break;
                         }
                     }
                 }
             } while (changed);
-            boolean unreachable = !canReachSink[0];
-            sinkPathCache.putIfAbsent(proofKey, unreachable);
-            return unreachable;
+            ConstantProofContext context = constantProof.get();
+            boolean complete = !context.budgetExceeded;
+            if (context.budgetExceeded) {
+                finiteFilterBudgetExceeded.increment();
+            }
+            boolean unreachable = complete && !canReachSink[0];
+            CfgProofResult computed = new CfgProofResult(unreachable, complete,
+                    context.budgetExceeded, context.evidence());
+            sinkPathCache.putIfAbsent(proofKey, computed);
+            return computed;
         } finally {
             if (previous == null) {
                 constantProof.remove();
@@ -4118,8 +4244,9 @@ public final class OriginSupport {
     /** Typed path-filter result used by new solver/report consumers. */
     public FilterAnalysis.Decision sinkPathDecision(MethodInfo method, int sinkOffset,
                                                     ForwardOrigins.Result result) {
-        boolean unreachable = sinkPathProvablyUnreachable(method, sinkOffset, result);
-        return FilterAnalysis.cfgPath(unreachable, constantProofBudgetExceeded());
+        CfgProofResult proof = sinkPathProof(method, sinkOffset, result);
+        return FilterAnalysis.cfgPath(proof.unreachable(), proof.budgetExceeded(),
+                proof.proofCompleted());
     }
 
     private boolean hasPathProofFeature(MethodInfo method) {
@@ -4148,7 +4275,7 @@ public final class OriginSupport {
 
     /** Whether the optional exact-constant refinement had to fail open on a budget. */
     public boolean constantProofBudgetExceeded() {
-        return constantProofBudgetExceeded.get();
+        return sinkPathCache.values().stream().anyMatch(CfgProofResult::budgetExceeded);
     }
 
     /** Additive evaluator time accumulated across filter calls, as a subset of analysis time. */
@@ -4161,9 +4288,42 @@ public final class OriginSupport {
         return finiteFilterEvaluations.sum();
     }
 
+    /** Number of finite local edge observations that were retained. */
+    public long finiteFilterRetained() {
+        return finiteFilterRetained.sum();
+    }
+
     /** Number of normal CFG edges removed by a proof from the bounded local filters. */
     public long finiteFilterRejections() {
         return finiteFilterRejections.sum();
+    }
+
+    /** Number of bounded path states expanded after a finite edge was accepted. */
+    public long finiteFilterExpanded() {
+        return finiteFilterExpanded.sum();
+    }
+
+    /** Number of local hotspot observations whose exact domain was not available. */
+    public long finiteFilterUnknown() {
+        return finiteFilterUnknown.sum();
+    }
+
+    /** Number of local proof sites that exhausted their own budget. */
+    public long finiteFilterBudgetExceeded() {
+        return finiteFilterBudgetExceeded.sum();
+    }
+
+    /** Deterministic local proof evidence; cache order never leaks into report order. */
+    public List<FilterAnalysis.Evidence> finiteFilterEvidence() {
+        Map<String, FilterAnalysis.Evidence> stable = new TreeMap<>();
+        for (CfgProofResult result : sinkPathCache.values()) {
+            for (FilterAnalysis.Evidence evidence : result.evidence()) {
+                String key = evidence.kind().name() + "|" + evidence.location() + "|"
+                        + evidence.domainDigest();
+                stable.putIfAbsent(key, evidence);
+            }
+        }
+        return List.copyOf(stable.values());
     }
 
     /** Cache hits for the method/offset proof identity used by the local filter. */
@@ -4186,34 +4346,43 @@ public final class OriginSupport {
         boolean measured = isFiniteFilterSite(insn);
         long started = measured ? System.nanoTime() : 0L;
         boolean rejected = false;
+        String reasonCode = "FILTER_PATH_PRESERVED";
         try {
             if (insn.op().isCondJump()) {
                 Boolean branch = knownBranchResult(method, result, insn);
                 if (branch == null) {
+                    reasonCode = "CFG_BRANCH_UNKNOWN";
                     return true;
                 }
                 if (label == CfgLabel.JUMP) {
                     rejected = !branch;
+                    reasonCode = rejected ? "CFG_EDGE_PROVABLY_UNREACHABLE"
+                            : "CFG_EDGE_PROVEN_RETAINED";
                     return branch;
                 }
                 if (label == CfgLabel.FALSE) {
                     rejected = branch;
+                    reasonCode = rejected ? "CFG_EDGE_PROVABLY_UNREACHABLE"
+                            : "CFG_EDGE_PROVEN_RETAINED";
                     return !branch;
                 }
             }
             if (insn.op() == Op.CHECKCAST && label != CfgLabel.EXCEPTION
                     && castAlwaysFails(method, result, insn)) {
                 rejected = true;
+                reasonCode = "CHECKCAST_TYPE_CONTRADICTION";
                 return false;
             }
             if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
                     && reflectiveLookupAlwaysFails(method, result, insn)) {
                 rejected = true;
+                reasonCode = "REFLECTIVE_LOOKUP_MISSING";
                 return false;
             }
             if (insn.op().isInvoke() && label != CfgLabel.EXCEPTION
                     && reflectiveInvocationAlwaysFails(method, result, insn)) {
                 rejected = true;
+                reasonCode = "REFLECTIVE_PRECONDITION_UNSAT";
                 return false;
             }
             return true;
@@ -4223,9 +4392,39 @@ public final class OriginSupport {
                 finiteFilterNanos.add(Math.max(0L, System.nanoTime() - started));
                 if (rejected) {
                     finiteFilterRejections.increment();
+                } else {
+                    finiteFilterRetained.increment();
+                }
+                ConstantProofContext context = constantProof.get();
+                if (context != null) {
+                    context.observe(method, insn, !rejected, rejected, reasonCode,
+                            Math.max(0L, System.nanoTime() - started));
+                    if ("CFG_BRANCH_UNKNOWN".equals(reasonCode)) {
+                        finiteFilterUnknown.increment();
+                    }
                 }
             }
         }
+    }
+
+    private static FilterAnalysis.Kind filterKind(InsnFact insn) {
+        if (insn == null) {
+            return null;
+        }
+        if (insn.op().isCondJump() || insn.op() == Op.CHECKCAST) {
+            return FilterAnalysis.Kind.CFG_PATH;
+        }
+        if (!insn.op().isInvoke() || insn.operands().isEmpty()
+                || !(insn.operands().get(0) instanceof MethodRef ref)) {
+            return null;
+        }
+        if ("java/lang/reflect/Method".equals(ref.owner()) && "invoke".equals(ref.name())) {
+            return FilterAnalysis.Kind.REFLECTIVE_INVOCATION;
+        }
+        if ("java/lang/Class".equals(ref.owner()) && ref.name().startsWith("get")) {
+            return FilterAnalysis.Kind.REFLECTIVE_INVOCATION;
+        }
+        return null;
     }
 
     private static boolean isFiniteFilterSite(InsnFact insn) {
@@ -4753,7 +4952,6 @@ public final class OriginSupport {
                 return context.facts.get(factKey);
             }
             if (!context.consume()) {
-                constantProofBudgetExceeded.set(true);
                 return null;
             }
             if (!context.active.add(factKey)) {
@@ -6734,6 +6932,13 @@ public final class OriginSupport {
 
     public static String methodKeyOf(String owner, String name, String desc) {
         return owner + "#" + name + desc;
+    }
+
+    private static long safeAdd(long left, long right) {
+        if (right > 0L && left > Long.MAX_VALUE - right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
     }
 
     private static String fieldKey(InsnFact insn) {
