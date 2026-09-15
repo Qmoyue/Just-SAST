@@ -23,46 +23,49 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class VerificationCliContractTest {
 
     @Test
-    void scanHelpMakesAutoTrustBoundaryAndStaticOnlyPathExplicit() {
+    void scanHelpExposesOnlyTheStaticScanContract() {
         CommandLine root = new CommandLine(new JustMain());
         StringWriter output = new StringWriter();
         root.getSubcommands().get("scan").usage(new PrintWriter(output));
         String help = output.toString();
 
-        assertTrue(help.contains("--no-verify"));
         assertTrue(help.contains("--pom"));
         assertTrue(help.contains("--repository"));
         assertTrue(help.contains("--offline"));
-        assertTrue(help.contains("不可信") || help.contains("来源不明"));
+        assertTrue(help.contains("--jdk-home"));
+        assertFalse(help.contains("--no-verify"));
+        assertFalse(help.contains("--verify-budget"));
         assertFalse(help.contains("--safe-exec"));
         assertFalse(help.contains("--safe-real-sink"));
         assertFalse(help.contains("--require-os-isolation"));
     }
 
     @Test
-    void performanceHelpHidesLegacyAdapterSwitches() {
+    void performanceHelpHidesRemovedExecutionSwitches() {
         CommandLine root = new CommandLine(new JustMain());
         StringWriter output = new StringWriter();
         root.getSubcommands().get("perf").usage(new PrintWriter(output));
         String help = output.toString();
 
-        assertTrue(help.contains("--no-verify"));
+        assertTrue(help.contains("--filter-p50-limit-ms"));
+        assertFalse(help.contains("--dynamic-p50-limit-ms"));
+        assertFalse(help.contains("--no-verify"));
+        assertFalse(help.contains("--verify-budget"));
         assertFalse(help.contains("--safe-exec"));
         assertFalse(help.contains("--safe-real-sink"));
         assertFalse(help.contains("--require-os-isolation"));
     }
 
     @Test
-    void scanAndPerformanceShareTheProductVerificationBudgetDefault() {
+    void scanAndPerformanceDoNotExposeVerifierConfiguration() {
         CommandLine root = new CommandLine(new JustMain());
         StringWriter scanOutput = new StringWriter();
         root.getSubcommands().get("scan").usage(new PrintWriter(scanOutput));
         StringWriter performanceOutput = new StringWriter();
         root.getSubcommands().get("perf").usage(new PrintWriter(performanceOutput));
 
-        assertEquals(io.just.sast.verify.VerificationDefaults.VERIFY_BUDGET, 32);
-        assertTrue(scanOutput.toString().contains("默认 32"));
-        assertTrue(performanceOutput.toString().contains("静态-only"));
+        assertFalse(scanOutput.toString().contains("verify"));
+        assertFalse(performanceOutput.toString().contains("verify"));
     }
 
     @Test
@@ -80,17 +83,17 @@ class VerificationCliContractTest {
 
         String error = captured.toString(StandardCharsets.UTF_8);
         assertEquals(2, code);
-        assertTrue(error.contains("verificationMode=STATIC_ONLY"), error);
-        assertTrue(error.contains("targetCodeExecutionPossible=false"), error);
-        assertTrue(error.contains("targetCodeExecuted=NO"), error);
+        assertTrue(error.contains("analysisMode=STATIC_ONLY"), error);
+        assertTrue(error.contains("targetCodeExecution=DISABLED"), error);
+        assertTrue(error.contains("boundedFiltering=ANALYSIS_ONLY"), error);
         assertFalse(error.contains("verificationMode=AUTO"), error);
     }
 
     @Test
     void removedExecutionOptionsAreUsageErrorsForScanAndPerformance(@TempDir Path temp) {
         Path missing = temp.resolve("not-an-input.jar");
-        for (String option : List.of("--safe-exec", "--safe-real-sink",
-                "--require-os-isolation")) {
+        for (String option : List.of("--no-verify", "--verify-budget", "--safe-exec",
+                "--safe-real-sink", "--require-os-isolation")) {
             int scanCode = new CommandLine(new JustMain()).execute(
                     "scan", "--jar", missing.toString(), option);
             assertEquals(2, scanCode, "scan must reject removed option " + option);
@@ -125,7 +128,7 @@ class VerificationCliContractTest {
             code = new CommandLine(new JustMain()).execute(
                     "scan", "--jar", target.toString(), "--pom", root.toString(),
                     "--repository", repository.toUri().toString(), "--offline",
-                    "--fast", "--no-verify", "--cache", temp.resolve("maven-cache").toString(),
+                    "--fast", "--cache", temp.resolve("maven-cache").toString(),
                     "--output", output.toString());
         } finally {
             System.setErr(original);
@@ -135,7 +138,8 @@ class VerificationCliContractTest {
         String log = captured.toString(StandardCharsets.UTF_8);
         assertTrue(log.contains("dependencyCompletion=COMPLETE")
                         && log.contains("resolutionWallMs=")
-                        && log.contains("scanTiming=dependencyResolutionMs="), log);
+                        && log.contains("scanTiming=dependencyResolutionMs=")
+                        && log.contains("filterMs="), log);
         assertTrue(Files.isDirectory(output));
         String inventory = Files.readString(output.resolve("evidence/dependencies.csv"));
         String bom = Files.readString(output.resolve("meta/dependencies.sbom.json"));
@@ -170,7 +174,7 @@ class VerificationCliContractTest {
         Path output = temp.resolve("directory-output");
 
         int code = new CommandLine(new JustMain()).execute(
-                "scan", "--jar", classes.toString(), "--fast", "--no-verify",
+                "scan", "--jar", classes.toString(), "--fast",
                 "--output", output.toString());
 
         assertEquals(0, code);

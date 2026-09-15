@@ -64,7 +64,7 @@ class JdkSourceInfoContractTest {
 
         ReportLayout layout = ReportLayout.flat(temp.resolve("identity-report"));
         new ScanIdentityWriter().write(layout, "artifact", "dependencies", "inventory", null,
-                temp, 52, false, false, 0, false, false, false, InputBudget.defaults(),
+                temp, 52, false, "component", InputBudget.defaults(),
                 InputBudget.defaults().tracker(),
                 new JdkSourceInfo(JdkSourceInfo.ImageKind.TARGET_RT_JAR, 7));
         String identityJson = Files.readString(layout.meta().resolve("scan-identity.json"));
@@ -78,7 +78,7 @@ class JdkSourceInfoContractTest {
         ReportLayout layout = ReportLayout.flat(temp.resolve("report"));
         JdkSourceInfo info = new JdkSourceInfo(JdkSourceInfo.ImageKind.TARGET_RT_JAR, 8);
         new ScanIdentityWriter().write(layout, "artifact", "dependencies", "inventory", null,
-                null, 52, false, false, 0, false, false, false, InputBudget.defaults(),
+                null, 52, false, "component", InputBudget.defaults(),
                 InputBudget.defaults().tracker(), info);
         String json = Files.readString(layout.meta().resolve("scan-identity.json"));
         assertTrue(json.contains("\"jdk_source_kind\":\"TARGET_RT_JAR\""));

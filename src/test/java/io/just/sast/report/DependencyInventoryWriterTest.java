@@ -45,7 +45,7 @@ class DependencyInventoryWriterTest {
         assertFalse(bom.contains(target.toAbsolutePath().toString()));
 
         String key = new ScanIdentityWriter().write(layout, hash, "dependency-inventory", null,
-                null, 61, false, false, 0, false, false);
+                null, 61, false, "component");
         String identity = Files.readString(layout.meta().resolve("scan-identity.json"));
         assertTrue(key.matches("[0-9a-f]{64}"));
         assertTrue(identity.contains("\"cache_key\":\"" + key + "\""));

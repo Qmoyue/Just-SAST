@@ -29,25 +29,25 @@ public final class PerformanceProfile {
     private static final long MAX_BYTES = 64L * 1024L;
     private static final Set<String> KEYS = Set.of(
             "wall_p50_ms", "wall_p95_ms", "static_p50_ms", "static_p95_ms",
-            "dynamic_p50_ms", "dynamic_p95_ms");
+            "filter_p50_ms", "filter_p95_ms");
 
     public record Limits(long wallP50Ms, long wallP95Ms,
                          long staticP50Ms, long staticP95Ms,
-                         long dynamicP50Ms, long dynamicP95Ms) {
+                         long filterP50Ms, long filterP95Ms) {
         public Limits {
             wallP50Ms = nonNegative(wallP50Ms, "wall_p50_ms");
             wallP95Ms = nonNegative(wallP95Ms, "wall_p95_ms");
             staticP50Ms = nonNegative(staticP50Ms, "static_p50_ms");
             staticP95Ms = nonNegative(staticP95Ms, "static_p95_ms");
-            dynamicP50Ms = nonNegative(dynamicP50Ms, "dynamic_p50_ms");
-            dynamicP95Ms = nonNegative(dynamicP95Ms, "dynamic_p95_ms");
+            filterP50Ms = nonNegative(filterP50Ms, "filter_p50_ms");
+            filterP95Ms = nonNegative(filterP95Ms, "filter_p95_ms");
         }
 
         /** A profile with no enabled dimension cannot act as a release gate. */
         public boolean hasEnabledLimit() {
             return wallP50Ms > 0L || wallP95Ms > 0L
                     || staticP50Ms > 0L || staticP95Ms > 0L
-                    || dynamicP50Ms > 0L || dynamicP95Ms > 0L;
+                    || filterP50Ms > 0L || filterP95Ms > 0L;
         }
     }
 
@@ -98,8 +98,8 @@ public final class PerformanceProfile {
                 value(properties, "wall_p95_ms"),
                 value(properties, "static_p50_ms"),
                 value(properties, "static_p95_ms"),
-                value(properties, "dynamic_p50_ms"),
-                value(properties, "dynamic_p95_ms"));
+                value(properties, "filter_p50_ms"),
+                value(properties, "filter_p95_ms"));
         if (!limits.hasEnabledLimit()) {
             throw new IOException("performance profile enables no limit");
         }

@@ -29,11 +29,11 @@ class PerformanceHarnessTest {
         assertEquals(3, report.samples().size());
         assertEquals(3, report.wall().samples());
         assertEquals(7L, report.samples().get(0).staticMs());
-        assertEquals(3L, report.samples().get(0).dynamicMs());
+        assertEquals(3L, report.samples().get(0).filterMs());
         assertEquals(7L, report.samples().get(0).phaseMs().get("frontend"));
-        assertEquals(3, report.phaseGates().get("verify").samples());
-        assertEquals(3L, report.phaseGates().get("verify").p50Ms());
-        assertEquals(3L, report.phaseGates().get("verify").p95Ms());
+        assertEquals(3, report.phaseGates().get("filter").samples());
+        assertEquals(3L, report.phaseGates().get("filter").p50Ms());
+        assertEquals(3L, report.phaseGates().get("filter").p95Ms());
         assertTrue(report.chainCountStable());
         assertTrue(report.completenessStable());
         assertTrue(report.resultDigestStable());
@@ -72,27 +72,25 @@ class PerformanceHarnessTest {
     }
 
     @Test
-    void candidateVerificationDurationsDriveDynamicGate() {
+    void filterPhaseDrivesFilterGate() {
         PerformanceHarness.Limits limits = new PerformanceHarness.Limits(
                 100L, 100L, 100L, 100L, 10L, 20L);
         PerformanceHarness.Report report = PerformanceHarness.report(0, List.of(
-                new PerformanceHarness.Sample(1, 10L, 6L, 99L, 1L, 2L, -1L,
-                        1, "COMPLETE", "same", Map.of(), Map.of(), List.of(4L, 7L)),
-                new PerformanceHarness.Sample(2, 10L, 6L, 99L, 1L, 2L, -1L,
-                        1, "COMPLETE", "same", Map.of(), Map.of(), List.of(5L, 8L))), limits);
+                new PerformanceHarness.Sample(1, 10L, 6L, 4L, 1L, 2L, -1L,
+                        1, "COMPLETE", "same", Map.of(), Map.of()),
+                new PerformanceHarness.Sample(2, 10L, 6L, 8L, 1L, 2L, -1L,
+                        1, "COMPLETE", "same", Map.of(), Map.of())), limits);
 
-        assertEquals(5L, report.dynamicPhase().p50Ms());
-        assertEquals(8L, report.dynamicPhase().p95Ms());
-        assertEquals(List.of(4L, 7L), report.samples().get(0).verificationCandidateMs());
-        assertEquals(4, report.phaseGates().get("verify.candidate").samples());
+        assertEquals(4L, report.filterPhase().p50Ms());
+        assertEquals(8L, report.filterPhase().p95Ms());
         assertTrue(report.passed());
     }
 
     private static ScanStatistics statistics(int chains, String completeness,
-                                             long staticMs, long dynamicMs) {
+                                             long staticMs, long filterMs) {
         return new ScanStatistics(1, 1, 0, 1, 1, chains,
-                staticMs + dynamicMs, 4L, 5L, completeness, List.of(),
-                Map.of("frontend", staticMs, "verify", dynamicMs),
+                staticMs + filterMs, 4L, 5L, completeness, List.of(),
+                Map.of("frontend", staticMs, "filter", filterMs),
                 Map.of("rss_peak_mb", 8L), "COMPLETE", null, "COMPLETE");
     }
 }

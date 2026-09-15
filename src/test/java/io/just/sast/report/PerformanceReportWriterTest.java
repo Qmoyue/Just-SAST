@@ -30,6 +30,10 @@ class PerformanceReportWriterTest {
         assertTrue(json.contains("\"phase_ms\":{}"));
         assertTrue(json.contains("\"resource_metrics\":{}"));
         assertTrue(json.contains("\"phase_gates\":{}"));
+        assertTrue(json.contains("\"filter\""));
+        assertTrue(json.contains("\"filter_ms\":3"));
+        assertFalse(json.contains("dynamic"));
+        assertFalse(json.contains("verification_candidate"));
         assertFalse(json.contains("C:\\"), "性能产物不得写入本机绝对路径");
     }
 }

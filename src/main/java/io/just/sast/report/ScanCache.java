@@ -60,47 +60,31 @@ public final class ScanCache {
 
     /** Calculate all immutable inputs needed for a cache lookup before frontend parsing. */
     public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
-                                      Path jdkHome, boolean fast, boolean verify,
-                                      int verifyBudget, boolean safeExec,
-                                      boolean requireOsIsolation) throws IOException {
-        return preflight(target, dependencies, rules, jdkHome, fast, verify, verifyBudget,
-                safeExec, false, requireOsIsolation, InputBudget.defaults());
-    }
-
-    /** Preflight identity including the explicit adapter-owned SAFE_REAL mode. */
-    public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
-                                      Path jdkHome, boolean fast, boolean verify,
-                                      int verifyBudget, boolean safeExec, boolean safeReal,
-                                      boolean requireOsIsolation) throws IOException {
-        return preflight(target, dependencies, rules, jdkHome, fast, verify, verifyBudget,
-                safeExec, safeReal, requireOsIsolation, InputBudget.defaults());
+                                      Path jdkHome, boolean fast, String mode) throws IOException {
+        return preflight(target, dependencies, rules, jdkHome, fast, mode,
+                InputBudget.defaults(), "");
     }
 
     /** Preflight identity including the path-free dependency-environment identity. */
     public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
-                                      Path jdkHome, boolean fast, boolean verify,
-                                      int verifyBudget, boolean safeExec, boolean safeReal,
-                                      boolean requireOsIsolation,
+                                      Path jdkHome, boolean fast, String mode,
                                       String dependencyEnvironmentIdentity) throws IOException {
-        return preflight(target, dependencies, rules, jdkHome, fast, verify, verifyBudget,
-                safeExec, safeReal, requireOsIsolation, InputBudget.defaults(),
-                dependencyEnvironmentIdentity);
+        return preflight(target, dependencies, rules, jdkHome, fast, mode,
+                InputBudget.defaults(), dependencyEnvironmentIdentity);
     }
 
     /** Preflight identity under an explicit immutable input policy. */
     public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
-                                      Path jdkHome, boolean fast, boolean verify,
-                                      int verifyBudget, boolean safeExec, boolean safeReal,
-                                      boolean requireOsIsolation, InputBudget budget) throws IOException {
-        return preflight(target, dependencies, rules, jdkHome, fast, verify, verifyBudget,
-                safeExec, safeReal, requireOsIsolation, budget, "");
+                                      Path jdkHome, boolean fast, String mode,
+                                      InputBudget budget) throws IOException {
+        return preflight(target, dependencies, rules, jdkHome, fast, mode,
+                budget, "");
     }
 
     /** Preflight with an explicit immutable dependency graph/environment identity. */
     public static Preflight preflight(Path target, List<Path> dependencies, Path rules,
-                                      Path jdkHome, boolean fast, boolean verify,
-                                      int verifyBudget, boolean safeExec, boolean safeReal,
-                                      boolean requireOsIsolation, InputBudget budget,
+                                      Path jdkHome, boolean fast, String mode,
+                                      InputBudget budget,
                                       String dependencyEnvironmentIdentity) throws IOException {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         validateInput(target, true);
@@ -121,8 +105,7 @@ public final class ScanCache {
         String dependencyIdentity = dependencyIdentityFromHashes(dependencyHashes,
                 dependencyEnvironmentIdentity);
         String cacheKey = ScanIdentityWriter.cacheKey(artifactHash, dependencyIdentity, rules,
-                jdkHome, fast, verify, verifyBudget, safeExec, safeReal,
-                requireOsIsolation, policy);
+                jdkHome, fast, mode, policy);
         return new Preflight(artifactHash, dependencyIdentity, dependencyHashes, cacheKey);
     }
 

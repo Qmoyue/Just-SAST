@@ -491,6 +491,7 @@ public final class ScanPipeline {
             phaseMs.put(timing.getKey(), timing.getValue());
         }
         phaseMs.put("analysis", elapsedMs(analysisStart));
+        phaseMs.put("filter", blackboard.originSupport().finiteFilterMs());
         // The verifier normally publishes this typed product before selecting a plan.  Keep a
         // report-boundary fallback for callers that omit the calibration source (for example a
         // custom controller or a future --no-verify execution path): absence must remain an
@@ -609,8 +610,7 @@ public final class ScanPipeline {
         phaseMs.put("report.inventory", elapsedMs(inventoryStart));
         new io.just.sast.report.ScanIdentityWriter().write(reportLayout, targetArtifactHash,
                 dependencyIdentity, dependencyInventoryHash, rules, jdkHome,
-                load.targetMajorVersion(), fast, verify, verifyBudget, safeExec,
-                safeReal, requireOsIsolation, inputBudget, inputTracker,
+                load.targetMajorVersion(), fast, modePolicy.wireName(), inputBudget, inputTracker,
                 jdkSource == null ? null : jdkSource.sourceInfo());
         new io.just.sast.report.BaselineSuppressionWriter().write(reportLayout, baseline,
                 suppressions, reportChains, reportCalibrations, inputBudget);
@@ -1059,6 +1059,7 @@ public final class ScanPipeline {
         metrics.put("analysis_ms", phaseMs.getOrDefault("analysis", -1L));
         long dynamicFilterMs = blackboard.originSupport().finiteFilterMs();
         long dynamicFilterEvaluations = blackboard.originSupport().finiteFilterEvaluations();
+        metrics.put("filter_ms", dynamicFilterMs);
         metrics.put("dynamic_filter_ms", dynamicFilterMs);
         metrics.put("dynamic_filter_evaluations", dynamicFilterEvaluations);
         metrics.put("dynamic_filter_rejections", blackboard.originSupport().finiteFilterRejections());
@@ -1123,6 +1124,7 @@ public final class ScanPipeline {
         status.put("analysis_ms", phaseMs.containsKey("analysis") ? "OBSERVED" : "UNKNOWN");
         String dynamicFilterStatus = dynamicFilterEvaluations == 0L
                 ? "NOT_APPLICABLE" : "OBSERVED";
+        status.put("filter_ms", dynamicFilterStatus);
         for (String name : List.of("dynamic_filter_ms", "dynamic_filter_evaluations",
                 "dynamic_filter_rejections", "dynamic_filter_cache_hits",
                 "dynamic_filter_cache_misses", "dynamic_filter_cache_size",
@@ -1188,6 +1190,7 @@ public final class ScanPipeline {
         analysis.put("representative_paths", -1L);
         analysis.put("forward_origin_cache_bytes_estimate",
                 blackboard.originSupport().forwardOriginCacheBytesEstimate());
+        analysis.put("filter_ms", dynamicFilterMs);
         analysis.put("dynamic_filter_ms", dynamicFilterMs);
         analysis.put("dynamic_filter_evaluations", dynamicFilterEvaluations);
         analysis.put("dynamic_filter_rejections",

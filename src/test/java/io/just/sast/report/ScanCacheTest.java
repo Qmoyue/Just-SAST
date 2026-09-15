@@ -25,9 +25,11 @@ class ScanCacheTest {
         String artifactHash = ArtifactFingerprint.sha256(artifact);
         String dependencyIdentity = ScanCache.dependencyIdentityFromHashes(List.of());
         String key = ScanIdentityWriter.cacheKey(artifactHash, dependencyIdentity, null, null,
-                false, false, 0, false, false);
+                false, "component");
         new ScanIdentityWriter().write(sourceLayout, artifactHash, dependencyIdentity,
-                "inventory", null, null, 0, false, false, 0, false, false);
+                "inventory", null, null, 0, false, "component");
+        assertFalse(Files.readString(source.resolve("meta/scan-identity.json"))
+                .contains("verify"));
         ScanStatistics complete = new ScanStatistics(1, 1, 0, 0, 0, 0,
                 1, 1, 1, "COMPLETE", List.of(), java.util.Map.of(), java.util.Map.of(),
                 "DISABLED", VerificationSummary.empty("DISABLED", 0), "COMPLETE", artifactHash);
@@ -58,7 +60,7 @@ class ScanCacheTest {
 
         Files.writeString(artifact, "changed-input");
         ScanCache.Preflight changed = ScanCache.preflight(artifact, List.of(), null, null,
-                false, false, 0, false, false);
+                false, "component");
         assertFalse(changed.cacheKey().equals(key));
         assertFalse(ScanCache.restore(cache, changed.cacheKey(), tmp.resolve("miss")));
     }
@@ -80,11 +82,11 @@ class ScanCacheTest {
         String artifactHash = ArtifactFingerprint.sha256(artifact);
         String dependencyIdentity = ScanCache.dependencyIdentityFromHashes(List.of());
         String defaultKey = ScanIdentityWriter.cacheKey(artifactHash, dependencyIdentity,
-                null, null, false, false, 0, false, false);
+                null, null, false, "component");
         InputBudget defaults = InputBudget.defaults();
         InputBudget changed = defaults.withRuleInputBytes(defaults.maxRuleInputBytes() / 2);
         String changedKey = ScanIdentityWriter.cacheKey(artifactHash, dependencyIdentity,
-                null, null, false, false, 0, false, false, changed);
+                null, null, false, "component", changed);
         assertFalse(defaultKey.equals(changedKey));
     }
 
@@ -93,9 +95,9 @@ class ScanCacheTest {
         Path artifact = tmp.resolve("app.jar");
         Files.writeString(artifact, "stable-input");
         ScanCache.Preflight first = ScanCache.preflight(artifact, List.of(), null, null,
-                false, false, 0, false, false, false, "pom-environment-a");
+                false, "component", "pom-environment-a");
         ScanCache.Preflight changed = ScanCache.preflight(artifact, List.of(), null, null,
-                false, false, 0, false, false, false, "pom-environment-b");
+                false, "component", "pom-environment-b");
 
         assertFalse(first.dependencyIdentity().equals(changed.dependencyIdentity()));
         assertFalse(first.cacheKey().equals(changed.cacheKey()));
@@ -111,8 +113,7 @@ class ScanCacheTest {
                 1024, 1024, 5, 1024, 16, 2, 16);
 
         assertThrows(java.io.IOException.class, () -> ScanCache.preflight(artifact,
-                List.of(dependency), null, null, false, false, 0, false, false,
-                false, budget));
+                List.of(dependency), null, null, false, "component", budget));
     }
 
     @Test
@@ -136,7 +137,7 @@ class ScanCacheTest {
 
         assertThrows(java.io.IOException.class, () -> ScanIdentityWriter.cacheKey(
                 "a".repeat(64), "b".repeat(64), rules, jdk,
-                false, false, 0, false, false, false, budget));
+                false, "component", budget));
     }
 
     @Test

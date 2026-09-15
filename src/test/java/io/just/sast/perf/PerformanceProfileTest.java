@@ -26,8 +26,8 @@ class PerformanceProfileTest {
         assertEquals(55_000L, limits.wallP95Ms());
         assertEquals(45_000L, limits.staticP50Ms());
         assertEquals(50_000L, limits.staticP95Ms());
-        assertEquals(0L, limits.dynamicP50Ms());
-        assertEquals(0L, limits.dynamicP95Ms());
+        assertEquals(0L, limits.filterP50Ms());
+        assertEquals(0L, limits.filterP95Ms());
     }
 
     @Test

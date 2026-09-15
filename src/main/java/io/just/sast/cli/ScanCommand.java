@@ -8,7 +8,6 @@ import io.just.sast.model.DependencyGraph;
 import io.just.sast.report.ScanStatistics;
 import io.just.sast.report.ScanCache;
 import io.just.sast.run.RunOutcome;
-import io.just.sast.verify.VerificationDefaults;
 
 import java.io.IOException;
 import java.net.URI;
@@ -70,25 +69,6 @@ public final class ScanCommand implements Callable<Integer> {
     @Option(names = "--stats", description = "输出扫描统计")
     boolean stats;
 
-    @Option(names = "--no-verify",
-            description = "关闭动态验证，仅执行静态分析；适用于来源不明或不可信制品（targetCodeExecutionPossible=false）")
-    boolean noVerify;
-
-    @Option(names = "--safe-exec",
-            hidden = true,
-            description = "已弃用的兼容调试选项；不改变目标信任模型")
-    boolean safeExec;
-
-    @Option(names = "--safe-real-sink",
-            hidden = true,
-            description = "已弃用的兼容调试选项；固定参数调用不等于 OS 访问控制边界或真实利用")
-    boolean safeRealSink;
-
-    @Option(names = "--require-os-isolation",
-            hidden = true,
-            description = "已弃用的兼容选项；动态验证始终 fail-closed，不会在无 Job Object 时启动目标")
-    boolean requireOsIsolation;
-
     @Option(names = "--baseline", paramLabel = "<scan-dir>",
             description = "按语义链身份比较已有扫描目录；只标记新增/不变/消失，不删除证据")
     Path baseline;
@@ -98,13 +78,8 @@ public final class ScanCommand implements Callable<Integer> {
     Path suppressions;
 
     @Option(names = "--cache", paramLabel = "<dir>",
-            description = "显式启用完整报告增量缓存；只缓存 COMPLETE 且无失败动态终态的扫描")
+            description = "显式启用完整报告增量缓存；只缓存 COMPLETE 且无内部失败终态的扫描")
     Path cache;
-
-    @Option(names = "--verify-budget", paramLabel = "<N>",
-            defaultValue = VerificationDefaults.VERIFY_BUDGET_TEXT,
-            description = "子进程动态验证的规范化 finding 组预算（默认 32；按证据分值选取）")
-    int verifyBudget;
 
 
     @Override
@@ -112,17 +87,9 @@ public final class ScanCommand implements Callable<Integer> {
         try {
             ScanMode selectedMode = ScanMode.parse(mode);
             ModeDemandPolicy modePolicy = ModeDemandPolicy.forMode(selectedMode);
-            if (safeExec || safeRealSink || requireOsIsolation) {
-                throw new ScanPipeline.UsageException(
-                        "真实动态验证已移除；--mode/静态扫描不接受旧 verifier 选项");
-            }
-            printVerificationDisclosure();
+            printStaticAnalysisDisclosure();
             PreparedDependencies prepared = resolveDependencies();
             List<Path> scanDeps = prepared.paths();
-            // The product CLI is static-only.  The library compatibility overloads still
-            // retain their old verifier seams for characterization until P1.4 removes them.
-            boolean useSafeReal = false;
-            boolean useOsIsolation = false;
             boolean useCache = selectedMode == ScanMode.APPLICATION
                     && cache != null && baseline == null && suppressions == null;
             if (selectedMode == ScanMode.COMPONENT && cache != null) {
@@ -136,8 +103,7 @@ public final class ScanCommand implements Callable<Integer> {
             if (useCache) {
                 try {
                     preflight = ScanCache.preflight(target, scanDeps, rules, jdkHome, fast,
-                            false, verifyBudget, false, false,
-                            useOsIsolation, prepared.environmentIdentity());
+                            modePolicy.wireName(), prepared.environmentIdentity());
                     if (ScanCache.restore(cache, preflight.cacheKey(), output)) {
                         System.err.println("[just:info] 增量缓存命中（报告身份已校验）");
                         return RunOutcome.success().exitCode();
@@ -148,8 +114,7 @@ public final class ScanCommand implements Callable<Integer> {
                 }
             }
             ScanPipeline.ScanResult result = ScanPipeline.run(target, scanDeps, output, rules, stats,
-                    fast, jdkHome, false, verifyBudget, false, false,
-                    useOsIsolation,
+                    fast, jdkHome, false, 0, false, false, false,
                     baseline, suppressions, overwrite,
                     modePolicy, prepared.environmentGraph(), prepared.explicitDependencyCount(),
                     prepared.environmentIdentity(), prepared.dependencyPreparation());
@@ -269,10 +234,10 @@ public final class ScanCommand implements Callable<Integer> {
         return localRepository;
     }
 
-    private static void printVerificationDisclosure() {
-        System.err.println("[just:info] verificationMode=STATIC_ONLY; "
-                + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
-                + "dynamicFiltering=ANALYSIS_ONLY; recommendedForUntrustedArtifacts=true");
+    private static void printStaticAnalysisDisclosure() {
+        System.err.println("[just:info] analysisMode=STATIC_ONLY; "
+                + "targetCodeExecution=DISABLED; boundedFiltering=ANALYSIS_ONLY; "
+                + "recommendedForUntrustedArtifacts=true");
     }
 
     private static ScanPipeline.DependencyPreparation dependencyPreparation(
@@ -295,7 +260,7 @@ public final class ScanCommand implements Callable<Integer> {
                 + "; networkDownloadWallMs=" + stats.metric("network_download_wall_ms", -1L)
                 + "; networkRequestMs=" + stats.metric("network_request_ms", -1L)
                 + "; analysisMs=" + stats.metric("analysis_ms", -1L)
-                + "; dynamicFilterMs=" + stats.metric("dynamic_filter_ms", -1L)
+                + "; filterMs=" + stats.metric("filter_ms", -1L)
                 + "; reportMs=" + stats.metric("report_ms", -1L)
                 + "; totalWallMs=" + stats.metric("total_wall_ms", -1L)
                 + "; timingStatus=" + stats.metricStatus("total_wall_ms")

@@ -21,14 +21,14 @@ import java.util.Locale;
 public final class ScanIdentityWriter {
 
     public static final String ENGINE_VERSION = "0.2.0";
+    public static final String FILTER_SEMANTICS_VERSION = "bounded-static-filter-v1";
 
     public String write(ReportLayout layout, String artifactHash, String dependencyHash,
                         Path rules, Path jdkHome, int targetMajorVersion,
-                        boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean requireOsIsolation) throws IOException {
+                        boolean fast, String mode) throws IOException {
         return write(layout, artifactHash, dependencyHash, dependencyHash, rules, jdkHome,
-                targetMajorVersion, fast, verify, verifyBudget, safeExec,
-                false, requireOsIsolation);
+                targetMajorVersion, fast, mode, InputBudget.defaults(),
+                InputBudget.defaults().tracker(), null);
     }
 
     /**
@@ -39,42 +39,28 @@ public final class ScanIdentityWriter {
      */
     public String write(ReportLayout layout, String artifactHash, String dependencyIdentityHash,
                         String inventoryHash, Path rules, Path jdkHome, int targetMajorVersion,
-                        boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean requireOsIsolation) throws IOException {
+                        boolean fast, String mode) throws IOException {
         return write(layout, artifactHash, dependencyIdentityHash, inventoryHash, rules, jdkHome,
-                targetMajorVersion, fast, verify, verifyBudget, safeExec, false,
-                requireOsIsolation);
+                targetMajorVersion, fast, mode, InputBudget.defaults(),
+                InputBudget.defaults().tracker(), null);
     }
 
     public String write(ReportLayout layout, String artifactHash, String dependencyIdentityHash,
                         String inventoryHash, Path rules, Path jdkHome, int targetMajorVersion,
-                        boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean safeReal, boolean requireOsIsolation) throws IOException {
+                        boolean fast, String mode, InputBudget budget) throws IOException {
+        InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         return write(layout, artifactHash, dependencyIdentityHash, inventoryHash, rules, jdkHome,
-                targetMajorVersion, fast, verify, verifyBudget, safeExec, safeReal,
-                requireOsIsolation, InputBudget.defaults());
+                targetMajorVersion, fast, mode, policy, policy.tracker(), null);
     }
 
     /** Write identity with an explicit input-policy version/digest for cache invalidation. */
     public String write(ReportLayout layout, String artifactHash, String dependencyIdentityHash,
                         String inventoryHash, Path rules, Path jdkHome, int targetMajorVersion,
-                        boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean safeReal, boolean requireOsIsolation, InputBudget budget) throws IOException {
+                        boolean fast, String mode, InputBudget budget,
+                        InputBudget.Tracker tracker) throws IOException {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         return write(layout, artifactHash, dependencyIdentityHash, inventoryHash, rules, jdkHome,
-                targetMajorVersion, fast, verify, verifyBudget, safeExec, safeReal,
-                requireOsIsolation, policy, policy.tracker());
-    }
-
-    /** Write identity while reusing the scan-boundary tracker for rules/JDK metadata. */
-    public String write(ReportLayout layout, String artifactHash, String dependencyIdentityHash,
-                        String inventoryHash, Path rules, Path jdkHome, int targetMajorVersion,
-                        boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean safeReal, boolean requireOsIsolation, InputBudget budget,
-                        InputBudget.Tracker tracker) throws IOException {
-        return write(layout, artifactHash, dependencyIdentityHash, inventoryHash, rules, jdkHome,
-                targetMajorVersion, fast, verify, verifyBudget, safeExec, safeReal,
-                requireOsIsolation, budget, tracker, null);
+                targetMajorVersion, fast, mode, policy, tracker, null);
     }
 
     /**
@@ -84,23 +70,16 @@ public final class ScanIdentityWriter {
      */
     public String write(ReportLayout layout, String artifactHash, String dependencyIdentityHash,
                         String inventoryHash, Path rules, Path jdkHome, int targetMajorVersion,
-                        boolean fast, boolean verify, int verifyBudget, boolean safeExec,
-                        boolean safeReal, boolean requireOsIsolation, InputBudget budget,
+                        boolean fast, String mode, InputBudget budget,
                         InputBudget.Tracker tracker, JdkSourceInfo sourceInfo) throws IOException {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         InputBudget.Tracker accounting = tracker == null ? policy.tracker() : tracker;
+        String selectedMode = modeValue(mode);
         JdkSourceInfo selectedSource = sourceInfo == null
                 ? new JdkSourceInfo(JdkSourceInfo.ImageKind.UNKNOWN, 0) : sourceInfo;
         String rulesHash = rulesHash(rules, policy, accounting);
         String jdkIdentity = jdkIdentity(jdkHome, targetMajorVersion, policy, accounting);
-        String parameters = "rules_schema=" + RuleSchemaV2.SCHEMA_VERSION
-                + ";rules_semantics=" + RuleSchemaV2.SEMANTICS_VERSION
-                + ";input_budget_schema=" + policy.schemaVersion()
-                + ";input_budget_digest=" + digest(policy.toCanonicalJson())
-                + ";fast=" + fast + ";verify=" + verify + ";verify_budget="
-                + Math.max(0, verifyBudget) + ";safe_exec=" + safeExec
-                + ";safe_real=" + safeReal
-                + ";os_isolation=" + requireOsIsolation;
+        String parameters = parameters(fast, selectedMode, policy);
         String canonical = String.join("\n", ENGINE_VERSION, value(artifactHash),
                 value(dependencyIdentityHash), rulesHash, jdkIdentity, parameters);
         String cacheKey = digest(canonical);
@@ -121,6 +100,9 @@ public final class ScanIdentityWriter {
                 + "  \"jdk_runtime_delegated\":" + selectedSource.runtimeDelegated() + ",\n"
                 + "  \"jdk_source_feature\":" + selectedSource.feature() + ",\n"
                 + "  \"target_major_version\":" + Math.max(0, targetMajorVersion) + ",\n"
+                + "  \"mode\":\"" + json(selectedMode) + "\",\n"
+                + "  \"filter_semantics_version\":\""
+                + json(FILTER_SEMANTICS_VERSION) + "\",\n"
                 + "  \"parameters\":\"" + json(parameters) + "\"\n"
                 + "}\n";
         AtomicFiles.writeUtf8(layout.meta().resolve("scan-identity.json"), json);
@@ -130,53 +112,39 @@ public final class ScanIdentityWriter {
     /** Compute the same path-free key used by the published identity before static analysis. */
     public static String cacheKey(String artifactHash, String dependencyIdentityHash,
                                   Path rules, Path jdkHome,
-                                  boolean fast, boolean verify, int verifyBudget,
-                                  boolean safeExec, boolean requireOsIsolation) throws IOException {
-        return cacheKey(artifactHash, dependencyIdentityHash, rules, jdkHome, fast, verify,
-                verifyBudget, safeExec, false, requireOsIsolation);
-    }
-
-    /** Compute a cache identity that includes the explicit SAFE_REAL adapter mode. */
-    public static String cacheKey(String artifactHash, String dependencyIdentityHash,
-                                  Path rules, Path jdkHome,
-                                  boolean fast, boolean verify, int verifyBudget,
-                                  boolean safeExec, boolean safeReal,
-                                  boolean requireOsIsolation) throws IOException {
-        return cacheKey(artifactHash, dependencyIdentityHash, rules, jdkHome, fast, verify,
-                verifyBudget, safeExec, safeReal, requireOsIsolation, InputBudget.defaults());
-    }
-
-    /** Compute a cache identity with an explicit input budget and the legacy SAFE_REAL default. */
-    public static String cacheKey(String artifactHash, String dependencyIdentityHash,
-                                  Path rules, Path jdkHome,
-                                  boolean fast, boolean verify, int verifyBudget,
-                                  boolean safeExec, boolean requireOsIsolation,
-                                  InputBudget budget) throws IOException {
-        return cacheKey(artifactHash, dependencyIdentityHash, rules, jdkHome, fast, verify,
-                verifyBudget, safeExec, false, requireOsIsolation, budget);
+                                  boolean fast, String mode) throws IOException {
+        return cacheKey(artifactHash, dependencyIdentityHash, rules, jdkHome, fast, mode,
+                InputBudget.defaults());
     }
 
     /** Compute a cache key including the explicit input-policy version/digest. */
     public static String cacheKey(String artifactHash, String dependencyIdentityHash,
                                   Path rules, Path jdkHome,
-                                  boolean fast, boolean verify, int verifyBudget,
-                                  boolean safeExec, boolean safeReal,
-                                  boolean requireOsIsolation, InputBudget budget) throws IOException {
+                                  boolean fast, String mode, InputBudget budget) throws IOException {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         InputBudget.Tracker tracker = policy.tracker();
-        String parameters = "rules_schema=" + RuleSchemaV2.SCHEMA_VERSION
-                + ";rules_semantics=" + RuleSchemaV2.SEMANTICS_VERSION
-                + ";input_budget_schema=" + policy.schemaVersion()
-                + ";input_budget_digest=" + digest(policy.toCanonicalJson())
-                + ";fast=" + fast + ";verify=" + verify + ";verify_budget="
-                + Math.max(0, verifyBudget) + ";safe_exec=" + safeExec
-                + ";safe_real=" + safeReal
-                + ";os_isolation=" + requireOsIsolation;
+        String parameters = parameters(fast, modeValue(mode), policy);
         String canonical = String.join("\n", ENGINE_VERSION, value(artifactHash),
                 value(dependencyIdentityHash), rulesHash(rules, policy, tracker),
                 jdkIdentity(jdkHome, 0, policy, tracker),
                 parameters);
         return digest(canonical);
+    }
+
+    private static String parameters(boolean fast, String mode, InputBudget policy) {
+        return "rules_schema=" + RuleSchemaV2.SCHEMA_VERSION
+                + ";rules_semantics=" + RuleSchemaV2.SEMANTICS_VERSION
+                + ";input_budget_schema=" + policy.schemaVersion()
+                + ";input_budget_digest=" + digest(policy.toCanonicalJson())
+                + ";fast=" + fast + ";mode=" + mode
+                + ";filter_semantics=" + FILTER_SEMANTICS_VERSION;
+    }
+
+    private static String modeValue(String mode) {
+        if ("component".equals(mode) || "application".equals(mode)) {
+            return mode;
+        }
+        throw new IllegalArgumentException("scan mode is invalid: " + mode);
     }
 
     static String rulesHash(Path rules) throws IOException {

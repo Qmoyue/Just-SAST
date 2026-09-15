@@ -9,7 +9,6 @@ import io.just.sast.run.InputBudget;
 import io.just.sast.run.RunOutcome;
 import io.just.sast.util.ArchiveLimits;
 import io.just.sast.util.IoUtil;
-import io.just.sast.verify.VerificationDefaults;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
@@ -49,8 +48,6 @@ public final class PerformanceCommand implements Callable<Integer> {
             "\\\"([^\\\"]+)\\\"\\s*:\\s*(-?\\d+)");
     private static final Pattern STRING = Pattern.compile(
             "\\\"([^\\\"]+)\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
-    private static final Pattern VERIFICATION_DURATION = Pattern.compile(
-            "\\\"duration_ms\\\"\\s*:\\s*(\\d+)");
 
     @Option(names = "--jar", required = true, paramLabel = "<jar|dir>",
             description = "目标 JAR 或 class 目录")
@@ -68,25 +65,6 @@ public final class PerformanceCommand implements Callable<Integer> {
 
     @Option(names = "--fast", description = "快速模式；结果完整性仍会如实记录")
     boolean fast;
-
-    @Option(names = "--no-verify", description = "兼容参数；产品始终仅执行静态分析")
-    boolean noVerify;
-
-    @Option(names = "--safe-exec", hidden = true,
-            description = "已移除；传入即拒绝，不会启动目标代码")
-    boolean safeExec;
-
-    @Option(names = "--safe-real-sink", hidden = true,
-            description = "已移除；传入即拒绝，不会启动目标代码")
-    boolean safeRealSink;
-
-    @Option(names = "--require-os-isolation", hidden = true,
-            description = "已移除；传入即拒绝，不会启动目标代码")
-    boolean requireOsIsolation;
-
-    @Option(names = "--verify-budget", defaultValue = VerificationDefaults.VERIFY_BUDGET_TEXT,
-            paramLabel = "<N>", description = "兼容参数；静态-only 扫描不执行动态验证")
-    int verifyBudget;
 
     @Option(names = "--mode", defaultValue = "hot", paramLabel = "<hot|cold>",
             description = "hot=同 JVM 重复扫描；cold=每次启动独立扫描进程")
@@ -132,13 +110,13 @@ public final class PerformanceCommand implements Callable<Integer> {
             description = "静态 p95 门限；0 表示只测量不设门")
     long staticP95LimitMs;
 
-    @Option(names = "--dynamic-p50-limit-ms", defaultValue = "0", paramLabel = "<ms>",
-            description = "动态 p50 门限；0 表示只测量不设门")
-    long dynamicP50LimitMs;
+    @Option(names = "--filter-p50-limit-ms", defaultValue = "0", paramLabel = "<ms>",
+            description = "静态有限过滤 p50 门限；0 表示只测量不设门")
+    long filterP50LimitMs;
 
-    @Option(names = "--dynamic-p95-limit-ms", defaultValue = "0", paramLabel = "<ms>",
-            description = "动态 p95 门限；0 表示只测量不设门")
-    long dynamicP95LimitMs;
+    @Option(names = "--filter-p95-limit-ms", defaultValue = "0", paramLabel = "<ms>",
+            description = "静态有限过滤 p95 门限；0 表示只测量不设门")
+    long filterP95LimitMs;
 
     @Option(names = "--limits-file", paramLabel = "<properties>",
             description = "固定 runner 性能门限 profile（UTF-8 properties）")
@@ -186,9 +164,6 @@ public final class PerformanceCommand implements Callable<Integer> {
         if (warmups < 0 || runs <= 0) {
             throw new ScanPipeline.UsageException("--warmups 不能为负数，--runs 必须大于 0");
         }
-        if (verifyBudget < 0) {
-            throw new ScanPipeline.UsageException("--verify-budget 不能为负数");
-        }
         if (processTimeoutMs <= 0) {
             throw new ScanPipeline.UsageException("--process-timeout-ms 必须大于 0");
         }
@@ -196,16 +171,11 @@ public final class PerformanceCommand implements Callable<Integer> {
         checkLimit(wallP95LimitMs, "--wall-p95-limit-ms");
         checkLimit(staticP50LimitMs, "--static-p50-limit-ms");
         checkLimit(staticP95LimitMs, "--static-p95-limit-ms");
-        checkLimit(dynamicP50LimitMs, "--dynamic-p50-limit-ms");
-        checkLimit(dynamicP95LimitMs, "--dynamic-p95-limit-ms");
+        checkLimit(filterP50LimitMs, "--filter-p50-limit-ms");
+        checkLimit(filterP95LimitMs, "--filter-p95-limit-ms");
         if (limitsFile != null && hasInlineLimit()) {
             throw new ScanPipeline.UsageException(
                     "--limits-file 不能与 --*-limit-ms 同时使用");
-        }
-        if (safeExec || safeRealSink || requireOsIsolation) {
-            throw new ScanPipeline.UsageException(
-                    "动态 verifier 已移除；--safe-exec、--safe-real-sink 和 "
-                            + "--require-os-isolation 均不再接受");
         }
         if (launcherJar != null) {
             Path normalized = launcherJar.toAbsolutePath().normalize();
@@ -221,7 +191,7 @@ public final class PerformanceCommand implements Callable<Integer> {
     private boolean hasInlineLimit() {
         return wallP50LimitMs != 0L || wallP95LimitMs != 0L
                 || staticP50LimitMs != 0L || staticP95LimitMs != 0L
-                || dynamicP50LimitMs != 0L || dynamicP95LimitMs != 0L;
+                || filterP50LimitMs != 0L || filterP95LimitMs != 0L;
     }
 
     private static PerformanceProfile.Limits readProfile(Path file)
@@ -273,7 +243,7 @@ public final class PerformanceCommand implements Callable<Integer> {
 
     private ScanStatistics scanOnce(Path output) throws Exception {
         return ScanPipeline.run(target, deps, output, rules, false, fast, jdkHome,
-                false, verifyBudget, false, false, false,
+                false, 0, false, false, false,
                 null, null, false, ModeDemandPolicy.forMode(ScanMode.COMPONENT)).stats();
     }
 
@@ -313,9 +283,6 @@ public final class PerformanceCommand implements Callable<Integer> {
         addPath(command, "--rules", rules);
         addPath(command, "--jdk-home", jdkHome);
         if (fast) command.add("--fast");
-        if (noVerify) command.add("--no-verify");
-        command.add("--verify-budget");
-        command.add(Integer.toString(verifyBudget));
 
         long started = System.nanoTime();
         Process process = new ProcessBuilder(command)
@@ -339,7 +306,7 @@ public final class PerformanceCommand implements Callable<Integer> {
                 "PERFORMANCE_METADATA");
         long wall = elapsedMs(started);
         long staticMs = objectNumber(json, "phase_ms", "static", 0L);
-        long dynamicMs = objectNumber(json, "phase_ms", "verify", 0L);
+        long filterMs = objectNumber(json, "phase_ms", "filter", 0L);
         long heapUsed = number(json, "heap_used_mb", 0L);
         long heapPeak = number(json, "heap_peak_mb", heapUsed);
         long rss = objectNumber(json, "metrics", "parent_rss_mb",
@@ -347,9 +314,9 @@ public final class PerformanceCommand implements Callable<Integer> {
         int chains = (int) Math.max(0L, number(json, "chains_found", 0L));
         String completeness = string(json, "completeness", "UNKNOWN");
         PerformanceHarness.Sample sample = new PerformanceHarness.Sample(iteration, wall, staticMs,
-                dynamicMs, heapUsed, heapPeak, rss, chains, completeness,
+                filterMs, heapUsed, heapPeak, rss, chains, completeness,
                 resultDigest(output, OUTPUT_INPUT_POLICY, outputBudget), objectNumbers(json, "phase_ms"),
-                resourceNumbers(json, "metrics"), verificationDurations(json));
+                resourceNumbers(json, "metrics"));
         return sample;
     }
 
@@ -465,12 +432,12 @@ public final class PerformanceCommand implements Callable<Integer> {
             return new PerformanceHarness.Limits(
                     disabled(profileLimits.wallP50Ms()), disabled(profileLimits.wallP95Ms()),
                     disabled(profileLimits.staticP50Ms()), disabled(profileLimits.staticP95Ms()),
-                    disabled(profileLimits.dynamicP50Ms()), disabled(profileLimits.dynamicP95Ms()));
+                    disabled(profileLimits.filterP50Ms()), disabled(profileLimits.filterP95Ms()));
         }
         return new PerformanceHarness.Limits(
                 disabled(wallP50LimitMs), disabled(wallP95LimitMs),
                 disabled(staticP50LimitMs), disabled(staticP95LimitMs),
-                disabled(dynamicP50LimitMs), disabled(dynamicP95LimitMs));
+                disabled(filterP50LimitMs), disabled(filterP95LimitMs));
     }
 
     private static long disabled(long value) {
@@ -567,31 +534,6 @@ public final class PerformanceCommand implements Callable<Integer> {
             }
         });
         return result.isEmpty() ? Map.of() : Map.copyOf(result);
-    }
-
-    private static List<Long> verificationDurations(String json) {
-        String source = json == null ? "" : json;
-        int marker = source.indexOf("\"dynamic_verification\"");
-        if (marker < 0) {
-            return List.of();
-        }
-        int results = source.indexOf("\"results\"", marker);
-        if (results < 0) {
-            return List.of();
-        }
-        // Scan to the end of the dynamic-verification object.  A JSON array descriptor such as
-        // [Ljava/lang/Object; may contain a closing bracket, so looking for the first ']' would
-        // silently drop later candidate samples.
-        Matcher matcher = VERIFICATION_DURATION.matcher(source.substring(results));
-        List<Long> values = new ArrayList<>();
-        while (matcher.find()) {
-            try {
-                values.add(Long.parseLong(matcher.group(1)));
-            } catch (NumberFormatException ignored) {
-                // Optional telemetry cannot invalidate an otherwise valid scan result.
-            }
-        }
-        return List.copyOf(values);
     }
 
     private static String string(String json, String key, String fallback) {
@@ -694,8 +636,8 @@ public final class PerformanceCommand implements Callable<Integer> {
     }
 
     private static void printStaticOnlyDisclosure() {
-        System.err.println("[just:info] perf verificationMode=STATIC_ONLY; "
-                + "targetCodeExecutionPossible=false; targetCodeExecuted=NO; "
-                + "dynamicFiltering=ANALYSIS_ONLY; recommendedForUntrustedArtifacts=true");
+        System.err.println("[just:info] perf analysisMode=STATIC_ONLY; "
+                + "targetCodeExecution=DISABLED; boundedFiltering=ANALYSIS_ONLY; "
+                + "recommendedForUntrustedArtifacts=true");
     }
 }

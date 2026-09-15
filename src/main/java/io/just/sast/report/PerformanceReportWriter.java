@@ -40,8 +40,8 @@ public final class PerformanceReportWriter {
         appendGate(out, report.wall());
         out.append(",\n  \"static\":");
         appendGate(out, report.staticPhase());
-        out.append(",\n  \"dynamic\":");
-        appendGate(out, report.dynamicPhase());
+        out.append(",\n  \"filter\":");
+        appendGate(out, report.filterPhase());
         out.append(",\n  \"phase_gates\":{");
         java.util.List<java.util.Map.Entry<String, PerformanceGate.Result>> phaseGates =
                 new java.util.ArrayList<>(report.phaseGates().entrySet());
@@ -64,7 +64,7 @@ public final class PerformanceReportWriter {
             out.append("    {\"iteration\":").append(sample.iteration())
                     .append(",\"wall_ms\":").append(sample.wallMs())
                     .append(",\"static_ms\":").append(sample.staticMs())
-                    .append(",\"dynamic_ms\":").append(sample.dynamicMs())
+                    .append(",\"filter_ms\":").append(sample.filterMs())
                     .append(",\"heap_used_mb\":").append(sample.heapUsedMb())
                     .append(",\"heap_peak_mb\":").append(sample.heapPeakMb())
                     .append(",\"rss_peak_mb\":").append(sample.rssPeakMb())
@@ -75,8 +75,6 @@ public final class PerformanceReportWriter {
             appendPhases(out, sample.phaseMs());
             out.append(",\"resource_metrics\":");
             appendMetrics(out, sample.resourceMetrics());
-            out.append(",\"verification_candidate_ms\":");
-            appendDurations(out, sample.verificationCandidateMs());
             out.append('}');
         }
         out.append("\n  ]\n}\n");
@@ -149,20 +147,6 @@ public final class PerformanceReportWriter {
             }
         }
         out.append('}');
-    }
-
-    private static void appendDurations(StringBuilder out, java.util.List<Long> durations) {
-        out.append('[');
-        if (durations != null) {
-            for (int i = 0; i < durations.size(); i++) {
-                if (i > 0) {
-                    out.append(',');
-                }
-                Long duration = durations.get(i);
-                out.append(Math.max(0L, duration == null ? 0L : duration));
-            }
-        }
-        out.append(']');
     }
 
     private static String escape(String value) {
