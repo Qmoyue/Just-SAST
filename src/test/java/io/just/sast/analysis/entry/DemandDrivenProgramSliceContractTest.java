@@ -189,6 +189,54 @@ class DemandDrivenProgramSliceContractTest {
     }
 
     @Test
+    void retainsConditionPolicyDeclarationAndCallSiteInDemandSlice() {
+        String appOwner = "app/Ingress";
+        String policyOwner = "lib/PolicyOis";
+        String messageOwner = "javax/jms/ObjectMessage";
+        String terminalOwner = "fixture/Terminal";
+        String checkDescriptor = "(Ljava/lang/Class;)V";
+        ClassInfo app = new ClassInfo(appOwner, "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(method(appOwner, "main", "([Ljava/lang/String;)V", Modifier.PUBLIC
+                        | Modifier.STATIC, new InsnFact(0, Op.INVOKEINTERFACE,
+                        List.of(new MethodRef(messageOwner, "getObject", "()Ljava/lang/Object;"))))),
+                List.of());
+        ClassInfo message = cls(messageOwner, List.of(
+                method(messageOwner, "getObject", "()Ljava/lang/Object;", Modifier.PUBLIC)));
+        MethodInfo resolver = method(policyOwner, "resolveClass", checkDescriptor,
+                Modifier.PUBLIC, new InsnFact(0, Op.INVOKESPECIAL,
+                        List.of(new MethodRef(policyOwner, "checkSecurity", checkDescriptor))));
+        MethodInfo checker = method(policyOwner, "checkSecurity", checkDescriptor,
+                Modifier.PRIVATE, new InsnFact(0, Op.INVOKESTATIC,
+                        List.of(new MethodRef(terminalOwner, "touch", "()V"))));
+        ClassInfo policy = new ClassInfo(policyOwner, "java/lang/Object", List.of(), Modifier.PUBLIC,
+                List.of(resolver, checker), List.of());
+        ClassInfo terminal = cls(terminalOwner,
+                List.of(method(terminalOwner, "touch", "()V", Modifier.PUBLIC)));
+        Map<String, ClassInfo> classes = new LinkedHashMap<>();
+        for (ClassInfo info : List.of(app, message, policy, terminal)) {
+            classes.put(info.internalName(), info);
+        }
+        Rule.SinkRule sink = new Rule.SinkRule("terminal-touch", "CODE_EXEC", "HIGH",
+                new Rule.CallMatcher(Match.of(terminalOwner), Match.of("touch"), null),
+                List.of(Rule.TaintedPos.Receiver.INSTANCE), Rule.SinkRole.TERMINAL);
+        Rule.ConditionRule policyCondition = new Rule.ConditionRule("PACKAGE",
+                Match.of(messageOwner), new Rule.SerializationPackagePolicy(
+                        new Rule.CallMatcher(Match.of(policyOwner), Match.of("checkSecurity"), null),
+                        List.of("java.lang")));
+
+        DemandDrivenProgramSlice.Result result = DemandDrivenProgramSlice.select(
+                new LoadResult(classes, List.of(), classes.size(), 61), Set.of(appOwner),
+                new RuleSet(List.of(sink), List.of(), List.of(), List.of(), List.of(),
+                        List.of(policyCondition)));
+
+        List<MethodInfo> retained = result.load().classes().get(policyOwner).methods();
+        assertTrue(retained.stream().anyMatch(method -> method.name().equals("resolveClass")),
+                "the caller that wires the policy check must survive method pruning");
+        assertTrue(retained.stream().anyMatch(method -> method.name().equals("checkSecurity")),
+                "the declared policy method must survive method pruning");
+    }
+
+    @Test
     void selectsConcreteJdbcImplementationsAndTheirBoundedDispatchClosure() {
         String appOwner = "app/ConnectionServlet";
         String connectDescriptor =

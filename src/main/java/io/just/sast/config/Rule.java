@@ -175,7 +175,7 @@ public sealed interface Rule {
      * reject it only when the selected condition is statically disproved.
      */
     sealed interface ConditionSpec permits SerializationGuard, SerializableRequirement,
-            PropertyFilterDecl {
+            SerializationPackagePolicy, PropertyFilterDecl {
     }
 
     /** A callback calls a guard whose configuration must equal the declared value. */
@@ -195,6 +195,28 @@ public sealed interface Rule {
             if (interfaceType == null || interfaceType.isBlank()) {
                 throw new IllegalArgumentException("serializable condition interface is blank");
             }
+        }
+    }
+
+    /**
+     * A deserializer package allowlist.  The policy call is a bytecode fact owned by the
+     * artifact; trusted package prefixes are rule data.  Calibration may reject a path only
+     * when both the policy call and a known serializable, non-trusted path type are present.
+     */
+    record SerializationPackagePolicy(CallMatcher policyCall,
+                                      List<String> trustedPackagePrefixes)
+            implements ConditionSpec {
+        public SerializationPackagePolicy {
+            if (policyCall == null || trustedPackagePrefixes == null
+                    || trustedPackagePrefixes.isEmpty()
+                    || trustedPackagePrefixes.stream().anyMatch(value -> value == null || value.isBlank())) {
+                throw new IllegalArgumentException("serialization package policy is incomplete");
+            }
+            trustedPackagePrefixes = trustedPackagePrefixes.stream()
+                    .map(String::trim)
+                    .distinct()
+                    .sorted()
+                    .toList();
         }
     }
 
@@ -232,6 +254,9 @@ public sealed interface Rule {
             }
             if (spec instanceof SerializableRequirement) {
                 return "serializable";
+            }
+            if (spec instanceof SerializationPackagePolicy) {
+                return "serialization-package-policy";
             }
             return "property-filter";
         }

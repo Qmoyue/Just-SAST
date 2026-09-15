@@ -30,11 +30,13 @@ class YamlRuleLoaderTest {
         assertTrue(set.sources().size() >= 42, "source 规则能力退化：实际 " + set.sources().size());
         assertTrue(set.models().size() >= 21, "model 规则能力退化：实际 " + set.models().size());
         assertTrue(set.magicEntries().size() >= 14, "magic-entry 含序列化侧入口，实际 " + set.magicEntries().size());
-        assertEquals(3, set.conditions().size(), "默认 Apache 条件规则必须全部装载");
+        assertEquals(4, set.conditions().size(), "默认 Apache 条件规则必须全部装载");
         assertTrue(set.conditions().stream().anyMatch(rule ->
                 rule.spec() instanceof Rule.SerializationGuard));
         assertTrue(set.conditions().stream().anyMatch(rule ->
                 rule.spec() instanceof Rule.SerializableRequirement));
+        assertTrue(set.conditions().stream().anyMatch(rule ->
+                rule.spec() instanceof Rule.SerializationPackagePolicy));
         assertTrue(set.conditions().stream().anyMatch(rule ->
                 rule.spec() instanceof Rule.PropertyFilterDecl));
         Rule.ModelRule defineClassReturn = set.models().stream()

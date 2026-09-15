@@ -442,6 +442,8 @@ public final class YamlRuleLoader {
         return switch (type) {
             case "serialization-guard" -> parseSerializationGuard(id, targetClass, condition);
             case "serializable" -> parseSerializableRequirement(id, targetClass, condition);
+            case "serialization-package-policy" -> parseSerializationPackagePolicy(id, targetClass,
+                    condition);
             case "property-filter" -> parsePropertyFilter(id, targetClass, condition);
             default -> throw new IOException("condition 规则 " + id + " 的 type 无效: " + type);
         };
@@ -475,6 +477,31 @@ public final class YamlRuleLoader {
         return new Rule.ConditionRule(id, targetClass,
                 new Rule.SerializableRequirement(requiredString(condition, "interface",
                         "condition 规则 " + id + " 缺少 interface")));
+    }
+
+    private Rule.ConditionRule parseSerializationPackagePolicy(String id, Match targetClass,
+                                                                Map<?, ?> condition) throws IOException {
+        rejectUnknownKeys(condition, Set.of("type", "call", "trusted-packages"),
+                "condition rule " + id + " serialization-package-policy");
+        Map<?, ?> call = requiredMap(condition, "call",
+                "condition 规则 " + id + " 缺少 policy call",
+                "condition 规则 " + id + " 的 policy call 必须是 map");
+        rejectUnknownKeys(call, CALL_KEYS, "condition rule " + id + " policy call");
+        Rule.CallMatcher policyCall = new Rule.CallMatcher(matchOf(call.get("owner")),
+                matchOf(call.get("name")), matchNullable(call.get("descriptor")));
+        Object rawPackages = condition.get("trusted-packages");
+        if (!(rawPackages instanceof List<?> packages) || packages.isEmpty()) {
+            throw new IOException("condition 规则 " + id + " 的 trusted-packages 必须是非空列表");
+        }
+        List<String> trusted = new ArrayList<>(packages.size());
+        for (Object value : packages) {
+            if (!(value instanceof String text) || text.isBlank()) {
+                throw new IOException("condition 规则 " + id + " 的 trusted-packages 必须全部是非空字符串");
+            }
+            trusted.add(text);
+        }
+        return new Rule.ConditionRule(id, targetClass,
+                new Rule.SerializationPackagePolicy(policyCall, trusted));
     }
 
     private Rule.ConditionRule parsePropertyFilter(String id, Match targetClass,

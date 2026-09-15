@@ -3,8 +3,10 @@ package io.just.sast.knowledge.calibrate;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.blackboard.Blackboard;
 import io.just.sast.blackboard.Chain;
+import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.Event;
 import io.just.sast.blackboard.EventType;
+import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.config.Match;
 import io.just.sast.config.Rule;
@@ -90,6 +92,41 @@ class ComponentConditionKnowledgeSourceTest {
         assertTrue(blackboard.chainNotesOf(chain.key()).stream()
                 .anyMatch(note -> note.contains("condition:serialization-guard")
                         && note.contains("status=CONDITIONAL")));
+    }
+
+    @Test
+    void packagePolicyRejectsOnlyKnownSerializableTypeOutsideTrustedPrefixes() {
+        String policyOwner = "fixture/PolicyOis";
+        MethodInfo resolver = new MethodInfo(policyOwner, "resolveClass",
+                "(Ljava/lang/Class;)Ljava/lang/Class;", Modifier.PUBLIC,
+                List.of(new InsnFact(0, Op.INVOKESPECIAL,
+                        List.of(new MethodRef(policyOwner, "checkSecurity",
+                                "(Ljava/lang/Class;)V")))), List.of(), false);
+        MethodInfo checker = new MethodInfo(policyOwner, "checkSecurity",
+                "(Ljava/lang/Class;)V", Modifier.PRIVATE, List.of(), List.of(), false);
+        Rule.ConditionRule condition = new Rule.ConditionRule("PACKAGE",
+                Match.of("javax/jms/ObjectMessage"),
+                new Rule.SerializationPackagePolicy(
+                        new Rule.CallMatcher(Match.of(policyOwner), Match.of("checkSecurity"), null),
+                        List.of("java.lang")));
+        Map<String, ClassInfo> classes = new HashMap<>();
+        classes.put(policyOwner, classInfo(policyOwner, List.of(), List.of(resolver, checker)));
+        classes.put("fixture/Blocked", classInfo("fixture/Blocked",
+                List.of("java/io/Serializable"), List.of()));
+        Blackboard blackboard = blackboard(classes, List.of(condition));
+        Chain chain = new Chain("fixture-condition", "CODE_EXEC", "HIGH", "fixture/App", "write",
+                "source", "fixture/Blocked", "run", List.of(
+                new ChainHop("fixture/App", "write", "javax/jms/ObjectMessage", "getObject",
+                        HopKind.DIRECT_CALL, null, null, "()Ljava/lang/Object;", null, null),
+                new ChainHop("javax/jms/ObjectMessage", "getObject", "fixture/Blocked", "equals",
+                        HopKind.DIRECT_CALL, null, null, "()Z", null, null)), 0,
+                "()V", "TERMINAL", null);
+        blackboard.addChain(chain);
+
+        calibrate(blackboard);
+
+        assertEquals("condition-package-policy:PACKAGE:fixture/Blocked",
+                blackboard.calibrationOf(chain.key()));
     }
 
     @Test

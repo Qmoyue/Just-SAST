@@ -404,6 +404,26 @@ public final class DemandDrivenProgramSlice {
                 }
             }
         }
+        // Condition facts are consumed after composition, but their artifact-owned policy
+        // classes must survive the conservative dependency slice.  Retain only literal owners
+        // declared by the condition; calibration still requires the actual bytecode call and a
+        // known path type before it can reject a chain.
+        for (Rule.ConditionRule rule : rules.conditions()) {
+            if (rule == null) {
+                continue;
+            }
+            addName(anchors, rule.targetClass().isRegex() ? null : rule.targetClass().pattern());
+            if (rule.spec() instanceof Rule.SerializationGuard guard) {
+                addLiteralOwner(anchors, guard.guardCall());
+            } else if (rule.spec() instanceof Rule.SerializationPackagePolicy policy) {
+                addLiteralOwner(anchors, policy.policyCall());
+            } else if (rule.spec() instanceof Rule.PropertyFilterDecl filter) {
+                addName(anchors, filter.registrationOwner().isRegex()
+                        ? null : filter.registrationOwner().pattern());
+                addName(anchors, filter.markerClass().isRegex()
+                        ? null : filter.markerClass().pattern());
+            }
+        }
         anchors.removeIf(name -> !available.containsKey(name));
         return anchors;
     }
@@ -980,6 +1000,55 @@ public final class DemandDrivenProgramSlice {
                     && (!rule.method().privateOnly()
                     || java.lang.reflect.Modifier.isPrivate(method.access()))) {
                 return true;
+            }
+        }
+        for (Rule.ConditionRule rule : rules.conditions()) {
+            if (rule == null || rule.spec() == null) {
+                continue;
+            }
+            Rule.CallMatcher conditionCall = conditionCall(rule);
+            if (conditionCall != null
+                    && conditionCall.matches(method.owner(), method.name(), method.descriptor())) {
+                return true;
+            }
+            if (containsConditionCall(method, conditionCall)) {
+                return true;
+            }
+            if (rule.spec() instanceof Rule.PropertyFilterDecl filter
+                    && filter.registrationOwner().matches(method.owner())
+                    && filter.registrationMethod().matches(method.name())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Return the bytecode call declared by a condition, when it has one. */
+    private static Rule.CallMatcher conditionCall(Rule.ConditionRule rule) {
+        if (rule == null || rule.spec() == null) {
+            return null;
+        }
+        if (rule.spec() instanceof Rule.SerializationGuard guard) {
+            return guard.guardCall();
+        }
+        if (rule.spec() instanceof Rule.SerializationPackagePolicy policy) {
+            return policy.policyCall();
+        }
+        return null;
+    }
+
+    /** Keep a caller whose body proves that a declared condition call is wired. */
+    private static boolean containsConditionCall(MethodInfo method,
+                                                  Rule.CallMatcher conditionCall) {
+        if (method == null || conditionCall == null) {
+            return false;
+        }
+        for (InsnFact instruction : method.instructions()) {
+            for (Object operand : instruction.operands()) {
+                if (operand instanceof MethodRef ref
+                        && conditionCall.matches(ref.owner(), ref.name(), ref.descriptor())) {
+                    return true;
+                }
             }
         }
         return false;

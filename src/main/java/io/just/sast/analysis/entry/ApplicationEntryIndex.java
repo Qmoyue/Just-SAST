@@ -1065,6 +1065,7 @@ public final class ApplicationEntryIndex {
         Map<String, Node> methods = new HashMap<>();
         Map<String, Set<String>> methodAnnotations = new HashMap<>();
         Map<String, Set<String>> classAnnotations = new HashMap<>();
+        Map<String, Set<String>> classSupertypes = new HashMap<>();
         for (Node method : graph.nodesOfType(NodeType.METHOD)) {
             String key = methodKey(method.owner(), method.name(), method.descriptor());
             methods.put(key, method);
@@ -1072,6 +1073,20 @@ public final class ApplicationEntryIndex {
                     "methodAnnotationDescriptors"));
             classAnnotations.computeIfAbsent(method.owner(), ignored -> new TreeSet<>())
                     .addAll(annotationDescriptors(method, "classAnnotationDescriptors"));
+            Set<String> supertypes = classSupertypes.computeIfAbsent(method.owner(),
+                    ignored -> new TreeSet<>());
+            Object superName = method.note("classSuperName");
+            if (superName != null && !superName.toString().isBlank()) {
+                supertypes.add(superName.toString());
+            }
+            Object interfaces = method.note("classInterfaces");
+            if (interfaces instanceof Iterable<?> values) {
+                for (Object value : values) {
+                    if (value != null && !value.toString().isBlank()) {
+                        supertypes.add(value.toString());
+                    }
+                }
+            }
         }
 
         List<ExecutionEntry> entries = new ArrayList<>();
@@ -1103,7 +1118,7 @@ public final class ApplicationEntryIndex {
         // APPLICATION_ENTRY until a typed source/bridge establishes controllability.
         for (Node method : graph.nodesOfType(NodeType.METHOD)) {
             FrameworkEntry framework = frameworkEntry(method, methods, methodAnnotations,
-                    classAnnotations);
+                    classAnnotations, classSupertypes);
             if (framework == null) {
                 continue;
             }
@@ -1132,6 +1147,15 @@ public final class ApplicationEntryIndex {
         Map<String, Boolean> sourceHosts = new HashMap<>();
         Map<String, DeserializeHost> deserializeHosts = new TreeMap<>();
         Set<String> bindingSiteHosts = new TreeSet<>();
+        List<String> boundarySliceReasons = new ArrayList<>();
+        Set<String> externalBoundaryRoots = entries.stream()
+                .filter(ExecutionEntry::externalControlProven)
+                .map(ExecutionEntry::methodKey)
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new));
+        Set<String> externalBoundaryForward = new TreeSet<>(forwardSlice(graph, methods,
+                externalBoundaryRoots, boundarySliceReasons));
+        boolean externalBoundaryForwardUnknown = boundarySliceReasons.stream()
+                .anyMatch(reason -> reason.contains("CAP"));
         Set<String> acceptedTypePrefixes = acceptedTypePrefixes(graph);
         List<String> acceptedApplicationTypes = owners.stream()
                 .filter(owner -> acceptedTypePrefixes.stream().anyMatch(owner::startsWith))
@@ -1179,7 +1203,14 @@ public final class ApplicationEntryIndex {
                     && isPublicMethod(hostNode)
                     && entries.stream().anyMatch(entry -> host.equals(entry.methodKey())
                     && entry.externalControlProven());
-            boolean boundaryExternal = explicitExecutionBoundary;
+            // A source helper is application-reachable when the typed external boundary can
+            // reach that exact host. Requiring the source method itself to be a framework entry
+            // loses real servlet/service flows that delegate through ordinary application code.
+            // If the bounded pre-slice is incomplete, retain the source rather than turning an
+            // analysis budget into negative evidence.
+            boolean reachableFromExternalBoundary = externalInput && owned
+                    && (externalBoundaryForwardUnknown || externalBoundaryForward.contains(host));
+            boolean boundaryExternal = explicitExecutionBoundary || reachableFromExternalBoundary;
             if (externalInput && owned && boundaryExternal) {
                 sourceHosts.put(host, true);
                 if (publicDeserializeBoundary && hostNode != null) {
@@ -1187,7 +1218,7 @@ public final class ApplicationEntryIndex {
                             hostNode.descriptor(), ruleId, "public-deserialize-source",
                             FindingState.EntryStatus.EXTERNAL_ENTRY, true, true));
                 }
-                if (hostNode != null) {
+                if (explicitExecutionBoundary && hostNode != null) {
                     String entryKind = source == null ? "ois-read" : "source:" + bridge;
                     entries.add(new ExecutionEntry(host, hostNode.owner(), hostNode.name(),
                             hostNode.descriptor(), ruleId, entryKind,
@@ -1201,7 +1232,7 @@ public final class ApplicationEntryIndex {
         // suffix.  It is deliberately not a dynamic-execution claim.
         for (Node method : graph.nodesOfType(NodeType.METHOD)) {
             FrameworkEntry framework = frameworkEntry(method, methods, methodAnnotations,
-                    classAnnotations);
+                    classAnnotations, classSupertypes);
             if (framework == null || !framework.bindingCapable()
                     || !applicationScopeKnown || !owners.contains(method.owner())) {
                 continue;
@@ -2155,7 +2186,8 @@ public final class ApplicationEntryIndex {
 
     private static FrameworkEntry frameworkEntry(Node method, Map<String, Node> methods,
                                                  Map<String, Set<String>> methodAnnotationByKey,
-                                                 Map<String, Set<String>> classAnnotationByOwner) {
+                                                 Map<String, Set<String>> classAnnotationByOwner,
+                                                 Map<String, Set<String>> classSupertypes) {
         if (method == null || method.owner() == null || method.name() == null
                 || "<init>".equals(method.name()) || "<clinit>".equals(method.name())) {
             return null;
@@ -2193,7 +2225,7 @@ public final class ApplicationEntryIndex {
         boolean httpClass = intersects(classAnnotations, HTTP_CLASS_ANNOTATIONS);
         boolean webService = intersects(classAnnotations, WEB_SERVICE_ANNOTATIONS)
                 || interfaceWebService;
-        boolean servlet = servletType(method);
+        boolean servlet = servletType(method, classSupertypes);
 
         if ("main".equals(method.name()) && "([Ljava/lang/String;)V".equals(method.descriptor())
                 && Modifier.isStatic(access)) {
@@ -2229,23 +2261,23 @@ public final class ApplicationEntryIndex {
         return null;
     }
 
-    private static boolean servletType(Node method) {
-        Set<String> types = new TreeSet<>();
-        String superName = method.note("classSuperName") == null ? null
-                : method.note("classSuperName").toString();
-        if (superName != null) {
-            types.add(superName);
+    private static boolean servletType(Node method, Map<String, Set<String>> classSupertypes) {
+        return method != null && isServletType(method.owner(), classSupertypes, new TreeSet<>());
+    }
+
+    private static boolean isServletType(String owner, Map<String, Set<String>> classSupertypes,
+                                         Set<String> visited) {
+        if (owner == null || owner.isBlank() || !visited.add(owner)) {
+            return false;
         }
-        Object interfaces = method.note("classInterfaces");
-        if (interfaces instanceof Iterable<?> values) {
-            for (Object value : values) {
-                if (value != null) {
-                    types.add(value.toString());
-                }
+        for (String type : classSupertypes.getOrDefault(owner, Set.of())) {
+            if (SERVLET_TYPES.contains(type) || type.endsWith("/Servlet")
+                    || type.endsWith("/Filter")
+                    || isServletType(type, classSupertypes, visited)) {
+                return true;
             }
         }
-        return types.stream().anyMatch(type -> SERVLET_TYPES.contains(type)
-                || type.endsWith("/Servlet") || type.endsWith("/Filter"));
+        return false;
     }
 
     private static boolean intersects(Set<String> values, Set<String> wanted) {

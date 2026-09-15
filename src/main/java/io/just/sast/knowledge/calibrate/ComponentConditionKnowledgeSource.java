@@ -21,6 +21,7 @@ import io.just.sast.model.Op;
 import io.just.sast.util.JustLogger;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -78,6 +79,7 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
         int rejected = 0;
         int guarded = 0;
         int propertyNotes = 0;
+        int packagePolicyRejected = 0;
         List<Rule.ConditionRule> conditions = blackboard.rules().conditions();
         if (conditions.isEmpty()) {
             return;
@@ -111,6 +113,20 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
                     guarded++;
                     continue;
                 }
+                if (condition.spec() instanceof Rule.SerializationPackagePolicy policy
+                        && deserializationSource(chain) && policyCallPresent(policy)) {
+                    String blocked = firstNonTrustedSerializable(chain, policy);
+                    if (blocked != null) {
+                        blackboard.calibrateChain(chain.key(),
+                                "condition-package-policy:" + condition.id() + ":" + blocked);
+                        rejected++;
+                        packagePolicyRejected++;
+                        break;
+                    }
+                    blackboard.chainNote(chain.key(), "condition:serialization-package-policy;status=CONDITIONAL"
+                            + ";trusted-packages=" + String.join(",", policy.trustedPackagePrefixes()));
+                    continue;
+                }
                 if (condition.spec() instanceof Rule.PropertyFilterDecl filter
                         && propertyFilterInstalled(filter)) {
                     if (explicitBlockedProperty(chain, targets, filter)) {
@@ -127,8 +143,8 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
                 }
             }
         }
-        JustLogger.info("组件条件校准：拒绝 {}，序列化保护条件 {}，属性过滤条件 {}（规则 {}）",
-                rejected, guarded, propertyNotes, conditions.size());
+        JustLogger.info("组件条件校准：拒绝 {}（包策略 {}），序列化保护条件 {}，属性过滤条件 {}（规则 {}）",
+                rejected, packagePolicyRejected, guarded, propertyNotes, conditions.size());
     }
 
     private String firstNonSerializable(List<String> targets, String interfaceType) {
@@ -184,6 +200,106 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
                 if (filter.markerClass().matches(ref.owner())) {
                     return true;
                 }
+            }
+        }
+        return false;
+    }
+
+    /** A source rule is the deserialization boundary even when the chain entry is an app helper. */
+    private static boolean deserializationSource(Chain chain) {
+        String kind = chain.entryKind() == null ? "" : chain.entryKind().toLowerCase(Locale.ROOT);
+        return "source".equals(kind) || "deserialize".equals(kind) || serializationBoundary(chain);
+    }
+
+    /**
+     * Prove that the selected artifact actually invokes the declared policy method.  This is
+     * deliberately bounded to loaded method facts and does not execute the policy or evaluate
+     * a runtime property override.
+     */
+    private boolean policyCallPresent(Rule.SerializationPackagePolicy policy) {
+        Set<String> inspectedOwners = new HashSet<>();
+        String exactOwner = policy.policyCall().ownerType();
+        if (exactOwner != null) {
+            inspectedOwners.add(exactOwner);
+        } else {
+            for (var node : bb.graph().nodesOfType(NodeType.METHOD)) {
+                inspectedOwners.add(node.owner());
+            }
+        }
+        for (String owner : inspectedOwners) {
+            if (owner == null || owner.isBlank()) {
+                continue;
+            }
+            ClassInfo info = bb.hierarchy().classInfo(owner);
+            if (info == null) {
+                continue;
+            }
+            for (MethodInfo method : info.methods()) {
+                for (InsnFact instruction : method.instructions()) {
+                    if (!instruction.op().isInvoke() || instruction.operands().isEmpty()
+                            || !(instruction.operands().get(0) instanceof MethodRef ref)) {
+                        continue;
+                    }
+                    if (policy.policyCall().matches(ref.owner(), ref.name(), ref.descriptor())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Package policy applies to every known serializable type carried by the candidate path.
+     * Unknown class facts remain candidates; a static policy must not be turned into a guessed
+     * denial.  Construction-plan nodes are included because they are the explicit object-shape
+     * evidence for a fragment path.
+     */
+    private String firstNonTrustedSerializable(Chain chain,
+                                               Rule.SerializationPackagePolicy policy) {
+        Set<String> classes = new LinkedHashSet<>();
+        add(classes, chain.entryClass());
+        add(classes, chain.sinkClass());
+        for (ChainHop hop : chain.hops()) {
+            add(classes, hop.fromOwner());
+            add(classes, hop.toOwner());
+        }
+        ObjectGraphPlan plan = chain.constructionPlan();
+        if (plan != null) {
+            for (ObjectGraphPlan.Node node : plan.nodes()) {
+                if (node != null) {
+                    add(classes, node.type());
+                }
+            }
+        }
+        for (String owner : classes) {
+            if (trustedPackage(owner, policy.trustedPackagePrefixes())) {
+                continue;
+            }
+            ClassInfo info = bb.hierarchy().classInfo(owner);
+            if (info != null && bb.hierarchy().isSerializable(owner)) {
+                return owner;
+            }
+        }
+        return null;
+    }
+
+    private static boolean trustedPackage(String owner, List<String> prefixes) {
+        String packageName = owner.replace('/', '.');
+        int inner = packageName.indexOf('$');
+        if (inner >= 0) {
+            packageName = packageName.substring(0, inner);
+        }
+        int lastDot = packageName.lastIndexOf('.');
+        packageName = lastDot < 0 ? "" : packageName.substring(0, lastDot);
+        for (String raw : prefixes) {
+            String prefix = raw.trim().replace('/', '.');
+            while (prefix.endsWith(".*")) {
+                prefix = prefix.substring(0, prefix.length() - 2);
+            }
+            if ("*".equals(prefix) || packageName.equals(prefix)
+                    || packageName.startsWith(prefix + '.')) {
+                return true;
             }
         }
         return false;

@@ -103,11 +103,13 @@ public final class ChainRanking {
         // longer generic suffix without knowing a class, package, rule id, or benchmark name.
         result = Integer.compare(a.compactTerminalRank(), b.compactTerminalRank());
         if (result != 0) return result;
-        // A semantic bridge or an obviously disconnected component is where static search most
-        // often appends decorative suffixes.  Prefer the shorter representative for that pair,
-        // while keeping the historical static-evidence ordering for ordinary connected paths.
-        boolean shortestFirst = a.pathPreferenceRank() == 0 || b.pathPreferenceRank() == 0;
-        if (shortestFirst) {
+        // Keep path preference as a candidate-owned category.  A semantic continuation and a
+        // disconnected suffix use precision/length before static score; ordinary connected
+        // paths use static evidence before length.  Comparing the category first means the
+        // within-category choice is stable and the comparator remains transitive.
+        result = Integer.compare(a.pathPreferenceRank(), b.pathPreferenceRank());
+        if (result != 0) return result;
+        if (a.pathPreferenceRank() == 0 || a.pathPreferenceRank() == 2) {
             result = Integer.compare(a.precisionRank(), b.precisionRank());
             if (result != 0) return result;
             result = Integer.compare(a.pathLength(), b.pathLength());
@@ -192,7 +194,11 @@ public final class ChainRanking {
         }
         int compactTerminal = isCompactDeclaredTerminal(chain) ? 0 : 1;
         int disconnectedHops = disconnectedEvidenceHops(chain);
-        int pathPreference = disconnectedHops > 0 || hasSemanticContinuation(chain) ? 0 : 1;
+        boolean semanticContinuation = hasSemanticContinuation(chain);
+        // 0=typed semantic continuation, 1=ordinary connected evidence, 2=disconnected suffix.
+        // The explicit third state prevents a decorative disconnected path from outranking a
+        // shorter ordinary path merely because it happened to carry more static hops.
+        int pathPreference = semanticContinuation ? 0 : disconnectedHops > 0 ? 2 : 1;
         String explanation = "dynamic=" + (status.isBlank() ? "NOT_SELECTED" : status)
                 + ";sink_role=" + chain.sinkRole()
                 + ";semantic=" + semanticLabel(semantic)
@@ -207,7 +213,11 @@ public final class ChainRanking {
                 + ";compact_terminal="
                 + (compactTerminal == 0 ? "DECLARED_MINIMAL" : "NO")
                 + ";path_preference="
-                + (pathPreference == 0 ? "SHORTEST_BRIDGE_OR_DISCONNECT" : "STATIC_EVIDENCE")
+                + switch (pathPreference) {
+                    case 0 -> "SEMANTIC_CONTINUATION";
+                    case 2 -> "DISCONNECTED_SUFFIX";
+                    default -> "STATIC_EVIDENCE";
+                }
                 + ";disconnected_hops=" + disconnectedHops
                 + ";path_length=" + chain.hops().size()
                 + ";precision=" + precision.compact();

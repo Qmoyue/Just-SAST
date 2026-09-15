@@ -283,6 +283,27 @@ rules:
       type: serializable
       interface: java/io/Serializable
 
+  # A package allowlist is an artifact-owned deserialization boundary.  The condition is
+  # generic: it joins a declared source path with a statically observed policy call and rejects
+  # only a known Serializable path type outside the declared default package set.  Runtime
+  # property overrides remain an explicit conditional note, never an execution claim.
+  - id: CONDITION-SERIALIZATION-PACKAGE-ALLOWLIST
+    kind: condition
+    match:
+      class: javax/jms/ObjectMessage
+    condition:
+      type: serialization-package-policy
+      call:
+        owner: org/apache/activemq/util/ClassLoadingAwareObjectInputStream
+        name: checkSecurity
+      trusted-packages:
+        - java.lang
+        - javax.security
+        - java.util
+        - org.apache.activemq
+        - org.fusesource.hawtbuf
+        - com.thoughtworks.xstream.mapper
+
   - id: CONDITION-BEANUTILS-CLASS-PROPERTY
     kind: condition
     match:
