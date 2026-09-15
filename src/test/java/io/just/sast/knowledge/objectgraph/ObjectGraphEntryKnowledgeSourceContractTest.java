@@ -104,8 +104,8 @@ class ObjectGraphEntryKnowledgeSourceContractTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null, Set.of("app/Entry"), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of("app/Entry"), true));
         Chain suffix = new Chain("runtime-exec", "CODE_EXEC", "CRITICAL", "dep/Terminal",
                 "readObject", "readObject", "java/lang/Runtime", "exec", List.of(
                 new ChainHop("dep/Terminal", "readObject", "java/lang/Runtime", "exec",

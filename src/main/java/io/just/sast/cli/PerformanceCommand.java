@@ -243,8 +243,7 @@ public final class PerformanceCommand implements Callable<Integer> {
 
     private ScanStatistics scanOnce(Path output) throws Exception {
         return ScanPipeline.run(target, deps, output, rules, false, fast, jdkHome,
-                false, 0, false, false, false,
-                null, null, false, ModeDemandPolicy.forMode(ScanMode.COMPONENT)).stats();
+                ModeDemandPolicy.forMode(ScanMode.COMPONENT)).stats();
     }
 
     private PerformanceHarness.Report runCold(Path root) throws Exception {

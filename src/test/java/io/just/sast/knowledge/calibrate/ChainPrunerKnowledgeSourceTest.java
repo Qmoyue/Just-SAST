@@ -68,8 +68,8 @@ class ChainPrunerKnowledgeSourceTest {
                         APP, new ClassInfo(APP, "java/lang/Object", List.of(), Modifier.PUBLIC,
                                 List.of(), List.of())), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, false, 0, null, 0,
-                        false, false, false, null, applicationOwners, true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        applicationOwners, true));
     }
 
     private static Chain deepChain() {

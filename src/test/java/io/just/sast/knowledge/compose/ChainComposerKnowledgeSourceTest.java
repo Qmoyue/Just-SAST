@@ -354,8 +354,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(java.nio.file.Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null, Set.of("app/Entry"), true));
+                new Blackboard.ScanInputs(java.nio.file.Path.of("."), List.of(), false,
+                        null, 0, null, Set.of("app/Entry"), true));
         Chain applicationNoise = new Chain("unrelated", "OTHER", "LOW", "app/Entry", "process",
                 "service", "java/lang/Object", "toString", List.of(
                 new ChainHop("app/Entry", "process", "app/Entry", "process", HopKind.ENTRY,
@@ -413,8 +413,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(java.nio.file.Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null, Set.of("app/Entry"), true));
+                new Blackboard.ScanInputs(java.nio.file.Path.of("."), List.of(), false,
+                        null, 0, null, Set.of("app/Entry"), true));
         Chain applicationNoise = new Chain("unrelated", "OTHER", "LOW", "app/Entry", "process",
                 "service", "java/lang/Object", "toString", List.of(
                 new ChainHop("app/Entry", "process", "app/Entry", "process", HopKind.ENTRY,
@@ -466,7 +466,7 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
-                new Blackboard.ScanInputs(target, List.of(), false, false, 0));
+                new Blackboard.ScanInputs(target, List.of(), false));
         bb.addChain(chain("T-NOISE", "CODE_EXEC", "dependency/Noise", "hashCode",
                 "java/lang/Runtime", "exec"));
         bb.addChain(chain("T-APP", "CODE_EXEC", "app/Gadget", "hashCode",
@@ -506,7 +506,7 @@ class ChainComposerKnowledgeSourceTest {
                         "framework/Stream", new ClassInfo("framework/Stream",
                                 "java/io/ObjectInputStream", List.of(), 0, List.of(), List.of())), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
-                new Blackboard.ScanInputs(target, List.of(), false, false, 0));
+                new Blackboard.ScanInputs(target, List.of(), false));
         bb.addChain(chain("T-NOISE", "CODE_EXEC", "dependency/Noise", "hashCode",
                 "java/lang/Runtime", "exec"));
         bb.addChain(chain("T-APP", "CODE_EXEC", "app/Gadget", "hashCode",
@@ -654,8 +654,7 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard blackboard = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(target, List.of(), false, true, 20, null, 0,
-                        false, false, false, null,
+                new Blackboard.ScanInputs(target, List.of(), false, null, 0, null,
                         applicationOwners, true));
 
         Chain capability = new Chain("z-capability", "REFLECTIVE_INVOKE", "HIGH",
@@ -776,7 +775,7 @@ class ChainComposerKnowledgeSourceTest {
                         "framework/Stream", new ClassInfo("framework/Stream",
                                 "java/io/ObjectInputStream", List.of(), 0, List.of(), List.of())), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
-                new Blackboard.ScanInputs(target, List.of(), false, false, 0));
+                new Blackboard.ScanInputs(target, List.of(), false));
     }
 
     @Test
@@ -824,8 +823,7 @@ class ChainComposerKnowledgeSourceTest {
         var hierarchy = new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null);
         Blackboard bb = new Blackboard(graph, hierarchy,
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(target, List.of(), false, false, 0, null, 0,
-                        false, false, false, null,
+                new Blackboard.ScanInputs(target, List.of(), false, null, 0, null,
                         Set.of("app/Host", "app/Gadget", "app/Gadget2"), true));
         bb.addChain(chain("T-APP", "CODE_EXEC", "app/Gadget", "hashCode",
                 "java/lang/Runtime", "exec"));
@@ -905,8 +903,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null, Set.of("app/Entry"), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of("app/Entry"), true));
         Chain front = new Chain("reflective-invoke", "REFLECTIVE_INVOKE", "HIGH",
                 "app/Entry", "process", "source", "java/lang/reflect/Method", "invoke",
                 List.of(
@@ -967,8 +965,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null, Set.of("app/Entry"), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of("app/Entry"), true));
         Chain appFront = new Chain("reflective-invoke", "REFLECTIVE_INVOKE", "HIGH",
                 "app/Entry", "process", "source", "java/lang/reflect/Method", "invoke",
                 List.of(
@@ -1070,8 +1068,7 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null,
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
                         Set.of("app/Entry", "app/Helper"), true));
         Chain helperFront = new Chain("reflective-invoke", "REFLECTIVE_INVOKE", "HIGH",
                 "app/Helper", "decode", "source", "java/lang/reflect/Method", "invoke",
@@ -1145,8 +1142,7 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null,
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
                         Set.of("app/Entry", "app/Helper"), true));
         Chain helperFront = new Chain("reflective-invoke", "REFLECTIVE_INVOKE", "HIGH",
                 "app/Helper", "decode", "source", "java/lang/reflect/Method", "invoke",
@@ -1430,8 +1426,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(new io.just.sast.cpg.graph.Graph(),
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, false, 0, null, 0,
-                        false, false, false, null, Set.of("app/Host"), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of("app/Host"), true));
         assertFalse(bb.addSolverCandidate(candidate, () -> {
             materialized.set(true);
             return producer.materializer().get();
@@ -1455,8 +1451,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard blackboard = new Blackboard(new io.just.sast.cpg.graph.Graph(),
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, false, 0, null, 0,
-                        false, false, false, null, Set.of("app/Host"), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of("app/Host"), true));
         ChainComposerKnowledgeSource source = new ChainComposerKnowledgeSource();
 
         assertFalse(source.admitSourceHosted(blackboard, producer, () -> {
@@ -1497,8 +1493,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard target = new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, false, 0, null, 0,
-                        false, false, false, null, Set.of(appOwner), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of(appOwner), true));
         Chain back = chain("runtime-exec", "CODE_EXEC", "dep/Gadget", "readObject",
                 sinkOwner, sinkName);
         ChainComposerKnowledgeSource.SourceHostedProducer producer =
@@ -1540,8 +1536,8 @@ class ChainComposerKnowledgeSourceTest {
         Blackboard bb = new Blackboard(new io.just.sast.cpg.graph.Graph(),
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), RuleSet.EMPTY, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, false, 0, null, 0,
-                        false, false, false, null, Set.of("app/Host"), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of("app/Host"), true));
 
         assertFalse(bb.addSolverCandidate(producer.candidate(), () -> {
             materialized.set(true);
@@ -1650,8 +1646,8 @@ class ChainComposerKnowledgeSourceTest {
         return new Blackboard(graph,
                 new io.just.sast.analysis.hierarchy.ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, false, 0, null, 0,
-                        false, false, false, null, Set.of(appOwner), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of(appOwner), true));
     }
 
     private static Chain declaredTemplatesFragment() {

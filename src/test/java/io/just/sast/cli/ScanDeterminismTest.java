@@ -102,8 +102,8 @@ class ScanDeterminismTest {
                 Map.of("app.Gadget", GADGET, "app.FieldGadget", FIELD_GADGET));
         Path out1 = tmp.resolve("out1");
         Path out2 = tmp.resolve("out2");
-        ScanPipeline.run(jar, null, out1, null, false, true, null, false, 0);
-        ScanPipeline.run(jar, null, out2, null, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out1, null, false, true, null);
+        ScanPipeline.run(jar, null, out2, null, false, true, null);
         for (String file : List.of("findings/findings.csv", "evidence/chains.csv",
                 "evidence/edges.csv", "evidence/calibrations.csv")) {
             assertEquals(Files.readString(out1.resolve(file)), Files.readString(out2.resolve(file)),

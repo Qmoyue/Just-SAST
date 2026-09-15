@@ -88,8 +88,8 @@ class FragmentKnowledgeSourceContractTest {
         graph.freeze();
         Blackboard bb = new Blackboard(graph, new ClassHierarchy(Map.of(), null),
                 new FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("."), List.of(), false, true, 20,
-                        null, 0, false, false, false, null, Set.of("app/Entry"), true));
+                new Blackboard.ScanInputs(Path.of("."), List.of(), false, null, 0, null,
+                        Set.of("app/Entry"), true));
 
         FragmentKnowledgeSource source = new FragmentKnowledgeSource();
         source.init(bb);

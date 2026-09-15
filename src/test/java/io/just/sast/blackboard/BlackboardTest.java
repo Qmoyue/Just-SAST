@@ -144,7 +144,7 @@ class BlackboardTest {
                 "lifecycle");
         RuleSet rules = new RuleSet(List.of(sink, bridgeSink), List.of(entry), List.of(), List.of(), List.of());
         Blackboard.ScanInputs inputs = new Blackboard.ScanInputs(Path.of("fixture.jar"), List.of(),
-                true, true, 20, null, 0, false, false, false, null, Set.of(appOwner), true);
+                true, null, 0, null, Set.of(appOwner), true);
         Blackboard bb = new Blackboard(graph, new ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20, inputs);
 
@@ -255,7 +255,7 @@ class BlackboardTest {
                 "lifecycle");
         RuleSet rules = new RuleSet(List.of(sink), List.of(entry), List.of(), List.of(), List.of());
         Blackboard.ScanInputs inputs = new Blackboard.ScanInputs(Path.of("fixture.jar"), List.of(),
-                true, true, 20, null, 0, false, false, false, null, Set.of(appOwner), true);
+                true, null, 0, null, Set.of(appOwner), true);
         Blackboard bb = new Blackboard(graph, new ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20, inputs);
 
@@ -304,8 +304,8 @@ class BlackboardTest {
         RuleSet rules = new RuleSet(List.of(sink), List.of(entry), List.of(), List.of(), List.of());
         Blackboard bb = new Blackboard(graph, new ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20,
-                new Blackboard.ScanInputs(Path.of("fixture.jar"), List.of(), true, true, 20,
-                        null, 0, false, false, false, null, Set.of(appOwner), true));
+                new Blackboard.ScanInputs(Path.of("fixture.jar"), List.of(), true,
+                        null, 0, null, Set.of(appOwner), true));
         Chain suffix = new Chain("runtime-exec", "COMMAND", "HIGH", "fixture/lib/Gadget",
                 "trigger", "readObject", sinkOwner, sinkName,
                 List.of(new ChainHop("fixture/lib/Gadget", "trigger", sinkOwner, sinkName,
@@ -375,7 +375,7 @@ class BlackboardTest {
                 "lifecycle");
         RuleSet rules = new RuleSet(List.of(sink), List.of(entry), List.of(), List.of(), List.of());
         Blackboard.ScanInputs inputs = new Blackboard.ScanInputs(Path.of("fixture.jar"), List.of(),
-                true, true, 20, null, 0, false, false, false, null, Set.of(appOwner), true);
+                true, null, 0, null, Set.of(appOwner), true);
         Blackboard bb = new Blackboard(graph, new ClassHierarchy(Map.of(), null),
                 new io.just.sast.cpg.build.FieldWriterIndex(), rules, 20, inputs);
 

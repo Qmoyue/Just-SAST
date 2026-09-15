@@ -260,10 +260,8 @@ public final class Blackboard {
     }
 
     /** 扫描输入（管线编排期注入；知识源经黑板读取，无全局属性通道）。 */
-    public record ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                             int verifyBudget, Path jdkHome, int targetMajorVersion,
-                             boolean safeExec, boolean safeReal,
-                             boolean requireOsIsolation,
+    public record ScanInputs(Path target, List<Path> deps, boolean fast,
+                             Path jdkHome, int targetMajorVersion,
                              io.just.sast.run.InputBudget.Tracker inputTracker,
                              Set<String> applicationClassNames,
                              boolean applicationScopeKnown) {
@@ -283,50 +281,17 @@ public final class Blackboard {
                                     .map(String::trim).toList()));
         }
 
-        /** Compatibility constructor retained for callers that predate application scope. */
-        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                          int verifyBudget, Path jdkHome, int targetMajorVersion,
-                          boolean safeExec, boolean safeReal, boolean requireOsIsolation,
-                          io.just.sast.run.InputBudget.Tracker inputTracker) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
-                    safeExec, safeReal, requireOsIsolation, inputTracker, Set.of(), false);
+        public ScanInputs(Path target, List<Path> deps, boolean fast) {
+            this(target, deps, fast, null, 0, null, Set.of(), false);
         }
 
-        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                          int verifyBudget) {
-            this(target, deps, fast, verify, verifyBudget, null, 0, false, false, false, null);
-        }
-
-        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                          int verifyBudget, Path jdkHome) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, 0, false, false, false, null);
-        }
-
-        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                          int verifyBudget, Path jdkHome, int targetMajorVersion) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
-                    false, false, false, null);
-        }
-
-        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                          int verifyBudget, Path jdkHome, int targetMajorVersion,
-                          boolean safeExec) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
-                    safeExec, false, false, null);
-        }
-
-        /** Compatibility constructor retained for callers before SAFE_REAL was added. */
-        public ScanInputs(Path target, List<Path> deps, boolean fast, boolean verify,
-                          int verifyBudget, Path jdkHome, int targetMajorVersion,
-                          boolean safeExec, boolean requireOsIsolation) {
-            this(target, deps, fast, verify, verifyBudget, jdkHome, targetMajorVersion,
-                    safeExec, false, requireOsIsolation, null);
+        public ScanInputs(Path target, List<Path> deps, boolean fast,
+                          Path jdkHome, int targetMajorVersion) {
+            this(target, deps, fast, jdkHome, targetMajorVersion, null, Set.of(), false);
         }
 
         public static ScanInputs fastDefault(Path target) {
-            return new ScanInputs(target, List.of(), true, true,
-                    io.just.sast.verify.VerificationDefaults.VERIFY_BUDGET, null, 0,
-                    false, false, false, null);
+            return new ScanInputs(target, List.of(), true);
         }
     }
 
@@ -862,7 +827,7 @@ public final class Blackboard {
 
     public synchronized void setVerificationSummary(VerificationSummary summary) {
         verificationSummary = summary == null
-                ? VerificationSummary.empty(verificationSummary.capability(), scanInputs.verifyBudget())
+                ? VerificationSummary.empty(verificationSummary.capability(), 0)
                 : summary;
     }
 

@@ -57,7 +57,6 @@ class ForwardEngineCharacterizationTest {
         graph.freeze();
         ClassHierarchy hierarchy = new ClassHierarchy(Map.of(), name -> null);
         return new Blackboard(graph, hierarchy, new FieldWriterIndex(), RuleSet.EMPTY, 8,
-                new Blackboard.ScanInputs(Path.of("characterization.jar"), List.of(), true,
-                        false, 20));
+                new Blackboard.ScanInputs(Path.of("characterization.jar"), List.of(), true));
     }
 }

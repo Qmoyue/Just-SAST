@@ -114,8 +114,7 @@ public final class ScanCommand implements Callable<Integer> {
                 }
             }
             ScanPipeline.ScanResult result = ScanPipeline.run(target, scanDeps, output, rules, stats,
-                    fast, jdkHome, false, 0, false, false, false,
-                    baseline, suppressions, overwrite,
+                    fast, jdkHome, baseline, suppressions, overwrite,
                     modePolicy, prepared.environmentGraph(), prepared.explicitDependencyCount(),
                     prepared.environmentIdentity(), prepared.dependencyPreparation());
             printScanTiming(result.stats());

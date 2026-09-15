@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class StaticModeBehaviorTest {
 
     @Test
-    void legacyVerificationRequestStillDoesNotLoadTargetClass(@TempDir Path temp) throws Exception {
+    void staticScanDoesNotLoadTargetClass(@TempDir Path temp) throws Exception {
         Path sentinel = temp.resolve("target-loaded.txt");
         String path = sentinel.toString().replace("\\", "\\\\");
         Path jar = compileToJar(temp.resolve("target.jar"), Map.of("app.Sentinel", """
@@ -51,8 +51,7 @@ class StaticModeBehaviorTest {
                 "the sentinel must prove that class initialization would be observable");
         Files.delete(sentinel);
 
-        ScanPipeline.run(jar, null, temp.resolve("out"), null, false, true, null,
-                true, 20);
+        ScanPipeline.run(jar, null, temp.resolve("out"), null, false, true, null);
         assertFalse(Files.exists(sentinel), "static analysis must not initialize target classes");
         String report = Files.readString(temp.resolve("out").resolve("report.json"));
         assertTrue(report.contains("\"target_code_executed\":\"NO\""));
@@ -73,7 +72,6 @@ class StaticModeBehaviorTest {
                 """));
         Path componentOut = temp.resolve("component");
         ScanPipeline.run(dependency, null, componentOut, null, false, true, null,
-                false, 0, false, false, false, null, null, false,
                 ModeDemandPolicy.forMode(ScanMode.COMPONENT));
         String component = Files.readString(componentOut.resolve("report.json"));
         assertTrue(component.contains("\"mode\":\"component\""));
@@ -86,7 +84,6 @@ class StaticModeBehaviorTest {
                 """));
         Path applicationOut = temp.resolve("application");
         ScanPipeline.run(application, List.of(dependency), applicationOut, null, false, true, null,
-                false, 0, false, false, false, null, null, false,
                 ModeDemandPolicy.forMode(ScanMode.APPLICATION));
         String applicationReport = Files.readString(applicationOut.resolve("report.json"));
         assertTrue(applicationReport.contains("\"mode\":\"application\""));
@@ -123,7 +120,6 @@ class StaticModeBehaviorTest {
         Path output = temp.resolve("application-positive-report");
 
         ScanPipeline.run(target, null, output, null, false, true, null,
-                false, 0, false, false, false, null, null, false,
                 ModeDemandPolicy.forMode(ScanMode.APPLICATION));
 
         String evidence = Files.readString(output.resolve("meta")
@@ -146,7 +142,6 @@ class StaticModeBehaviorTest {
                 """));
         Path output = temp.resolve("negative-report");
         ScanPipeline.run(target, null, output, null, false, true, null,
-                false, 0, false, false, false, null, null, false,
                 ModeDemandPolicy.forMode(ScanMode.COMPONENT));
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));

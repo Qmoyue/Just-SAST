@@ -147,85 +147,26 @@ public final class ScanPipeline {
         }
     }
 
+    /** Minimal component scan entry point used by library and test callers. */
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, false, verify, false, null, null);
+        boolean stats, boolean fast, Path jdkHome) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome,
+                null, null, false, ModeDemandPolicy.forMode(ScanMode.COMPONENT));
     }
 
+    /** Explicit mode entry point; all scans remain static-only. */
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, safeExec, verify && !safeExec, false, null, null);
+        boolean stats, boolean fast, Path jdkHome, ModeDemandPolicy modePolicy) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome,
+                null, null, false, modePolicy);
     }
 
+    /** Scan entry point with explicit report-difference and overwrite policies. */
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec,
-                                 boolean requireOsIsolation) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify,
-                verifyBudget, safeExec, verify && !safeExec, requireOsIsolation, null, null);
-    }
-
-    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec,
-                                 boolean requireOsIsolation, Path baseline,
-                                 Path suppressions) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
-                safeExec, verify && !safeExec, requireOsIsolation, baseline, suppressions);
-    }
-
-    /** Full pipeline entry point with an explicit adapter-owned SAFE_REAL mode. */
-    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec, boolean safeReal,
-                                 boolean requireOsIsolation, Path baseline,
-                                 Path suppressions) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
-                safeExec, safeReal, requireOsIsolation, baseline, suppressions, false);
-    }
-
-    /** Full pipeline entry point with explicit overwrite authorization for run-level output. */
-    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec, boolean safeReal,
-                                 boolean requireOsIsolation, Path baseline,
-                                 Path suppressions, boolean overwrite) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
-                safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
-                ModeDemandPolicy.forMode(ScanMode.COMPONENT));
-    }
-
-    /**
-     * Compatibility entry point retaining the former export-policy parameter.
-     *
-     * <p>The old enum is converted immediately to the single mode/demand policy so a caller
-     * cannot accidentally use application export with component demand.</p>
-     */
-    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec, boolean safeReal,
-                                 boolean requireOsIsolation, Path baseline,
-                                 Path suppressions, boolean overwrite,
-                                 ExportPolicy exportPolicy) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
-                safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
-                ModeDemandPolicy.fromExportPolicy(exportPolicy));
-    }
-
-    /** Full pipeline entry point with one owner for scan mode, demand roots and export policy. */
-    public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec, boolean safeReal,
-                                 boolean requireOsIsolation, Path baseline,
-                                 Path suppressions, boolean overwrite,
-                                 ModeDemandPolicy modePolicy) throws Exception {
-        return run(target, deps, output, rules, stats, fast, jdkHome, verify, verifyBudget,
-                safeExec, safeReal, requireOsIsolation, baseline, suppressions, overwrite,
-                modePolicy, null, -1, "MAVEN_POM_NOT_PROVIDED",
+        boolean stats, boolean fast, Path jdkHome, Path baseline, Path suppressions,
+        boolean overwrite, ModeDemandPolicy modePolicy) throws Exception {
+        return run(target, deps, output, rules, stats, fast, jdkHome, baseline, suppressions,
+                overwrite, modePolicy, null, -1, "MAVEN_POM_NOT_PROVIDED",
                 DependencyPreparation.notProvided());
     }
 
@@ -235,9 +176,7 @@ public final class ScanPipeline {
      * selected CACHE/REMOTE provenance into frontend ownership and report identity.
      */
     public static ScanResult run(Path target, List<Path> deps, Path output, Path rules,
-        boolean stats, boolean fast, Path jdkHome, boolean verify,
-                                 int verifyBudget, boolean safeExec, boolean safeReal,
-                                 boolean requireOsIsolation, Path baseline,
+        boolean stats, boolean fast, Path jdkHome, Path baseline,
                                  Path suppressions, boolean overwrite,
                                  ModeDemandPolicy modePolicy,
                                  DependencyGraph preparedDependencyGraph,
@@ -287,33 +226,6 @@ public final class ScanPipeline {
         if (suppressions != null) {
             validatePath(suppressions, "suppression 文件", false);
         }
-        if (verifyBudget < 0) {
-            throw new UsageException("--verify-budget 不能为负数");
-        }
-        if (safeExec && !verify) {
-            throw new UsageException("--safe-exec 需要启用动态验证（不能与 --no-verify 同时使用）");
-        }
-        if (safeReal && !verify) {
-            throw new UsageException("--safe-real-sink 需要启用动态验证（不能与 --no-verify 同时使用）");
-        }
-        if (safeExec && safeReal) {
-            throw new UsageException("--safe-exec 与 --safe-real-sink 不能同时使用");
-        }
-        if (requireOsIsolation && !verify) {
-            throw new UsageException("--require-os-isolation 需要启用动态验证（不能与 --no-verify 同时使用）");
-        }
-
-        // The product contract is static-only.  Keep the legacy boolean and safety switches
-        // at this compatibility seam so older library callers receive the same scan, but do
-        // not prewarm a verifier boundary or pass target-execution capabilities downstream.
-        if (verify) {
-            JustLogger.info("静态分析模式：忽略旧 verifier 请求，目标代码不会加载或执行");
-            verify = false;
-            safeExec = false;
-            safeReal = false;
-            requireOsIsolation = false;
-        }
-
         // Hash immutable inputs once at the scan boundary. Besides making report identity
         // available to the cache layer before frontend parsing, reusing these values avoids a
         // second full read of a large target/dependency archive during report generation.
@@ -478,9 +390,8 @@ public final class ScanPipeline {
         // 分析期（黑板串行三阶段：ANALYSIS → COMPOSITION → CALIBRATION）
         long analysisStart = System.nanoTime();
         Blackboard blackboard = new Blackboard(cpg.graph(), hierarchy, cpg.fieldWriters(), cpg.index(), ruleSet, MAX_DEPTH,
-                new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast, verify,
-                        verifyBudget, jdkHome, load.targetMajorVersion(), safeExec, safeReal,
-                        requireOsIsolation, inputTracker, applicationClassNames,
+                new Blackboard.ScanInputs(target.toAbsolutePath().normalize(), scanDeps, fast,
+                        jdkHome, load.targetMajorVersion(), inputTracker, applicationClassNames,
                         // Component mode deliberately has no application-entry scope: its
                         // mechanism products are retained in the kernel store and exported by
                         // the component report.  Application mode enables the strict

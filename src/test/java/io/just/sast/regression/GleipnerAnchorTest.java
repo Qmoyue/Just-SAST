@@ -26,7 +26,7 @@ class GleipnerAnchorTest {
         io.just.sast.cli.ScanPipeline.ScanResult result = io.just.sast.cli.ScanPipeline.run(
                 jar, null, tmp.resolve("basic"),
                 Path.of("benchmark/Gleipner/just-rules.yaml"),
-                false, true, null, true, 20);
+                false, true, null);
         List<String> entries = csvColumn(tmp.resolve("basic"), "entry_class");
         assertTrue(entries.stream().anyMatch(e -> e.contains("BasicTriggerGadget")),
                 "basic_001 锚点丢失: " + entries);
@@ -39,7 +39,7 @@ class GleipnerAnchorTest {
         Path jar = Path.of("benchmark/Gleipner/chains/target/gleipner.chains-1.0-depth.jar");
         Assumptions.assumeTrue(Files.exists(jar), "本地无 Gleipner 基准");
         io.just.sast.cli.ScanPipeline.run(jar, null, tmp.resolve("depth"),
-                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null, true, 20);
+                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null);
         List<String> entries = csvColumn(tmp.resolve("depth"), "entry_class");
         long found = entries.stream().filter(e -> e.contains("Depth_0")).distinct().count();
         assertTrue(found >= 15, "depth 锚点数 " + found + " < 15（历史稳定 ≥15，漂移即红）");
@@ -50,7 +50,7 @@ class GleipnerAnchorTest {
         Path jar = Path.of("benchmark/Gleipner/chains/target/gleipner.chains-1.0-polymorphism.jar");
         Assumptions.assumeTrue(Files.exists(jar), "本地无 Gleipner 基准");
         io.just.sast.cli.ScanPipeline.run(jar, null, tmp.resolve("poly"),
-                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null, true, 20);
+                Path.of("benchmark/Gleipner/just-rules.yaml"), false, true, null);
         List<String> entries = csvColumn(tmp.resolve("poly"), "entry_class");
         long found = entries.stream().filter(e -> e.contains("Polymorphism_0")).distinct().count();
         assertTrue(found >= 12, "polymorphism 锚点数 " + found + " < 12（历史 ≥12）");

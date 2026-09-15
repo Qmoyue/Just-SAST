@@ -98,7 +98,7 @@ class EngineCapabilityTest {
                 """;
         Path jar = compileToJar(tmp.resolve("arr.jar"), Map.of("app.Carrier", carrier, "app.ArrayGadget", gadget));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        ScanPipeline.run(jar, null, out, null, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/ArrayGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
                 "数组元素流（fill 内 AASTORE → Carrier.cells 字段污点 → readObject 内 AALOAD）应闭合链:\n"
@@ -133,7 +133,7 @@ class EngineCapabilityTest {
                 """;
         Path jar = compileToJar(tmp.resolve("lambda.jar"), Map.of("app.Fn", fn, "app.LambdaGadget", gadget));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        ScanPipeline.run(jar, null, out, null, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/LambdaGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
                 "lambda 实参经 f.go(cmd) 分发时污点应到达 lambda$0 实现方法:\n" + findings);
@@ -160,7 +160,7 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("direct-lambda.jar"),
                 Map.of("app.DirectLambdaGadget", gadget));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        ScanPipeline.run(jar, null, out, null, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/DirectLambdaGadget,readObject")
                         && findings.contains("java/lang/Runtime,exec"),
@@ -198,7 +198,7 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("iterator-view.jar"),
                 Map.of("app.CollectionGadget", gadget, "app.UnrelatedIterator", unrelated));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        ScanPipeline.run(jar, null, out, null, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertFalse(findings.contains("app/UnrelatedIterator,next"),
                 "iterator view 本身不是反序列化对象，不能通过 CHA 把无关实现接入:\n" + findings);
@@ -246,7 +246,7 @@ class EngineCapabilityTest {
                 "app.ResolveGadget", resolve, "app.ExternalGadget", external,
                 "app.FieldGadget", field));
         Path positiveOut = tmp.resolve("positive-out");
-        ScanPipeline.run(jar, null, positiveOut, null, false, true, null, false, 20);
+        ScanPipeline.run(jar, null, positiveOut, null, false, true, null);
         String positiveFindings = Files.readString(
                 positiveOut.resolve("findings").resolve("findings.csv"));
         assertTrue(positiveFindings.contains("app/ResolveGadget,readResolve")
@@ -290,7 +290,7 @@ class EngineCapabilityTest {
                 "app.ReplaceGadget", replace, "app.FakeExternal", fakeExternal,
                 "app.ExcludedFields", excludedFields));
         Path negativeOut = tmp.resolve("negative-out");
-        ScanPipeline.run(negativeJar, null, negativeOut, null, false, true, null, false, 20);
+        ScanPipeline.run(negativeJar, null, negativeOut, null, false, true, null);
         String negativeFindings = Files.readString(
                 negativeOut.resolve("findings").resolve("findings.csv"));
         assertFalse(negativeFindings.contains("app/ReplaceGadget,writeReplace"),
@@ -332,7 +332,7 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("native-callback.jar"), Map.of(
                 "app.NativeBridge", bridge, "app.UnrelatedNativeTarget", unrelated));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        ScanPipeline.run(jar, null, out, null, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/NativeBridge,readObject")
                         && findings.contains("app/NativeBridge.onCallback")
@@ -373,7 +373,7 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("gate.jar"),
                 Map.of("app.Reflective", reflective, "app.Isolated", isolated));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, false, 20);
+        ScanPipeline.run(jar, null, out, null, false, true, null);
         String sinks = Files.readString(out.resolve("evidence").resolve("sinks.csv"));
         assertTrue(sinks.lines().anyMatch(l -> l.contains("app/Isolated") && l.contains("fetch")
                         && l.contains("NO_PATH")),

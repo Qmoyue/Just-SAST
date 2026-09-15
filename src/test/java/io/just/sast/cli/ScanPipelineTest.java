@@ -33,7 +33,7 @@ class ScanPipelineTest {
         assertThrows(ScanPipeline.UsageException.class, () -> ScanPipeline.run(
                 Path.of("target", "definitely-missing-input.jar"), List.of(),
                 Path.of("target", "just-test-output"), null,
-                false, true, null, false, 0));
+                false, true, null));
     }
 
     @Test
@@ -44,20 +44,9 @@ class ScanPipelineTest {
 
         ScanPipeline.UsageException failure = assertThrows(ScanPipeline.UsageException.class,
                 () -> ScanPipeline.run(jar, List.of(), tmp.resolve("out"), null,
-                        false, true, missingJdk, false, 0));
+                        false, true, missingJdk));
 
         assertTrue(failure.getMessage().contains("--jdk-home"), failure.getMessage());
-    }
-
-    @Test
-    void safeExecRequiresDynamicVerification(@TempDir Path tmp) throws Exception {
-        Path input = Files.writeString(tmp.resolve("input.jar"), "not-a-jar");
-
-        ScanPipeline.UsageException failure = assertThrows(ScanPipeline.UsageException.class,
-                () -> ScanPipeline.run(input, List.of(), tmp.resolve("out"), null,
-                        false, true, null, false, 0, true));
-
-        assertTrue(failure.getMessage().contains("--safe-exec"));
     }
 
     @Test
@@ -75,10 +64,10 @@ class ScanPipelineTest {
         }
         assertThrows(ScanPipeline.UsageException.class, () -> ScanPipeline.run(
                 inputLink, List.of(), tmp.resolve("out"), null,
-                false, true, null, false, 0));
+                false, true, null));
         assertThrows(ScanPipeline.UsageException.class, () -> ScanPipeline.run(
                 realInput, List.of(), outputLink, null,
-                false, true, null, false, 0));
+                false, true, null));
     }
 
     /** 内存 Java 源。 */
@@ -164,7 +153,7 @@ class ScanPipelineTest {
         Path jar = compileToJar(tmp.resolve("app.jar"),
                 Map.of("app.Gadget", GADGET, "app.EqGadget", EQ_GADGET));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, null, false, true, null, true, 20);
+        ScanPipeline.run(jar, null, out, null, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         String calibrations = Files.readString(out.resolve("evidence").resolve("calibrations.csv"));
         // 正向链：app/Gadget.readObject → Runtime.exec（rule JUST-SINK-COMMAND-EXEC-RUNTIME）
@@ -208,7 +197,7 @@ class ScanPipelineTest {
                 "app.UnreachableGuard", unreachable, "app.ReachableGuard", reachable));
 
         ScanPipeline.ScanResult result = ScanPipeline.run(jar, null, tmp.resolve("out"), null,
-                false, true, null, true, 20);
+                false, true, null);
         String findings = Files.readString(tmp.resolve("out").resolve("findings")
                 .resolve("findings.csv"));
 
@@ -260,7 +249,7 @@ class ScanPipelineTest {
         Path rulesFile = tmp.resolve("source-rules.yaml");
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/SourceApp,run")
                         && findings.contains("java/lang/Runtime,exec"),
@@ -321,7 +310,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Entry,readObject")
@@ -387,7 +376,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Mixed,readObject")
@@ -450,7 +439,7 @@ class ScanPipelineTest {
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Bean,setCommand")
@@ -507,7 +496,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Trigger,readObject")
@@ -593,7 +582,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/HandleGadget,readObject")
@@ -639,7 +628,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertFalse(findings.contains("app/UnconnectedHandler,invoke")
@@ -719,7 +708,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Trigger,readObject")
@@ -784,7 +773,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Entry,readObject")
@@ -862,7 +851,7 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules, StandardCharsets.UTF_8);
         Path out = tmp.resolve("out");
 
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, false, 0);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/Trigger,readObject")
@@ -923,7 +912,7 @@ class ScanPipelineTest {
         Path rulesFile = tmp.resolve("method-array-rules.yaml");
         Files.writeString(rulesFile, rules);
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, true, 20);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         assertTrue(findings.contains("app/ArrayGadget,readObject")
                         && findings.contains("app/Sinks,accept"),
@@ -993,7 +982,7 @@ class ScanPipelineTest {
         Path rulesFile = tmp.resolve("rules.yaml");
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
-        ScanPipeline.run(jar, null, out, rulesFile, false, true, null, true, 20);
+        ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
         String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
         // UnsafeApp：入口链保留，且框架管线中间跳（Fw.load → Fw.run → Method.invoke）保留
         assertTrue(findings.contains("app/UnsafeApp,readObject"), "未安全配置的入口链应上报：\n" + findings);
@@ -1010,7 +999,7 @@ class ScanPipelineTest {
     void exitCodeZeroOnSuccess(@TempDir Path tmp) throws Exception {
         Path jar = compileToJar(tmp.resolve("app.jar"), Map.of("app.Gadget", GADGET));
         ScanPipeline.ScanResult result = ScanPipeline.run(jar, null, tmp.resolve("out"), null,
-                false, true, null, true, 20);
+                false, true, null);
         assertTrue(result.exitCode() == 0);
         assertFalse(result.chains().isEmpty());
         Path output = tmp.resolve("out");
