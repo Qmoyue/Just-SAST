@@ -44,7 +44,6 @@ class EvidenceGraphContractTest {
                 .startsWith("appchain-"));
         assertTrue(FindingId.fromCanonical("chain").value().startsWith("finding-"));
         assertTrue(CandidateId.fromCanonical("path").value().startsWith("candidate-"));
-        assertTrue(AttemptId.fromCanonical("attempt").value().startsWith("attempt-"));
     }
 
     @Test

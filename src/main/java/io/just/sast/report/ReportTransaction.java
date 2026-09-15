@@ -468,7 +468,7 @@ public final class ReportTransaction implements AutoCloseable {
                 || ArchiveLimits.isLinkOrReparsePoint(root)) {
             return false;
         }
-        for (String child : new String[] {"findings", "verification", "evidence", "meta"}) {
+        for (String child : new String[] {"findings", "evidence", "meta"}) {
             Path directory = root.resolve(child);
             if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)
                     || ArchiveLimits.isLinkOrReparsePoint(directory)) {
@@ -485,8 +485,7 @@ public final class ReportTransaction implements AutoCloseable {
         if (!Files.isDirectory(staging, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("report staging is missing: " + staging);
         }
-        for (Path directory : new Path[] { layout.findings(), layout.verification(),
-                layout.evidence(), layout.meta() }) {
+        for (Path directory : new Path[] { layout.findings(), layout.evidence(), layout.meta() }) {
             rejectUnsafePath(directory, "report staging directory");
             if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
                 throw new IOException("report staging directory is missing: " + directory);

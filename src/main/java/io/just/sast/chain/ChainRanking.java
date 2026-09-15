@@ -3,7 +3,6 @@ package io.just.sast.chain;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
-import io.just.sast.blackboard.VerificationSummary;
 
 import java.util.Comparator;
 import java.util.IdentityHashMap;
@@ -11,34 +10,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * One deterministic ranking contract shared by verification selection and reporters.
- *
- * <p>The order is deliberately a tuple rather than a pile of unrelated bonuses.  This makes
- * the reason a candidate moves visible and prevents a long list of static points from
- * accidentally outranking an exact dynamic boundary.  The comparator has no knowledge of
- * benchmark names or WP signatures.</p>
- */
+/** One deterministic ranking contract shared by all static report renderers. */
 public final class ChainRanking {
 
-    /** Stable, reportable ranking factors. Lower values are preferred except staticScore. */
-    public record Evidence(int dynamicRank, int sinkRoleRank, int semanticRank,
-                           int constructionRank,
+    /** Stable, reportable static ranking factors. Lower values are preferred. */
+    public record Evidence(int sinkRoleRank, int semanticRank, int constructionRank,
                            int sinkPrecisionRank, int entryRank, int unresolvedHops,
                            int incompleteness, int compactTerminalRank, int pathPreferenceRank,
-                           int pathLength, int staticScore,
-                           int precisionRank,
+                           int pathLength, int staticScore, int precisionRank,
                            String explanation) {
-        /** Compatibility constructor for consumers compiled against the previous tuple. */
-        public Evidence(int dynamicRank, int sinkRoleRank, int constructionRank,
-                        int sinkPrecisionRank, int entryRank, int unresolvedHops,
-                        int incompleteness, int pathLength, int staticScore,
-                        String explanation) {
-            this(dynamicRank, sinkRoleRank, 2, constructionRank, sinkPrecisionRank, entryRank,
-                    unresolvedHops, incompleteness, 1, 1, pathLength, staticScore, 99,
-                    explanation);
-        }
-
         public Evidence {
             explanation = explanation == null ? "" : explanation;
             precisionRank = Math.max(0, precisionRank);
@@ -49,44 +29,31 @@ public final class ChainRanking {
     }
 
     public static Comparator<Chain> comparator(Map<String, List<String>> notes,
-                                              Map<String, VerificationSummary.ChainResult> verification,
                                               Set<String> constructible) {
         Map<String, List<String>> stableNotes = notes == null ? Map.of() : notes;
-        Map<String, VerificationSummary.ChainResult> stableVerification =
-                verification == null ? Map.of() : verification;
         Set<String> stableConstructible = constructible == null ? Set.of() : constructible;
-        // TimSort may compare the same candidate O(log n) times.  Precision assessment walks
-        // every hop and note, so recomputing it from the comparator made large closures pay a
-        // hidden O(n log n * chain-size) cost.  Candidates are immutable for one phase; an
-        // identity cache keeps this optimization local to the sort and cannot leak stale notes
-        // across phases.
         Map<Chain, Evidence> memo = new IdentityHashMap<>();
         return (left, right) -> compareEvidence(left, right,
                 memo.computeIfAbsent(left, candidate -> evidence(candidate, stableNotes,
-                        stableVerification, stableConstructible)),
+                        stableConstructible)),
                 memo.computeIfAbsent(right, candidate -> evidence(candidate, stableNotes,
-                        stableVerification, stableConstructible)));
+                        stableConstructible)));
     }
 
     public static int compare(Chain left, Chain right,
                               Map<String, List<String>> notes,
-                              Map<String, VerificationSummary.ChainResult> verification,
                               Set<String> constructible) {
-        return compareEvidence(left, right, evidence(left, notes, verification, constructible),
-                evidence(right, notes, verification, constructible));
+        return compareEvidence(left, right, evidence(left, notes, constructible),
+                evidence(right, notes, constructible));
     }
 
-    /** Compare two already-materialized evidence tuples using the product ordering. */
+    /** Compare two materialized evidence tuples using the static product ordering. */
     public static int compareEvidence(Evidence a, String leftKey, Evidence b, String rightKey) {
         if (a == null || b == null) {
             throw new IllegalArgumentException("ranking evidence must not be null");
         }
-        int result = Integer.compare(a.dynamicRank(), b.dynamicRank());
+        int result = Integer.compare(a.sinkRoleRank(), b.sinkRoleRank());
         if (result != 0) return result;
-        result = Integer.compare(a.sinkRoleRank(), b.sinkRoleRank());
-        if (result != 0) return result;
-        // Evidence completeness is a hard boundary: a semantically attractive but partial
-        // chain must not outrank a complete chain merely because it carries a bridge marker.
         result = Integer.compare(a.incompleteness(), b.incompleteness());
         if (result != 0) return result;
         result = Integer.compare(a.semanticRank(), b.semanticRank());
@@ -99,14 +66,8 @@ public final class ChainRanking {
         if (result != 0) return result;
         result = Integer.compare(a.unresolvedHops(), b.unresolvedHops());
         if (result != 0) return result;
-        // A declaration-backed one-hop terminal is an exact usable endpoint.  It outranks a
-        // longer generic suffix without knowing a class, package, rule id, or benchmark name.
         result = Integer.compare(a.compactTerminalRank(), b.compactTerminalRank());
         if (result != 0) return result;
-        // Keep path preference as a candidate-owned category.  A semantic continuation and a
-        // disconnected suffix use precision/length before static score; ordinary connected
-        // paths use static evidence before length.  Comparing the category first means the
-        // within-category choice is stable and the comparator remains transitive.
         result = Integer.compare(a.pathPreferenceRank(), b.pathPreferenceRank());
         if (result != 0) return result;
         if (a.pathPreferenceRank() == 0 || a.pathPreferenceRank() == 2) {
@@ -132,10 +93,9 @@ public final class ChainRanking {
     }
 
     public static Evidence evidence(Chain chain, Map<String, List<String>> notes,
-                                    Map<String, VerificationSummary.ChainResult> verification,
                                     Set<String> constructible) {
         if (chain == null) {
-            return new Evidence(9, 9, 9, 9, 9, 9, Integer.MAX_VALUE, Integer.MAX_VALUE,
+            return new Evidence(9, 9, 9, 9, 9, Integer.MAX_VALUE, Integer.MAX_VALUE,
                     1, 1, Integer.MAX_VALUE, Integer.MIN_VALUE, 99, "null-candidate");
         }
         List<String> chainNotes = notes == null ? List.of()
@@ -143,24 +103,12 @@ public final class ChainRanking {
         if (chainNotes == null) {
             chainNotes = List.of();
         }
-        VerificationSummary.ChainResult result = verification == null ? null
-                : verification.get(chain.key());
-        String status = result == null ? "" : result.outcomeStatus().name();
-        if (status.isBlank()) {
-            status = ConfidenceScorer.statusFromNotes(chainNotes);
-        }
         ConfidenceScorer.RankFeatures rankFeatures =
                 ConfidenceScorer.rankFeatures(chain, chainNotes);
-        int dynamic = rankFeatures.dynamicRank();
-        // A terminal-looking frame without the authenticated readiness bit is not dynamic
-        // evidence. Keep the candidate visible, but place it with untestable results.
-        if (result != null && !result.sandboxReady()) {
-            dynamic = Math.max(dynamic, ConfidenceScorer.DYNAMIC_NEGATIVE_OR_UNTESTABLE);
-        }
         int sinkRole = chain.terminalSink() ? 0 : 1;
         int semantic = semanticRank(chain);
         boolean isConstructible = constructible != null && constructible.contains(chain.key())
-                || chainNotes.stream().anyMatch("verify:constructible"::equals);
+                || chainNotes.stream().anyMatch("static:constructible"::equals);
         boolean hasDeclaredPlan = chain.constructionPlan() != null
                 && !chain.constructionPlan().isEmpty();
         boolean declaredPlanValid = hasDeclaredPlan
@@ -178,7 +126,7 @@ public final class ChainRanking {
             case "hashCode", "equals", "compareTo", "compare", "toString", "proxyInvoke" -> 2;
             default -> 3;
         };
-        ChainPrecision.Assessment precision = ChainPrecision.assess(chain, chainNotes, result);
+        ChainPrecision.Assessment precision = ChainPrecision.assess(chain, chainNotes);
         int incomplete = 0;
         for (String note : chainNotes) {
             if (note != null && (note.startsWith("degrade:") || note.contains("CAP")
@@ -195,12 +143,8 @@ public final class ChainRanking {
         int compactTerminal = isCompactDeclaredTerminal(chain) ? 0 : 1;
         int disconnectedHops = disconnectedEvidenceHops(chain);
         boolean semanticContinuation = hasSemanticContinuation(chain);
-        // 0=typed semantic continuation, 1=ordinary connected evidence, 2=disconnected suffix.
-        // The explicit third state prevents a decorative disconnected path from outranking a
-        // shorter ordinary path merely because it happened to carry more static hops.
         int pathPreference = semanticContinuation ? 0 : disconnectedHops > 0 ? 2 : 1;
-        String explanation = "dynamic=" + (status.isBlank() ? "NOT_SELECTED" : status)
-                + ";sink_role=" + chain.sinkRole()
+        String explanation = "sink_role=" + chain.sinkRole()
                 + ";semantic=" + semanticLabel(semantic)
                 + ";construction=" + (isConstructible ? "CONSTRUCTIBLE"
                 : declaredPlanValid ? "DECLARED_PLAN"
@@ -210,10 +154,8 @@ public final class ChainRanking {
                 + ";entry_direction=" + (entry == 0 ? "DESERIALIZE_CALLBACK" : chain.entryKind())
                 + ";unresolved=" + chain.unresolvedHops()
                 + ";incompleteness=" + incomplete
-                + ";compact_terminal="
-                + (compactTerminal == 0 ? "DECLARED_MINIMAL" : "NO")
-                + ";path_preference="
-                + switch (pathPreference) {
+                + ";compact_terminal=" + (compactTerminal == 0 ? "DECLARED_MINIMAL" : "NO")
+                + ";path_preference=" + switch (pathPreference) {
                     case 0 -> "SEMANTIC_CONTINUATION";
                     case 2 -> "DISCONNECTED_SUFFIX";
                     default -> "STATIC_EVIDENCE";
@@ -221,17 +163,11 @@ public final class ChainRanking {
                 + ";disconnected_hops=" + disconnectedHops
                 + ";path_length=" + chain.hops().size()
                 + ";precision=" + precision.compact();
-        return new Evidence(dynamic, sinkRole, semantic, construction, sinkPrecision, entry,
+        return new Evidence(sinkRole, semantic, construction, sinkPrecision, entry,
                 chain.unresolvedHops(), incomplete, compactTerminal, pathPreference,
                 chain.hops().size(), rankFeatures.totalScore(), precision.rank(), explanation);
     }
 
-    /**
-     * A direct declared fragment has no unresolved gadget suffix: its construction plan, sink,
-     * entry and single ENTRY hop all describe the same callable endpoint.  This is a structural
-     * rank, not a class-name exception, so every rule can benefit from the same minimal-chain
-     * policy.
-     */
     private static boolean isCompactDeclaredTerminal(Chain chain) {
         if (chain == null || !chain.terminalSink()
                 || !"reflectiveTarget".equals(chain.entryKind())
@@ -258,11 +194,6 @@ public final class ChainRanking {
                 || hop.reason().startsWith("fragment-activation-")));
     }
 
-    /**
-     * Do not reward an isolated direct/field component that is not connected to the declared
-     * application entry.  UNKNOWN/disconnected evidence remains visible in the candidate, but
-     * it cannot inflate the score used to select the representative chain.
-     */
     private static int disconnectedEvidenceHops(Chain chain) {
         if (chain == null || chain.hops().size() < 2
                 || isBlank(chain.entryClass()) || isBlank(chain.entryMethod())) {
@@ -277,8 +208,7 @@ public final class ChainRanking {
                 continue;
             }
             if (sameMethod(hop.fromOwner(), hop.fromName(), chain.entryClass(), chain.entryMethod())
-                    || sameMethod(hop.toOwner(), hop.toName(), chain.entryClass(),
-                    chain.entryMethod())) {
+                    || sameMethod(hop.toOwner(), hop.toName(), chain.entryClass(), chain.entryMethod())) {
                 connected[i] = true;
                 seeded = true;
             }
@@ -293,8 +223,7 @@ public final class ChainRanking {
                 ChainHop left = hops.get(i);
                 ChainHop right = hops.get(i + 1);
                 if (left == null || right == null || left.kind() == HopKind.ENTRY
-                        || right.kind() == HopKind.ENTRY
-                        || !adjacentMethods(left, right)) {
+                        || right.kind() == HopKind.ENTRY || !adjacentMethods(left, right)) {
                     continue;
                 }
                 if (connected[i] != connected[i + 1]) {
@@ -333,11 +262,6 @@ public final class ChainRanking {
         return value == null || value.isBlank();
     }
 
-    /**
-     * Prefer a complete, typed nested-deserialization bridge over an otherwise more convenient
-     * generic construction variant.  The evidence is intentionally made only from immutable
-     * hop reasons: it does not know a benchmark, a package, a rule id, or a gadget name.
-     */
     private static int semanticRank(Chain chain) {
         boolean invokeActivation = false;
         boolean deserializeActivation = false;

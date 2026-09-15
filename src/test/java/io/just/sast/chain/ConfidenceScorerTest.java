@@ -3,7 +3,6 @@ package io.just.sast.chain;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
-import io.just.sast.blackboard.VerificationOutcome;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -12,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 置信度契约（javadoc 公开计分规则）：逐跳/入口/严重度/模式加分/惩罚与 evidence 因子分解。 */
+/** Static confidence contract: score is evidence ordering, never a reachability proof. */
 class ConfidenceScorerTest {
 
     private static ChainHop call(String from, String to) {
@@ -23,8 +22,8 @@ class ConfidenceScorerTest {
         return new ChainHop(from, "m", to, "n", HopKind.VIRTUAL_DISPATCH, null, "call", "()V", null);
     }
 
-    private static ChainHop field(String from, String to, String f) {
-        return new ChainHop(from, "m", to, "n", HopKind.FIELD_FLOW, f, "field-read", "", null);
+    private static ChainHop field(String from, String to, String name) {
+        return new ChainHop(from, "m", to, "n", HopKind.FIELD_FLOW, name, "field-read", "", null);
     }
 
     private static ChainHop entry(String owner, String kind) {
@@ -38,173 +37,98 @@ class ConfidenceScorerTest {
 
     @Test
     void scoreFollowsDocumentedFormula() {
-        // 1 direct + 1 field + readObject(+2) + HIGH(+1) = 5 → HIGH
-        Chain c = chain(List.of(call("x", "y"), field("a", "b", "f"), entry("app/A", "readObject")),
-                "readObject", "HIGH", 0);
+        Chain c = chain(List.of(call("x", "y"), field("a", "b", "f"),
+                        entry("app/A", "readObject")), "readObject", "HIGH", 0);
         assertEquals(5, ConfidenceScorer.evidenceScore(c, null));
-        assertTrue(ConfidenceScorer.score(c, null).startsWith("FEASIBLE"), ConfidenceScorer.score(c, null));
-        // toString 入口(+1)：1+1+1+1=4 → MEDIUM
-        Chain t = chain(List.of(call("x", "y"), field("a", "b", "f"), entry("app/A", "toString")),
-                "toString", "HIGH", 0);
+        assertEquals("FEASIBLE", ConfidenceScorer.score(c, null));
+
+        Chain t = chain(List.of(call("x", "y"), field("a", "b", "f"),
+                        entry("app/A", "toString")), "toString", "HIGH", 0);
         assertEquals(4, ConfidenceScorer.evidenceScore(t, null));
-        assertTrue(ConfidenceScorer.score(t, null).startsWith("FEASIBLE"), ConfidenceScorer.score(t, null));
+        assertEquals("FEASIBLE", ConfidenceScorer.score(t, null));
     }
 
     @Test
     void virtualDispatchScoresZeroButIsCounted() {
-        Chain c = chain(List.of(virtual("x", "y"), virtual("y", "z"), entry("app/A", "readObject")),
-                "readObject", "HIGH", 0);
-        assertEquals(3, ConfidenceScorer.evidenceScore(c, null), "VIRTUAL_DISPATCH 计 0 分");
-        String decomposition = ConfidenceScorer.evidenceDecomposition(c, null);
-        assertTrue(decomposition.contains("virtual=2+0"), "分解串应列出 virtual 跳数： " + decomposition);
+        Chain c = chain(List.of(virtual("x", "y"), virtual("y", "z"),
+                        entry("app/A", "readObject")), "readObject", "HIGH", 0);
+        assertEquals(3, ConfidenceScorer.evidenceScore(c, null));
+        assertTrue(ConfidenceScorer.evidenceDecomposition(c, null).contains("virtual=2+0"));
     }
 
     @Test
     void unresolvedIsPenalizedAndDecomposed() {
         Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
                 "readObject", "HIGH", 2);
-        assertEquals(1 + 2 + 1 - 4, ConfidenceScorer.evidenceScore(c, null));
-        String decomposition = ConfidenceScorer.evidenceDecomposition(c, null);
-        assertTrue(decomposition.contains("unresolved:2-4"), "惩罚应逐项分解： " + decomposition);
+        assertEquals(0, ConfidenceScorer.evidenceScore(c, null));
+        assertTrue(ConfidenceScorer.evidenceDecomposition(c, null).contains("unresolved:2-4"));
     }
 
     @Test
     void patternBonusAndDecomposition() {
-        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")), "readObject", "HIGH", 0);
+        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
+                "readObject", "HIGH", 0);
         List<String> notes = List.of("pattern:CC6", "pattern:Rome");
-        assertEquals(1 + 2 + 1 + 2 * ConfidenceScorer.PATTERN_BONUS, ConfidenceScorer.evidenceScore(c, notes));
+        assertEquals(1 + 2 + 1 + 2 * ConfidenceScorer.PATTERN_BONUS,
+                ConfidenceScorer.evidenceScore(c, notes));
         String decomposition = ConfidenceScorer.evidenceDecomposition(c, notes);
-        assertTrue(decomposition.contains("pattern:CC6+2"), decomposition);
-        assertTrue(decomposition.contains("pattern:Rome+2"), decomposition);
+        assertTrue(decomposition.contains("pattern:CC6+2"));
+        assertTrue(decomposition.contains("pattern:Rome+2"));
     }
 
     @Test
-    void entryWeightsFollowContract() {
-        // writeReplace 序列化侧入口权重 2（本轮新增契约）
-        Chain c = chain(List.of(entry("app/A", "writeReplace")), "writeReplace", "LOW", 0);
-        assertEquals(2, ConfidenceScorer.evidenceScore(c, null));
-    }
+    void entryWeightsAndFrameworkInputFollowContract() {
+        Chain replace = chain(List.of(entry("app/A", "writeReplace")),
+                "writeReplace", "LOW", 0);
+        assertEquals(2, ConfidenceScorer.evidenceScore(replace, null));
 
-    @Test
-    void frameworkBeanInputIsPositiveEvidence() {
-        Chain c = chain(List.of(
-                        new ChainHop("app/Bean", "setCommand", "app/Bean", "setCommand",
-                                HopKind.ENTRY, null, "framework-bean-input", "(Ljava/lang/String;)V", null)),
-                "deserialize", "HIGH", 0);
-        assertEquals(1 + 1 + ConfidenceScorer.FRAMEWORK_BEAN_INPUT_BONUS,
-                ConfidenceScorer.evidenceScore(c, null));
-        assertTrue(ConfidenceScorer.evidenceDecomposition(c, null)
+        Chain bean = chain(List.of(new ChainHop("app/Bean", "setCommand", "app/Bean",
+                        "setCommand", HopKind.ENTRY, null, "framework-bean-input",
+                        "(Ljava/lang/String;)V", null)), "deserialize", "HIGH", 0);
+        assertEquals(4, ConfidenceScorer.evidenceScore(bean, null));
+        assertTrue(ConfidenceScorer.evidenceDecomposition(bean, null)
                 .contains("source-boundary:framework-bean-input+2"));
     }
 
     @Test
-    void sinkBoundaryKeepsProbeConstructionWarningVisible() {
+    void degradationIsVisibleWithoutChangingStaticEvidencePrecedence() {
         Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
                 "readObject", "HIGH", 0);
         assertEquals("DEGRADED(partial-construct)", ConfidenceScorer.score(c,
-                List.of("degrade:partial-construct", "verify:confirmed")));
+                List.of("degrade:partial-construct", "static:constructible")));
         assertTrue(ConfidenceScorer.evidenceScore(c,
-                List.of("degrade:partial-construct", "verify:confirmed")) >= 5);
+                List.of("degrade:partial-construct", "static:constructible")) >= 4);
     }
 
     @Test
-    void safeAdapterAndEntryReturnAreExplicitlyLowerThanSinkBoundary() {
-        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
-                "readObject", "HIGH", 0);
-        assertEquals("DEGRADED(SAFE_EFFECT_DISTORTED)", ConfidenceScorer.score(c,
-                List.of("verify:safe-effect-observed")));
-        assertEquals("DEGRADED(ENTRY_RETURN_ONLY)", ConfidenceScorer.score(c,
-                List.of("verify:executed")));
-        assertTrue(ConfidenceScorer.dynamicRank("SAFE_EFFECT_OBSERVED", List.of())
-                > ConfidenceScorer.dynamicRank("SINK_BLOCKED", List.of()));
-        assertTrue(ConfidenceScorer.dynamicRank("SAFE_SINK_EXECUTED", List.of())
-                > ConfidenceScorer.dynamicRank("SINK_BLOCKED", List.of()),
-                "legacy adapter label must not become a sink-boundary confirmation");
-    }
-
-    @Test
-    void typedDynamicRankUsesClosedVerificationStatus() {
-        assertEquals(
-                ConfidenceScorer.dynamicRank("SINK_BLOCKED", List.of()),
-                ConfidenceScorer.dynamicRank(VerificationOutcome.Status.SINK_BLOCKED, List.of()));
-        assertEquals(
-                ConfidenceScorer.dynamicRank("SAFE_EFFECT_OBSERVED", List.of()),
-                ConfidenceScorer.dynamicRank(VerificationOutcome.Status.SAFE_EFFECT_OBSERVED, List.of()));
-    }
-
-    @Test
-    void legacyNotesNormalizeByEvidencePrecedence() {
-        assertEquals("EXECUTED", ConfidenceScorer.statusFromNotes(List.of("verify:executed")));
-        assertEquals("CONCRETE_REACHED", ConfidenceScorer.statusFromNotes(
-                java.util.Arrays.asList(null, "verify:safe-effect-observed",
-                        "verify:segment-confirmed")));
-        assertEquals("SINK_BLOCKED", ConfidenceScorer.statusFromNotes(
-                java.util.Arrays.asList("verify:executed", "verify:confirmed")));
-    }
-
-    @Test
-    void evidenceVectorKeepsUncertaintyAsASeparateDimension() {
-        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
-                "readObject", "HIGH", 1);
-        ConfidenceScorer.EvidenceVector vector = ConfidenceScorer.vector(c,
-                List.of("verify:concrete-reached", "verify:constructible"));
-        assertEquals(2, vector.constructionScore());
-        assertEquals(2, vector.runtimeScore());
-        assertEquals(2, vector.uncertaintyPenalty());
-        assertEquals(vector.staticScore() + vector.constructionScore()
-                        + vector.runtimeScore() + vector.isolationScore()
-                        - vector.completenessPenalty(),
-                vector.totalScore());
-    }
-
-    @Test
-    void authenticatedIsolationIsSeparateFromCanaryObservation() {
-        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
-                "readObject", "HIGH", 0);
-        ConfidenceScorer.EvidenceVector vector = ConfidenceScorer.vector(c,
-                List.of("verify:sink-blocked"), "PROCESS_RESOURCE", true);
-        assertEquals(1, vector.isolationScore());
-        assertEquals("SINK_CANARY_BOUNDARY", vector.runtimeEvidence());
-        assertEquals("FEASIBLE", vector.confidence());
-    }
-
-    @Test
-    void unavailableCanaryKeepsPathEvidenceButReceivesNoIsolationScore() {
-        Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
-                "readObject", "HIGH", 0);
-        assertEquals("FEASIBLE", ConfidenceScorer.score(c,
-                List.of("verify:sink-blocked")));
-        ConfidenceScorer.EvidenceVector vector = ConfidenceScorer.vector(c,
-                List.of("verify:sink-blocked"), "NONE", false);
-        assertEquals(0, vector.isolationScore());
-    }
-
-    @Test
-    void sinkBoundaryCannotPromoteAnUnresolvedStaticPath() {
-        Chain c = chain(List.of(entry("app/A", "readObject")),
+    void staticTransitionNeverTurnsUnknownOrDegradedEvidenceIntoSat() {
+        Chain unresolved = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
                 "readObject", "HIGH", 4);
-        String score = ConfidenceScorer.score(c, List.of("verify:sink-blocked"));
-        assertEquals("NOT_FEASIBLE", score,
-                "a dynamic boundary is additive evidence and cannot erase unresolved static hops");
-        ConfidenceScorer.ConfidenceTransition transition = ConfidenceScorer.transition(c,
-                List.of("verify:sink-blocked"));
+        ConfidenceScorer.ConfidenceTransition transition = ConfidenceScorer.transition(unresolved,
+                List.of("static:constructible"));
+        assertEquals("NOT_FEASIBLE", transition.bucket());
         assertEquals("STATIC_INFEASIBLE", transition.reasonCode());
         assertFalse(transition.staticFeasible());
-        assertEquals("SINK_BLOCKED", transition.runtimeStatus());
+
+        Chain degraded = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
+                "readObject", "HIGH", 0);
+        assertEquals("DEGRADED(partial-path)", ConfidenceScorer.score(degraded,
+                List.of("degrade:partial-path")));
+        assertTrue(ConfidenceScorer.transition(degraded, List.of("degrade:partial-path"))
+                .staticFeasible());
     }
 
     @Test
-    void rankFeaturesSeparateStaticAndDynamicEvidenceDeterministically() {
+    void rankFeaturesAreDeterministic() {
         Chain c = chain(List.of(call("x", "y"), entry("app/A", "readObject")),
                 "readObject", "HIGH", 0);
         ConfidenceScorer.RankFeatures features = ConfidenceScorer.rankFeatures(c,
-                List.of("verify:sink-blocked", "degrade:partial-construct"));
+                List.of("degrade:partial-construct"));
         assertEquals(4, features.staticScore());
-        assertEquals(ConfidenceScorer.SINK_BLOCKED_BONUS, features.dynamicScore());
-        assertEquals(8, features.totalScore());
+        assertEquals(features.staticScore(), features.totalScore());
+        assertEquals(1, features.staticRank());
         assertTrue(features.staticFeasible());
         assertEquals(1, features.degradationCount());
-        assertEquals(List.of("DYNAMIC_SINK_BLOCKED", "STATIC_DEGRADATION_PRESENT"),
-                features.reasons());
+        assertEquals(List.of("STATIC_DEGRADATION_PRESENT"), features.reasons());
     }
 }

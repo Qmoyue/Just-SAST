@@ -580,8 +580,8 @@ class YamlRuleLoaderTest {
         assertNotNull(fragment.constructionPlan());
         assertTrue(fragment.constructionPlan().nodes().size() >= 6);
         assertTrue(fragment.constructionPlan().fields().size() >= 6);
-        assertTrue(fragment.constructionPlan().encodedForProbe().length() < 16_384);
-        assertTrue(fragment.constructionPlan().encodedForProbe().contains("getOutputProperties"));
+        assertTrue(fragment.constructionPlan().fingerprint().length() < 16_384);
+        assertTrue(fragment.constructionPlan().fingerprint().contains("getOutputProperties"));
     }
 
     @Test

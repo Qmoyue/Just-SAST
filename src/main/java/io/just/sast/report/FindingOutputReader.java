@@ -5,7 +5,6 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ConstructionSummary;
 import io.just.sast.blackboard.FindingId;
 import io.just.sast.blackboard.FindingState;
-import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ChainIds;
 import io.just.sast.chain.ChainRanking;
@@ -20,16 +19,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 
-/**
- * Canonical report reader for the typed finding contract.
- *
- * <p>This class is intentionally a reader, not an analyzer.  It freezes the immutable inputs at
- * the report boundary and computes the shared evidence tuple once.  Renderers may keep their
- * legacy wire fields during migration, but they must consume this snapshot instead of parsing
- * notes or recomputing a format-specific ranking.  A missing producer-side {@link FindingState}
- * is represented conservatively; no application entry, dependency join, terminal impact or
- * external control is invented from a chain name or free-form note.</p>
- */
+/** Canonical report reader for the typed static finding contract. */
 public final class FindingOutputReader {
 
     public static final String SCHEMA_VERSION = "JUST-FINDING-OUTPUT-D004-V1";
@@ -39,7 +29,6 @@ public final class FindingOutputReader {
             String id,
             Chain chain,
             List<String> notes,
-            VerificationSummary.ChainResult verification,
             FindingState state,
             ConfidenceScorer.ConfidenceTransition confidence,
             ChainRanking.Evidence ranking,
@@ -61,18 +50,6 @@ public final class FindingOutputReader {
             calibration = calibration == null ? "" : calibration;
         }
 
-        public String verificationStatus(boolean structuredVerification) {
-            return legacyVerificationStatus(verification, notes, structuredVerification);
-        }
-
-        public String verificationEvidence() {
-            return verification == null ? "" : normalize(verification.evidence(), "UNKNOWN");
-        }
-
-        public String verificationGroup() {
-            return ReportEvidence.verificationGroup(verification);
-        }
-
         public List<String> typedViolations() {
             return state.defaultFindingViolations();
         }
@@ -85,29 +62,14 @@ public final class FindingOutputReader {
             input.stream().filter(Objects::nonNull).forEach(copy::add);
             return List.copyOf(copy);
         }
-
-        private static String normalize(String value, String fallback) {
-            return value == null || value.isBlank() ? fallback : value;
-        }
     }
 
-    /** Frozen report view.  All maps and lists are immutable and deterministically ordered. */
+    /** Frozen report view. All maps and lists are immutable and deterministically ordered. */
     public record Snapshot(
             String schemaVersion,
             List<Finding> findings,
             Map<String, Finding> byChainKey,
-            Map<String, VerificationSummary.ChainResult> verificationByKey,
-            boolean structuredVerification,
             Map<String, ApplicationTrace> applicationTraces) {
-
-        /** Compatibility constructor for callers that do not have application evidence. */
-        public Snapshot(String schemaVersion, List<Finding> findings,
-                        Map<String, Finding> byChainKey,
-                        Map<String, VerificationSummary.ChainResult> verificationByKey,
-                        boolean structuredVerification) {
-            this(schemaVersion, findings, byChainKey, verificationByKey, structuredVerification,
-                    Map.of());
-        }
 
         public Snapshot {
             if (!SCHEMA_VERSION.equals(schemaVersion)) {
@@ -122,15 +84,6 @@ public final class FindingOutputReader {
                 stableFindings.putIfAbsent(finding.chain().key(), finding);
             }
             byChainKey = Map.copyOf(stableFindings);
-            Map<String, VerificationSummary.ChainResult> stableResults = new TreeMap<>();
-            if (verificationByKey != null) {
-                verificationByKey.forEach((key, value) -> {
-                    if (key != null && value != null) {
-                        stableResults.putIfAbsent(key, value);
-                    }
-                });
-            }
-            verificationByKey = Map.copyOf(stableResults);
             Map<String, ApplicationTrace> stableTraces = new TreeMap<>();
             if (applicationTraces != null) {
                 applicationTraces.forEach((key, value) -> {
@@ -154,16 +107,14 @@ public final class FindingOutputReader {
             return findings.stream().filter(Finding::exported).toList();
         }
 
-        /** Typed application-entry projection for a raw chain key, if one was joined. */
         public ApplicationTrace applicationTrace(String chainKey) {
             return applicationTraces.get(chainKey);
         }
 
-        /** Canonical machine contract used by migration goldens and cache/debug consumers. */
+        /** Canonical machine contract used by report, cache and audit consumers. */
         public String toCanonicalJson() {
             StringBuilder json = new StringBuilder("{\"schema_version\":\"")
-                    .append(escape(schemaVersion)).append("\",\"structured_verification\":")
-                    .append(structuredVerification).append(",\"findings\":[");
+                    .append(escape(schemaVersion)).append("\",\"findings\":[");
             for (int i = 0; i < findings.size(); i++) {
                 if (i > 0) json.append(',');
                 Finding finding = findings.get(i);
@@ -174,6 +125,8 @@ public final class FindingOutputReader {
                         .append("\",\"rule_id\":\"").append(escape(chain.ruleId()))
                         .append("\",\"entry_class\":\"").append(escape(chain.entryClass()))
                         .append("\",\"entry_method\":\"").append(escape(chain.entryMethod()))
+                        .append("\",\"entry_descriptor\":\"")
+                        .append(escape(ChainIdentity.entryDescriptor(chain)))
                         .append("\",\"entry_kind\":\"").append(escape(chain.entryKind()))
                         .append("\",\"sink_class\":\"").append(escape(chain.sinkClass()))
                         .append("\",\"sink_method\":\"").append(escape(chain.sinkMethod()))
@@ -183,7 +136,6 @@ public final class FindingOutputReader {
                         .append("\",\"chain_progress\":\"").append(state.chainProgress())
                         .append("\",\"feasibility\":\"").append(state.feasibility())
                         .append("\",\"completeness\":\"").append(state.completeness())
-                        .append("\",\"verification\":\"").append(state.verification())
                         .append("\",\"risk\":\"").append(state.risk())
                         .append("\",\"eligibility\":\"")
                         .append(escape(state.eligibility().name())).append("\",\"violations\":");
@@ -196,11 +148,7 @@ public final class FindingOutputReader {
                         .append(finding.confidence().features().staticRank())
                         .append(",\"total_score\":")
                         .append(finding.confidence().features().totalScore())
-                        .append(",\"verification_status\":\"")
-                        .append(escape(finding.verificationStatus(structuredVerification)))
-                        .append("\",\"verification_group\":\"")
-                        .append(escape(finding.verificationGroup()))
-                        .append("\",\"exported\":").append(finding.exported())
+                        .append(",\"exported\":").append(finding.exported())
                         .append(",\"calibration\":\"").append(escape(finding.calibration()))
                         .append("\",\"application_trace\":");
                 ApplicationTrace trace = applicationTraces.get(chain.key());
@@ -215,45 +163,28 @@ public final class FindingOutputReader {
     }
 
     public Snapshot read(List<Chain> chains, Map<String, String> calibrations,
-                         Map<String, List<String>> notes, VerificationSummary verification) {
-        return read(chains, calibrations, notes, verification, Map.of());
+                         Map<String, List<String>> notes) {
+        return read(chains, calibrations, notes, Map.of(), false, null);
     }
 
-    /**
-     * Read a single immutable snapshot.  The optional map is the only producer-side route for
-     * proving typed state during the migration; absent keys deliberately stay conservative.
-     */
     public Snapshot read(List<Chain> chains, Map<String, String> calibrations,
-                         Map<String, List<String>> notes, VerificationSummary verification,
+                         Map<String, List<String>> notes,
                          Map<String, FindingState> typedStates) {
-        return read(chains, calibrations, notes, verification, typedStates, false);
+        return read(chains, calibrations, notes, typedStates, false, null);
     }
 
-    /**
-     * Read a report snapshot with an explicit default-export policy.
-     *
-     * <p>The legacy overloads intentionally keep their compatibility projection for
-     * standalone renderer callers that do not provide producer-side typed state.  The scan
-     * pipeline must pass {@code enforceDefaultExportPolicy=true}: in that product path a
-     * finding is exported only when the immutable state satisfies the complete application
-     * entry/join/terminal contract.  Rejected candidates remain in this canonical snapshot so
-     * the audit evidence and calibration writers can explain why they were not user findings.</p>
-     */
+    /** Read a snapshot with an explicit default-export policy. */
     public Snapshot read(List<Chain> chains, Map<String, String> calibrations,
-                         Map<String, List<String>> notes, VerificationSummary verification,
+                         Map<String, List<String>> notes,
                          Map<String, FindingState> typedStates,
                          boolean enforceDefaultExportPolicy) {
-        return read(chains, calibrations, notes, verification, typedStates,
+        return read(chains, calibrations, notes, typedStates,
                 enforceDefaultExportPolicy, null);
     }
 
-    /**
-     * Read a snapshot with the producer-owned application evidence carried to every renderer.
-     * This additive overload leaves compatibility callers unable to infer an application root
-     * from a legacy chain or free-form note.
-     */
+    /** Read a snapshot with producer-owned application evidence carried to every renderer. */
     public Snapshot read(List<Chain> chains, Map<String, String> calibrations,
-                         Map<String, List<String>> notes, VerificationSummary verification,
+                         Map<String, List<String>> notes,
                          Map<String, FindingState> typedStates,
                          boolean enforceDefaultExportPolicy,
                          ApplicationChainEvidence applicationEvidence) {
@@ -261,7 +192,6 @@ public final class FindingOutputReader {
         Map<String, String> hidden = calibrations == null ? Map.of() : calibrations;
         Map<String, List<String>> stableNotes = stableNotesMap(notes);
         Map<String, FindingState> states = typedStates == null ? Map.of() : typedStates;
-        Map<String, VerificationSummary.ChainResult> results = verificationByKey(verification);
         Map<String, Finding> byKey = new LinkedHashMap<>();
         List<Finding> allFindings = new ArrayList<>();
         for (Chain chain : input) {
@@ -269,106 +199,42 @@ public final class FindingOutputReader {
                 continue;
             }
             List<String> chainNotes = stableNotes.getOrDefault(chain.key(), List.of());
-            VerificationSummary.ChainResult result = results.get(chain.key());
             FindingState state = states.get(chain.key());
             if (state == null) {
-                state = conservativeState(chain, result);
+                state = conservativeState(chain);
             }
             ConfidenceScorer.ConfidenceTransition confidence =
                     ConfidenceScorer.transition(chain, chainNotes);
-            ChainRanking.Evidence ranking = ChainRanking.evidence(chain, stableNotes, results,
-                    Set.of());
-            ChainPrecision.Assessment precision = ChainPrecision.assess(chain, chainNotes, result);
-            ConstructionSummary construction = ReportEvidence.construction(chain, chainNotes,
-                    result);
+            ChainRanking.Evidence ranking = ChainRanking.evidence(chain, stableNotes, Set.of());
+            ChainPrecision.Assessment precision = ChainPrecision.assess(chain, chainNotes);
+            ConstructionSummary construction = ReportEvidence.construction(chain, chainNotes);
             Finding candidate = new Finding(
                     FindingId.fromCanonical(chain.ruleId(), chain.key()).value(), chain,
-                    chainNotes, result, state, confidence, ranking, precision,
-                    ChainPrecision.isHighConfidence(chain, chainNotes, result), construction,
+                    chainNotes, state, confidence, ranking, precision,
+                    ChainPrecision.isHighConfidence(chain, chainNotes), construction,
                     (!enforceDefaultExportPolicy || state.defaultFindingEligible())
                             && !hidden.containsKey(chain.key()),
                     hidden.getOrDefault(chain.key(), ""));
             allFindings.add(candidate);
-            // A duplicate key is retained as one canonical reader row.  Format-specific
-            // renderers may still expose variants through chains.csv/edges.csv, but must not
-            // let iteration order select a different semantic projection.
             byKey.putIfAbsent(chain.key(), candidate);
         }
-        return new Snapshot(SCHEMA_VERSION, allFindings, byKey, results,
-                verification != null, ApplicationTrace.fromEvidence(applicationEvidence));
+        return new Snapshot(SCHEMA_VERSION, allFindings, byKey,
+                ApplicationTrace.fromEvidence(applicationEvidence));
     }
 
-    public static FindingState conservativeState(Chain chain,
-                                                 VerificationSummary.ChainResult result) {
+    public static FindingState conservativeState(Chain chain) {
         Objects.requireNonNull(chain, "chain");
         FindingState.EntryStatus entry = FindingState.EntryStatus.NO_APPLICATION_ENTRY;
         FindingState.ChainProgress progress = FindingState.ChainProgress.ENTRY_IDENTIFIED;
         FindingState.Feasibility feasibility = FindingState.Feasibility.UNKNOWN;
         FindingState.Completeness completeness = chain.unresolvedHops() > 0
                 ? FindingState.Completeness.PARTIAL : FindingState.Completeness.UNKNOWN;
-        FindingState.Verification verification = verification(result);
         FindingState.Risk risk = switch (chain.sinkRisk()) {
             case SAFE_CALLABLE -> FindingState.Risk.LOW;
             case CONTROLLED_EFFECT -> FindingState.Risk.MEDIUM;
             case HIGH_RISK_TERMINAL -> FindingState.Risk.HIGH;
         };
-        return new FindingState(entry, progress, feasibility, completeness, verification, risk);
-    }
-
-    public static Map<String, VerificationSummary.ChainResult> verificationByKey(
-            VerificationSummary verification) {
-        if (verification == null || verification.results().isEmpty()) {
-            return Map.of();
-        }
-        Map<String, VerificationSummary.ChainResult> result = new TreeMap<>();
-        for (VerificationSummary.ChainResult item : verification.results()) {
-            if (item != null) {
-                result.putIfAbsent(item.chainKey(), item);
-            }
-        }
-        return Map.copyOf(result);
-    }
-
-    /**
-     * Compatibility projection for report formats that still expose the v1 verification label.
-     * The parser is deliberately kept here, next to the canonical finding reader, so format
-     * writers cannot disagree about note precedence while the analyzer migrates to typed
-     * verification outcomes.  A typed result always wins; notes are consulted only when the
-     * caller explicitly has no structured result.
-     */
-    public static String legacyVerificationStatus(VerificationSummary.ChainResult result,
-                                                  List<String> notes,
-                                                  boolean structuredVerification) {
-        if (result != null) {
-            return normalizeStatus(result.status(), "UNKNOWN");
-        }
-        if (structuredVerification) {
-            return "NOT_SELECTED";
-        }
-        String status = ConfidenceScorer.statusFromNotes(notes);
-        return status.isBlank() ? "NOT_SELECTED" : status;
-    }
-
-    /** Compatibility confidence label used by SARIF/v1 consumers during the migration. */
-    public static String legacyConfidence(Chain chain, List<String> notes,
-                                          VerificationSummary.ChainResult result,
-                                          boolean structuredVerification) {
-        if (result != null) {
-            return legacyVerificationStatus(result, notes, structuredVerification);
-        }
-        if (structuredVerification) {
-            return "NOT_SELECTED";
-        }
-        List<String> stable = notes == null ? List.of() : notes;
-        if (stable.contains("verify:confirmed") && !stable.contains("verify:sink-blocked")) {
-            return "CONFIRMED";
-        }
-        String status = ConfidenceScorer.statusFromNotes(stable);
-        return status.isBlank() ? ConfidenceScorer.score(chain, stable) : status;
-    }
-
-    private static String normalizeStatus(String value, String fallback) {
-        return value == null || value.isBlank() ? fallback : value;
+        return new FindingState(entry, progress, feasibility, completeness, risk);
     }
 
     private static Map<String, List<String>> stableNotesMap(Map<String, List<String>> notes) {
@@ -385,28 +251,11 @@ public final class FindingOutputReader {
         return Map.copyOf(stable);
     }
 
-    private static FindingState.Verification verification(VerificationSummary.ChainResult result) {
-        if (result == null) {
-            return FindingState.Verification.NOT_ATTEMPTED;
-        }
-        return switch (result.outcomeStatus()) {
-            case SINK_BLOCKED -> FindingState.Verification.DYNAMIC_BOUNDARY_CONFIRMED;
-            case PRE_SINK_CONFIRMED, CONCRETE_REACHED, EXECUTED ->
-                    FindingState.Verification.DYNAMIC_SEGMENT_CONFIRMED;
-            case SINK_EXECUTED_SAFE, JNI_EXECUTED_SAFE ->
-                    FindingState.Verification.SAFE_TERMINAL_CONFIRMED;
-            case SAFE_EFFECT_OBSERVED -> FindingState.Verification.DYNAMIC_SEGMENT_CONFIRMED;
-            case PARTIAL, FAILED, TIMEOUT -> FindingState.Verification.FAILED;
-            case UNTESTABLE -> FindingState.Verification.UNSUPPORTED;
-            case UNKNOWN -> FindingState.Verification.UNKNOWN;
-        };
-    }
-
     private static void appendStrings(StringBuilder json, List<String> values) {
         json.append('[');
         for (int i = 0; i < values.size(); i++) {
             if (i > 0) json.append(',');
-            json.append('\"').append(escape(values.get(i))).append('\"');
+            json.append('"').append(escape(values.get(i))).append('"');
         }
         json.append(']');
     }

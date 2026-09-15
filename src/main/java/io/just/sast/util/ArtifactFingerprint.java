@@ -17,8 +17,8 @@ import io.just.sast.run.InputBudget;
  *
  * <p>Files are hashed as-is.  Directory inputs are hashed as a sorted sequence of
  * normalized relative names, a zero separator, and file bytes.  Keeping this in one
- * utility makes the report identity and the child-verifier attestation use exactly the
- * same contract.</p>
+ * utility makes report identity, cache identity and input provenance use exactly the same
+ * contract.</p>
  */
 public final class ArtifactFingerprint {
 

@@ -9,7 +9,6 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -87,7 +86,7 @@ public final class RuleSchemaV2 {
         }
     }
 
-    /** One schema-v2 rule definition; matching payload remains in the legacy Rule object. */
+    /** One schema-v2 rule definition; matching details remain in the legacy Rule object. */
     public record Definition(String id, RuleKind kind, String category, String severity,
                              Semantics semantics) {
         public Definition {
@@ -144,102 +143,6 @@ public final class RuleSchemaV2 {
         }
     }
 
-    /**
-     * A deterministic migration record used during the shadow period.  It deliberately keeps
-     * the legacy kind/role and the typed definition side by side, so a reader cannot silently
-     * reinterpret a v1 terminal as a v2 capability (or vice versa).
-     */
-    public record ShadowRecord(String id, String legacyKind, String legacyRole,
-                               boolean legacyTerminal, int legacyCount, Definition typed,
-                               List<String> differences) {
-        public ShadowRecord {
-            if (id == null || id.isBlank() || typed == null || !id.equals(typed.id())
-                    || legacyCount < 1) {
-                throw new IllegalArgumentException("shadow record identity mismatch: " + id);
-            }
-            legacyKind = legacyKind == null ? "unknown" : legacyKind;
-            legacyRole = legacyRole == null ? "NONE" : legacyRole;
-            List<String> sorted = new ArrayList<>(differences == null ? List.of() : differences);
-            sorted.removeIf(value -> value == null || value.isBlank());
-            sorted.sort(String::compareTo);
-            differences = List.copyOf(sorted.isEmpty() ? List.of("NO_DIFFERENCE") : sorted);
-        }
-
-        public String toCanonicalJson() {
-            StringBuilder json = new StringBuilder("{\"id\":\"")
-                    .append(escape(id)).append("\",\"legacy_kind\":\"")
-                    .append(escape(legacyKind)).append("\",\"legacy_role\":\"")
-                    .append(escape(legacyRole)).append("\",\"legacy_terminal\":")
-                    .append(legacyTerminal).append(",\"legacy_count\":")
-                    .append(legacyCount).append(",\"typed\":")
-                    .append(typed.toCanonicalJson()).append(",\"differences\":[");
-            for (int i = 0; i < differences.size(); i++) {
-                if (i > 0) {
-                    json.append(',');
-                }
-                json.append('"').append(escape(differences.get(i))).append('"');
-            }
-            return json.append("]}").toString();
-        }
-    }
-
-    /** Stable report-side shadow document; it is additive and never changes findings wire data. */
-    public record Shadow(String schemaVersion, List<ShadowRecord> records) {
-        public static final String SCHEMA_VERSION = "JUST-RULES-D002-V2-SHADOW-1";
-
-        public Shadow {
-            if (!SCHEMA_VERSION.equals(schemaVersion)) {
-                throw new IllegalArgumentException("unsupported shadow schema: " + schemaVersion);
-            }
-            List<ShadowRecord> sorted = new ArrayList<>(records == null ? List.of() : records);
-            sorted.sort(java.util.Comparator.comparing(ShadowRecord::id));
-            Set<String> ids = new HashSet<>();
-            for (ShadowRecord record : sorted) {
-                if (!ids.add(record.id())) {
-                    throw new IllegalArgumentException("duplicate shadow rule id: " + record.id());
-                }
-            }
-            records = List.copyOf(sorted);
-        }
-
-        public Map<String, Integer> differenceCounts() {
-            Map<String, Integer> counts = new java.util.TreeMap<>();
-            for (ShadowRecord record : records) {
-                for (String difference : record.differences()) {
-                    counts.merge(difference, 1, Integer::sum);
-                }
-            }
-            return Collections.unmodifiableMap(counts);
-        }
-
-        public String toCanonicalJson() {
-            StringBuilder json = new StringBuilder("{\"schema_version\":\"")
-                    .append(escape(schemaVersion)).append("\",\"rules_schema_version\":\"")
-                    .append(escape(RuleSchemaV2.SCHEMA_VERSION)).append("\",\"rules\":[");
-            for (int i = 0; i < records.size(); i++) {
-                if (i > 0) {
-                    json.append(',');
-                }
-                json.append(records.get(i).toCanonicalJson());
-            }
-            json.append("],\"difference_counts\":{");
-            List<Map.Entry<String, Integer>> counts = new ArrayList<>(differenceCounts().entrySet());
-            for (int i = 0; i < counts.size(); i++) {
-                if (i > 0) {
-                    json.append(',');
-                }
-                Map.Entry<String, Integer> entry = counts.get(i);
-                json.append('"').append(escape(entry.getKey())).append("\":")
-                        .append(entry.getValue());
-            }
-            return json.append("}}").toString();
-        }
-
-        public String digest() {
-            return sha256(toCanonicalJson());
-        }
-    }
-
     private RuleSchemaV2() {
     }
 
@@ -256,73 +159,6 @@ public final class RuleSchemaV2 {
         rules.fragments().forEach(rule -> definitions.add(adapt(rule)));
         rules.conditions().forEach(rule -> definitions.add(adapt(rule)));
         return new Catalog(SCHEMA_VERSION, definitions);
-    }
-
-    /** Build the old/new shadow without changing the legacy RuleSet or report format. */
-    public static Shadow shadow(RuleSet rules) {
-        if (rules == null) {
-            return new Shadow(Shadow.SCHEMA_VERSION, List.of());
-        }
-        Map<String, List<ShadowRecord>> grouped = new java.util.TreeMap<>();
-        rules.sinks().forEach(rule -> addShadow(grouped, rule, "sink",
-                rule.role().name(), rule.terminal()));
-        rules.magicEntries().forEach(rule -> addShadow(grouped, rule, "magic-entry",
-                "NONE", false));
-        rules.sources().forEach(rule -> addShadow(grouped, rule, "source",
-                "NONE", false));
-        rules.models().forEach(rule -> addShadow(grouped, rule, "model",
-                "NONE", false));
-        rules.fragments().forEach(rule -> addShadow(grouped, rule, "chain-fragment",
-                "NONE", false));
-        rules.conditions().forEach(rule -> addShadow(grouped, rule, "condition",
-                "NONE", false));
-        List<ShadowRecord> records = new ArrayList<>(grouped.size());
-        for (List<ShadowRecord> candidates : grouped.values()) {
-            candidates.sort(java.util.Comparator.comparing(ShadowRecord::toCanonicalJson));
-            ShadowRecord selected = candidates.get(0);
-            if (candidates.size() > 1) {
-                List<String> differences = new ArrayList<>(selected.differences());
-                differences.add("V1_DUPLICATE_ID");
-                selected = new ShadowRecord(selected.id(), selected.legacyKind(),
-                        selected.legacyRole(), selected.legacyTerminal(), candidates.size(),
-                        selected.typed(), differences);
-            }
-            records.add(selected);
-        }
-        return new Shadow(Shadow.SCHEMA_VERSION, records);
-    }
-
-    private static void addShadow(Map<String, List<ShadowRecord>> grouped, Rule rule,
-                                  String kind, String role, boolean terminal) {
-        ShadowRecord candidate = shadow(rule, adapt(rule), kind, role, terminal, 1);
-        grouped.computeIfAbsent(candidate.id(), ignored -> new ArrayList<>()).add(candidate);
-    }
-
-    private static ShadowRecord shadow(Rule rule, Definition definition, String kind,
-                                       String role, boolean terminal, int legacyCount) {
-        List<String> differences = new ArrayList<>();
-        Semantics semantics = definition.semantics();
-        if (!semantics.capability().isEmpty()) differences.add("V2_CAPABILITY_CLASSIFIED");
-        if (!semantics.bridge().isEmpty()) differences.add("V2_BRIDGE_CLASSIFIED");
-        if (!semantics.boundary().isEmpty()) differences.add("V2_BOUNDARY_CLASSIFIED");
-        if (!semantics.terminal().isEmpty()) differences.add("V2_TERMINAL_CLASSIFIED");
-        if (!semantics.source().isEmpty()) differences.add("V2_SOURCE_CLASSIFIED");
-        if (!semantics.filter().isEmpty() && !semantics.filter().equals(Set.of(Filter.NONE))) {
-            differences.add("V2_FILTER_CLASSIFIED");
-        }
-        if (!semantics.callback().isEmpty()) differences.add("V2_CALLBACK_CLASSIFIED");
-        boolean typedTerminal = !semantics.terminal().isEmpty();
-        if (rule instanceof Rule.SinkRule) {
-            if (terminal && !typedTerminal) {
-                differences.add("SINK_TERMINAL_RECLASSIFIED_TO_CAPABILITY");
-            } else if (!terminal && typedTerminal) {
-                differences.add("SINK_CAPABILITY_RECLASSIFIED_TO_TERMINAL");
-            } else if (terminal == typedTerminal) {
-                differences.add("SINK_TERMINAL_ROLE_PRESERVED");
-            }
-        }
-        return new ShadowRecord(definition.id(), kind, role, terminal, legacyCount,
-                definition, differences);
     }
 
     public static Definition adapt(Rule rule) {

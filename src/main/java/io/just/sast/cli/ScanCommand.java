@@ -19,8 +19,8 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.concurrent.Callable;
 
-/** scan 子命令：深度扫描 JAR/目录（默认含 JDK 运行库全量分析），导出 gadget 链 CSV。 */
-@Command(name = "scan", description = "深度扫描 JAR/class 目录，挖掘反序列化 gadget 链并导出 CSV")
+/** scan 子命令：深度扫描 JAR/目录并输出 canonical static report。 */
+@Command(name = "scan", description = "深度扫描 JAR/class 目录并输出静态链报告")
 public final class ScanCommand implements Callable<Integer> {
 
     @Option(names = "--jar", required = true, paramLabel = "<jar|dir>",
@@ -48,7 +48,7 @@ public final class ScanCommand implements Callable<Integer> {
     boolean offline;
 
     @Option(names = "--output", paramLabel = "<dir>", defaultValue = "just-out",
-            description = "CSV 输出目录（默认 just-out）")
+            description = "静态报告输出目录（默认 just-out）")
     Path output;
 
     @Option(names = "--overwrite",

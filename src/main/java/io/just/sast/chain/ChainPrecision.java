@@ -2,8 +2,6 @@ package io.just.sast.chain;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
-import io.just.sast.blackboard.VerificationOutcome;
-import io.just.sast.blackboard.VerificationSummary;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -12,33 +10,20 @@ import java.util.List;
 import java.util.Set;
 import java.util.function.Function;
 
-/**
- * Stable, reportable precision dimensions for one candidate chain.
- *
- * <p>This is deliberately derived from facts already present on the blackboard.  It does not
- * invent a points-to proof when the frontend did not publish one, and it keeps a missing or
- * budget-truncated fact visible as {@code UNKNOWN}.  The assessment is therefore useful both
- * for ranking and for explaining why a result is not high confidence.</p>
- */
+/** Stable, reportable precision dimensions for one static candidate chain. */
 public final class ChainPrecision {
 
     public enum Controllability {
-        CONCRETE,
-        SEALED_SET,
-        CHA_BOUNDED,
-        POINTS_TO_BOUNDED,
-        UNKNOWN
+        CONCRETE, SEALED_SET, CHA_BOUNDED, POINTS_TO_BOUNDED, UNKNOWN
     }
 
-    /** The eight dimensions are intentionally strings in the wire model for schema stability. */
+    /** Static precision dimensions; unknown remains visible and is never treated as SAT. */
     public record Assessment(
             String controllability,
             String dispatchPrecision,
             String fieldPrecision,
             String reflectionPrecision,
             String construction,
-            String runtime,
-            String isolation,
             String completeness,
             int rank,
             List<String> reasons) {
@@ -49,8 +34,6 @@ public final class ChainPrecision {
             fieldPrecision = valueOrUnknown(fieldPrecision);
             reflectionPrecision = valueOrUnknown(reflectionPrecision);
             construction = valueOrUnknown(construction);
-            runtime = valueOrUnknown(runtime);
-            isolation = valueOrUnknown(isolation);
             completeness = valueOrUnknown(completeness);
             rank = Math.max(0, rank);
             reasons = reasons == null ? List.of() : List.copyOf(reasons);
@@ -62,8 +45,6 @@ public final class ChainPrecision {
                     + ";field=" + fieldPrecision
                     + ";reflection=" + reflectionPrecision
                     + ";construction=" + construction
-                    + ";runtime=" + runtime
-                    + ";isolation=" + isolation
                     + ";completeness=" + completeness
                     + ";precision_rank=" + rank
                     + (reasons.isEmpty() ? "" : ";reasons=" + String.join("|", reasons));
@@ -73,11 +54,10 @@ public final class ChainPrecision {
     private ChainPrecision() {
     }
 
-    public static Assessment assess(Chain chain, List<String> notes,
-                                    VerificationSummary.ChainResult verification) {
+    public static Assessment assess(Chain chain, List<String> notes) {
         if (chain == null) {
             return new Assessment("UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN",
-                    "NOT_RUN", "UNKNOWN", "UNKNOWN", 99, List.of("NULL_CHAIN"));
+                    "UNKNOWN", 99, List.of("NULL_CHAIN"));
         }
         List<String> stableNotes = notes == null ? List.of() : notes;
         List<ChainHop> hops = chain.hops();
@@ -106,10 +86,6 @@ public final class ChainPrecision {
             if (reason.equals("serialized-proxy-handler")
                     || reason.equals("serialized-proxy-interface")
                     || reason.equals("serialized-proxy-handler-object")) {
-                // The scanned bytecode proves a compatible callback contract, but not that
-                // the runtime proxy object and handler are the same serialized object when
-                // their assembly happens outside this artifact.  Keep the path for recall;
-                // never present this wildcard object identity as a concrete/complete proof.
                 externalProxyIdentityUnresolved = true;
                 hasUnknown = true;
                 hasReflection = true;
@@ -223,8 +199,6 @@ public final class ChainPrecision {
                 : reflectiveSink && !reflectionRecovered ? "SINK_DECLARED_ONLY"
                 : "RECOVERED_BOUNDED";
         String construction = construction(stableNotes, chain);
-        String runtime = runtime(stableNotes, verification);
-        String isolation = isolation(verification);
         String completeness = completeness(chain, stableNotes, hasUnknown);
 
         if (dispatchBudget) {
@@ -242,81 +216,35 @@ public final class ChainPrecision {
         if (externalProxyIdentityUnresolved) {
             reasons.add("EXTERNAL_PROXY_OBJECT_IDENTITY_UNRESOLVED");
         }
-        if ("SAFE_EFFECT_DISTORTED".equals(runtime)) {
-            reasons.add("SAFE_ADAPTER_DISTORTED");
-        }
-        if ("REAL_SINK_SAFE".equals(runtime)) {
-            reasons.add("REAL_SINK_FIXED_ARGUMENTS");
-        } else if ("JNI_SAFE_FIXTURE".equals(runtime)) {
-            reasons.add("JNI_FIXED_FIXTURE");
-        }
-        if ("JOB_OBJECT_ATTESTED".equals(isolation)) {
-            reasons.add("JOB_OBJECT_ATTESTED");
-        } else if (verification != null && verification.sandboxReady()) {
-            reasons.add("SANDBOX_NOT_JOB_OBJECT_ATTESTED");
-        }
-        int rank = rank(controllability, dispatch, field, reflection, construction,
-                runtime, isolation, completeness);
+        int rank = rank(controllability, dispatch, field, reflection, construction, completeness);
         return new Assessment(controllability, dispatch, field, reflection, construction,
-                runtime, isolation, completeness, rank, stableUnique(reasons));
+                completeness, rank, stableUnique(reasons));
     }
 
-    public static Assessment assess(Chain chain, List<String> notes) {
-        return assess(chain, notes, null);
-    }
-
-    /**
-     * Whether a candidate satisfies Just's deliberately narrow high-confidence contract.
-     *
-     * <p>This is kept separate from {@link ConfidenceScorer#score(Chain, List)}.  The latter
-     * is a legacy/static confidence bucket used by integrations and must continue to describe
-     * useful static candidates even when the host cannot provide the Windows process boundary.
-     * This method is the release-grade gate: an authenticated safe terminal return, a ready
-     * Job Object backend, a fully accounted chain, and no adapter or analysis degradation.</p>
-     */
-    public static boolean isHighConfidence(Chain chain, List<String> notes,
-                                           VerificationSummary.ChainResult verification) {
-        VerificationOutcome.Status status = verification == null
-                ? VerificationOutcome.Status.UNKNOWN : verification.outcomeStatus();
-        if (chain == null || verification == null
-                || status != VerificationOutcome.Status.SINK_EXECUTED_SAFE
-                || verification.sinkDistorted() || !verification.terminalExecuted()
-                || !"TERMINAL_EXECUTED_SAFE".equals(verification.verificationScope())
-                || !verification.sandboxReady()
-                || chain.unresolvedHops() != 0) {
+    /** Static high-confidence gate used only as a presentation aid, never as export authority. */
+    public static boolean isHighConfidence(Chain chain, List<String> notes) {
+        if (chain == null || chain.unresolvedHops() != 0) {
             return false;
         }
-        Assessment assessment = assess(chain, notes, verification);
-        if (!"REAL_SINK_SAFE".equals(assessment.runtime())
-                || !"JOB_OBJECT_ATTESTED".equals(assessment.isolation())
-                || !"COMPLETE".equals(assessment.completeness())
-                || !"CONSTRUCTIBLE".equals(assessment.construction())) {
-            return false;
-        }
-        // A canary can be reached even when a reflective target or dispatch frontier is only
-        // declared.  Keep that result useful, but do not call it high confidence until every
-        // dimension needed to explain the concrete boundary is bounded.
-        if ("UNKNOWN".equals(assessment.controllability())
-                || "UNKNOWN".equals(assessment.dispatchPrecision())
-                || "UNKNOWN".equals(assessment.fieldPrecision())
-                || "UNKNOWN".equals(assessment.reflectionPrecision())
-                || "SINK_DECLARED_ONLY".equals(assessment.reflectionPrecision())) {
-            return false;
-        }
-        return notes == null || notes.stream().filter(java.util.Objects::nonNull)
-                .noneMatch(note -> note.startsWith("degrade:")
-                        || "verify:construction-deferred".equals(note));
+        Assessment assessment = assess(chain, notes);
+        return "COMPLETE".equals(assessment.completeness())
+                && !"UNKNOWN".equals(assessment.controllability())
+                && !"UNKNOWN".equals(assessment.dispatchPrecision())
+                && !"UNKNOWN".equals(assessment.fieldPrecision())
+                && !"UNKNOWN".equals(assessment.reflectionPrecision())
+                && !"SINK_DECLARED_ONLY".equals(assessment.reflectionPrecision())
+                && !"UNKNOWN".equals(assessment.construction())
+                && !"PARTIAL".equals(assessment.construction())
+                && !"PLAN_PARTIAL".equals(assessment.construction());
     }
 
     public static String toJson(Assessment assessment, Function<String, String> escape) {
         return toJson(assessment, escape, false);
     }
 
-    /** JSON projection with the high-confidence gate kept explicit at the call site. */
     public static String toJson(Assessment assessment, Function<String, String> escape,
                                 boolean highConfidence) {
-        Assessment value = assessment == null
-                ? assess(null, List.of(), null) : assessment;
+        Assessment value = assessment == null ? assess(null, List.of()) : assessment;
         Function<String, String> esc = escape == null ? Function.identity() : escape;
         StringBuilder json = new StringBuilder("{")
                 .append("\"controllability\":\"").append(esc.apply(value.controllability()))
@@ -324,8 +252,6 @@ public final class ChainPrecision {
                 .append("\",\"field_precision\":\"").append(esc.apply(value.fieldPrecision()))
                 .append("\",\"reflection_precision\":\"").append(esc.apply(value.reflectionPrecision()))
                 .append("\",\"construction\":\"").append(esc.apply(value.construction()))
-                .append("\",\"runtime\":\"").append(esc.apply(value.runtime()))
-                .append("\",\"isolation\":\"").append(esc.apply(value.isolation()))
                 .append("\",\"completeness\":\"").append(esc.apply(value.completeness()))
                 .append("\",\"rank\":").append(value.rank())
                 .append(",\"high_confidence\":").append(highConfidence)
@@ -343,21 +269,11 @@ public final class ChainPrecision {
                                              boolean exactReceiver, boolean sealedReceiver,
                                              boolean chaBoundedReceiver, boolean points,
                                              boolean lambda, boolean nativeCallback) {
-        if (unknown) {
-            return "UNKNOWN";
-        }
-        if (exactReceiver) {
-            return "RECEIVER_EXACT";
-        }
-        if (sealedReceiver) {
-            return "SEALED_SET";
-        }
-        if (points || nativeCallback) {
-            return "POINTS_TO_BOUNDED";
-        }
-        if (lambda) {
-            return "LAMBDA_EXACT";
-        }
+        if (unknown) return "UNKNOWN";
+        if (exactReceiver) return "RECEIVER_EXACT";
+        if (sealedReceiver) return "SEALED_SET";
+        if (points || nativeCallback) return "POINTS_TO_BOUNDED";
+        if (lambda) return "LAMBDA_EXACT";
         boolean dispatch = hops.stream().anyMatch(hop -> hop != null
                 && (hop.kind() == io.just.sast.blackboard.HopKind.VIRTUAL_DISPATCH
                 || hop.kind() == io.just.sast.blackboard.HopKind.NATIVE_CALLBACK
@@ -366,7 +282,7 @@ public final class ChainPrecision {
     }
 
     private static String construction(List<String> notes, Chain chain) {
-        if (notes.stream().anyMatch("verify:constructible"::equals)) {
+        if (notes.stream().anyMatch("static:constructible"::equals)) {
             return "CONSTRUCTIBLE";
         }
         if (notes.stream().anyMatch("degrade:partial-construct"::equals)) {
@@ -376,49 +292,6 @@ public final class ChainPrecision {
             return chain.constructionPlan().shapeSummary().valid() ? "DECLARED_PLAN" : "PLAN_PARTIAL";
         }
         return "UNKNOWN";
-    }
-
-    private static String runtime(List<String> notes, VerificationSummary.ChainResult result) {
-        if (result != null && result.outcomeStatus() != VerificationOutcome.Status.UNKNOWN) {
-            return switch (result.outcomeStatus()) {
-                case SINK_BLOCKED -> "SINK_BOUNDARY";
-                case PRE_SINK_CONFIRMED -> "PREFIX_CONFIRMED_HIGH_RISK";
-                case SINK_EXECUTED_SAFE -> "REAL_SINK_SAFE";
-                case JNI_EXECUTED_SAFE -> "JNI_SAFE_FIXTURE";
-                case SAFE_EFFECT_OBSERVED -> "SAFE_EFFECT_DISTORTED";
-                case CONCRETE_REACHED -> "CONCRETE_PREFIX";
-                case EXECUTED -> "ENTRY_RETURN";
-                case PARTIAL -> "PARTIAL";
-                case TIMEOUT -> "TIMEOUT";
-                case FAILED -> "FAILED";
-                case UNTESTABLE -> "UNTESTABLE";
-                case UNKNOWN -> "NOT_SELECTED";
-            };
-        }
-        return switch (ConfidenceScorer.statusFromNotes(notes)) {
-            case "SINK_BLOCKED" -> "SINK_BOUNDARY";
-            case "SINK_EXECUTED_SAFE" -> "REAL_SINK_SAFE";
-            case "JNI_EXECUTED_SAFE" -> "JNI_SAFE_FIXTURE";
-            case "SAFE_EFFECT_OBSERVED" -> "SAFE_EFFECT_DISTORTED";
-            case "CONCRETE_REACHED" -> "CONCRETE_PREFIX";
-            case "EXECUTED" -> "ENTRY_RETURN";
-            case "PARTIAL" -> "PARTIAL";
-            default -> "NOT_SELECTED";
-        };
-    }
-
-    private static String isolation(VerificationSummary.ChainResult result) {
-        if (result == null) {
-            return "NOT_RUN";
-        }
-        if (!result.sandboxReady()) {
-            return "UNAVAILABLE";
-        }
-        String backend = result.backend() == null ? "" : result.backend().toUpperCase();
-        if ("WINDOWS_JOB_OBJECT_JVM_POLICY".equals(backend)) {
-            return "JOB_OBJECT_ATTESTED";
-        }
-        return "PROCESS_RESOURCE_UNATTESTED";
     }
 
     private static String completeness(Chain chain, List<String> notes, boolean unknown) {
@@ -431,25 +304,19 @@ public final class ChainPrecision {
     }
 
     private static int rank(String controllability, String dispatch, String field,
-                            String reflection, String construction, String runtime,
-                            String isolation, String completeness) {
+                            String reflection, String construction, String completeness) {
         int value = 0;
-        // Points-to/receiver constraints are normally narrower than CHA.  Keep the order
-        // explicit because this rank is part of the stable report and selection contract.
         value += rankOf(controllability, "CONCRETE", "SEALED_SET", "POINTS_TO_BOUNDED",
                 "CHA_BOUNDED", "UNKNOWN");
         value += rankOf(dispatch, "EXACT", "RECEIVER_EXACT", "SEALED_SET", "LAMBDA_EXACT",
                 "POINTS_TO_BOUNDED", "RECOVERED_BOUNDED", "CHA_BOUNDED", "UNKNOWN");
         value += switch (field) {
-            // No field edge is not a missing field proof.  It must not penalize a direct chain.
             case "NOT_APPLICABLE", "EXACT_DECLARATION" -> 0;
             case "NAME_ONLY" -> 1;
             case "UNKNOWN" -> 2;
             default -> 3;
         };
         value += switch (reflection) {
-            // Non-reflective chains have no reflection obligation.  A declared reflective sink
-            // without a recovered target is weaker than a recovered, bounded target.
             case "NOT_APPLICABLE" -> 0;
             case "RECOVERED_BOUNDED" -> 1;
             case "SINK_DECLARED_ONLY" -> 2;
@@ -458,28 +325,19 @@ public final class ChainPrecision {
         };
         value += rankOf(construction, "CONSTRUCTIBLE", "DECLARED_PLAN", "PARTIAL",
                 "PLAN_PARTIAL", "UNKNOWN");
-        value += rankOf(runtime, "REAL_SINK_SAFE", "PREFIX_CONFIRMED_HIGH_RISK", "SINK_BOUNDARY",
-                "JNI_SAFE_FIXTURE",
-                "SAFE_EFFECT_DISTORTED", "CONCRETE_PREFIX", "ENTRY_RETURN", "NOT_SELECTED",
-                "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE");
-        value += rankOf(isolation, "JOB_OBJECT_ATTESTED", "PROCESS_RESOURCE_UNATTESTED",
-                "NOT_RUN", "UNAVAILABLE");
         value += rankOf(completeness, "COMPLETE", "PARTIAL", "UNKNOWN");
         return value;
     }
 
     private static int rankOf(String actual, String... ordered) {
         for (int i = 0; i < ordered.length; i++) {
-            if (ordered[i].equals(actual)) {
-                return i;
-            }
+            if (ordered[i].equals(actual)) return i;
         }
         return ordered.length;
     }
 
     private static boolean hasBudget(List<String> notes, String prefix) {
-        return notes.stream().filter(java.util.Objects::nonNull)
-                .map(ChainPrecision::lower)
+        return notes.stream().filter(java.util.Objects::nonNull).map(ChainPrecision::lower)
                 .anyMatch(note -> note.contains(prefix.toLowerCase()));
     }
 
@@ -487,8 +345,7 @@ public final class ChainPrecision {
         String owner = lower(chain.sinkClass());
         String method = lower(chain.sinkMethod());
         String category = lower(chain.category());
-        return owner.startsWith("java/lang/reflect/")
-                || owner.contains("methodhandle")
+        return owner.startsWith("java/lang/reflect/") || owner.contains("methodhandle")
                 || ("invoke".equals(method) && category.contains("reflect"));
     }
 

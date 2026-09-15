@@ -4,7 +4,6 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.SinkOutcome;
-import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.chain.ChainIds;
 import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ChainRanking;
@@ -22,8 +21,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * CSV 报告（四表）：findings.csv（一条链一行，entry → sink 顺序）+ edges.csv（每跳明细）
- * + sinks.csv（每个 sink 的裁决）+ calibrations.csv（被校准拒绝的链与拒绝理由——剪枝可审计）。
+ * Optional static evidence renderer: findings.csv（一条链一行，entry → sink 顺序）
+ * + edges.csv（每跳明细）+ sinks.csv（每个 sink 的裁决）
+ * + calibrations.csv（静态校准拒绝的链与拒绝理由——剪枝可审计）。
  * findings 含 patterns 列（已知 gadget 模式标注）与 evidence 因子分解串（逐项可核对计分）。
  * RFC 4180，UTF-8 with BOM（Excel 中文兼容）。
  */
@@ -40,41 +40,20 @@ public final class CsvReporter {
 
     public void write(Path outDir, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
                       Map<String, String> calibrations, Map<String, List<String>> chainNotes) throws IOException {
-        write(ReportLayout.flat(outDir), chains, outcomes, calibrations, chainNotes, null);
+        write(ReportLayout.flat(outDir), chains, outcomes, calibrations, chainNotes);
     }
 
     public void write(ReportLayout layout, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
                       Map<String, String> calibrations, Map<String, List<String>> chainNotes) throws IOException {
-        write(layout, chains, outcomes, calibrations, chainNotes, null);
-    }
-
-    /**
-     * Report the verifier's closed result model directly.  Notes remain a compatibility input
-     * for static annotations, but a dynamic terminal state must not depend on note insertion
-     * order or on a reporter-specific interpretation of free-form text.
-     */
-    public void write(ReportLayout layout, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
-                      Map<String, String> calibrations, Map<String, List<String>> chainNotes,
-                      VerificationSummary verification) throws IOException {
-        write(layout, chains, outcomes, calibrations, chainNotes, verification, null);
-    }
-
-    /**
-     * Report with optional phase timings. The map is a diagnostic sink for the pipeline; it
-     * never participates in ordering or output and can be omitted by standalone consumers.
-     */
-    public void write(ReportLayout layout, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
-                      Map<String, String> calibrations, Map<String, List<String>> chainNotes,
-                      VerificationSummary verification, Map<String, Long> timings) throws IOException {
         FindingOutputReader.Snapshot output = new FindingOutputReader().read(
-                chains, calibrations, chainNotes, verification);
-        write(layout, chains, outcomes, calibrations, chainNotes, verification, timings, output);
+                chains, calibrations, chainNotes);
+        write(layout, outcomes, output, null);
     }
 
     /**
      * Render from a snapshot that was already frozen by the scan pipeline.  This overload keeps
-     * CSV on the same reader boundary as JSON/HTML/Markdown/SARIF and avoids rebuilding all
-     * confidence, precision and verification projections for each format.
+     * CSV on the same reader boundary as the canonical report and avoids rebuilding all static
+     * projections for each format.
      */
     public void write(ReportLayout layout, Map<Long, SinkOutcome> outcomes,
                       FindingOutputReader.Snapshot output, Map<String, Long> timings)
@@ -97,14 +76,12 @@ public final class CsvReporter {
             }
             notes.putIfAbsent(finding.chain().key(), finding.notes());
         }
-        VerificationSummary verification = output.structuredVerification()
-                ? VerificationSummary.empty("STRUCTURED", 0) : null;
-        write(layout, chains, outcomes, calibrations, notes, verification, timings, output);
+        write(layout, chains, outcomes, calibrations, notes, timings, output);
     }
 
     private void write(ReportLayout layout, List<Chain> chains, Map<Long, SinkOutcome> outcomes,
                        Map<String, String> calibrations, Map<String, List<String>> chainNotes,
-                       VerificationSummary verification, Map<String, Long> timings,
+                       Map<String, Long> timings,
                        FindingOutputReader.Snapshot output) throws IOException {
         long phaseStart = System.nanoTime();
         chains = chains == null ? List.of() : chains;
@@ -141,16 +118,9 @@ public final class CsvReporter {
             // semantically identical application projections are folded.
             groups.computeIfAbsent(pairKey(chain, output), k -> new ArrayList<>()).add(chain);
         }
-        Map<String, VerificationSummary.ChainResult> verificationByKey = output.verificationByKey();
         for (List<Chain> group : groups.values()) {
-            // The representative must describe the same variant as the strongest dynamic
-            // evidence.  A shortest unverified variant paired with a longer SINK_BLOCKED
-            // result produces a misleading row (status from one path, path text from another)
-            // and can make a high-confidence finding impossible to audit.  With no dynamic
-            // evidence this comparator falls back to the historical shortest-path order.
             group.sort((left, right) -> {
-                int comparison = ChainRanking.compare(left, right, stableChainNotes,
-                        verificationByKey, Set.of());
+                int comparison = ChainRanking.compare(left, right, stableChainNotes, Set.of());
                 return comparison != 0 ? comparison : chainOrder().compare(left, right);
             });
         }
@@ -158,7 +128,7 @@ public final class CsvReporter {
         phaseStart = System.nanoTime();
         // 高可用链置顶：置信度 → 质量（无未解析） → 链长 → 变体数
         List<List<Chain>> sortedGroups = new ArrayList<>(groups.values());
-        sortedGroups.sort((a, b) -> compareGroups(a, b, stableChainNotes, verificationByKey));
+        sortedGroups.sort((a, b) -> compareGroups(a, b, stableChainNotes));
         recordTiming(timings, "sort", phaseStart);
         phaseStart = System.nanoTime();
         List<SinkOutcome> orderedOutcomes = new ArrayList<>(outcomes.values());
@@ -175,7 +145,7 @@ public final class CsvReporter {
         // made reporting a second memory peak after analysis had already completed.
         phaseStart = System.nanoTime();
         writeFindings(layout.findings().resolve("findings.csv"), sortedGroups, stableChainNotes,
-                verification, verificationByKey, output);
+                output);
         recordTiming(timings, "findings", phaseStart);
         phaseStart = System.nanoTime();
         writeEdges(layout.evidence().resolve("edges.csv"), sortedGroups);
@@ -194,8 +164,6 @@ public final class CsvReporter {
 
     private void writeFindings(Path file, List<List<Chain>> groups,
                                Map<String, List<String>> chainNotes,
-                               VerificationSummary verification,
-                               Map<String, VerificationSummary.ChainResult> results,
                                FindingOutputReader.Snapshot output) throws IOException {
         writeCsv(file, FINDINGS_HEADER, writer -> {
             for (int i = 0; i < groups.size(); i++) {
@@ -209,16 +177,13 @@ public final class CsvReporter {
                     }
                 }
                 String chainId = groupId(representative, i + 1);
-                VerificationSummary.ChainResult groupVerification = verificationForGroup(group, results);
                 boolean groupHighConfidence = group.stream().anyMatch(variant ->
                         output.byChainKey().get(variant.key()) != null
                                 ? output.byChainKey().get(variant.key()).highConfidence()
                                 : ChainPrecision.isHighConfidence(variant,
-                                chainNotes.getOrDefault(variant.key(), List.of()),
-                                results.get(variant.key())));
+                                chainNotes.getOrDefault(variant.key(), List.of())));
                 writeRow(writer, findingRow(chainId, representative, group.size(),
-                        Map.of(representative.key(), groupNotes), groupVerification,
-                        verification != null, groupHighConfidence, output));
+                        Map.of(representative.key(), groupNotes), groupHighConfidence, output));
             }
         });
     }
@@ -341,11 +306,10 @@ public final class CsvReporter {
 
     /** 组排序：SINK_BLOCKED 链置顶 → 证据分值降序 → 链长（短优先） → 变体数（多优先）。 */
     private static int compareGroups(List<Chain> g1, List<Chain> g2,
-                                     Map<String, List<String>> chainNotes,
-                                     Map<String, VerificationSummary.ChainResult> verificationByKey) {
+                                     Map<String, List<String>> chainNotes) {
         Chain c1 = g1.get(0);
         Chain c2 = g2.get(0);
-        int cmp = ChainRanking.compare(c1, c2, chainNotes, verificationByKey, Set.of());
+        int cmp = ChainRanking.compare(c1, c2, chainNotes, Set.of());
         if (cmp != 0) {
             return cmp;
         }
@@ -376,11 +340,9 @@ public final class CsvReporter {
 
     private static final String FINDINGS_HEADER = "chain_id,rule_id,category,severity,confidence,confidence_score,quality,"
             + "entry_class,entry_method,entry_descriptor,entry_kind,sink_class,sink_method,sink_kind,"
-            + "sink_descriptor,sink_role,chain_length,unresolved_hops,variant_count,patterns,path,evidence,rank_evidence,verify,"
+            + "sink_descriptor,sink_role,chain_length,unresolved_hops,variant_count,patterns,path,evidence,rank_evidence,static_evidence,"
             + "construction_status,construction_type,construction_fields,construction_trigger,construction_sink_control,"
-            + "construction_reasons,verification_status,sink_distorted,resource_containment_ready,precision,high_confidence,"
-            + "verification_scope,verification_group,sink_risk,terminal_executed,stop_reason,last_confirmed_stage,"
-            + "requested_mode,effective_mode,fallback,application_entry_class,application_entry_method,"
+            + "construction_reasons,precision,high_confidence,sink_risk,application_entry_class,application_entry_method,"
             + "application_site_class,application_site_method,application_site_kind,application_join_kind,"
             + "application_chain_entry_method,application_entry_prefix_path,application_path";
 
@@ -404,8 +366,6 @@ public final class CsvReporter {
 
     private Row findingRow(String chainId, Chain chain, int variantCount,
                            Map<String, List<String>> chainNotes,
-                           VerificationSummary.ChainResult verification,
-                           boolean structuredVerification,
                            boolean highConfidence,
                            FindingOutputReader.Snapshot output) {
         List<String> notes = chainNotes.getOrDefault(chain.key(), List.of());
@@ -421,23 +381,18 @@ public final class CsvReporter {
         String confidence = view == null ? ConfidenceScorer.score(chain, notes)
                 : view.confidence().bucket();
         ChainPrecision.Assessment precisionAssessment = view == null
-                ? ChainPrecision.assess(chain, notes, verification) : view.precision();
+                ? ChainPrecision.assess(chain, notes) : view.precision();
         String quality = "COMPLETE".equals(precisionAssessment.completeness())
                 ? "COMPLETE" : "PARTIAL";
         String path = pathSummary(chain);
         String evidence = ConfidenceScorer.evidenceDecomposition(chain, notes);
         String precision = precisionAssessment.compact();
         io.just.sast.blackboard.ConstructionSummary construction = view == null
-                ? ReportEvidence.construction(chain, notes, verification) : view.construction();
+                ? ReportEvidence.construction(chain, notes) : view.construction();
         int evidenceScore = view == null ? ConfidenceScorer.evidenceScore(chain, notes)
                 : view.confidence().features().totalScore();
-        String verificationStatus = view == null
-                ? FindingOutputReader.legacyVerificationStatus(verification, notes,
-                structuredVerification)
-                : view.verificationStatus(structuredVerification);
         String rankingEvidence = view == null
-                ? ChainRanking.evidence(chain, chainNotes,
-                verification == null ? Map.of() : Map.of(chain.key(), verification), Set.of())
+                ? ChainRanking.evidence(chain, chainNotes, Set.of())
                 .explanation()
                 : view.ranking().explanation();
         ApplicationTrace trace = output == null ? null : output.applicationTrace(chain.key());
@@ -449,23 +404,12 @@ public final class CsvReporter {
                 String.valueOf(chain.hops().size()), String.valueOf(chain.unresolvedHops()),
                 String.valueOf(variantCount), patterns, path, evidence,
                 rankingEvidence,
-                verifySummary(chain, notes, verification, structuredVerification),
+                staticEvidenceSummary(chain),
                 construction.overallStatus(), construction.typeStatus(), construction.fieldStatus(),
                 construction.triggerStatus(), construction.sinkControlStatus(),
                 String.join("|", construction.reasons()),
-                verificationStatus,
-                verification != null && verification.sinkDistorted() ? "true" : "false",
-                verification != null && verification.sandboxReady() ? "true" : "false",
                 precision, Boolean.toString(highConfidence),
-                verification == null ? "NONE" : verification.verificationScope(),
-                ReportEvidence.verificationGroup(verification),
                 chain.sinkRisk().name(),
-                verification != null && verification.terminalExecuted() ? "true" : "false",
-                verification == null ? "NOT_SELECTED" : verification.stopReason(),
-                verification == null ? "NONE" : verification.lastConfirmedStage(),
-                verification == null ? "UNKNOWN" : verification.requestedMode(),
-                verification == null ? "UNKNOWN" : verification.effectiveMode(),
-                verification == null ? "none" : verification.fallback(),
                 trace == null ? "" : trace.applicationEntryClass(),
                 trace == null ? "" : trace.applicationEntryMethod(),
                 trace == null ? "" : trace.applicationSiteClass(),
@@ -477,82 +421,21 @@ public final class CsvReporter {
                 trace == null ? "" : trace.applicationPath(chain));
     }
 
-    /** 验证候选摘要（GadgetHunter Vars/Flow/Runtime 静态子集 + 动态验证结果）。 */
-    private static String verifySummary(Chain chain, List<String> notes,
-                                        VerificationSummary.ChainResult verification,
-                                        boolean structuredVerification) {
-        if (verification != null) {
-            return "status=" + verification.status()
-                    + ";evidence=" + verification.evidence()
-                    + ";rank=" + verification.rank()
-                    + ";backend=" + verification.backend()
-                    + ";policy_digest=" + verification.policyDigest()
-                    + ";sink_distorted=" + verification.sinkDistorted()
-                    + ";resource_containment_ready=" + verification.sandboxReady()
-                    + ";verification_scope=" + verification.verificationScope()
-                    + ";verification_group=" + ReportEvidence.verificationGroup(verification)
-                    + ";sink_risk=" + verification.sinkRisk()
-                    + ";terminal_executed=" + verification.terminalExecuted()
-                    + ";stop_reason=" + verification.stopReason()
-                    + ";last_confirmed_stage=" + verification.lastConfirmedStage()
-                    + ";requested_mode=" + verification.requestedMode()
-                    + ";effective_mode=" + verification.effectiveMode()
-                    + ";fallback=" + verification.fallback()
-                    + ";cleanup=" + verification.cleanup()
-                    + ";" + verifySummary(chain);
-        }
-        if (structuredVerification) {
-            return "status=NOT_SELECTED;rank=0;sink_distorted=false;resource_containment_ready=false;"
-                    + verifySummary(chain);
-        }
-        String base = verifySummary(chain);
-        String status = FindingOutputReader.legacyVerificationStatus(null, notes, false);
-        if (!"NOT_SELECTED".equals(status)) {
-            return status + ";" + base;
-        }
-        return base;
-    }
-
-    private static Map<String, VerificationSummary.ChainResult> verificationByKey(
-            VerificationSummary verification) {
-        if (verification == null || verification.results().isEmpty()) {
-            return Map.of();
-        }
-        Map<String, VerificationSummary.ChainResult> result = new java.util.HashMap<>();
-        for (VerificationSummary.ChainResult item : verification.results()) {
-            result.putIfAbsent(item.chainKey(), item);
-        }
-        return result;
-    }
-
-    /** Pick the strongest selected variant so grouped findings do not hide a confirmed path. */
-    private static VerificationSummary.ChainResult verificationForGroup(
-            List<Chain> group, Map<String, VerificationSummary.ChainResult> results) {
-        VerificationSummary.ChainResult best = null;
-        for (Chain variant : group) {
-            VerificationSummary.ChainResult candidate = results.get(variant.key());
-            if (candidate == null) {
-                continue;
-            }
-            int candidateOrder = verificationOrder(candidate);
-            int bestOrder = verificationOrder(best);
-            if (best == null || candidateOrder < bestOrder
-                    || (candidateOrder == bestOrder
-                    && candidate.chainKey().compareTo(best.chainKey()) < 0)) {
-                best = candidate;
+    /** Compact static evidence summary used only by the optional CSV view. */
+    private static String staticEvidenceSummary(Chain chain) {
+        StringBuilder fields = new StringBuilder("[");
+        for (ChainHop hop : chain.hops()) {
+            if (hop.kind() == HopKind.FIELD_FLOW && hop.field() != null) {
+                fields.append(hop.field()).append(',');
             }
         }
-        return best;
-    }
-
-    private static int verificationOrder(VerificationSummary.ChainResult result) {
-        if (result == null) {
-            return Integer.MAX_VALUE;
+        if (fields.length() > 1) {
+            fields.setLength(fields.length() - 1);
         }
-        int order = ConfidenceScorer.dynamicRank(result.outcomeStatus(), List.of());
-        return result.sandboxReady()
-                ? order
-                : Math.max(order, ConfidenceScorer.DYNAMIC_NEGATIVE_OR_UNTESTABLE);
+        fields.append(']');
+        return "rule=" + chain.ruleId()
+                + ";entry=" + chain.entryKind() + ",fields=" + fields
+                + ";unresolved_hops=" + chain.unresolvedHops();
     }
 
     private static String sinkInvocationKind(Chain chain) {
@@ -566,22 +449,6 @@ public final class CsvReporter {
             }
         }
         return "UNKNOWN";
-    }
-
-    private static String verifySummary(Chain chain) {
-        StringBuilder fields = new StringBuilder("[");
-        for (ChainHop hop : chain.hops()) {
-            if (hop.kind() == HopKind.FIELD_FLOW && hop.field() != null) {
-                fields.append(hop.field()).append(',');
-            }
-        }
-        if (fields.length() > 1) {
-            fields.setLength(fields.length() - 1);
-        }
-        fields.append(']');
-        return "vars:rule=" + chain.ruleId()
-                + ";flow:entry=" + chain.entryKind() + ",fields=" + fields
-                + ";runtime:unresolved=" + chain.unresolvedHops();
     }
 
     /** 入口方法描述符（ENTRY 跳携带；未知为空）。 */

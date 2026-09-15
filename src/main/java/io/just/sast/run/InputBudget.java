@@ -276,7 +276,7 @@ public record InputBudget(
         /**
          * Read one bounded stream chunk and account the actual bytes while holding the tracker
          * monitor.  Keeping sizing, the provider read and accounting in one operation prevents
-         * parallel verifier/report consumers from all observing the same aggregate remainder and
+         * parallel input/report consumers from all observing the same aggregate remainder and
          * then physically reading past it before {@link #recordRead(long)} can reject the second
          * result.  The stream call is intentionally inside this narrow monitor: untrusted input
          * accounting is correctness-critical, and serialising only the bounded read (not graph

@@ -54,7 +54,7 @@ class StaticModeBehaviorTest {
         ScanPipeline.run(jar, null, temp.resolve("out"), null, false, true, null);
         assertFalse(Files.exists(sentinel), "static analysis must not initialize target classes");
         String report = Files.readString(temp.resolve("out").resolve("report.json"));
-        assertTrue(report.contains("\"target_code_executed\":\"NO\""));
+        assertTrue(report.contains("\"target_code_executed\":false"));
     }
 
     @Test
@@ -129,9 +129,9 @@ class StaticModeBehaviorTest {
         assertTrue(evidence.contains("\"entry_status\":\"EXTERNAL_ENTRY\""), evidence);
         assertTrue(evidence.contains("\"completeness\":\"COMPLETE\""), evidence);
 
-        String findings = Files.readString(output.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Main,handle"), findings);
-        assertTrue(findings.contains("java/lang/Runtime,exec"), findings);
+        String findings = Files.readString(output.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Main", "handle"), findings);
+        assertTrue(containsMember(findings, "java/lang/Runtime", "exec"), findings);
     }
 
     @Test
@@ -196,5 +196,12 @@ class StaticModeBehaviorTest {
                 zip.closeEntry();
             }
         }
+    }
+
+    private static boolean containsMember(String report, String owner, String method) {
+        String member = owner + "#" + method;
+        return report.contains("\"class\":\"" + owner + "\",\"method\":\"" + method + "\"")
+                || report.contains("\"from\":\"" + member + "\"")
+                || report.contains("\"to\":\"" + member + "\"");
     }
 }

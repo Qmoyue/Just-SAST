@@ -289,7 +289,7 @@ public final class ForwardEngine {
      * Forward analysis is an optional precision refinement on top of the independent
      * backward engine. A dependency-heavy fat jar can contain a very large reachable
      * closure; using the small-jar budget there made the refinement monopolize the
-     * controller deadline and prevented calibration/verification from running at all.
+     * controller deadline and prevented static calibration from running at all.
      * The budget is selected from graph size, never from an artifact/class name, and every
      * early stop is reported as an explicit completeness reason.
      */

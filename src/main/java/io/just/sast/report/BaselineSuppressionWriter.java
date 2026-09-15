@@ -11,11 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.LinkOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -87,56 +84,25 @@ public final class BaselineSuppressionWriter {
     }
 
     static String identity(Chain chain) {
-        return String.join("|", safe(chain.ruleId()), safe(chain.entryClass()),
-                safe(chain.entryMethod()), safe(entryDescriptor(chain)), safe(chain.entryKind()),
-                safe(chain.sinkClass()), safe(chain.sinkMethod()), safe(sinkDescriptor(chain)));
+        return ChainIdentity.of(chain);
     }
 
     private static Set<String> readBaseline(Path baseline, InputBudget policy,
                                              InputBudget.Tracker tracker) throws IOException {
-        Path csv = baseline;
-        if (Files.isDirectory(baseline)) {
-            csv = baseline.resolve("findings").resolve("findings.csv");
-            if (!Files.exists(csv)) {
-                csv = baseline.resolve("findings.csv");
-            }
+        Path report = baseline;
+        if (Files.isDirectory(baseline, LinkOption.NOFOLLOW_LINKS)) {
+            report = baseline.resolve("report.json");
         }
-        if (!Files.isRegularFile(csv, LinkOption.NOFOLLOW_LINKS)
-                || ArchiveLimits.isLinkOrReparsePoint(csv)
-                || Files.size(csv) > MAX_BASELINE_BYTES) {
-            throw new IOException("baseline findings.csv not found: " + baseline.toAbsolutePath());
+        if (!Files.isRegularFile(report, LinkOption.NOFOLLOW_LINKS)
+                || ArchiveLimits.isLinkOrReparsePoint(report)
+                || Files.size(report) > MAX_BASELINE_BYTES) {
+            throw new IOException("baseline report.json not found: " + baseline.toAbsolutePath());
         }
-        List<String> lines = readBoundedLines(csv, MAX_BASELINE_BYTES, policy, tracker,
-                "baseline");
-        List<String> header = null;
-        Map<String, Integer> indexes = new LinkedHashMap<>();
+        CanonicalReportReader.Snapshot snapshot = new CanonicalReportReader().read(report, policy,
+                tracker);
         Set<String> identities = new TreeSet<>();
-        for (String line : lines) {
-            List<String> fields = parseCsv(line);
-            if (fields.isEmpty()) {
-                continue;
-            }
-            if (header == null) {
-                header = fields;
-                for (String name : List.of("rule_id", "entry_class", "entry_method",
-                        "entry_descriptor", "entry_kind", "sink_class", "sink_method",
-                        "sink_descriptor")) {
-                    int index = fields.indexOf(name);
-                    if (index < 0) {
-                        throw new IOException("baseline findings.csv missing column: " + name);
-                    }
-                    indexes.put(name, index);
-                }
-                continue;
-            }
-            if (indexes.values().stream().anyMatch(index -> index >= fields.size())) {
-                throw new IOException("baseline findings.csv has a short row");
-            }
-            identities.add(String.join("|", fields.get(indexes.get("rule_id")),
-                    fields.get(indexes.get("entry_class")), fields.get(indexes.get("entry_method")),
-                    fields.get(indexes.get("entry_descriptor")), fields.get(indexes.get("entry_kind")),
-                    fields.get(indexes.get("sink_class")), fields.get(indexes.get("sink_method")),
-                    fields.get(indexes.get("sink_descriptor"))));
+        for (CanonicalReportReader.ChainRecord chain : snapshot.chains()) {
+            identities.add(chain.identity());
         }
         return Set.copyOf(identities);
     }
@@ -231,11 +197,11 @@ public final class BaselineSuppressionWriter {
                     .append(csv(chain == null ? "" : chain.ruleId())).append(',')
                     .append(csv(chain == null ? "" : chain.entryClass())).append(',')
                     .append(csv(chain == null ? "" : chain.entryMethod())).append(',')
-                    .append(csv(chain == null ? "" : entryDescriptor(chain))).append(',')
+                    .append(csv(chain == null ? "" : ChainIdentity.entryDescriptor(chain))).append(',')
                     .append(csv(chain == null ? "" : chain.entryKind())).append(',')
                     .append(csv(chain == null ? "" : chain.sinkClass())).append(',')
                     .append(csv(chain == null ? "" : chain.sinkMethod())).append(',')
-                    .append(csv(chain == null ? "" : sinkDescriptor(chain))).append('\n');
+                    .append(csv(chain == null ? "" : ChainIdentity.sinkDescriptor(chain))).append('\n');
         }
         AtomicFiles.writeUtf8(path, csv.toString());
     }
@@ -269,29 +235,6 @@ public final class BaselineSuppressionWriter {
         return json.append("]\n}\n").toString();
     }
 
-    private static String entryDescriptor(Chain chain) {
-        for (var hop : chain.hops()) {
-            if (hop.kind() == io.just.sast.blackboard.HopKind.ENTRY && hop.desc() != null) {
-                return hop.desc();
-            }
-        }
-        return "";
-    }
-
-    private static String sinkDescriptor(Chain chain) {
-        if (chain.sinkDescriptor() != null && !chain.sinkDescriptor().isBlank()) {
-            return chain.sinkDescriptor();
-        }
-        for (var hop : chain.hops()) {
-            if (safe(chain.sinkClass()).equals(safe(hop.toOwner()))
-                    && safe(chain.sinkMethod()).equals(safe(hop.toName()))
-                    && hop.desc() != null && !hop.desc().isBlank()) {
-                return hop.desc();
-            }
-        }
-        return "";
-    }
-
     private static String safe(String value) {
         return value == null ? "" : value;
     }
@@ -306,45 +249,4 @@ public final class BaselineSuppressionWriter {
                 .replace("\r", "\\r").replace("\n", "\\n");
     }
 
-    private static List<String> parseCsv(String line) throws IOException {
-        List<String> fields = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        boolean quoted = false;
-        boolean started = false;
-        for (int i = 0; i < line.length(); i++) {
-            char value = line.charAt(i);
-            if (quoted) {
-                if (value == '"') {
-                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
-                        current.append('"');
-                        i++;
-                    } else {
-                        quoted = false;
-                    }
-                } else {
-                    current.append(value);
-                }
-            } else if (value == '"') {
-                quoted = true;
-                started = true;
-            } else if (value == ',') {
-                fields.add(current.toString());
-                current.setLength(0);
-                started = false;
-            } else {
-                if (value == '\uFEFF' && fields.isEmpty() && current.length() == 0) {
-                    continue;
-                }
-                current.append(value);
-                started = true;
-            }
-        }
-        if (quoted) {
-            throw new IOException("baseline CSV has an unterminated quote");
-        }
-        if (started || !fields.isEmpty()) {
-            fields.add(current.toString());
-        }
-        return fields;
-    }
 }

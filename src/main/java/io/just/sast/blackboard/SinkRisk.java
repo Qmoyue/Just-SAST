@@ -5,8 +5,8 @@ import java.util.Locale;
 /**
  * Data-only terminal risk metadata shared by rules, chains and reports.
  *
- * <p>The verifier may execute only a completely controlled effect.  Everything else stays at
- * the authenticated pre-sink boundary.  The inference helper is deliberately conservative and
+ * <p>Only a completely controlled effect receives the lowest risk tier. Everything else stays
+ * at the authenticated pre-sink boundary. The inference helper is deliberately conservative and
  * has no project, package, version or benchmark-specific branches.</p>
  */
 public enum SinkRisk {

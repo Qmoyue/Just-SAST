@@ -1,7 +1,6 @@
 package io.just.sast.report;
 
 import io.just.sast.analysis.taint.FilterAnalysis;
-import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
@@ -13,12 +12,13 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MultiFormatReporterTest {
 
     @Test
-    void writesLargeFindingFormatsIncrementally(@TempDir Path temp) throws Exception {
+    void writesStaticDetailedViewsFromOneSnapshot(@TempDir Path temp) throws Exception {
         Chain chain = new Chain("RULE-1", "DESERIALIZE", "HIGH",
                 "example.Entry", "readObject", "deserialize",
                 "java.lang.reflect.Method", "invoke",
@@ -26,68 +26,64 @@ class MultiFormatReporterTest {
                         "java.lang.reflect.Method", "invoke", HopKind.DIRECT_CALL,
                         null, "test", "()V", null)), 0);
 
-        new MultiFormatReporter().write(temp, List.of(chain), Map.of(), Map.of());
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(chain), Map.of(), Map.of(), Map.of());
+        new MultiFormatReporter().write(ReportLayout.create(temp), snapshot);
 
-        String json = Files.readString(temp.resolve("findings.json"));
-        assertTrue(json.startsWith("[\n") && json.endsWith("\n]"));
-        assertTrue(json.contains("\"construction\":")
-                && json.contains("\"sink_control\":\"STATIC_UNCERTAIN\""));
-        assertTrue(Files.readString(temp.resolve("findings.html")).contains("RULE-1"));
-        assertTrue(Files.readString(temp.resolve("findings.html")).contains("Construction"));
-        assertTrue(Files.readString(temp.resolve("findings.md")).contains("java.lang.reflect.Method"));
+        String json = Files.readString(temp.resolve("findings/findings.json"));
+        assertTrue(json.startsWith("[\n") && json.endsWith("\n]\n"));
+        assertTrue(json.contains("\"construction\":"));
+        assertTrue(json.contains("\"sink_control\":\"STATIC_UNCERTAIN\""));
+        assertFalse(json.contains("verification"));
+        assertTrue(Files.readString(temp.resolve("findings/findings.html"))
+                .contains("Static evidence only"));
+        assertTrue(Files.readString(temp.resolve("findings/findings.md"))
+                .contains("java.lang.reflect.Method"));
     }
 
     @Test
-    void metadataPersistsDynamicVerificationAsSeparateDeterministicArtifact(@TempDir Path temp)
-            throws Exception {
-        VerificationSummary summary = new VerificationSummary(
-                "JVM_SANDBOX", 4, 1, 0, 1,
-                Map.of("CONFIRMED", 1), Map.of(),
-                List.of(new VerificationSummary.ChainResult(
-                        1, "entry|sink", "CONFIRMED", "SINK_REACHED",
-                        "HIGH", 12, 1, 17)));
-        ScanStatistics stats = new ScanStatistics(1, 1, 0, 1, 1, 1,
-                20, 10, 12, "COMPLETE", List.of(), Map.of("report", 1L),
-                Map.of("graph_nodes", 3L),
-                "JVM_SANDBOX", summary, "UNKNOWN");
+    void metadataPersistsStaticRunAndFilterEvidence(@TempDir Path temp) throws Exception {
+        ScanStatistics stats = stats();
+        ReportLayout layout = ReportLayout.create(temp);
+        new MultiFormatReporter().writeMetadata(layout, stats);
 
-        new MultiFormatReporter().writeMetadata(temp, stats);
-
-        String metadata = Files.readString(temp.resolve("scan-metadata.json"));
-        String dynamic = Files.readString(temp.resolve("dynamic-verification.json"));
-        String run = Files.readString(temp.resolve("run.json"));
-        assertTrue(metadata.contains("\"dynamic_verification\""));
-        assertTrue(metadata.contains("\"run_outcome\":{\"schema_version\":1")
-                && metadata.contains("\"status\":\"PARTIAL\""));
-        assertTrue(metadata.contains("\"schema_version\":1")
-                && metadata.contains("\"verificationMode\":\"AUTO\"")
-                && metadata.contains("\"targetCodeExecutionPossible\":true")
-                && metadata.contains("\"resourceContainmentOnly\":true")
-                && metadata.contains("\"filesystemIsolation\":false")
-                && metadata.contains("\"isolation_level\":\"UNKNOWN\"")
-                && metadata.contains("\"isolation_capabilities\":[]")
-                && metadata.contains("\"artifact_sha256\":\"UNKNOWN\"")
-                && metadata.contains("\"heap_peak_mb\":12")
-                && metadata.contains("\"chain_proof_completeness\":\"UNKNOWN\"")
-                && metadata.contains("\"metrics\":{\"graph_nodes\":3}")
-                && metadata.contains("\"metric_status\":{}")
-                && metadata.contains("\"metric_namespaces\":{}")
-                && metadata.contains("\"metric_namespace_status\":{}"));
-        assertTrue(run.contains("\"kind\":\"just-run\"")
-                && run.contains("\"run_outcome\":{\"schema_version\":1")
-                && run.contains("\"verificationMode\":\"AUTO\"")
-                && run.contains("\"targetCodeExecutionPossible\":true")
-                && run.contains("\"recommendedForUntrustedArtifacts\":false"));
-        assertTrue(dynamic.contains("\"status\":\"CONFIRMED\"")
-                && dynamic.contains("\"schema_version\":1")
-                && dynamic.contains("\"artifact_sha256\":\"UNKNOWN\"")
-                && dynamic.contains("\"confidence_score\":12")
-                && dynamic.contains("\"duration_ms\":17"));
+        String metadata = Files.readString(temp.resolve("meta/scan-metadata.json"));
+        String run = Files.readString(temp.resolve("meta/run.json"));
+        assertTrue(metadata.contains("\"run_outcome\":{\"schema_version\":1"));
+        assertTrue(metadata.contains("\"artifact_sha256\":\"" + "a".repeat(64) + "\""));
+        assertTrue(metadata.contains("\"filter_evidence\":["));
+        assertTrue(metadata.contains("\"domain_digest\":\"" + "b".repeat(64) + "\""));
+        assertTrue(metadata.contains("\"expanded\":4"));
+        assertTrue(metadata.contains("\"filter_cost_nanos\":123"));
+        assertFalse(metadata.contains("dynamic_verification"));
+        assertFalse(metadata.contains("verificationMode"));
+        assertTrue(run.contains("\"kind\":\"just-run\""));
+        assertFalse(run.contains("verification"));
     }
 
     @Test
-    void metadataAndIndexExposeOneTimingAndDependencySourceSnapshot(@TempDir Path temp)
+    void metadataAndIndexExposeTimingAndDependencySourceSnapshot(@TempDir Path temp)
             throws Exception {
+        ScanStatistics stats = stats();
+        ReportLayout layout = ReportLayout.create(temp);
+        new MultiFormatReporter().writeMetadata(layout, stats);
+        new ReportIndexWriter().write(layout, stats);
+
+        String metadata = Files.readString(temp.resolve("meta/scan-metadata.json"));
+        String index = Files.readString(temp.resolve("index.md"));
+        assertTrue(metadata.contains("\"dependency_resolution_ms\":8")
+                        && metadata.contains("\"network_download_wall_ms\":12")
+                        && metadata.contains("\"filter_ms\":0")
+                        && metadata.contains("\"total_wall_ms\":49"), metadata);
+        assertTrue(index.contains("| Dependency resolution | 8 ms (OBSERVED) |")
+                        && index.contains("| Bounded filter | 0 ms (NOT_APPLICABLE) |")
+                        && index.contains("actual_application=1")
+                        && index.contains("pom_derived=4")
+                        && index.contains("jdk=7"), index);
+        assertFalse(index.contains("verification"));
+    }
+
+    private static ScanStatistics stats() {
         Map<String, Long> metrics = Map.ofEntries(
                 Map.entry("dependency_resolution_ms", 8L),
                 Map.entry("network_download_wall_ms", 12L),
@@ -111,11 +107,10 @@ class MultiFormatReporterTest {
                 Map.entry("filter_ms", "NOT_APPLICABLE"),
                 Map.entry("report_ms", "OBSERVED"),
                 Map.entry("total_wall_ms", "OBSERVED"));
-        ScanStatistics stats = new ScanStatistics(1, 1, 0, 1, 1, 1,
+        return new ScanStatistics(1, 1, 0, 1, 1, 1,
                 49L, 10L, 12L, "COMPLETE", List.of(),
                 Map.of("dependency_resolution", 8L, "analysis", 21L, "report", 5L),
-                metrics, "STATIC_ONLY", VerificationSummary.empty("STATIC_ONLY", 0),
-                "COMPLETE", "a".repeat(64), statuses, Map.of(), Map.of(),
+                metrics, "STATIC_ONLY", "a".repeat(64), statuses, Map.of(), Map.of(),
                 List.of(new FilterAnalysis.Evidence(
                         FilterAnalysis.Kind.CFG_PATH,
                         "app.Entry#readObject@12",
@@ -123,58 +118,5 @@ class MultiFormatReporterTest {
                         "CFG_EXACT_PATH_UNREACHABLE",
                         "b".repeat(64), "c".repeat(64), 4096,
                         3L, 1L, 2L, 4L, 123L)));
-
-        new MultiFormatReporter().writeMetadata(temp, stats);
-        new ReportIndexWriter().write(ReportLayout.flat(temp), stats);
-
-        String metadata = Files.readString(temp.resolve("scan-metadata.json"));
-        String index = Files.readString(temp.resolve("index.md"));
-        assertTrue(metadata.contains("\"dependency_resolution_ms\":8")
-                        && metadata.contains("\"network_download_wall_ms\":12")
-                        && metadata.contains("\"filter_ms\":0")
-                        && metadata.contains("\"total_wall_ms\":49")
-                        && metadata.contains("\"filter_ms\":\"NOT_APPLICABLE\"")
-                        && metadata.contains("\"filter_evidence\":[")
-                        && metadata.contains("\"domain_digest\":\"" + "b".repeat(64) + "\"")
-                        && metadata.contains("\"expanded\":4")
-                        && metadata.contains("\"filter_cost_nanos\":123"),
-                metadata);
-        assertTrue(index.contains("| Dependency resolution | 8 ms (OBSERVED) |")
-                        && index.contains("| Bounded filter | 0 ms (NOT_APPLICABLE) |")
-                        && index.contains("actual_application=1")
-                        && index.contains("pom_derived=4")
-                        && index.contains("jdk=7"), index);
-    }
-
-    @Test
-    void findingsFormatsConsumeStructuredVerificationSnapshot(@TempDir Path temp) throws Exception {
-        Chain chain = new Chain("RULE-2", "CODE_EXEC", "HIGH",
-                "app.Entry", "readObject", "readObject", "java.lang.Runtime", "exec",
-                List.of(new ChainHop("app.Entry", "readObject", "java.lang.Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "call", "()V", null)), 0);
-        VerificationSummary summary = new VerificationSummary(
-                "WINDOWS_JOB_OBJECT", 1, 1, 0, 1,
-                Map.of("SINK_BLOCKED", 1), Map.of(),
-                List.of(new VerificationSummary.ChainResult(1, chain.key(), "SINK_BLOCKED",
-                        "canary", "HIGH", 19, 1, 3, "SINK_CANARY_BOUNDARY",
-                        "WINDOWS_JOB_OBJECT", "17.0.19", "policy-1", true, true, "CLEANED")));
-        new MultiFormatReporter().write(ReportLayout.flat(temp), List.of(chain), Map.of(),
-                Map.of(chain.key(), List.of("verify:stale-note")), summary);
-
-        String json = Files.readString(temp.resolve("findings.json"));
-        assertTrue(json.contains("\"verification_status\":\"SINK_BLOCKED\""));
-        assertTrue(json.contains("\"verification_evidence\":\"SINK_CANARY_BOUNDARY\""));
-        assertTrue(json.contains("\"verification_group\":\"boundary_only\""));
-        assertTrue(json.contains("\"last_confirmed_stage\":\"SINK_BOUNDARY\""),
-                "findings.json must close the last_confirmed_stage JSON string");
-        assertTrue(json.contains("\"precision\":")
-                && json.contains("\"high_confidence\":false"));
-        assertTrue(!json.contains("]}\",\"construction\":"),
-                "findings.json must remain valid JSON around the nested precision object");
-        assertTrue(json.endsWith("\n]"));
-        assertTrue(Files.readString(temp.resolve("findings.html")).contains("SINK_BLOCKED"));
-        assertTrue(Files.readString(temp.resolve("findings.md")).contains("SINK_BLOCKED"));
-        assertTrue(Files.readString(temp.resolve("findings.html")).contains("boundary_only"));
-        assertTrue(Files.readString(temp.resolve("findings.md")).contains("boundary_only"));
     }
 }

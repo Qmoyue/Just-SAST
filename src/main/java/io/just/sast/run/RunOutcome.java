@@ -26,10 +26,6 @@ public record RunOutcome(Status status, ExitReason exitReason, SupportStatus sup
         NOT_RUN
     }
 
-    private static final String[] NEGATIVE_DYNAMIC_STATUSES = {
-            "PARTIAL", "FAILED", "TIMEOUT", "UNTESTABLE", "UNKNOWN"
-    };
-
     public RunOutcome {
         status = status == null ? Status.NOT_RUN : status;
         exitReason = exitReason == null ? ExitReason.INTERNAL : exitReason;
@@ -105,29 +101,16 @@ public record RunOutcome(Status status, ExitReason exitReason, SupportStatus sup
      * Classify a completed scan from its typed report axes.  This replaces cache/runner/report
      * copies of the old COMPLETE/PARTIAL/UNKNOWN string inference.
      */
-    public static RunOutcome forScan(String completeness, String chainProofCompleteness,
-                                     Collection<String> dynamicStatuses) {
+    public static RunOutcome forScan(String completeness, String chainProofCompleteness) {
         String complete = normalize(completeness);
         String proof = normalize(chainProofCompleteness);
-        TreeSet<String> statuses = new TreeSet<>();
-        if (dynamicStatuses != null) {
-            for (String status : dynamicStatuses) {
-                if (status != null && !status.isBlank()) {
-                    statuses.add(normalize(status));
-                }
-            }
-        }
         List<String> reasons = new ArrayList<>();
         boolean unknown = "UNKNOWN".equals(complete) || "UNKNOWN".equals(proof);
         boolean incomplete = !"COMPLETE".equals(complete) || !"COMPLETE".equals(proof);
-        boolean dynamicIncomplete = statuses.stream().anyMatch(RunOutcome::negativeDynamicStatus);
         if (unknown) {
             reasons.add("ANALYSIS_STATUS_UNKNOWN");
         } else if (incomplete) {
             reasons.add("ANALYSIS_INCOMPLETE");
-        }
-        if (dynamicIncomplete) {
-            reasons.add("DYNAMIC_INCOMPLETE");
         }
         if (reasons.isEmpty()) {
             return success();
@@ -162,15 +145,6 @@ public record RunOutcome(Status status, ExitReason exitReason, SupportStatus sup
         }
         out.append("],\"detail\":\"").append(escape(detail)).append("\"}");
         return out.toString();
-    }
-
-    private static boolean negativeDynamicStatus(String status) {
-        for (String negative : NEGATIVE_DYNAMIC_STATUSES) {
-            if (negative.equals(status)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static String normalize(String value) {

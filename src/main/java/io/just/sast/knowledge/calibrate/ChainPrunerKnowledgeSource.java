@@ -91,7 +91,7 @@ public final class ChainPrunerKnowledgeSource implements KnowledgeSource {
         // Producer admission keeps an application-owned lifecycle callback that is not yet
         // an application entry in a calibration-only store.  Include that audit input here so
         // it receives the same typed no-trigger decision instead of disappearing before the
-        // report; it remains excluded from composition and dynamic verification.
+        // report; it remains excluded from composition and downstream projections.
         for (Chain chain : bb.reportChains()) {
             if (!TRIGGER_REQUIRED.contains(chain.entryKind())
                     || bb.calibrationOf(chain.key()) != null) {

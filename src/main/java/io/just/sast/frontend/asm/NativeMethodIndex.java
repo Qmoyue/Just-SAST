@@ -15,8 +15,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Frontend-owned bytecode fact extractor for the bounded native-method index used by the
- * verifier.  Keeping ASM here prevents the verifier/runtime layer from parsing class files.
+ * Frontend-owned bytecode fact extractor for the bounded native-method index used by static
+ * analysis. Keeping ASM here prevents downstream semantic layers from parsing class files.
  */
 public final class NativeMethodIndex {
     private static final int MAX_CLASS_BYTES = 8 * 1024 * 1024;

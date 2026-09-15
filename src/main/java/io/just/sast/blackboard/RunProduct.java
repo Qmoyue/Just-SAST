@@ -16,9 +16,7 @@ public enum RunProduct {
     /** Object-graph and dependency fragments assembled after analysis. */
     COMPOSED_CHAINS(true, false),
     /** Constraint, trigger and configuration calibration results. */
-    CALIBRATED_CHAINS(true, false),
-    /** The one typed dynamic-verification result stream for this run. */
-    VERIFICATION_RESULTS(false, false);
+    CALIBRATED_CHAINS(true, false);
 
     private final boolean appendOnly;
     private final boolean initiallyAvailable;

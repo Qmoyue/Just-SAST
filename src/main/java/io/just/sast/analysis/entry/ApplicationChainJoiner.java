@@ -378,7 +378,7 @@ public final class ApplicationChainJoiner {
                         ? FindingState.Feasibility.SAT : FindingState.Feasibility.UNKNOWN,
                 chain.unresolvedHops() == 0 ? FindingState.Completeness.COMPLETE
                         : FindingState.Completeness.PARTIAL,
-                FindingState.Verification.NOT_ATTEMPTED, risk(chain.sinkRisk()));
+                risk(chain.sinkRisk()));
 
         Map<String, EvidenceNode> localNodes = new LinkedHashMap<>();
         localNodes.put(entry.id(), entry);

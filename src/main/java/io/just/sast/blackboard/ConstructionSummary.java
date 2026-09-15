@@ -5,14 +5,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
-/**
- * Separate evidence dimensions for the safe, declarative object-graph plan.
- *
- * <p>A valid plan proves only that the bounded description is internally coherent.  It does
- * not prove that an application class can be instantiated or that a serialized payload is
- * exploitable.  Dynamic states describe the authenticated child boundary and keep
- * safe-adapter distortion visible.</p>
- */
+/** Static construction and terminal-control evidence for one chain. */
 public record ConstructionSummary(String typeStatus, String fieldStatus,
                                   String triggerStatus, String sinkControlStatus,
                                   String overallStatus, List<String> reasons) {
@@ -26,8 +19,7 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
         reasons = stableReasons(reasons);
     }
 
-    public static ConstructionSummary summarize(Chain chain, List<String> notes,
-                                                 VerificationSummary.ChainResult verification) {
+    public static ConstructionSummary summarize(Chain chain, List<String> notes) {
         if (chain == null) {
             return new ConstructionSummary("UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN",
                     "NOT_EVALUATED", List.of("NULL_CHAIN"));
@@ -36,16 +28,12 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
         ObjectGraphPlan plan = chain.constructionPlan();
         ObjectGraphPlan.ShapeSummary shape = plan == null ? null : plan.shapeSummary();
         boolean shapeValid = shape != null && shape.valid();
-        boolean safeShapeVerified = stableNotes.stream()
-                .anyMatch("verify:constructible"::equals);
 
         String type;
         if (plan == null) {
             type = "NOT_DECLARED";
         } else if (!shapeValid) {
             type = "PARTIAL";
-        } else if (safeShapeVerified) {
-            type = "SAFE_SHAPE_VERIFIED";
         } else {
             type = "DECLARED_SHAPE";
         }
@@ -61,40 +49,12 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
             fields = "DECLARED_ASSIGNMENTS";
         }
 
-        VerificationOutcome.Status dynamic = verification == null
-                ? VerificationOutcome.Status.UNKNOWN : verification.outcomeStatus();
-        String trigger;
-        if (dynamic == VerificationOutcome.Status.SINK_BLOCKED) {
-            trigger = "DYNAMIC_CANARY_BOUNDARY";
-        } else if (dynamic == VerificationOutcome.Status.SINK_EXECUTED_SAFE) {
-            trigger = "DYNAMIC_REAL_SINK_SAFE_ARGUMENTS";
-        } else if (dynamic == VerificationOutcome.Status.JNI_EXECUTED_SAFE) {
-            trigger = "DYNAMIC_JNI_SAFE_FIXTURE";
-        } else if (dynamic == VerificationOutcome.Status.SAFE_EFFECT_OBSERVED) {
-            trigger = "DYNAMIC_SAFE_ADAPTER_BOUNDARY";
-        } else if (dynamic == VerificationOutcome.Status.CONCRETE_REACHED) {
-            trigger = "DYNAMIC_TRIGGER_REACHED";
-        } else if (dynamic == VerificationOutcome.Status.EXECUTED) {
-            trigger = "DYNAMIC_ENTRY_RETURNED";
-        } else if (dynamic == VerificationOutcome.Status.PARTIAL) {
-            trigger = "PARTIAL";
-        } else if (!chain.hops().isEmpty() && chain.entryClass() != null
-                && !chain.entryClass().isBlank()) {
-            trigger = "STATIC_PATH_ONLY";
-        } else {
-            trigger = "NOT_PROVEN";
-        }
+        String trigger = !chain.hops().isEmpty() && chain.entryClass() != null
+                && !chain.entryClass().isBlank() ? "STATIC_PATH_ONLY" : "NOT_PROVEN";
 
         String sinkControl;
         if (!chain.terminalSink()) {
             sinkControl = "CAPABILITY_ONLY";
-        } else if (dynamic == VerificationOutcome.Status.SINK_BLOCKED) {
-            sinkControl = "DYNAMIC_CANARY_REACHED";
-        } else if (dynamic == VerificationOutcome.Status.SINK_EXECUTED_SAFE
-                || dynamic == VerificationOutcome.Status.JNI_EXECUTED_SAFE) {
-            sinkControl = "DYNAMIC_TARGET_SAFE_ARGUMENTS";
-        } else if ("SAFE_EFFECT_OBSERVED".equals(dynamic)) {
-            sinkControl = "DYNAMIC_ADAPTER_ONLY";
         } else if (chain.sinkDescriptor() == null || chain.sinkDescriptor().isBlank()
                 || chain.unresolvedHops() > 0) {
             sinkControl = "STATIC_UNCERTAIN";
@@ -123,11 +83,6 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
                         && (note.startsWith("degrade:") || note.contains("CAP")
                         || note.contains("UNKNOWN")))
                 .forEach(reasons::add);
-        if (verification == null) {
-            reasons.add("DYNAMIC_NOT_SELECTED");
-        } else if (verification.sinkDistorted()) {
-            reasons.add("SINK_DISTORTED:" + verification.outcomeStatus().name());
-        }
 
         boolean degraded = reasons.stream().anyMatch(reason -> reason.startsWith("degrade:")
                 || reason.startsWith("UNRESOLVED_HOPS")
@@ -135,8 +90,6 @@ public record ConstructionSummary(String typeStatus, String fieldStatus,
         String overall;
         if ("PARTIAL".equals(type) || "PARTIAL".equals(fields) || degraded) {
             overall = "PARTIAL";
-        } else if ("SAFE_SHAPE_VERIFIED".equals(type)) {
-            overall = "SAFE_SHAPE_VERIFIED";
         } else if (plan != null) {
             overall = "DECLARED";
         } else {

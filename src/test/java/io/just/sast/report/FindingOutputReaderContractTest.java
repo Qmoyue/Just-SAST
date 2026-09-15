@@ -1,15 +1,15 @@
 package io.just.sast.report;
 
 import io.just.sast.analysis.entry.ApplicationChainEvidence;
+import io.just.sast.blackboard.ApplicationChainId;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
-import io.just.sast.blackboard.ApplicationChainId;
 import io.just.sast.blackboard.EntryChainJoinEvidence;
 import io.just.sast.blackboard.EvidenceAtom;
 import io.just.sast.blackboard.EvidenceEdge;
 import io.just.sast.blackboard.EvidenceGraph;
-import io.just.sast.blackboard.GadgetSegmentId;
 import io.just.sast.blackboard.FindingState;
+import io.just.sast.blackboard.GadgetSegmentId;
 import io.just.sast.blackboard.HopKind;
 import org.junit.jupiter.api.Test;
 
@@ -18,10 +18,9 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Contract tests for the one typed report reader used by all format writers. */
+/** Contract tests for the one typed static report reader used by every renderer. */
 class FindingOutputReaderContractTest {
 
     private static Chain chain(String method) {
@@ -37,9 +36,9 @@ class FindingOutputReaderContractTest {
         Chain duplicate = chain("readObject");
         FindingOutputReader reader = new FindingOutputReader();
         FindingOutputReader.Snapshot a = reader.read(List.of(duplicate, first), Map.of(),
-                Map.of(first.key(), List.of("verify:confirmed")), null);
+                Map.of(first.key(), List.of("static:constructible")), Map.of());
         FindingOutputReader.Snapshot b = reader.read(List.of(first, duplicate), Map.of(),
-                Map.of(first.key(), List.of("verify:confirmed")), null);
+                Map.of(first.key(), List.of("static:constructible")), Map.of());
 
         assertEquals(FindingOutputReader.SCHEMA_VERSION, a.schemaVersion());
         assertEquals(2, a.findings().size(), "variant rows remain visible to evidence writers");
@@ -49,8 +48,8 @@ class FindingOutputReaderContractTest {
         assertEquals(FindingState.EntryStatus.NO_APPLICATION_ENTRY, view.state().entryStatus());
         assertEquals(FindingState.Feasibility.UNKNOWN, view.state().feasibility());
         assertFalse(view.state().defaultFindingEligible());
-        assertEquals("SINK_BLOCKED", view.verificationStatus(false));
-        assertSame(view.ranking(), a.require(first.key()).ranking());
+        assertTrue(view.confidence().reasons().isEmpty());
+        assertFalse(a.toCanonicalJson().contains("verification"));
     }
 
     @Test
@@ -61,33 +60,29 @@ class FindingOutputReaderContractTest {
                 FindingState.ChainProgress.IMPACT_CHAIN_COMPLETE,
                 FindingState.Feasibility.SAT,
                 FindingState.Completeness.COMPLETE,
-                FindingState.Verification.DYNAMIC_BOUNDARY_CONFIRMED,
                 FindingState.Risk.HIGH);
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                List.of(candidate), Map.of(), Map.of(candidate.key(), List.of("verify:old-note")),
-                null, Map.of(candidate.key(), typed));
+                List.of(candidate), Map.of(), Map.of(candidate.key(), List.of("static:old-note")),
+                Map.of(candidate.key(), typed));
         FindingOutputReader.Finding view = snapshot.require(candidate.key());
 
         assertEquals(typed, view.state());
         assertTrue(view.state().defaultFindingEligible());
-        assertEquals("NOT_SELECTED", view.verificationStatus(true));
-        assertEquals("", view.confidence().runtimeStatus(),
-                "legacy confidence may retain a compatibility runtime projection, but it does not "
-                        + "prove typed dynamic evidence");
         assertTrue(view.typedViolations().isEmpty());
         String json = snapshot.toCanonicalJson();
         assertTrue(json.startsWith("{\"schema_version\":\"JUST-FINDING-OUTPUT-D004-V1\""));
         assertTrue(json.contains("\"entry_status\":\"EXTERNAL_ENTRY\""));
+        assertFalse(json.contains("verification"));
         assertEquals(snapshot.digest(), new FindingOutputReader().read(
-                List.of(candidate), Map.of(), Map.of(candidate.key(), List.of("verify:old-note")),
-                null, Map.of(candidate.key(), typed)).digest());
+                List.of(candidate), Map.of(), Map.of(candidate.key(), List.of("static:old-note")),
+                Map.of(candidate.key(), typed)).digest());
     }
 
     @Test
     void strictProductExportKeepsAuditRowsButHidesUnanchoredCandidates() {
         Chain candidate = chain("readObject");
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                List.of(candidate), Map.of(), Map.of(), null, Map.of(), true);
+                List.of(candidate), Map.of(), Map.of(), Map.of(), true);
 
         assertEquals(1, snapshot.findings().size(),
                 "canonical evidence must retain the rejected candidate");
@@ -99,11 +94,10 @@ class FindingOutputReaderContractTest {
     @Test
     void emptyAndNullInputsProduceAnImmutableEmptySnapshot() {
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                null, null, null, null, null);
+                null, null, null, Map.of(), false);
         assertTrue(snapshot.findings().isEmpty());
         assertTrue(snapshot.byChainKey().isEmpty());
-        assertTrue(snapshot.verificationByKey().isEmpty());
-        assertFalse(snapshot.structuredVerification());
+        assertTrue(snapshot.applicationTraces().isEmpty());
     }
 
     @Test
@@ -151,7 +145,7 @@ class FindingOutputReaderContractTest {
                 Map.of(appChain.value(), join), Map.of(), Map.of(chainKey, "JOINED"), List.of());
 
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                List.of(candidate), Map.of(), Map.of(), null, Map.of(), true, evidence);
+                List.of(candidate), Map.of(), Map.of(), Map.of(), true, evidence);
         ApplicationTrace trace = snapshot.applicationTrace(chainKey);
         assertTrue(trace != null);
         assertEquals("app/ApiController", trace.applicationEntryClass());

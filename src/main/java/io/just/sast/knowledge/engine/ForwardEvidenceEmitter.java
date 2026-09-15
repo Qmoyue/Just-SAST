@@ -17,8 +17,8 @@ import java.util.function.Supplier;
 
 /**
  * Pure translation from a forward source-to-sink path to the legacy sink-to-entry Chain product.
- * Blackboard insertion, ranking and dynamic verification remain outside this owner.  Keeping
- * the reversal and entry metadata in one place prevents individual solver branches from
+ * Blackboard insertion and ranking remain outside this owner. Keeping the reversal and entry
+ * metadata in one place prevents individual solver branches from
  * inventing subtly different evidence shapes.
  */
 public final class ForwardEvidenceEmitter {

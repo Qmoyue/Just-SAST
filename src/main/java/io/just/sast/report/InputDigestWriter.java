@@ -9,7 +9,7 @@ public final class InputDigestWriter {
 
     public void write(ReportLayout layout, InputDigestVerification verification) throws IOException {
         if (layout == null || verification == null) {
-            throw new IOException("input digest report requires layout and verification");
+            throw new IOException("input digest report requires layout and digest snapshot");
         }
         StringBuilder json = new StringBuilder(512);
         json.append("{\n")

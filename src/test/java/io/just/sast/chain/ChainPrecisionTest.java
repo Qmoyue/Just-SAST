@@ -3,7 +3,6 @@ package io.just.sast.chain;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
-import io.just.sast.blackboard.VerificationSummary;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -54,14 +53,11 @@ class ChainPrecisionTest {
         Chain cha = virtualChain("receiver-cha-bounded");
 
         assertEquals("CONCRETE", ChainPrecision.assess(exact, List.of()).controllability());
-        assertEquals("RECEIVER_EXACT", ChainPrecision.assess(exact, List.of())
-                .dispatchPrecision());
+        assertEquals("RECEIVER_EXACT", ChainPrecision.assess(exact, List.of()).dispatchPrecision());
         assertEquals("SEALED_SET", ChainPrecision.assess(sealed, List.of()).controllability());
-        assertEquals("SEALED_SET", ChainPrecision.assess(sealed, List.of())
-                .dispatchPrecision());
+        assertEquals("SEALED_SET", ChainPrecision.assess(sealed, List.of()).dispatchPrecision());
         assertEquals("CHA_BOUNDED", ChainPrecision.assess(cha, List.of()).controllability());
-        assertEquals("CHA_BOUNDED", ChainPrecision.assess(cha, List.of())
-                .dispatchPrecision());
+        assertEquals("CHA_BOUNDED", ChainPrecision.assess(cha, List.of()).dispatchPrecision());
     }
 
     @Test
@@ -73,10 +69,11 @@ class ChainPrecisionTest {
         assertEquals("UNKNOWN", assessment.controllability());
         assertEquals("UNKNOWN", assessment.dispatchPrecision());
         assertEquals("PARTIAL", assessment.completeness());
+        assertFalse(ChainPrecision.isHighConfidence(chain, List.of("static:constructible")));
     }
 
     @Test
-    void dynamicAndFieldDimensionsExposeBoundedEvidence() {
+    void staticReflectionAndFieldDimensionsExposeBoundedEvidence() {
         Chain chain = new Chain("R", "REFLECT", "HIGH", "app/Entry", "readObject",
                 "readObject", "java/lang/reflect/Method", "invoke", List.of(
                 new ChainHop("app/Entry", "readObject", "app/Holder", "call",
@@ -84,20 +81,16 @@ class ChainPrecisionTest {
                 new ChainHop("app/Entry", "readObject", "app/Holder", "value",
                         HopKind.FIELD_FLOW, "value", "reflective-recovered", "", null,
                         "app/Holder")), 0, "()V", "TERMINAL");
-        VerificationSummary.ChainResult result = new VerificationSummary.ChainResult(
-                1, chain.key(), "SAFE_EFFECT_OBSERVED", "adapter", "DEGRADED", 3, 1,
-                2, "SAFE_EFFECT_OBSERVED", "PROCESS_RESOURCE", "17", "policy", true, true, "CLEAN");
 
         ChainPrecision.Assessment assessment = ChainPrecision.assess(chain,
-                List.of("verify:safe-effect-observed"), result);
+                List.of("static:constructible"));
 
         assertEquals("POINTS_TO_BOUNDED", assessment.controllability());
         assertEquals("POINTS_TO_BOUNDED", assessment.dispatchPrecision());
         assertEquals("EXACT_DECLARATION", assessment.fieldPrecision());
         assertEquals("RECOVERED_BOUNDED", assessment.reflectionPrecision());
-        assertEquals("SAFE_EFFECT_DISTORTED", assessment.runtime());
-        assertEquals("PROCESS_RESOURCE_UNATTESTED", assessment.isolation());
-        assertTrue(assessment.reasons().contains("SAFE_ADAPTER_DISTORTED"));
+        assertEquals("CONSTRUCTIBLE", assessment.construction());
+        assertTrue(assessment.reasons().isEmpty());
     }
 
     @Test
@@ -135,51 +128,16 @@ class ChainPrecisionTest {
     }
 
     @Test
-    void legacySafeSinkLabelRemainsDistortedAndNonReflectiveIsNotPenalized() {
-        Chain chain = new Chain("R", "COMMAND_EXEC", "HIGH", "app/Entry", "readObject",
-                "readObject", "java/lang/Runtime", "exec", List.of(
-                new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "direct", "()V", null)), 0);
-        VerificationSummary.ChainResult result = new VerificationSummary.ChainResult(
-                1, chain.key(), "SAFE_SINK_EXECUTED", "legacy", "DEGRADED", 1, 1,
-                1, "SAFE_EFFECT_OBSERVED", "LEGACY", "8", "policy", true, true, "CLEAN");
-
-        ChainPrecision.Assessment assessment = ChainPrecision.assess(chain, List.of(), result);
-
-        assertEquals("SAFE_EFFECT_DISTORTED", assessment.runtime());
-        assertEquals("NOT_APPLICABLE", assessment.reflectionPrecision());
-        assertTrue(assessment.reasons().contains("SAFE_ADAPTER_DISTORTED"));
-    }
-
-    @Test
-    void highConfidenceRequiresAnUndistortedSafeTerminalAndAttestedJobObject() {
-        Chain chain = new Chain("R", "COMMAND_EXEC", "HIGH", "app/Entry", "readObject",
+    void staticHighConfidenceRequiresCompleteStaticEvidence() {
+        Chain complete = new Chain("R", "COMMAND_EXEC", "HIGH", "app/Entry", "readObject",
                 "readObject", "java/lang/Runtime", "exec", List.of(
                 new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
                         HopKind.DIRECT_CALL, null, "direct", "(Ljava/lang/String;)Ljava/lang/Process;", 0)),
                 0, "(Ljava/lang/String;)Ljava/lang/Process;", "TERMINAL");
-        VerificationSummary.ChainResult boundary = new VerificationSummary.ChainResult(
-                1, chain.key(), "SINK_BLOCKED", "canary", "FEASIBLE", 10, 1, 3,
-                "SINK_CANARY_BOUNDARY", "WINDOWS_JOB_OBJECT_JVM_POLICY", "17", "policy", false,
-                true, "CLEANED");
 
-        assertFalse(ChainPrecision.isHighConfidence(chain,
-                List.of("verify:constructible", "verify:sink-blocked"), boundary));
-        VerificationSummary.ChainResult safe = new VerificationSummary.ChainResult(
-                1, chain.key(), "SINK_EXECUTED_SAFE", "body=1;body_returned=1",
-                "FEASIBLE", 10, 1, 3, "REAL_SINK_BODY_SAFE_ARGUMENTS",
-                "WINDOWS_JOB_OBJECT_JVM_POLICY", "17", "policy", false, true, "CLEANED",
-                "LIGHT_SAFE_CALL", "LIGHT_SAFE_CALL", "none", "TERMINAL_EXECUTED_SAFE",
-                "CONTROLLED_EFFECT", true, "SAFE_TERMINAL_RETURNED", "SINK_RETURNED");
-        assertTrue(ChainPrecision.isHighConfidence(chain,
-                List.of("verify:constructible"), safe));
-        assertFalse(ChainPrecision.isHighConfidence(chain,
-                List.of("verify:constructible", "verify:safe-effect-observed"),
-                new VerificationSummary.ChainResult(1, chain.key(), "SAFE_EFFECT_OBSERVED",
-                        "adapter", "DEGRADED", 3, 1, 3, "SAFE_EFFECT_OBSERVED",
-                        "WINDOWS_JOB_OBJECT_JVM_POLICY", "17", "policy", true, true, "CLEANED")));
-        assertFalse(ChainPrecision.isHighConfidence(chain,
-                List.of("verify:constructible", "degrade:partial-path"), boundary));
+        assertTrue(ChainPrecision.isHighConfidence(complete, List.of("static:constructible")));
+        assertFalse(ChainPrecision.isHighConfidence(complete, List.of("degrade:partial-path")));
+        assertFalse(ChainPrecision.isHighConfidence(complete, List.of()));
     }
 
     private static Chain virtualChain(String reason) {

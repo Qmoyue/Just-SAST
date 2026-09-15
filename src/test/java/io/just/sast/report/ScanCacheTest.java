@@ -1,6 +1,5 @@
 package io.just.sast.report;
 
-import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.run.InputBudget;
 import io.just.sast.util.ArtifactFingerprint;
 import org.junit.jupiter.api.Test;
@@ -32,7 +31,8 @@ class ScanCacheTest {
                 .contains("verify"));
         ScanStatistics complete = new ScanStatistics(1, 1, 0, 0, 0, 0,
                 1, 1, 1, "COMPLETE", List.of(), java.util.Map.of(), java.util.Map.of(),
-                "DISABLED", VerificationSummary.empty("DISABLED", 0), "COMPLETE", artifactHash);
+                "COMPLETE", artifactHash, java.util.Map.of(), java.util.Map.of(),
+                java.util.Map.of(), List.of());
         assertTrue(complete.runOutcome().cacheable());
 
         Path cache = tmp.resolve("cache");
@@ -66,11 +66,11 @@ class ScanCacheTest {
     }
 
     @Test
-    void neverCachesPartialOrNegativeDynamicResults(@TempDir Path tmp) {
+    void neverCachesPartialResults(@TempDir Path tmp) {
         ScanStatistics partial = new ScanStatistics(0, 0, 0, 0, 0, 0,
                 0, 0, 0, "PARTIAL", List.of("ANALYSIS_BOUND"), java.util.Map.of(),
-                java.util.Map.of(), "PROCESS_RESOURCE",
-                VerificationSummary.empty("PROCESS_RESOURCE", 1), "PARTIAL", "hash");
+                java.util.Map.of(), "PARTIAL", "hash", java.util.Map.of(),
+                java.util.Map.of(), java.util.Map.of(), List.of());
         assertFalse(partial.runOutcome().cacheable());
         assertFalse(ScanCache.cacheable(partial));
     }

@@ -20,7 +20,7 @@ import java.util.TreeMap;
  *
  * <p>The product is deliberately separate from the legacy {@code Chain} store.  A chain can
  * still be useful kernel evidence while lacking an application join; this record makes that
- * distinction explicit without allowing a renderer or verifier to infer it from notes.</p>
+ * distinction explicit without allowing a renderer to infer it from notes.</p>
  */
 public record ApplicationChainEvidence(
         String schemaVersion,
@@ -203,7 +203,6 @@ public record ApplicationChainEvidence(
                     .append("\",\"chain_progress\":\"").append(state.chainProgress())
                     .append("\",\"feasibility\":\"").append(state.feasibility())
                     .append("\",\"completeness\":\"").append(state.completeness())
-                    .append("\",\"verification\":\"").append(state.verification())
                     .append("\",\"risk\":\"").append(state.risk())
                     .append("\",\"eligibility\":\"").append(state.eligibility())
                     .append("\"}");
@@ -231,7 +230,7 @@ public record ApplicationChainEvidence(
         return json.append("]}").toString();
     }
 
-    /** Attach the scan-boundary artifact identity after the verifier has published the join. */
+    /** Attach the scan-boundary artifact identity after the join has been published. */
     public ApplicationChainEvidence withArtifactDigest(String digest) {
         return new ApplicationChainEvidence(schemaVersion, digest, applicationIndexDigest,
                 applicationScopeKnown, graph, joins, states, decisions, admissionDecisions,

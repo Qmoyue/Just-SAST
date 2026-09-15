@@ -2,7 +2,7 @@ package io.just.sast.run;
 
 import java.util.Locale;
 
-/** Closed result for input/verification budget accounting. */
+/** Closed result for bounded input accounting. */
 public record InputBudgetResult(State state, long limit, long consumed, String reasonCode) {
 
     public enum State {

@@ -30,8 +30,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 
 /**
  * Opt-in fixed-runner performance command.  Normal scans never invoke this command and pay no
@@ -326,67 +324,9 @@ public final class PerformanceCommand implements Callable<Integer> {
      */
     private static String resultDigest(Path output, InputBudget policy,
                                        InputBudget.Tracker tracker) throws IOException {
-        Path findings = output.resolve("findings").resolve("findings.csv");
-        Path chains = output.resolve("evidence").resolve("chains.csv");
-        if (!Files.isRegularFile(findings, LinkOption.NOFOLLOW_LINKS)
-                || !Files.isRegularFile(chains, LinkOption.NOFOLLOW_LINKS)) {
-            throw new IOException("scan did not produce canonical result files");
-        }
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            updateDigest(digest, "findings", findings, policy, tracker);
-            updateDigest(digest, "chains", chains, policy, tracker);
-            StringBuilder hex = new StringBuilder(64);
-            for (byte value : digest.digest()) {
-                hex.append(String.format(Locale.ROOT, "%02x", value));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IOException("SHA-256 unavailable", impossible);
-        }
-    }
-
-    private static void updateDigest(MessageDigest digest, String name, Path file,
-                                     InputBudget policy, InputBudget.Tracker tracker)
-            throws IOException {
-        byte[] label = name.getBytes(StandardCharsets.UTF_8);
-        digest.update((byte) label.length);
-        digest.update(label);
-        ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
-                file, policy, "PERFORMANCE_RESULT");
-        BasicFileAttributes before = snapshot.fileAttributes();
-        long limit = Math.min(policy.maxEntryBytes(), tracker.remainingReadBytes());
-        if (before.size() > policy.maxEntryBytes() || before.size() > limit) {
-            throw new IOException("PERFORMANCE_RESULT_INPUT_LIMIT:" + policy.maxEntryBytes());
-        }
-        try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(file, "PERFORMANCE_RESULT");
-             InputStream input = opened.stream()) {
-            byte[] buffer = new byte[8192];
-            long total = 0L;
-            for (int read; ; ) {
-                tracker.checkTime();
-                read = tracker.readBounded(input, buffer, 0, buffer.length, limit - total,
-                        "PERFORMANCE_RESULT_INPUT_LIMIT:" + limit);
-                if (read < 0) {
-                    break;
-                }
-                if (read == 0) {
-                    int one = tracker.readByteBounded(input, limit - total,
-                            "PERFORMANCE_RESULT_INPUT_LIMIT:" + limit);
-                    if (one < 0) {
-                        break;
-                    }
-                    buffer[0] = (byte) one;
-                    read = 1;
-                }
-                if (read > limit - total) {
-                    throw new IOException("PERFORMANCE_RESULT_INPUT_LIMIT:" + limit);
-                }
-                digest.update(buffer, 0, read);
-                total += read;
-            }
-        }
-        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "PERFORMANCE_RESULT");
+        Path report = output.resolve("report.json");
+        return new io.just.sast.report.CanonicalReportReader()
+                .read(report, policy, tracker).digest();
     }
 
     private static String readBoundedText(Path file, InputBudget policy,
@@ -406,18 +346,6 @@ public final class PerformanceCommand implements Callable<Integer> {
         }
         ArchiveLimits.verifyRegularFileUnchanged(snapshot, label);
         return new String(bytes, StandardCharsets.UTF_8);
-    }
-
-    /** Package-local hostile contract seam; production result reads use the same snapshot. */
-    static ArchiveLimits.FileReadSnapshot snapshotResultForContract(Path file) throws IOException {
-        return ArchiveLimits.snapshotRegularFile(file, OUTPUT_INPUT_POLICY,
-                "PERFORMANCE_RESULT");
-    }
-
-    /** Package-local hostile contract seam; production result reads use the same snapshot. */
-    static void verifyResultSnapshotForContract(ArchiveLimits.FileReadSnapshot snapshot)
-            throws IOException {
-        ArchiveLimits.verifyRegularFileUnchanged(snapshot, "PERFORMANCE_RESULT");
     }
 
     /** Package-local hostile contract seam for shared metadata/result input accounting. */

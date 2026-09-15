@@ -91,6 +91,7 @@ class PerformanceHarnessTest {
         return new ScanStatistics(1, 1, 0, 1, 1, chains,
                 staticMs + filterMs, 4L, 5L, completeness, List.of(),
                 Map.of("frontend", staticMs, "filter", filterMs),
-                Map.of("rss_peak_mb", 8L), "COMPLETE", null, "COMPLETE");
+                Map.of("rss_peak_mb", 8L), "COMPLETE", "UNKNOWN",
+                Map.of(), Map.of(), Map.of(), List.of());
     }
 }

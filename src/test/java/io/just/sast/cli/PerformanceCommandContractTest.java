@@ -44,28 +44,6 @@ class PerformanceCommandContractTest {
     }
 
     @Test
-    void resultReaderParentReplacementFailsClosed(@TempDir Path temp) throws Exception {
-        Path parent = Files.createDirectories(temp.resolve("parent"));
-        Path result = parent.resolve("scan-metadata.json");
-        Files.writeString(result, "{}\n");
-        var snapshot = PerformanceCommand.snapshotResultForContract(result);
-        var before = Files.readAttributes(parent,
-                java.nio.file.attribute.BasicFileAttributes.class,
-                java.nio.file.LinkOption.NOFOLLOW_LINKS);
-        org.junit.jupiter.api.Assumptions.assumeTrue(
-                before.fileKey() != null || before.creationTime().toMillis() != 0L,
-                "provider does not expose a stable directory identity");
-        Files.delete(result);
-        Files.delete(parent);
-        Files.createDirectory(parent);
-        Files.writeString(result, "{}\n");
-        IOException failure = assertThrows(IOException.class,
-                () -> PerformanceCommand.verifyResultSnapshotForContract(snapshot));
-        assertTrue(failure.getMessage().contains("PERFORMANCE_RESULT_CHANGED_DURING_READ"),
-                failure.getMessage());
-    }
-
-    @Test
     void resultReaderUsesOneCallerTotalBudget(@TempDir Path temp) throws Exception {
         Path first = temp.resolve("first.json");
         Path second = temp.resolve("second.json");

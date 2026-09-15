@@ -26,7 +26,6 @@ public record EvidenceAtom(
         TERMINAL_IMPACT,
         CONSTRAINT,
         FILTER,
-        DYNAMIC_OBSERVATION,
         PROTOCOL_BRIDGE,
         UNKNOWN
     }

@@ -668,7 +668,7 @@ public final class YamlRuleLoader {
     }
 
     /**
-     * Parse the bounded object-shape DSL used by safe verification.  It intentionally has no
+     * Parse the bounded object-shape DSL used by static construction constraints. It intentionally has no
      * expression/evaluation form: nodes are allocate/proxy/constructor records and field values
      * are typed literals or references to another node.
      */

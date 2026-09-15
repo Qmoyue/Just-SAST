@@ -5,7 +5,7 @@ import io.just.sast.analysis.taint.FilterAnalysis;
 /**
  * Converts a typed local feasibility decision into the forward solver's propagation outcome.
  * Unknown and budget-exhausted filters preserve a conservative candidate; only an independently
- * proven unreachable path blocks propagation.  This prevents a diagnostic string or a verifier
+ * proven unreachable path blocks propagation. This prevents a diagnostic string or an external
  * boundary from silently becoming a false negative.
  */
 public final class ForwardConstraintPropagation {

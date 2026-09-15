@@ -17,8 +17,7 @@ import java.util.Objects;
  * Writes the small, stable reading surface for a scan.
  *
  * <p>The canonical {@link FindingOutputReader.Snapshot} is the only source for both files.
- * Older renderer files remain available during migration, but this pair is deliberately free
- * of payload bytes, verifier output and format-specific re-ranking.</p>
+ * This pair contains no executable material and no format-specific re-ranking.</p>
  */
 public final class ConciseReportWriter {
 
@@ -60,10 +59,8 @@ public final class ConciseReportWriter {
         StringBuilder out = new StringBuilder(4096);
         out.append("{\"schema_version\":").append(quote(SCHEMA_VERSION))
                 .append(",\"mode\":").append(quote(mode))
-                .append(",\"static_safety\":{\"verification_mode\":\"STATIC_ONLY\"")
-                .append(",\"target_code_execution_possible\":false")
-                .append(",\"target_code_executed\":\"NO\"")
-                .append(",\"dynamic_filtering\":\"ANALYSIS_ONLY\"}")
+                .append(",\"static_analysis\":{\"target_code_executed\":false")
+                .append(",\"filter_evidence\":\"meta/scan-metadata.json\"}")
                 .append(",\"artifact_sha256\":").append(quote(stats.artifactHash()))
                 .append(",\"run\":{")
                 .append("\"status\":").append(quote(stats.runOutcome().status().name()))
@@ -101,6 +98,7 @@ public final class ConciseReportWriter {
                 .append(",\"severity\":").append(quote(chain.severity()))
                 .append(",\"entry\":{\"class\":").append(quote(chain.entryClass()))
                 .append(",\"method\":").append(quote(chain.entryMethod()))
+                .append(",\"descriptor\":").append(quote(ChainIdentity.entryDescriptor(chain)))
                 .append(",\"kind\":").append(quote(chain.entryKind())).append('}')
                 .append(",\"sink\":{\"class\":").append(quote(chain.sinkClass()))
                 .append(",\"method\":").append(quote(chain.sinkMethod()))
@@ -112,7 +110,6 @@ public final class ConciseReportWriter {
                 .append(",\"chain_progress\":").append(quote(state.chainProgress().name()))
                 .append(",\"feasibility\":").append(quote(state.feasibility().name()))
                 .append(",\"completeness\":").append(quote(state.completeness().name()))
-                .append(",\"verification\":").append(quote(state.verification().name()))
                 .append(",\"risk\":").append(quote(state.risk().name()))
                 .append(",\"eligibility\":").append(quote(state.eligibility().name()))
                 .append(",\"violations\":");

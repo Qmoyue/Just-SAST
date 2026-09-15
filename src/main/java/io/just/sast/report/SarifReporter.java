@@ -4,9 +4,8 @@ import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
-import io.just.sast.blackboard.VerificationSummary;
-import io.just.sast.chain.ChainRanking;
 import io.just.sast.chain.ChainPrecision;
+import io.just.sast.chain.ChainRanking;
 import io.just.sast.config.RuleSet;
 
 import java.io.IOException;
@@ -19,55 +18,41 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * C1: SARIF 2.1.0 输出（GitHub Code Scanning / IDE 集成标准格式）。
- * 每个链组（rule×入口×sink 去重）→ 一个 result：driver.rules 全量声明、severity→level 映射、
- * region.startLine 定位入口方法首行（需 withHierarchy）、uri 用内部名路径、confidence 口径与
- * findings.csv 一致（verify:confirmed / ConfidenceScorer）、partialFingerprints 供 PR 去重。
- */
+/** Optional SARIF 2.1.0 view of the canonical static finding snapshot. */
 public final class SarifReporter {
 
     private ClassHierarchy hierarchy;
     private RuleSet ruleSet;
 
-    /** 供 startLine 解析的类层次（ScanPipeline 报告期接线；缺省不输出 region）。 */
     public SarifReporter withHierarchy(ClassHierarchy hierarchy) {
         this.hierarchy = hierarchy;
         return this;
     }
 
-    /** 供 driver.rules 声明的规则集。 */
     public SarifReporter withRules(RuleSet ruleSet) {
         this.ruleSet = ruleSet;
         return this;
     }
 
     public void write(Path outDir, List<Chain> chains,
-                      Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
-        write(ReportLayout.flat(outDir), chains, calibrations, notes, null);
+                      Map<String, String> calibrations, Map<String, List<String>> notes)
+            throws IOException {
+        write(ReportLayout.flat(outDir), chains, calibrations, notes);
     }
 
     public void write(ReportLayout layout, List<Chain> chains,
-                      Map<String, String> calibrations, Map<String, List<String>> notes) throws IOException {
-        write(layout, chains, calibrations, notes, null);
+                      Map<String, String> calibrations, Map<String, List<String>> notes)
+            throws IOException {
+        write(layout, new FindingOutputReader().read(chains, calibrations, notes));
     }
 
-    public void write(ReportLayout layout, List<Chain> chains,
-                      Map<String, String> calibrations, Map<String, List<String>> notes,
-                      VerificationSummary verification) throws IOException {
-        write(layout, new FindingOutputReader().read(chains, calibrations, notes, verification));
-    }
-
-    /** Render SARIF from the canonical snapshot shared with the other report formats. */
     public void write(ReportLayout layout, FindingOutputReader.Snapshot output)
             throws IOException {
         write(layout, output, null);
     }
 
-    /** Render SARIF with the canonical run outcome in run.properties when available. */
     public void write(ReportLayout layout, FindingOutputReader.Snapshot output,
-                      io.just.sast.run.RunOutcome runOutcome)
-            throws IOException {
+                      io.just.sast.run.RunOutcome runOutcome) throws IOException {
         if (layout == null) {
             throw new IOException("report layout is null");
         }
@@ -76,31 +61,22 @@ public final class SarifReporter {
         }
         List<Chain> chains = output.findings().stream()
                 .map(FindingOutputReader.Finding::chain).toList();
-        Map<String, String> calibrations = new java.util.TreeMap<>();
-        Map<String, List<String>> notes = new java.util.TreeMap<>();
+        Map<String, List<String>> stableNotes = new java.util.TreeMap<>();
         for (FindingOutputReader.Finding finding : output.findings()) {
-            if (!finding.exported()) {
-                calibrations.putIfAbsent(finding.chain().key(), finding.calibration());
-            }
-            notes.putIfAbsent(finding.chain().key(), finding.notes());
+            stableNotes.putIfAbsent(finding.chain().key(), finding.notes());
         }
-        chains = chains == null ? List.of() : chains;
-        calibrations = calibrations == null ? Map.of() : calibrations;
-        final Map<String, List<String>> stableNotes = notes == null ? Map.of() : notes;
         Files.createDirectories(layout.findings());
         StringBuilder sb = new StringBuilder();
-        sb.append("{\n");
-        sb.append("  \"version\": \"2.1.0\",\n");
-        sb.append("  \"$schema\": \"https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json\",\n");
-        sb.append("  \"runs\": [{\n");
-        sb.append("    \"tool\": {\n");
-        sb.append("      \"driver\": {\n");
-        sb.append("        \"name\": \"just-sast\",\n");
-        sb.append("        \"version\": \"0.2.0\",\n");
-        sb.append("        \"informationUri\": \"https://github.com/just-sast/just\",\n");
-        sb.append("        \"rules\": [").append(rulesArray()).append("]\n");
-        sb.append("      }\n");
-        sb.append("    },\n");
+        sb.append("{\n")
+                .append("  \"version\": \"2.1.0\",\n")
+                .append("  \"$schema\": \"https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json\",\n")
+                .append("  \"runs\": [{\n")
+                .append("    \"tool\": {\n      \"driver\": {\n")
+                .append("        \"name\": \"just-sast\",\n")
+                .append("        \"version\": \"0.2.0\",\n")
+                .append("        \"informationUri\": \"https://github.com/just-sast/just\",\n")
+                .append("        \"rules\": [").append(rulesArray()).append("]\n")
+                .append("      }\n    },\n");
         if (runOutcome != null) {
             sb.append("    \"properties\": {\"just/run_outcome\":")
                     .append(runOutcome.toCanonicalJson()).append("},\n");
@@ -108,40 +84,17 @@ public final class SarifReporter {
         sb.append("    \"results\": [");
         List<String> results = new ArrayList<>();
         Set<String> seen = new HashSet<>();
-        Map<String, VerificationSummary.ChainResult> verificationByKey = output.verificationByKey();
-        boolean structuredVerification = output.structuredVerification();
         List<Chain> orderedChains = new ArrayList<>(chains);
-        // All report projections must consume the same deterministic evidence tuple.  The
-        // former SARIF-only "high confidence, then shortest path" order could disagree with
-        // CSV/JSON/Markdown when two variants shared a dynamic status but differed in
-        // construction, completeness, dispatch, or static evidence.  High-confidence remains
-        // visible as a property; it is not a second, format-specific ranking contract.
-        orderedChains.sort(ChainRanking.comparator(stableNotes, verificationByKey, Set.of()));
+        orderedChains.sort(ChainRanking.comparator(stableNotes, Set.of()));
         for (Chain chain : orderedChains) {
-            if (calibrations.containsKey(chain.key())) {
+            FindingOutputReader.Finding finding = output.byChainKey().get(chain.key());
+            if (finding == null || !seen.add(resultIdentity(chain, chain.ruleId()))) {
                 continue;
             }
-            String ruleId = chain.ruleId() != null ? chain.ruleId() : "unknown";
-            if (!seen.add(resultIdentity(chain, ruleId))) {
-                continue; // 同组变体只报一次（与 findings.csv 折叠口径一致）
-            }
             List<String> chainNotes = stableNotes.getOrDefault(chain.key(), List.of());
-            if (chainNotes == null) {
-                chainNotes = List.of();
-            }
-            VerificationSummary.ChainResult verificationResult = verificationByKey.get(chain.key());
-            FindingOutputReader.Finding finding = output.byChainKey().get(chain.key());
-            ChainPrecision.Assessment precision = finding == null
-                    ? ChainPrecision.assess(chain, chainNotes, verificationResult)
-                    : finding.precision();
-            String confidence = FindingOutputReader.legacyConfidence(chain, chainNotes,
-                    verificationResult, structuredVerification);
-            String message = escape(chain.entryKind() + " → " + chain.sinkClass().replace('/', '.')
-                    + "." + chain.sinkMethod());
-            String props = "\"confidence\":\"" + escape(confidence) + "\""
-                    + ",\"high_confidence\":"
-                    + (finding == null ? ChainPrecision.isHighConfidence(chain, chainNotes,
-                            verificationResult) : finding.highConfidence())
+            ChainPrecision.Assessment precision = finding.precision();
+            String props = "\"confidence\":\"" + escape(finding.confidence().bucket()) + "\""
+                    + ",\"high_confidence\":" + finding.highConfidence()
                     + ",\"entry_kind\":\"" + escape(chain.entryKind()) + "\""
                     + ",\"entry_descriptor\":\"" + escape(entryDescriptor(chain)) + "\""
                     + ",\"sink_descriptor\":\"" + escape(sinkDescriptor(chain)) + "\""
@@ -149,41 +102,23 @@ public final class SarifReporter {
                     + ",\"sink_risk\":\"" + escape(chain.sinkRisk().name()) + "\""
                     + ",\"unresolved_hops\":" + chain.unresolvedHops()
                     + ",\"chain_length\":" + chain.hops().size()
-                    + ",\"verification_status\":\"" + escape(confidence) + "\""
-                    + ",\"verification_evidence\":\""
-                    + escape(verificationResult == null ? "" : verificationResult.evidence()) + "\""
-                    + ",\"backend\":\""
-                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.backend()) + "\""
-                    + ",\"jdk\":\""
-                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.jdk()) + "\""
-                    + ",\"policy_digest\":\""
-                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.policyDigest()) + "\""
-                    + ",\"sink_distorted\":"
-                    + (verificationResult != null && verificationResult.sinkDistorted())
-                    + ",\"resource_containment_ready\":"
-                    + (verificationResult != null && verificationResult.sandboxReady())
-                    + ",\"requested_mode\":\""
-                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.requestedMode())
-                    + "\",\"effective_mode\":\""
-                    + escape(verificationResult == null ? "UNKNOWN" : verificationResult.effectiveMode())
-                    + "\",\"fallback\":\""
-                    + escape(verificationResult == null ? "none" : verificationResult.fallback())
-                    + "\",\"verification_scope\":\""
-                    + escape(verificationResult == null ? "NONE" : verificationResult.verificationScope())
-                    + "\",\"verification_group\":\""
-                    + escape(ReportEvidence.verificationGroup(verificationResult))
-                    + "\",\"terminal_executed\":"
-                    + (verificationResult != null && verificationResult.terminalExecuted())
-                    + ",\"stop_reason\":\""
-                    + escape(verificationResult == null ? "NOT_SELECTED" : verificationResult.stopReason())
-                    + "\",\"last_confirmed_stage\":\""
-                    + escape(verificationResult == null ? "NONE" : verificationResult.lastConfirmedStage())
-                    + "\",\"precision\":"
-                    + ChainPrecision.toJson(precision, SarifReporter::escape)
+                    + ",\"precision\":" + ChainPrecision.toJson(precision,
+                    SarifReporter::escape, finding.highConfidence())
                     + ",\"construction\":"
-                    + ReportEvidence.constructionJson(chain, chainNotes, verificationResult);
-            ApplicationTrace applicationTrace = finding == null
-                    ? null : output.applicationTrace(chain.key());
+                    + ReportEvidence.constructionJson(finding.construction())
+                    + ",\"state\":{\"entry_status\":\""
+                    + escape(finding.state().entryStatus().name())
+                    + "\",\"chain_progress\":\""
+                    + escape(finding.state().chainProgress().name())
+                    + "\",\"feasibility\":\""
+                    + escape(finding.state().feasibility().name())
+                    + "\",\"completeness\":\""
+                    + escape(finding.state().completeness().name())
+                    + "\",\"risk\":\"" + escape(finding.state().risk().name())
+                    + "\",\"eligibility\":\""
+                    + escape(finding.state().eligibility().name()) + "\"}"
+                    + ",\"violations\":" + jsonArray(finding.typedViolations());
+            ApplicationTrace applicationTrace = output.applicationTrace(chain.key());
             if (applicationTrace != null) {
                 props += ",\"application_entry_class\":\""
                         + escape(applicationTrace.applicationEntryClass())
@@ -197,42 +132,37 @@ public final class SarifReporter {
                         + escape(applicationTrace.applicationSiteKind())
                         + "\",\"application_join_kind\":\""
                         + escape(applicationTrace.joinKind())
-                        + "\",\"application_chain_entry_method\":\""
-                        + escape(applicationTrace.chainEntryMethod())
-                        + "\",\"application_entry_prefix_path\":\""
-                        + escape(applicationTrace.entryPrefixPath())
                         + "\",\"application_path\":\""
                         + escape(applicationTrace.applicationPath(chain)) + "\"";
             }
             if (!chainNotes.isEmpty()) {
                 props += ",\"notes\":" + jsonArray(chainNotes);
             }
+            String level = "HIGH".equals(chain.severity()) || "CRITICAL".equals(chain.severity())
+                    ? "error" : "warning";
             results.add("\n      {\n"
-                    + "        \"ruleId\": \"" + escape(ruleId) + "\",\n"
-                    + "        \"level\": \"" + ("HIGH".equals(chain.severity()) || "CRITICAL".equals(chain.severity()) ? "error" : "warning") + "\",\n"
-                    + "        \"message\": {\"text\": \"" + message + "\"},\n"
+                    + "        \"ruleId\": \"" + escape(chain.ruleId()) + "\",\n"
+                    + "        \"level\": \"" + level + "\",\n"
+                    + "        \"message\": {\"text\": \""
+                    + escape(chain.entryKind() + " → " + chain.sinkClass().replace('/', '.')
+                    + "." + chain.sinkMethod()) + "\"},\n"
                     + "        \"locations\": [{\n"
                     + "          \"physicalLocation\": {\n"
-                    + "            \"artifactLocation\": {\"uri\": \"" + chain.entryClass() + ".class\"}"
+                    + "            \"artifactLocation\": {\"uri\": \""
+                    + escape(chain.entryClass() + ".class") + "\"}"
                     + regionOf(chain)
-                    + "          }\n"
-                    + "        }],\n"
-                    + "        \"partialFingerprints\": {\"just/v1\": \"" + fingerprint(chain, ruleId) + "\"},\n"
+                    + "          }\n        }],\n"
+                    + "        \"partialFingerprints\": {\"just/v1\": \""
+                    + fingerprint(chain, chain.ruleId()) + "\"},\n"
                     + "        \"properties\": {" + props + "}\n"
                     + "      }");
         }
-        sb.append(String.join(",", results));
-        sb.append("\n    ]\n");
-        sb.append("  }]\n");
-        sb.append("}");
+        sb.append(String.join(",", results)).append("\n    ]\n  }]\n}");
         AtomicFiles.writeUtf8(layout.findings().resolve("findings.sarif"), sb.toString());
     }
 
-    /** 入口方法首行（ENTRY 跳携带描述符；层次/行号缺失输出空段——不造假日行号）。 */
     private String regionOf(Chain chain) {
-        if (hierarchy == null) {
-            return "";
-        }
+        if (hierarchy == null) return "";
         for (ChainHop hop : chain.hops()) {
             if (hop.kind() == HopKind.ENTRY && hop.desc() != null) {
                 var ci = hierarchy.classInfo(hop.fromOwner());
@@ -246,71 +176,43 @@ public final class SarifReporter {
         return "\n";
     }
 
-    /** PR 去重指纹：rule×入口×sink 的稳定摘要（路径变体不产生新指纹）。 */
     private static String fingerprint(Chain chain, String ruleId) {
         String src = resultIdentity(chain, ruleId);
         try {
             byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
                     .digest(src.getBytes(StandardCharsets.UTF_8));
             StringBuilder hex = new StringBuilder();
-            for (int i = 0; i < 8; i++) {
-                hex.append(String.format("%02x", digest[i]));
-            }
+            for (int i = 0; i < 8; i++) hex.append(String.format("%02x", digest[i]));
             return hex.toString();
         } catch (java.security.NoSuchAlgorithmException e) {
             throw new IllegalStateException("required SHA-256 digest unavailable", e);
         }
     }
 
-    /** driver.rules：sink 规则全量声明（result 引用的 ruleId 须在此，GitHub 渲染依赖）。 */
     private String rulesArray() {
-        if (ruleSet == null) {
-            return "";
-        }
+        if (ruleSet == null) return "";
         List<String> rules = new ArrayList<>();
         Set<String> ids = new HashSet<>();
         for (var rule : ruleSet.sinks()) {
-            if (!ids.add(rule.id())) {
-                continue;
+            if (ids.add(rule.id())) {
+                rules.add("{\"id\": \"" + escape(rule.id())
+                        + "\", \"shortDescription\": {\"text\": \""
+                        + escape(rule.category()) + "\"}}");
             }
-            rules.add("{\"id\": \"" + escape(rule.id()) + "\", \"shortDescription\": {\"text\": \""
-                    + escape(rule.category()) + "\"}}");
         }
         return String.join(",", rules);
     }
 
-    private static String escape(String s) {
-        if (s == null) {
-            return "";
-        }
-        return s.replace("\\", "\\\\").replace("\"", "\\\"")
-                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
-    }
-
-    private static Map<String, VerificationSummary.ChainResult> verificationByKey(
-            VerificationSummary verification) {
-        if (verification == null || verification.results().isEmpty()) {
-            return Map.of();
-        }
-        Map<String, VerificationSummary.ChainResult> result = new java.util.HashMap<>();
-        for (VerificationSummary.ChainResult item : verification.results()) {
-            result.putIfAbsent(item.chainKey(), item);
-        }
-        return result;
-    }
-
     private static String resultIdentity(Chain chain, String ruleId) {
-        return ruleId + "|" + chain.category() + "|" + chain.entryClass() + "|" + chain.entryMethod()
-                + "|" + entryDescriptor(chain) + "|" + chain.entryKind()
-                + "|" + chain.sinkClass() + "|" + chain.sinkMethod()
-                + "|" + sinkDescriptor(chain) + "|" + chain.sinkRole();
+        return ruleId + "|" + chain.category() + "|" + chain.entryClass() + "|"
+                + chain.entryMethod() + "|" + entryDescriptor(chain) + "|" + chain.entryKind()
+                + "|" + chain.sinkClass() + "|" + chain.sinkMethod() + "|"
+                + sinkDescriptor(chain) + "|" + chain.sinkRole();
     }
 
     private static String entryDescriptor(Chain chain) {
         for (ChainHop hop : chain.hops()) {
-            if (hop.kind() == HopKind.ENTRY && hop.desc() != null) {
-                return hop.desc();
-            }
+            if (hop.kind() == HopKind.ENTRY && hop.desc() != null) return hop.desc();
         }
         return "";
     }
@@ -321,9 +223,7 @@ public final class SarifReporter {
         }
         for (ChainHop hop : chain.hops()) {
             if (chain.sinkClass().equals(hop.toOwner()) && chain.sinkMethod().equals(hop.toName())
-                    && hop.desc() != null && !hop.desc().isEmpty()) {
-                return hop.desc();
-            }
+                    && hop.desc() != null && !hop.desc().isEmpty()) return hop.desc();
         }
         return "";
     }
@@ -331,5 +231,11 @@ public final class SarifReporter {
     private static String jsonArray(List<String> items) {
         return "[" + items.stream().map(i -> "\"" + escape(i) + "\"")
                 .reduce((a, b) -> a + "," + b).orElse("") + "]";
+    }
+
+    private static String escape(String value) {
+        if (value == null) return "";
+        return value.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
     }
 }

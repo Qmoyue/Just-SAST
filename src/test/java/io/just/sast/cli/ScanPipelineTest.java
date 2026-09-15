@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 端到端用户流：源码 → 内存编译 → jar → CLI 扫描 → CSV 断言。
+ * 端到端用户流：源码 → 内存编译 → jar → CLI 扫描 → canonical report.json 断言。
  * 覆盖：readObject 入口链检出、equals 无触发链被剪枝、框架桥接中间路径、SafeConfig 顺序抑制。
  */
 class ScanPipelineTest {
@@ -154,15 +154,17 @@ class ScanPipelineTest {
                 Map.of("app.Gadget", GADGET, "app.EqGadget", EQ_GADGET));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        String calibrations = Files.readString(out.resolve("evidence").resolve("calibrations.csv"));
+        String findings = Files.readString(out.resolve("report.json"));
+        String findingOutput = Files.readString(out.resolve("meta").resolve("finding-output.json"));
         // 正向链：app/Gadget.readObject → Runtime.exec（rule JUST-SINK-COMMAND-EXEC-RUNTIME）
-        assertTrue(findings.contains("app/Gadget,readObject") && findings.contains("java/lang/Runtime,exec"),
+        assertTrue(containsMember(findings, "app/Gadget", "readObject")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "readObject 链应检出：\n" + findings);
-        // equals 入口无反序列化可达触发者：链被剪枝（no-trigger）而非上报
-        assertTrue(calibrations.contains("app/EqGadget") && calibrations.contains("no-trigger"),
-                "无触发 equals 链应进 calibrations.csv：\n" + calibrations);
-        assertFalse(findings.contains("app/EqGadget,equals"), "被剪枝链不得出现在 findings");
+        // equals 入口无反序列化可达触发者：保留为静态校准候选，但不导出。
+        assertTrue(findingOutput.contains("\"entry_class\":\"app/EqGadget\"")
+                        && findingOutput.contains("\"calibration\":\"no-trigger\"")
+                        && findingOutput.contains("\"exported\":false"),
+                "无触发 equals 链应保留 no-trigger 静态校准证据：\n" + findingOutput);
     }
 
     @Test
@@ -198,13 +200,12 @@ class ScanPipelineTest {
 
         ScanPipeline.ScanResult result = ScanPipeline.run(jar, null, tmp.resolve("out"), null,
                 false, true, null);
-        String findings = Files.readString(tmp.resolve("out").resolve("findings")
-                .resolve("findings.csv"));
+        String findings = Files.readString(tmp.resolve("out").resolve("report.json"));
 
-        assertTrue(findings.contains("app/ReachableGuard,readObject")
-                        && findings.contains("java/lang/Runtime,exec"),
+        assertTrue(containsMember(findings, "app/ReachableGuard", "readObject")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "a false String guard must retain the reachable sink path:\n" + findings);
-        assertFalse(findings.contains("app/UnreachableGuard,readObject"),
+        assertFalse(containsMember(findings, "app/UnreachableGuard", "readObject"),
                 "an exact true String guard must remove only its impossible sink path");
         assertTrue(result.stats().metric("filter_rejections", 0L) > 0L,
                 "the report must expose that a bounded filter rejected a normal CFG edge");
@@ -250,9 +251,9 @@ class ScanPipelineTest {
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/SourceApp,run")
-                        && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/SourceApp", "run")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "deserialize source 的返回值应作为前向污点入口闭合到 sink:\n" + findings);
     }
 
@@ -312,10 +313,10 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Entry,readObject")
-                        && findings.contains("java/lang/Class,newInstance")
-                        && findings.contains("app/Loader.defineClass"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Entry", "readObject")
+                        && containsMember(findings, "java/lang/Class", "newInstance")
+                        && containsMember(findings, "app/Loader", "defineClass"),
                 "继承 ClassLoader 方法的 return model 应接到后续 Class.newInstance：\n" + findings);
     }
 
@@ -378,12 +379,12 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Mixed,readObject")
-                        && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Mixed", "readObject")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "the real deserialize entry should remain analyzable in a mixed-direction flow:\n"
                         + findings);
-        assertFalse(findings.contains("fake/Serializer,write"),
+        assertFalse(containsMember(findings, "fake/Serializer", "write"),
                 "serialize-only source must not create an external deserialize path:\n" + findings);
     }
 
@@ -441,11 +442,11 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Bean,setCommand")
-                        && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Bean", "setCommand")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "deserialize source 应建立通用 setter 输入边界：\n" + findings);
-        assertFalse(findings.contains("app/Unrelated,run"),
+        assertFalse(containsMember(findings, "app/Unrelated", "run"),
                 "普通公共方法不能仅因存在 source 就被泛化为外部输入：\n" + findings);
     }
 
@@ -498,12 +499,11 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Trigger,readObject")
-                        && findings.contains("app/Trigger.readObject")
-                        && findings.contains("app/ExternalHandler.invoke")
-                        && findings.contains("java/util/List.iterator")
-                        && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Trigger", "readObject")
+                        && containsMember(findings, "app/ExternalHandler", "invoke")
+                        && containsMember(findings, "java/util/List", "iterator")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "外部组装的可序列化 JDK Proxy 应闭合到 handler sink，并保留容器元素桥接证据：\n"
                         + findings);
     }
@@ -584,10 +584,10 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/HandleGadget,readObject")
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/HandleGadget", "readObject")
                         && findings.contains("T-METHODHANDLE-SINK")
-                        && findings.contains("app/Sinks,fire"),
+                        && containsMember(findings, "app/Sinks", "fire"),
                 "MethodHandle 的 static/virtual/constructor lookup 应将直接参数投影到精确 sink：\n"
                         + findings);
     }
@@ -630,9 +630,9 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertFalse(findings.contains("app/UnconnectedHandler,invoke")
-                        || findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertFalse(containsMember(findings, "app/UnconnectedHandler", "invoke")
+                        || containsMember(findings, "java/lang/Runtime", "exec"),
                 "没有反序列化入口或实际 proxy callback 的 handler 不能成为独立污点根：\n"
                         + findings);
     }
@@ -710,12 +710,11 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Trigger,readObject")
-                        && findings.contains("app/Trigger.readObject")
-                        && findings.contains("app/ExternalHandler.invoke")
-                        && findings.contains("java/util/List.iterator")
-                        && findings.contains("cn/hutool/core/util/ObjectUtil,deserialize"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Trigger", "readObject")
+                        && containsMember(findings, "app/ExternalHandler", "invoke")
+                        && containsMember(findings, "java/util/List", "iterator")
+                        && containsMember(findings, "cn/hutool/core/util/ObjectUtil", "deserialize"),
                 "Hutool Convert 的 return←arg1 摘要应把外部 Proxy 输入带到二次反序列化 sink，"
                         + "并保留容器元素桥接证据：\n" + findings);
     }
@@ -775,9 +774,9 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Entry,readObject")
-                        && findings.contains("fake/Sink,fire"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Entry", "readObject")
+                        && containsMember(findings, "fake/Sink", "fire"),
                 "已被框架边界预纳入的方法仍应在真实入口抵达后展开：\n" + findings);
     }
 
@@ -853,10 +852,10 @@ class ScanPipelineTest {
 
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/Trigger,readObject")
-                        && findings.contains("app/MapHandler.invoke")
-                        && findings.contains("fake/ObjectUtil,deserialize"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/Trigger", "readObject")
+                        && containsMember(findings, "app/MapHandler", "invoke")
+                        && containsMember(findings, "fake/ObjectUtil", "deserialize"),
                 "外部序列化 Proxy handler 应将 Map 字段值传递到二次反序列化 sink：\n" + findings);
     }
 
@@ -913,9 +912,9 @@ class ScanPipelineTest {
         Files.writeString(rulesFile, rules);
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/ArrayGadget,readObject")
-                        && findings.contains("app/Sinks,accept"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/ArrayGadget", "readObject")
+                        && containsMember(findings, "app/Sinks", "accept"),
                 "Class.getDeclaredMethods()[i] 应在有界 Class 元数据下恢复目标方法并传递参数：\n"
                         + findings);
     }
@@ -983,16 +982,18 @@ class ScanPipelineTest {
         Files.write(rulesFile, rules.getBytes(StandardCharsets.UTF_8));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
+        String findings = Files.readString(out.resolve("report.json"));
         // UnsafeApp：入口链保留，且框架管线中间跳（Fw.load → Fw.run → Method.invoke）保留
-        assertTrue(findings.contains("app/UnsafeApp,readObject"), "未安全配置的入口链应上报：\n" + findings);
-        assertTrue(findings.contains("fake/Fw.run"), "管线中间跳应保留：\n" + findings);
-        // SafeApp：先 lock 后 load → safe-config 抑制
-        assertFalse(findings.contains("app/SafeApp,readObject"),
-                "安全配置先于入口的链应被抑制：\n" + findings);
-        String calibrations = Files.readString(out.resolve("evidence").resolve("calibrations.csv"));
-        assertTrue(calibrations.contains("app/SafeApp") && calibrations.contains("safe-config"),
-                "抑制理由应进 calibrations.csv：\n" + calibrations);
+        assertTrue(findings.contains("app/UnsafeApp") && findings.contains("\"method\":\"readObject\""),
+                "未安全配置的入口链应上报：\n" + findings);
+        assertTrue(containsMember(findings, "fake/Fw", "run"), "管线中间跳应保留：\n" + findings);
+        // SafeApp：先 lock 后 load → 保留为静态候选但不导出；校准理由在 typed snapshot 中。
+        assertTrue(findings.contains("app/SafeApp") && findings.contains("\"exported\":false"),
+                "安全配置先于入口的链应以静态候选保留但不导出：\n" + findings);
+        String findingOutput = Files.readString(out.resolve("meta").resolve("finding-output.json"));
+        assertTrue(findingOutput.contains("\"entry_class\":\"app/SafeApp\"")
+                        && findingOutput.contains("\"calibration\":\"safe-config\""),
+                "抑制理由应进入 canonical finding-output：\n" + findingOutput);
     }
 
     @Test
@@ -1005,7 +1006,7 @@ class ScanPipelineTest {
         Path output = tmp.resolve("out");
         String metadata = Files.readString(output.resolve("meta").resolve("scan-metadata.json"));
         assertTrue(metadata.contains("\"completeness\"")
-                        && metadata.contains("\"verification\":\"")
+                        && !metadata.contains("verification")
                         && metadata.contains("\"phase_ms\"")
                         && metadata.contains("dependency_resolution")
                         && metadata.contains("\"dependency_resolution_ms\"")
@@ -1015,25 +1016,33 @@ class ScanPipelineTest {
                         && metadata.contains("\"report_ms\"")
                         && metadata.contains("\"total_wall_ms\"")
                         && metadata.contains("\"metric_status\""),
-                "扫描元数据必须公开完整性、验证模式和分段耗时：\n" + metadata);
+                "扫描元数据必须公开完整性、静态筛选和分段耗时：\n" + metadata);
         String dependencies = Files.readString(output.resolve("evidence")
                 .resolve("dependencies.csv"));
         assertTrue(dependencies.contains("application")
                         && Files.exists(output.resolve("meta").resolve("dependencies.sbom.json")),
                 "依赖报告必须来自扫描阶段冻结的实际制品图：\n" + dependencies);
         assertTrue(Files.exists(output.resolve("index.md"))
-                        && Files.exists(output.resolve("findings").resolve("findings.md"))
-                        && Files.exists(output.resolve("verification").resolve("payload.json"))
-                        && Files.exists(output.resolve("verification").resolve("payload.md")),
-                "生产扫描必须生成根索引和分类后的阅读产物");
+                        && Files.exists(output.resolve("report.json"))
+                        && Files.exists(output.resolve("report.md"))
+                        && Files.exists(output.resolve("meta").resolve("finding-output.json"))
+                        && !Files.exists(output.resolve("verification")),
+                "生产扫描必须生成单一静态报告和可追溯快照");
         String index = Files.readString(output.resolve("index.md"));
-        assertTrue(index.contains("[Payload review](verification/payload.md)")
-                        && index.contains("[Dynamic verification](verification/dynamic-verification.json)")
+        assertTrue(!index.contains("Payload")
+                        && !index.contains("verification")
                         && index.contains("| Dependency resolution | ")
                         && index.contains("| Network download wall | ")
                         && index.contains("| Bounded filter | ")
                         && index.contains("| Total wall | ")
                         && index.contains("| Dependency sources | "),
                 "根索引必须暴露人类/agent 两条阅读入口：\n" + index);
+    }
+
+    private static boolean containsMember(String report, String owner, String method) {
+        String member = owner + "#" + method;
+        return report.contains("\"class\":\"" + owner + "\",\"method\":\"" + method + "\"")
+                || report.contains("\"from\":\"" + member + "\"")
+                || report.contains("\"to\":\"" + member + "\"");
     }
 }

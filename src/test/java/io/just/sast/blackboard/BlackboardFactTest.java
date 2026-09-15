@@ -68,23 +68,8 @@ class BlackboardFactTest {
         assertThrows(UnsupportedOperationException.class,
                 () -> bb.productProducers().get(RunProduct.ANALYSIS_CHAINS).clear());
 
-        bb.publishProduct(RunProduct.VERIFICATION_RESULTS, "verify", Phase.CALIBRATION);
-        assertThrows(IllegalStateException.class,
-                () -> bb.publishProduct(RunProduct.VERIFICATION_RESULTS, "other", Phase.CALIBRATION));
-    }
-
-    @Test
-    void legacyVerificationStatusIsOnlyAProjectionOfTheSummaryOwner() {
-        Blackboard bb = empty();
-        bb.setVerificationStatus("UNTESTABLE");
-        assertEquals("UNTESTABLE", bb.verificationStatus());
-        assertEquals("UNTESTABLE", bb.verificationSummary().capability());
-
-        VerificationSummary detailed = VerificationSummary.empty("READY", 3);
-        bb.setVerificationSummary(detailed);
-        bb.setVerificationStatus("TIMEOUT");
-        assertEquals("TIMEOUT", bb.verificationSummary().capability());
-        assertEquals(detailed.results(), bb.verificationSummary().results());
-        assertEquals(3, bb.verificationSummary().budget());
+        bb.publishProduct(RunProduct.ANALYSIS_CHAINS, "other-phase", Phase.COMPOSITION);
+        assertEquals(Set.of("backward-taint", "forward-taint", "other-phase"),
+                bb.productProducers().get(RunProduct.ANALYSIS_CHAINS));
     }
 }

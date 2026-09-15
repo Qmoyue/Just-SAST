@@ -72,10 +72,9 @@ class ApplicationPathReportContractTest {
                 Map.of(appChain.value(), join), Map.of(), Map.of(key, "JOINED"), List.of());
         FindingState state = new FindingState(FindingState.EntryStatus.EXTERNAL_ENTRY,
                 FindingState.ChainProgress.IMPACT_CHAIN_COMPLETE, FindingState.Feasibility.SAT,
-                FindingState.Completeness.COMPLETE, FindingState.Verification.NOT_ATTEMPTED,
-                FindingState.Risk.HIGH);
+                FindingState.Completeness.COMPLETE, FindingState.Risk.HIGH);
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                List.of(chain), Map.of(), Map.of(), null, Map.of(key, state), true, evidence);
+                List.of(chain), Map.of(), Map.of(), Map.of(key, state), true, evidence);
         ReportLayout layout = ReportLayout.create(tmp.resolve("report"));
 
         new FindingOutputWriter().write(layout, snapshot);

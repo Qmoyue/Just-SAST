@@ -1095,7 +1095,7 @@ rules:
 
   # Declarative object-shape evidence for the Spring AOP / Jackson node variant commonly
   # used with a JDK 17 RMI return path.  The plan describes only allocations, field slots and
-  # an inert JDK proxy; the verifier never serializes attacker-supplied bytes or executes the
+  # an inert JDK proxy; static analysis never serializes attacker-supplied bytes or executes the
   # TemplatesImpl body.  Keeping this in rule data lets other applications reuse the same
   # fragment without a class/package/benchmark branch in production code.
   - id: FRAG-JDK-EVENTLISTENER-SPRING-TEMPLATES

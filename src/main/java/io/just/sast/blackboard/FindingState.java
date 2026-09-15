@@ -7,17 +7,14 @@ import java.util.Objects;
 /**
  * The six independent axes of a product finding.
  *
- * <p>This is the typed seam for the state migration.  It is deliberately not
- * derived from report prose or verifier notes.  A dynamic failure/unknown is
- * evidence about the attempted segment, not a licence to erase a statically
- * proven application chain.</p>
+ * <p>This is the typed seam for the static finding contract. It is deliberately not
+ * derived from report prose or free-form notes.</p>
  */
 public record FindingState(
         EntryStatus entryStatus,
         ChainProgress chainProgress,
         Feasibility feasibility,
         Completeness completeness,
-        Verification verification,
         Risk risk) {
 
     /** Whether an execution root belongs to the target application and has external control. */
@@ -62,7 +59,7 @@ public record FindingState(
         }
     }
 
-    /** Constraint result is independent from completeness and dynamic verification. */
+    /** Constraint result is independent from completeness. */
     public enum Feasibility {
         SAT,
         UNSAT,
@@ -81,23 +78,6 @@ public record FindingState(
 
         public static Completeness parse(String value) {
             return parseEnum("completeness", value, Completeness.class);
-        }
-    }
-
-    /** Dynamic evidence is additive; UNKNOWN/FAILED must not refute static facts. */
-    public enum Verification {
-        NOT_REQUESTED,
-        NOT_ATTEMPTED,
-        DYNAMIC_SEGMENT_CONFIRMED,
-        DYNAMIC_BOUNDARY_CONFIRMED,
-        SAFE_TERMINAL_CONFIRMED,
-        CONTRADICTION_OBSERVED,
-        UNKNOWN,
-        FAILED,
-        UNSUPPORTED;
-
-        public static Verification parse(String value) {
-            return parseEnum("verification", value, Verification.class);
         }
     }
 
@@ -133,7 +113,6 @@ public record FindingState(
         chainProgress = Objects.requireNonNull(chainProgress, "chainProgress");
         feasibility = Objects.requireNonNull(feasibility, "feasibility");
         completeness = Objects.requireNonNull(completeness, "completeness");
-        verification = Objects.requireNonNull(verification, "verification");
         risk = Objects.requireNonNull(risk, "risk");
     }
 
@@ -162,9 +141,6 @@ public record FindingState(
         }
         if (risk == Risk.NONE) {
             return Eligibility.RISK_NOT_ACTIONABLE;
-        }
-        if (verification == Verification.CONTRADICTION_OBSERVED) {
-            return Eligibility.CONSTRAINTS_UNSAT;
         }
         return Eligibility.ELIGIBLE_APPLICATION_CHAIN;
     }
@@ -212,9 +188,6 @@ public record FindingState(
         } else if (risk == Risk.NONE) {
             errors.add("RISK_NOT_ACTIONABLE");
         }
-        if (verification == Verification.CONTRADICTION_OBSERVED) {
-            errors.add("CONTRADICTION_OBSERVED");
-        }
         return List.copyOf(errors);
     }
 
@@ -233,13 +206,12 @@ public record FindingState(
      * and local; future producers must construct FindingState directly.
      */
     public static FindingState fromLegacy(String entry, String progress, String feasible,
-                                           String complete, String verification, String risk) {
+                                           String complete, String risk) {
         return new FindingState(
                 EntryStatus.parse(entry),
                 ChainProgress.parse(progress),
                 Feasibility.parse(feasible),
                 Completeness.parse(complete),
-                Verification.parse(verification),
                 Risk.parse(risk));
     }
 

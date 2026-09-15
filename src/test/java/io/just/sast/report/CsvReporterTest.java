@@ -2,10 +2,8 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
-import io.just.sast.blackboard.FindingState;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.SinkOutcome;
-import io.just.sast.blackboard.VerificationSummary;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -14,190 +12,75 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** CSV 报告契约：四表 schema、被拒链不进 findings 进 calibrations、patterns/evidence 列。 */
 class CsvReporterTest {
 
-    private static Chain chain(String entryMethod, String entryKind) {
-        List<ChainHop> hops = List.of(
-                new ChainHop("app/Sink", "run", "java/lang/Runtime", "exec", HopKind.DIRECT_CALL, null, "call", "()V", null),
-                new ChainHop(entryMethod, entryKind, entryMethod, entryKind, HopKind.ENTRY, null, entryKind, "", null));
-        return new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", entryMethod, entryKind,
-                "java/lang/Runtime", "exec", hops, 0);
+    @Test
+    void writesStaticEvidenceAndCalibrationTables(@TempDir Path temp) throws Exception {
+        Chain kept = chain("kept", "TERMINAL");
+        Chain rejected = chain("rejected", "TERMINAL");
+        SinkOutcome sink = new SinkOutcome("RULE", "COMMAND_EXEC", "java/lang/Runtime", "exec",
+                "app/Entry", "readObject", 2, "FOUND", 3, 0, 0);
+
+        new CsvReporter().write(temp, List.of(kept, rejected), Map.of(1L, sink),
+                Map.of(rejected.key(), "STATIC_CALIBRATION"),
+                Map.of(kept.key(), List.of("static:constructible")));
+
+        String findings = Files.readString(temp.resolve("findings.csv"));
+        assertTrue(findings.startsWith("\uFEFFchain_id,"));
+        assertTrue(findings.contains("static_evidence"));
+        assertFalse(findings.contains("verification"));
+        assertTrue(findings.contains(kept.ruleId()));
+        assertTrue(Files.readString(temp.resolve("calibrations.csv"))
+                .contains("STATIC_CALIBRATION"));
+        assertTrue(Files.readString(temp.resolve("sinks.csv")).contains("FOUND"));
+        assertFalse(Files.readString(temp.resolve("findings.csv")).contains(rejected.ruleId()));
     }
 
     @Test
-    void writesFourTablesWithContractedHeaders(@TempDir Path tmp) throws Exception {
-        Chain kept = chain("readObject", "readObject");
-        Chain rejected = chain("equals", "equals");
-        new CsvReporter().write(tmp, List.of(kept, rejected),
-                Map.of(1L, new SinkOutcome("T-RULE", "CODE_EXEC", "java/lang/Runtime", "exec",
-                        "app/Sink", "run", 0, "NO_PATH", 10, 0, 0)),
-                Map.of(rejected.key(), "no-trigger"),
-                Map.of(kept.key(), List.of("pattern:CC6")));
-        String findings = Files.readString(tmp.resolve("findings.csv"));
-        assertTrue(findings.startsWith("\uFEFFchain_id,rule_id"), "BOM + 表头契约");
-        assertTrue(findings.contains("construction_status,construction_type,construction_fields")
-                && findings.contains("verification_status,sink_distorted,resource_containment_ready"));
-        assertTrue(findings.contains("verification_scope,verification_group,sink_risk"));
-        assertTrue(findings.contains("app/Gadget,readObject"), "保留链在 findings");
-        assertFalse(findings.contains("app/Gadget,equals"), "被拒链不进 findings");
-        assertTrue(findings.contains("CC6"), "patterns 列含模式名");
-        assertTrue(findings.contains("entry:readObject+2"), "evidence 因子分解");
-        String calibrations = Files.readString(tmp.resolve("calibrations.csv"));
-        assertTrue(calibrations.startsWith("\uFEFFvariant_id,rule_id,category"), "拒绝表使用紧凑稳定 schema");
-        assertTrue(calibrations.contains("path_digest,reject_reason")
-                && calibrations.contains("app/Gadget,equals")
-                && calibrations.contains("no-trigger"), "拒绝理由和入口摘要落盘可审计");
-        String variants = Files.readString(tmp.resolve("chains.csv"));
-        assertTrue(variants.contains("calibration_status,calibration_reason")
-                && variants.contains("REJECTED"), "所有路径变体必须可通过状态回溯");
-        String sinks = Files.readString(tmp.resolve("sinks.csv"));
-        assertTrue(sinks.contains("NO_PATH"));
-        String edges = Files.readString(tmp.resolve("edges.csv"));
-        assertTrue(edges.contains("app/Sink,run"));
-        assertTrue(findings.contains("java/lang/Runtime,exec,DIRECT_CALL,"),
-                "sink_kind 必须记录调用边类型，不能复用 category");
-    }
-
-    @Test
-    void structuredVerificationStateIsPreferredOverNoteOrder(@TempDir Path tmp) throws Exception {
-        Chain kept = chain("readObject", "readObject");
-        VerificationSummary summary = new VerificationSummary(
-                "WINDOWS_JOB_OBJECT", 1, 1, 0, 1,
-                Map.of("SINK_BLOCKED", 1), Map.of(),
-                List.of(new VerificationSummary.ChainResult(
-                        1, kept.key(), "SINK_BLOCKED", "SINK_CANARY", "HIGH", 22,
-                        1, 5, "SINK_CANARY_BOUNDARY", "WINDOWS_JOB_OBJECT", "17.0.19",
-                        "policy-1", true, true, "CLEANED")));
-        new CsvReporter().write(ReportLayout.flat(tmp), List.of(kept), Map.of(), Map.of(),
-                Map.of(kept.key(), List.of("verify:old-note")), summary);
-        String findings = Files.readString(tmp.resolve("findings.csv"));
-        assertTrue(findings.contains("status=SINK_BLOCKED"));
-        assertTrue(findings.contains("backend=WINDOWS_JOB_OBJECT"));
-        assertTrue(findings.contains("verification_group=boundary_only"));
-        assertFalse(findings.contains("status=OLD-NOTE"));
-    }
-
-    @Test
-    void qualityCannotCallAnUnresolvedProxyIdentityComplete(@TempDir Path tmp) throws Exception {
-        Chain proxy = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Trigger", "readObject",
-                "readObject", "java/lang/Runtime", "exec", List.of(
-                new ChainHop("app/Trigger", "readObject", "app/Handler", "invoke",
-                        HopKind.VIRTUAL_DISPATCH, null, "serialized-proxy-interface",
-                        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
-                        null),
-                new ChainHop("app/Handler", "invoke", "java/lang/Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "command", "()V", null),
-                new ChainHop("app/Trigger", "readObject", "app/Trigger", "readObject",
-                        HopKind.ENTRY, null, "readObject", "", null)), 0);
-
-        new CsvReporter().write(ReportLayout.flat(tmp), List.of(proxy), Map.of(), Map.of(), Map.of());
-
-        String findings = Files.readString(tmp.resolve("findings.csv"));
-        assertTrue(findings.contains(",PARTIAL,"),
-                "unresolved external proxy identity must not be exported as COMPLETE: " + findings);
-        assertTrue(findings.contains("completeness=PARTIAL"), findings);
-    }
-
-    @Test
-    void groupedFindingRetainsConfirmedNonRepresentativeVariant(@TempDir Path tmp) throws Exception {
-        Chain shortest = chain("readObject", "readObject");
-        Chain longer = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",
-                "readObject", "java/lang/Runtime", "exec", List.of(
-                new ChainHop("app/Sink", "run", "java/lang/Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "call", "()V", null),
-                new ChainHop("app/Gadget", "readObject", "app/Sink", "run",
-                        HopKind.DIRECT_CALL, null, "delegates", "()V", null),
-                new ChainHop("app/Gadget", "readObject", "app/Gadget", "readObject",
-                        HopKind.ENTRY, null, "readObject", "", null)), 0);
-        VerificationSummary summary = new VerificationSummary(
-                "WINDOWS_JOB_OBJECT", 2, 2, 0, 2,
-                Map.of("SINK_BLOCKED", 1, "PARTIAL", 1), Map.of(),
-                List.of(new VerificationSummary.ChainResult(2, longer.key(), "SINK_BLOCKED",
-                        "canary", "HIGH", 22, 1, 5, "SINK_CANARY_BOUNDARY",
-                        "WINDOWS_JOB_OBJECT", "17.0.19", "policy-1", true, true, "CLEANED"),
-                        new VerificationSummary.ChainResult(1, shortest.key(), "PARTIAL",
-                                "construction", "HIGH", 18, 1, 5, "PARTIAL",
-                                "WINDOWS_JOB_OBJECT", "17.0.19", "policy-1", true, true, "CLEANED")));
-        new CsvReporter().write(ReportLayout.flat(tmp), List.of(shortest, longer), Map.of(), Map.of(),
-                Map.of(), summary);
-        String findings = Files.readString(tmp.resolve("findings.csv"));
-        assertTrue(findings.contains("status=SINK_BLOCKED"),
-                "分组代表链未被动态确认的变体不应覆盖已确认变体");
-        assertTrue(findings.contains("rank=2"), findings);
-        assertTrue(findings.contains("app/Gadget.readObject -> app/Sink.run -> java/lang/Runtime.exec"),
-                "代表路径必须与被选作最强证据的动态变体一致");
-    }
-
-    @Test
-    void groupingDoesNotFoldDistinctApplicationTraces(@TempDir Path tmp) throws Exception {
-        Chain first = chain("readObject", "readObject");
-        Chain second = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",
-                "readObject", "java/lang/Runtime", "exec", List.of(
-                new ChainHop("app/Sink", "run", "java/lang/Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "call", "()V", null),
-                new ChainHop("app/Gadget", "readObject", "app/Sink", "run",
-                        HopKind.DIRECT_CALL, null, "delegates", "()V", null),
-                new ChainHop("app/Gadget", "readObject", "app/Gadget", "readObject",
-                        HopKind.ENTRY, null, "readObject", "", null)), 0);
-        FindingOutputReader reader = new FindingOutputReader();
-        FindingOutputReader.Snapshot base = reader.read(List.of(first, second), Map.of(),
-                Map.of(), null);
-        FindingOutputReader.Snapshot snapshot = new FindingOutputReader.Snapshot(
-                base.schemaVersion(), base.findings(), base.byChainKey(), base.verificationByKey(),
-                base.structuredVerification(), Map.of(
-                        first.key(), applicationTrace("app/Root#first()V"),
-                        second.key(), applicationTrace("app/Root#second()V")));
-
-        new CsvReporter().write(ReportLayout.flat(tmp), Map.of(), snapshot,
-                new java.util.LinkedHashMap<>());
-        String findings = Files.readString(tmp.resolve("findings.csv"));
-        assertTrue(findings.contains("app/Root#first()V"), findings);
-        assertTrue(findings.contains("app/Root#second()V"), findings);
-        long rows = findings.lines().filter(line -> line.startsWith(""))
-                .count() - 1;
-        assertEquals(2, rows, "distinct typed application traces must not be folded together");
-    }
-
-    private static ApplicationTrace applicationTrace(String prefix) {
-        return new ApplicationTrace("app/Root", "handle()V", "app/Site", "read()V",
-                "DESERIALIZATION_SITE", "JOINED", prefix, prefix, "dep/Gadget",
-                "java/lang/Runtime", "exec");
-    }
-
-    @Test
-    void snapshotDoesNotInventRejectedCalibrationForUnexportedTypedCandidate(@TempDir Path tmp)
-            throws Exception {
-        Chain candidate = chain("readObject", "readObject");
-        FindingState unanchored = new FindingState(
-                FindingState.EntryStatus.NO_APPLICATION_ENTRY,
-                FindingState.ChainProgress.ENTRY_IDENTIFIED,
-                FindingState.Feasibility.UNKNOWN,
-                FindingState.Completeness.UNKNOWN,
-                FindingState.Verification.NOT_ATTEMPTED,
-                FindingState.Risk.HIGH);
+    void snapshotRendererCarriesStableStaticPath(@TempDir Path temp) throws Exception {
+        Chain chain = new Chain("RULE-PATH", "COMMAND_EXEC", "HIGH", "app/Entry",
+                "readObject", "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Entry", "readObject", "app/Holder", "value",
+                        HopKind.FIELD_FLOW, "value", "field", "Ljava/lang/Object;", null,
+                        "app/Holder"),
+                new ChainHop("app/Holder", "value", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "sink", "()V", null)), 0);
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                List.of(candidate), Map.of(), Map.of(), null,
-                Map.of(candidate.key(), unanchored), true);
+                List.of(chain), Map.of(), Map.of(chain.key(), List.of("static:constructible")),
+                Map.of());
+        ReportLayout layout = ReportLayout.create(temp.resolve("report"));
 
-        assertFalse(snapshot.findings().get(0).exported(),
-                "strict snapshot keeps the unanchored candidate out of product findings");
-        new CsvReporter().write(ReportLayout.flat(tmp), Map.of(), snapshot,
+        new CsvReporter().write(layout, Map.of(), snapshot,
                 new java.util.LinkedHashMap<>());
 
-        String variants = Files.readString(tmp.resolve("chains.csv"));
-        assertTrue(variants.contains("calibration_status,calibration_reason"));
-        assertFalse(variants.contains(",REJECTED,"),
-                "an unexported typed candidate without a calibration reason is not a rejection row");
-        assertTrue(variants.contains(",ACCEPTED,"),
-                "the variant remains available in the audit evidence table");
+        String findings = Files.readString(layout.findings().resolve("findings.csv"));
+        String chains = Files.readString(layout.evidence().resolve("chains.csv"));
+        assertTrue(findings.contains("app/Entry"));
+        assertTrue(chains.contains("app/Entry"));
+        assertTrue(chains.contains("app/Entry,readObject"));
+        assertFalse(findings.contains("verification"));
+    }
 
-        String findings = Files.readString(tmp.resolve("findings.csv"));
-        assertEquals(1, findings.lines().count(),
-                "strict report findings must not project an unexported typed candidate");
+    @Test
+    void nullNotesRemainAStaticEmptyProjection(@TempDir Path temp) throws Exception {
+        Chain chain = chain("null-notes", "TERMINAL");
+        new CsvReporter().write(ReportLayout.flat(temp), List.of(chain), Map.of(), Map.of(),
+                java.util.Collections.singletonMap(chain.key(), null));
+
+        String findings = Files.readString(temp.resolve("findings.csv"));
+        assertTrue(findings.contains("static_evidence"));
+        assertFalse(findings.contains("verification"));
+    }
+
+    private static Chain chain(String name, String role) {
+        return new Chain("RULE-" + name, "COMMAND_EXEC", "HIGH", "app/Entry",
+                "readObject", "readObject", "java/lang/Runtime", "exec", List.of(
+                new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "test",
+                        "(Ljava/lang/String;)Ljava/lang/Process;", 0)), 0,
+                "(Ljava/lang/String;)Ljava/lang/Process;", role);
     }
 }

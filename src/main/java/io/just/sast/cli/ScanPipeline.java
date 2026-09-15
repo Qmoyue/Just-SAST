@@ -27,7 +27,6 @@ import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.DependencyGraph;
 import io.just.sast.model.ProgramUniverse;
 import io.just.sast.report.ConsoleSummary;
-import io.just.sast.report.CsvReporter;
 import io.just.sast.report.ReportIndexWriter;
 import io.just.sast.report.ReportLayout;
 import io.just.sast.report.ReportTransaction;
@@ -49,7 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** 扫描管线编排：frontend → 层次 → CPG/调用图（构建后冻结）→ 黑板（串行三阶段）→ CSV。 */
+/** 扫描管线编排：frontend → 层次 → CPG/调用图（构建后冻结）→ 黑板（串行三阶段）→ report。 */
 public final class ScanPipeline {
 
     /** 反向回溯递归深度上限（内部固定，不暴露参数）。覆盖 ~8 层链（再深需按链一致性做精度门，见 development.md）。 */
@@ -403,10 +402,9 @@ public final class ScanPipeline {
         }
         phaseMs.put("analysis", elapsedMs(analysisStart));
         phaseMs.put("filter", blackboard.originSupport().finiteFilterMs());
-        // The verifier normally publishes this typed product before selecting a plan.  Keep a
-        // report-boundary fallback for callers that omit the calibration source (for example a
-        // custom controller or a future --no-verify execution path): absence must remain an
-        // explicit empty/unknown product, never a renderer-inferred application finding.
+        // The joiner normally publishes this typed product before report assembly. Keep a
+        // report-boundary fallback for callers that omit the application-entry source: absence
+        // must remain an explicit empty/unknown product, never a renderer-inferred finding.
         ApplicationChainEvidence applicationEvidence = latestApplicationChainEvidence(blackboard);
         if (applicationEvidence == null) {
             applicationEvidence = ApplicationChainJoiner.build(blackboard);
@@ -421,7 +419,7 @@ public final class ScanPipeline {
         if (!inputDigest.matched()) {
             inputDigest.reasons().forEach(blackboard::markIncomplete);
         }
-        // The verifier publishes the join before report identity is assembled.  Enrich that
+        // The joiner publishes the application join before report identity is assembled. Enrich that
         // immutable product exactly once with the scan-boundary target digest so every exported
         // application chain can be traced back to the bytes that were analyzed.
         applicationEvidence = applicationEvidence.withArtifactDigest(targetArtifactHash);
@@ -430,8 +428,8 @@ public final class ScanPipeline {
                     List.of("COMPONENT_MODE_KERNEL_ONLY"));
         }
         blackboard.publishFact(applicationEvidence);
-        // Publish one static phase for the performance harness. There is no child verifier
-        // phase, so the complete pre-report interval is static analysis.
+        // Publish one static phase for the performance harness. The complete pre-report
+        // interval is static analysis.
         long preReportMs = elapsedMs(start);
         phaseMs.put("static", Math.max(0L, preReportMs));
 
@@ -444,18 +442,13 @@ public final class ScanPipeline {
         // chain-note map independently.  On a large closure that turned reporting into a
         // repeated synchronization/copy pass without changing any emitted byte.
         // Include calibration-only callback candidates in the audit snapshot.  They never
-        // enter composition/dynamic verification and strict product export still requires the
-        // typed application finding state, but retaining them here preserves an explainable
+        // enter composition and strict product export still requires the typed application
+        // finding state, but retaining them here preserves an explainable
         // no-trigger/rejection row instead of silently dropping a solver observation.
         List<Chain> reportChains = blackboard.reportChains();
         Map<Long, io.just.sast.blackboard.SinkOutcome> reportOutcomes = blackboard.sinkOutcomes();
         Map<String, String> reportCalibrations = blackboard.chainCalibrations();
         Map<String, List<String>> reportNotes = blackboardNotes(blackboard);
-        // The product has one execution policy: static analysis only. Keep the typed summary
-        // for legacy report consumers, but never infer a dynamic attempt from absent facts or
-        // compatibility flags.
-        io.just.sast.blackboard.VerificationSummary reportVerification =
-                io.just.sast.blackboard.VerificationSummary.empty("STATIC_ONLY", 0);
         LinkedHashSet<String> completeness = new LinkedHashSet<>(completenessReasons(load, cpg.graph(),
                 reportOutcomes, blackboard.completenessReasons(), fast, jdkHome, targetFeature));
         if (jdkSource instanceof TargetJdkSource targetJdk) {
@@ -468,41 +461,16 @@ public final class ScanPipeline {
                 scanCompletenessReasons);
         RunOutcome scanOutcome = RunOutcome.forScan(
                 scanCompletenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
-                scanChainProofCompleteness,
-                reportVerification == null ? List.of() : reportVerification.statusCounts().keySet());
+                scanChainProofCompleteness);
         io.just.sast.report.FindingOutputReader.Snapshot findingOutput =
                 new io.just.sast.report.FindingOutputReader().read(
-                        reportChains, reportCalibrations, reportNotes, reportVerification,
+                        reportChains, reportCalibrations, reportNotes,
                         applicationEvidence.states(),
                         modePolicy.requireApplicationJoin(),
                         applicationEvidence);
         long findingOutputStart = System.nanoTime();
         new io.just.sast.report.FindingOutputWriter().write(reportLayout, findingOutput);
         phaseMs.put("report.finding_output", elapsedMs(findingOutputStart));
-        CsvReporter reporter = new CsvReporter();
-        io.just.sast.report.MultiFormatReporter multiFormatReporter = new io.just.sast.report.MultiFormatReporter();
-        reporter.withGraph(cpg.graph());
-        long csvReportStart = System.nanoTime();
-        Map<String, Long> csvTimings = new java.util.LinkedHashMap<>();
-        reporter.write(reportLayout, reportOutcomes, findingOutput, csvTimings);
-        phaseMs.put("report.csv", elapsedMs(csvReportStart));
-        for (Map.Entry<String, Long> timing : csvTimings.entrySet()) {
-            phaseMs.put("report.csv." + timing.getKey(), timing.getValue());
-        }
-        // C1: SARIF 2.1.0 + E1-E3: JSON/HTML/Markdown 多格式输出
-        long sarifReportStart = System.nanoTime();
-        new io.just.sast.report.SarifReporter().withHierarchy(hierarchy).withRules(ruleSet).write(
-                reportLayout, findingOutput, scanOutcome);
-        phaseMs.put("report.sarif", elapsedMs(sarifReportStart));
-        long multiFormatReportStart = System.nanoTime();
-        multiFormatReporter.write(reportLayout, findingOutput);
-        phaseMs.put("report.multi_format", elapsedMs(multiFormatReportStart));
-        long ruleShadowStart = System.nanoTime();
-        new io.just.sast.report.RuleSchemaShadowWriter().write(reportLayout, ruleSet);
-        phaseMs.put("report.rules_v2_shadow", elapsedMs(ruleShadowStart));
-        long findingShadowStart = System.nanoTime();
-        new io.just.sast.report.FindingShadowWriter().write(reportLayout, findingOutput);
-        phaseMs.put("report.findings_v2_shadow", elapsedMs(findingShadowStart));
         long inputDigestReportStart = System.nanoTime();
         new io.just.sast.report.InputDigestWriter().write(reportLayout, inputDigest);
         phaseMs.put("report.input_digest", elapsedMs(inputDigestReportStart));
@@ -511,10 +479,6 @@ public final class ScanPipeline {
                 applicationEvidence);
         phaseMs.put("report.application_chain_evidence",
                 elapsedMs(applicationEvidenceReportStart));
-        long payloadReportStart = System.nanoTime();
-        new io.just.sast.report.PayloadPlanWriter().write(reportLayout, reportChains,
-                reportCalibrations, reportNotes, reportVerification);
-        phaseMs.put("report.payload", elapsedMs(payloadReportStart));
         long inventoryStart = System.nanoTime();
         String dependencyInventoryHash = new io.just.sast.report.DependencyInventoryWriter()
                 .write(reportLayout, dependencyGraph, targetArtifactHash);
@@ -548,7 +512,7 @@ public final class ScanPipeline {
         Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes = reportOutcomes;
         GcSnapshot gcDelta = gcSnapshot().delta(gcStarted);
         ScanMetricCapture metricCapture = scanMetricCapture(cpg, blackboard, reportChains,
-                reportNotes, reportVerification, parentCpuStarted, entryCount, phaseMs, gcDelta,
+                reportNotes, parentCpuStarted, entryCount, phaseMs, gcDelta,
                 applicationEvidence, dependencyGraph, dependencyPreparation, totalWallMs);
         ScanStatistics scanStats = new ScanStatistics(
                 load.filesScanned(), load.classCount(), load.diagnosticCount(),
@@ -558,12 +522,10 @@ public final class ScanPipeline {
                 heapPeakMb(),
                 scanCompletenessReasons.isEmpty() ? "COMPLETE" : "PARTIAL",
                 scanCompletenessReasons, phaseMs, metricCapture.values(),
-                "STATIC_ONLY",
-                io.just.sast.blackboard.VerificationSummary.empty("STATIC_ONLY", 0),
                 scanChainProofCompleteness,
                 targetArtifactHash, metricCapture.status(), metricCapture.namespaces(),
                 metricCapture.namespaceStatus(), blackboard.originSupport().finiteFilterEvidence());
-        multiFormatReporter.writeMetadata(reportLayout, scanStats);
+        new io.just.sast.report.MultiFormatReporter().writeMetadata(reportLayout, scanStats);
         new ReportIndexWriter().write(reportLayout, scanStats);
         new io.just.sast.report.ConciseReportWriter().write(reportLayout,
                 modePolicy.wireName(),
@@ -718,8 +680,8 @@ public final class ScanPipeline {
             reasons.add("FAST_MODE");
         }
         if (jdkHome != null && targetFeature <= 0) {
-            // Multi-release selection and verifier runtime choice cannot be called target
-            // accurate when an external image exposes no readable feature metadata.
+            // Multi-release selection cannot be called target accurate when an external image
+            // exposes no readable feature metadata.
             reasons.add("JDK_FEATURE_UNKNOWN");
         }
         if (load.diagnosticCount() > 0) {
@@ -846,7 +808,6 @@ public final class ScanPipeline {
     private static ScanMetricCapture scanMetricCapture(BuiltCpg cpg, Blackboard blackboard,
                                                        List<Chain> chains,
                                                        Map<String, List<String>> chainNotes,
-                                                       io.just.sast.blackboard.VerificationSummary verification,
                                                        long parentCpuStarted,
                                                        int entryCandidates,
                                                        Map<String, Long> phaseMs,
@@ -857,7 +818,7 @@ public final class ScanPipeline {
                                                        long totalWallMs) {
         ForwardRunMetrics forward = latestForwardMetrics(blackboard);
         Map<String, Long> metrics = scanMetrics(cpg, blackboard, chains, chainNotes,
-                verification, parentCpuStarted, forward);
+                parentCpuStarted, forward);
         List<Chain> observedChains = chains == null ? List.of() : chains;
         long unresolved = observedChains.stream().filter(chain -> chain.unresolvedHops() > 0).count();
         long structurallyComplete = observedChains.stream()
@@ -988,8 +949,6 @@ public final class ScanPipeline {
                 blackboard.originSupport().forwardOriginCacheHits());
         addPassTelemetry(metrics, phaseMs, "calibration", "blackboard.calibration", -1L);
         addPassTelemetry(metrics, phaseMs, "composition", "blackboard.composition", -1L);
-        addPassTelemetry(metrics, phaseMs, "verification", "verify",
-                verification == null ? -1L : verification.selected());
         addPassTelemetry(metrics, phaseMs, "report", "report", 0L);
         // A negative value is the stable numeric representation of UNKNOWN.  Its availability
         // is recorded separately below and consumers must not coerce it to zero.
@@ -1060,7 +1019,6 @@ public final class ScanPipeline {
         addPassTelemetryStatus(status, metrics, phaseMs, "analysis", "analysis", true);
         addPassTelemetryStatus(status, metrics, phaseMs, "calibration", "blackboard.calibration", false);
         addPassTelemetryStatus(status, metrics, phaseMs, "composition", "blackboard.composition", false);
-        addPassTelemetryStatus(status, metrics, phaseMs, "verification", "verify", true);
         addPassTelemetryStatus(status, metrics, phaseMs, "report", "report", true);
 
         Map<String, Long> application = new java.util.LinkedHashMap<>();
@@ -1181,7 +1139,6 @@ public final class ScanPipeline {
     private static Map<String, Long> scanMetrics(BuiltCpg cpg, Blackboard blackboard,
                                                  List<Chain> chains,
                                                  Map<String, List<String>> chainNotes,
-                                                 io.just.sast.blackboard.VerificationSummary verification,
                                                  long parentCpuStarted,
                                                  ForwardRunMetrics forward) {
         Map<String, Long> metrics = new java.util.LinkedHashMap<>();
@@ -1210,25 +1167,7 @@ public final class ScanPipeline {
                 metrics.put(name, -1L);
             }
         }
-        verification = verification == null ? blackboard.verificationSummary() : verification;
-        metrics.put("verification_constructible", (long) verification.constructible());
-        metrics.put("verification_rejected", (long) verification.rejected());
-        metrics.put("verification_construction_deferred", (chains == null ? List.<Chain>of() : chains).stream()
-                .map(chain -> chainNotes == null ? List.<String>of()
-                        : chainNotes.getOrDefault(chain.key(), List.of()))
-                .filter(notes -> notes.contains("verify:construction-deferred"))
-                .count());
-        metrics.put("verification_selected", (long) verification.selected());
-        metrics.put("verification_results", (long) verification.results().size());
-        metrics.put("verification_attempts", verification.results().stream()
-                .mapToLong(io.just.sast.blackboard.VerificationSummary.ChainResult::attempt).sum());
-        metrics.put("verification_timeouts", (long) verification.statusCounts()
-                .getOrDefault("TIMEOUT", 0));
-        metrics.put("verification_untestable", (long) verification.statusCounts()
-                .getOrDefault("UNTESTABLE", 0));
-        metrics.putAll(blackboard.verificationResourceMetrics());
-        // RSS is optional telemetry. The former implementation obtained it from the removed
-        // Job Object verifier; retaining UNKNOWN is safer than reintroducing that dependency.
+        // RSS is optional telemetry and remains UNKNOWN when the host does not expose it.
         metrics.put("parent_rss_mb", -1L);
         long parentCpuNow = processCpuTimeMs();
         metrics.put("parent_cpu_ms", parentCpuStarted >= 0L && parentCpuNow >= parentCpuStarted
@@ -1408,7 +1347,7 @@ public final class ScanPipeline {
         }
     }
 
-    /** Stable SHA-256 identity used by reports and the dynamic child attestation protocol. */
+    /** Stable SHA-256 identity used by reports and cache keys. */
     private static String artifactHash(Path input) throws IOException {
         return artifactHash(input, InputBudget.defaults());
     }

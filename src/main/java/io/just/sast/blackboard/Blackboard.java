@@ -322,7 +322,7 @@ public final class Blackboard {
     /**
      * Application-owned callback candidates rejected from the default product but retained for
      * calibration-only audit (for example an equals sink with no proven deserialize trigger).
-     * This store is deliberately excluded from composition and dynamic verification.
+     * This store is deliberately excluded from composition and downstream projections.
      */
     private final ChainStore calibrationCandidateStore = new ChainStore();
     private long solverAdmissionInput;
@@ -347,10 +347,6 @@ public final class Blackboard {
     private final Set<String> completenessReasons = ConcurrentHashMap.newKeySet();
     /** Controller phase timings are immutable snapshots at the report boundary. */
     private final Map<String, Long> phaseTimings = new ConcurrentHashMap<>();
-    /** 动态验证正式产物；报告层不得从 stderr 重新推断验证结果。 */
-    private volatile VerificationSummary verificationSummary = VerificationSummary.empty("NOT_RUN", 0);
-    /** Runner resource observations published by the calibration source for report metrics. */
-    private volatile Map<String, Long> verificationResourceMetrics = Map.of();
     private final Deque<Event> queue = new ArrayDeque<>();
 
     public Blackboard(Graph graph, ClassHierarchy hierarchy, FieldWriterIndex fieldWriters,
@@ -811,46 +807,6 @@ public final class Blackboard {
 
     public Map<String, Long> phaseMs() {
         return java.util.Collections.unmodifiableMap(new java.util.TreeMap<>(phaseTimings));
-    }
-
-    /**
-     * Compatibility projection for callers that still report a run capability separately.
-     * The immutable summary remains the only owner of this state.
-     */
-    public synchronized void setVerificationStatus(String status) {
-        verificationSummary = verificationSummary.withCapability(status);
-    }
-
-    public String verificationStatus() {
-        return verificationSummary.capability();
-    }
-
-    public synchronized void setVerificationSummary(VerificationSummary summary) {
-        verificationSummary = summary == null
-                ? VerificationSummary.empty(verificationSummary.capability(), 0)
-                : summary;
-    }
-
-    public VerificationSummary verificationSummary() {
-        return verificationSummary;
-    }
-
-    public void setVerificationResourceMetrics(Map<String, Long> metrics) {
-        if (metrics == null || metrics.isEmpty()) {
-            verificationResourceMetrics = Map.of();
-            return;
-        }
-        Map<String, Long> sorted = new java.util.TreeMap<>();
-        metrics.forEach((name, value) -> {
-            if (name != null && !name.isBlank() && value != null && value >= 0L) {
-                sorted.put(name, value);
-            }
-        });
-        verificationResourceMetrics = java.util.Collections.unmodifiableMap(sorted);
-    }
-
-    public Map<String, Long> verificationResourceMetrics() {
-        return verificationResourceMetrics;
     }
 
     /** 链级注释（gadget 模式标注等），附着到具体链 key。 */

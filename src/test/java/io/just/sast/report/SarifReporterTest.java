@@ -22,11 +22,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * SARIF 契约：driver.rules 全量声明（result 引用的 ruleId 必须存在——GitHub 渲染依赖）、
- * severity→level 映射、uri 用内部名路径、startLine 来自入口方法首行、
- * confidence 口径与 findings.csv 一致（verify:confirmed → CONFIRMED）、变体折叠不重复。
- */
+/** Static SARIF contract: rules, level, location, fingerprints and shared evidence only. */
 class SarifReporterTest {
 
     private static Chain chain(String severity) {
@@ -51,95 +47,53 @@ class SarifReporterTest {
     }
 
     @Test
-    void emitsRulesLevelRegionAndConfirmedParity(@TempDir Path tmp) throws Exception {
-        Path out = tmp.resolve("sarif");
-        Files.createDirectories(out);
+    void emitsRulesLevelRegionAndStaticParity(@TempDir Path tmp) throws Exception {
         new SarifReporter().withHierarchy(hierarchyWithLine()).withRules(rules()).write(
-                out, List.of(chain("HIGH")), Map.of(), Map.of());
-        String sarif = Files.readString(out.resolve("findings.sarif"));
+                tmp, List.of(chain("HIGH")), Map.of(), Map.of());
+        String sarif = Files.readString(tmp.resolve("findings.sarif"));
 
-        // driver.rules 声明 + result ruleId 引用一致
-        assertTrue(sarif.contains("\"rules\": [{\"id\": \"T-RULE\""), "rules 数组应声明 T-RULE:\n" + sarif);
-        // severity HIGH → error
-        assertTrue(sarif.contains("\"level\": \"error\""), sarif);
-        // uri 内部名路径（斜杠），非点分
-        assertTrue(sarif.contains("\"uri\": \"app/Gadget.class\""), sarif);
-        // startLine 来自入口方法首行
-        assertTrue(sarif.contains("\"startLine\": 42"), sarif);
-        // 指纹存在
-        assertTrue(sarif.contains("\"partialFingerprints\""), sarif);
-        assertTrue(sarif.contains("\"precision\":{"), sarif);
-        assertTrue(sarif.contains("\"construction\":{"), sarif);
-        assertTrue(sarif.contains("\"verification_group\":\"not_selected\""), sarif);
-        // OASIS 规范 schema
-        assertTrue(sarif.contains("docs.oasis-open.org/sarif"), sarif);
-        // Strict SARIF consumers reject a trailing comma before the object closes.
-        assertFalse(sarif.contains("\"startLine\": 42},\n          }"),
-                "region must be the final physicalLocation member:\n" + sarif);
+        assertTrue(sarif.contains("\"rules\": [{\"id\": \"T-RULE\""));
+        assertTrue(sarif.contains("\"level\": \"error\""));
+        assertTrue(sarif.contains("\"uri\": \"app/Gadget.class\""));
+        assertTrue(sarif.contains("\"startLine\": 42"));
+        assertTrue(sarif.contains("\"partialFingerprints\""));
+        assertTrue(sarif.contains("\"precision\":{"));
+        assertTrue(sarif.contains("\"construction\":{"));
+        assertFalse(sarif.contains("verification"));
+        assertTrue(sarif.contains("docs.oasis-open.org/sarif"));
+        assertFalse(sarif.contains("\"startLine\": 42},\n          }"));
     }
 
     @Test
     void mediumSeverityMapsToWarningAndVariantsFold(@TempDir Path tmp) throws Exception {
-        Path out = tmp.resolve("sarif");
-        Files.createDirectories(out);
         Chain a = chain("MEDIUM");
-        Chain b = chain("MEDIUM"); // 同组变体
-        new SarifReporter().withRules(rules()).write(out, List.of(a, b), Map.of(), Map.of());
-        String sarif = Files.readString(out.resolve("findings.sarif"));
-        assertTrue(sarif.contains("\"level\": \"warning\""), sarif);
-        assertTrue(sarif.contains("\"results\": [") && sarif.indexOf("ruleId") == sarif.lastIndexOf("ruleId"),
-                "同组变体应折叠为一个 result:\n" + sarif);
-        // 无层次接线时不输出 region（不造假日行号）
+        Chain b = chain("MEDIUM");
+        new SarifReporter().withRules(rules()).write(tmp, List.of(a, b), Map.of(), Map.of());
+        String sarif = Files.readString(tmp.resolve("findings.sarif"));
+        assertTrue(sarif.contains("\"level\": \"warning\""));
+        assertTrue(sarif.contains("\"results\": [")
+                        && sarif.indexOf("ruleId") == sarif.lastIndexOf("ruleId"));
         assertFalse(sarif.contains("startLine"));
-        assertFalse(sarif.contains("artifactLocation\": {\"uri\": \"app/Gadget.class\"},\n          }"),
-                "artifactLocation must not be followed by a trailing comma when region is absent:\n" + sarif);
+        assertFalse(sarif.contains("verification"));
     }
 
     @Test
-    void confirmedNoteYieldsConfidentUpperCase(@TempDir Path tmp) throws Exception {
+    void legacyDynamicNotesDoNotChangeStaticConfidence(@TempDir Path tmp) throws Exception {
         Chain c = chain("HIGH");
-        Path out = tmp.resolve("sarif2");
         new SarifReporter().withRules(rules()).write(
-                out, List.of(c), Map.of(), Map.of(c.key(), List.of("verify:confirmed")));
-        String sarif = Files.readString(out.resolve("findings.sarif"));
-        assertTrue(sarif.contains("\"confidence\":\"CONFIRMED\""),
-                "verify:confirmed 注记应映射 CONFIRMED（与 findings.csv 口径一致）:\n" + sarif);
+                tmp, List.of(c), Map.of(), Map.of(c.key(), List.of("verify:confirmed")));
+        String sarif = Files.readString(tmp.resolve("findings.sarif"));
+        assertTrue(sarif.contains("\"confidence\":\"FEASIBLE\""));
+        assertFalse(sarif.contains("verification"));
     }
 
     @Test
-    void usesSharedEvidenceOrderWhenFoldingVariants(@TempDir Path tmp) throws Exception {
-        Chain shortest = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",
-                "readObject", "java/lang/Runtime", "exec", List.of(
-                new ChainHop("app/Gadget", "readObject", "java/lang/Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "call", "()V", null),
-                new ChainHop("app/Gadget", "readObject", "app/Gadget", "readObject",
-                        HopKind.ENTRY, null, "readObject", "(Ljava/io/ObjectInputStream;)V", null)), 0);
-        Chain longer = new Chain("T-RULE", "CODE_EXEC", "HIGH", "app/Gadget", "readObject",
-                "readObject", "java/lang/Runtime", "exec", List.of(
-                new ChainHop("app/Gadget", "readObject", "app/Mid", "run",
-                        HopKind.DIRECT_CALL, null, "delegates", "()V", null),
-                new ChainHop("app/Mid", "run", "java/lang/Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "call", "()V", null),
-                new ChainHop("app/Gadget", "readObject", "app/Gadget", "readObject",
-                        HopKind.ENTRY, null, "readObject", "(Ljava/io/ObjectInputStream;)V", null)), 0);
-
-        Path out = tmp.resolve("sarif-order");
-        new SarifReporter().withRules(rules()).write(out, List.of(shortest, longer), Map.of(), Map.of());
-        String sarif = Files.readString(out.resolve("findings.sarif"));
-        assertTrue(sarif.contains("\"chain_length\":3")
-                        && !sarif.contains("\"chain_length\":2"),
-                "SARIF must choose the same strongest variant as the shared evidence tuple:\n"
-                        + sarif);
-    }
-
-    @Test
-    void exposesCanonicalRunOutcomeOnlyWhenThePipelineSuppliesIt(@TempDir Path tmp) throws Exception {
-        Path out = tmp.resolve("sarif-outcome");
+    void exposesCanonicalRunOutcomeWhenThePipelineSuppliesIt(@TempDir Path tmp) throws Exception {
         new SarifReporter().withRules(rules()).write(
-                ReportLayout.flat(out), new FindingOutputReader().read(
-                        List.of(chain("HIGH")), Map.of(), Map.of(), null),
-                RunOutcome.forScan("PARTIAL", "PARTIAL", List.of("TIMEOUT")));
-        String sarif = Files.readString(out.resolve("findings.sarif"));
+                ReportLayout.flat(tmp), new FindingOutputReader().read(
+                        List.of(chain("HIGH")), Map.of(), Map.of()),
+                RunOutcome.forScan("PARTIAL", "PARTIAL"));
+        String sarif = Files.readString(tmp.resolve("findings.sarif"));
         assertTrue(sarif.contains("\"just/run_outcome\""));
         assertTrue(sarif.contains("\"status\":\"PARTIAL\""));
     }

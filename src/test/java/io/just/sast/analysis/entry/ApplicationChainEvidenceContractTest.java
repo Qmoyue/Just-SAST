@@ -74,7 +74,7 @@ class ApplicationChainEvidenceContractTest {
         FindingState state = new FindingState(FindingState.EntryStatus.EXTERNAL_ENTRY,
                 FindingState.ChainProgress.IMPACT_CHAIN_COMPLETE,
                 FindingState.Feasibility.SAT, FindingState.Completeness.COMPLETE,
-                FindingState.Verification.NOT_ATTEMPTED, FindingState.Risk.HIGH);
+                FindingState.Risk.HIGH);
         return new ApplicationChainEvidence(ApplicationChainEvidence.SCHEMA_VERSION,
                 "A".repeat(64), "B".repeat(64), true, graph,
                 Map.of(chainId.value(), join), Map.of(chainKey, state),

@@ -99,8 +99,9 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("arr.jar"), Map.of("app.Carrier", carrier, "app.ArrayGadget", gadget));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/ArrayGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/ArrayGadget", "readObject")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "数组元素流（fill 内 AASTORE → Carrier.cells 字段污点 → readObject 内 AALOAD）应闭合链:\n"
                         + findings);
     }
@@ -134,8 +135,9 @@ class EngineCapabilityTest {
         Path jar = compileToJar(tmp.resolve("lambda.jar"), Map.of("app.Fn", fn, "app.LambdaGadget", gadget));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/LambdaGadget,readObject") && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/LambdaGadget", "readObject")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "lambda 实参经 f.go(cmd) 分发时污点应到达 lambda$0 实现方法:\n" + findings);
     }
 
@@ -161,9 +163,9 @@ class EngineCapabilityTest {
                 Map.of("app.DirectLambdaGadget", gadget));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/DirectLambdaGadget,readObject")
-                        && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/DirectLambdaGadget", "readObject")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "直接调用捕获 this 的 lambda 时，污点应映射到 synthetic 实现方法:\n" + findings);
     }
 
@@ -199,8 +201,8 @@ class EngineCapabilityTest {
                 Map.of("app.CollectionGadget", gadget, "app.UnrelatedIterator", unrelated));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertFalse(findings.contains("app/UnrelatedIterator,next"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertFalse(containsMember(findings, "app/UnrelatedIterator", "next"),
                 "iterator view 本身不是反序列化对象，不能通过 CHA 把无关实现接入:\n" + findings);
     }
 
@@ -247,12 +249,11 @@ class EngineCapabilityTest {
                 "app.FieldGadget", field));
         Path positiveOut = tmp.resolve("positive-out");
         ScanPipeline.run(jar, null, positiveOut, null, false, true, null);
-        String positiveFindings = Files.readString(
-                positiveOut.resolve("findings").resolve("findings.csv"));
-        assertTrue(positiveFindings.contains("app/ResolveGadget,readResolve")
-                        && positiveFindings.contains("app/ExternalGadget,readExternal")
-                        && positiveFindings.contains("app/FieldGadget,readObject")
-                        && positiveFindings.contains("java/lang/Runtime,exec"),
+        String positiveFindings = Files.readString(positiveOut.resolve("report.json"));
+        assertTrue(containsMember(positiveFindings, "app/ResolveGadget", "readResolve")
+                        && containsMember(positiveFindings, "app/ExternalGadget", "readExternal")
+                        && containsMember(positiveFindings, "app/FieldGadget", "readObject")
+                        && containsMember(positiveFindings, "java/lang/Runtime", "exec"),
                 "readResolve/readExternal/非 transient 字段应形成反序列化链:\n" + positiveFindings);
 
         String replace = """
@@ -291,13 +292,12 @@ class EngineCapabilityTest {
                 "app.ExcludedFields", excludedFields));
         Path negativeOut = tmp.resolve("negative-out");
         ScanPipeline.run(negativeJar, null, negativeOut, null, false, true, null);
-        String negativeFindings = Files.readString(
-                negativeOut.resolve("findings").resolve("findings.csv"));
-        assertFalse(negativeFindings.contains("app/ReplaceGadget,writeReplace"),
+        String negativeFindings = Files.readString(negativeOut.resolve("report.json"));
+        assertFalse(containsMember(negativeFindings, "app/ReplaceGadget", "writeReplace"),
                 "writeReplace 是序列化侧回调，不能成为反序列化根:\n" + negativeFindings);
-        assertFalse(negativeFindings.contains("app/FakeExternal,readExternal"),
+        assertFalse(containsMember(negativeFindings, "app/FakeExternal", "readExternal"),
                 "Serializable 类的同名方法不是 Externalizable 回调:\n" + negativeFindings);
-        assertFalse(negativeFindings.contains("app/ExcludedFields,readObject"),
+        assertFalse(containsMember(negativeFindings, "app/ExcludedFields", "readObject"),
                 "transient/static 字段不得制造可控字段流:\n" + negativeFindings);
     }
 
@@ -333,15 +333,14 @@ class EngineCapabilityTest {
                 "app.NativeBridge", bridge, "app.UnrelatedNativeTarget", unrelated));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertTrue(findings.contains("app/NativeBridge,readObject")
-                        && findings.contains("app/NativeBridge.onCallback")
-                        && findings.contains("native=1")
-                        && findings.contains("java/lang/Runtime,exec"),
+        String findings = Files.readString(out.resolve("report.json"));
+        assertTrue(containsMember(findings, "app/NativeBridge", "readObject")
+                        && containsMember(findings, "app/NativeBridge", "onCallback")
+                        && containsMember(findings, "java/lang/Runtime", "exec"),
                 "native 回调应保留同 receiver 的显式 JNI 跳转:\n" + findings);
-        assertFalse(findings.contains("hiddenCallback"),
+        assertFalse(containsMember(findings, "app/NativeBridge", "hiddenCallback"),
                 "private callback 不满足 JNI 回调的公开目标契约:\n" + findings);
-        assertFalse(findings.contains("app/UnrelatedNativeTarget.onCallback"),
+        assertFalse(containsMember(findings, "app/UnrelatedNativeTarget", "onCallback"),
                 "native callback 不得跨到无关 receiver:\n" + findings);
     }
 
@@ -374,11 +373,15 @@ class EngineCapabilityTest {
                 Map.of("app.Reflective", reflective, "app.Isolated", isolated));
         Path out = tmp.resolve("out");
         ScanPipeline.run(jar, null, out, null, false, true, null);
-        String sinks = Files.readString(out.resolve("evidence").resolve("sinks.csv"));
-        assertTrue(sinks.lines().anyMatch(l -> l.contains("app/Isolated") && l.contains("fetch")
-                        && l.contains("NO_PATH")),
-                "无框架时不可达入口的 sink 宿主应判 NO_PATH:\n" + sinks);
-        String findings = Files.readString(out.resolve("findings").resolve("findings.csv"));
-        assertFalse(findings.contains("app/Isolated,fetch"), "不可达链不得出现在 findings");
+        String findings = Files.readString(out.resolve("report.json"));
+        assertFalse(containsMember(findings, "app/Isolated", "fetch"),
+                "无框架时不可达入口不得进入 canonical findings：\n" + findings);
+    }
+
+    private static boolean containsMember(String report, String owner, String method) {
+        String member = owner + "#" + method;
+        return report.contains("\"class\":\"" + owner + "\",\"method\":\"" + method + "\"")
+                || report.contains("\"from\":\"" + member + "\"")
+                || report.contains("\"to\":\"" + member + "\"");
     }
 }

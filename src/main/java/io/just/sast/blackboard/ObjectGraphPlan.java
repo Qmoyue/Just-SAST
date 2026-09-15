@@ -6,20 +6,18 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Declarative, bounded object-shape evidence used by the safe verifier.
+ * Declarative, bounded object-shape evidence used by static construction constraints.
  *
- * <p>This is a description of a candidate graph, not a payload.  Nodes are allocated without
- * invoking target constructors by the child probe; proxy nodes are created by the probe's
- * already guarded JDK proxy factory.  Values are deliberately small and typed so a rule cannot
- * smuggle an executable expression into the verifier protocol.</p>
+ * <p>This is a description of a candidate graph, not executable input. Values are deliberately
+ * small and typed so a rule cannot smuggle an expression or instruction into the analysis
+ * contract.</p>
  */
 public record ObjectGraphPlan(List<Node> nodes, List<FieldAssignment> fields) {
 
     /**
-     * Shape-only construction evidence.  It deliberately does not claim that a target class
-     * can be instantiated on the selected JDK: that fact is established by the isolated
-     * verifier.  The summary is nevertheless useful before dynamic verification because it
-     * catches dangling references and field owners without loading or executing target code.
+     * Shape-only construction evidence. It deliberately does not claim that a target class can
+     * be instantiated on the selected JDK. The summary catches dangling references and field
+     * owners without loading or executing target code.
      */
     public record ShapeSummary(int nodeCount, int fieldCount, int referenceCount,
                                int resolvedReferenceCount, int fieldOwnersResolved,
@@ -182,8 +180,8 @@ public record ObjectGraphPlan(List<Node> nodes, List<FieldAssignment> fields) {
                 ownersResolved, ownersUnresolved, stableReasons.isEmpty(), stableReasons);
     }
 
-    /** Stable length-prefixed wire form for the isolated probe. */
-    public String encodedForProbe() {
+    /** Stable length-prefixed canonical form for static construction evidence. */
+    private String canonicalEncoding() {
         StringBuilder out = new StringBuilder("v1;");
         out.append('N').append(nodes.size()).append(';');
         for (Node node : nodes) {
@@ -209,9 +207,9 @@ public record ObjectGraphPlan(List<Node> nodes, List<FieldAssignment> fields) {
         return out.toString();
     }
 
-    /** Human/report identity; the protocol form is already deterministic and bounded. */
+    /** Human/report identity; the canonical form is deterministic and bounded. */
     public String fingerprint() {
-        return encodedForProbe();
+        return canonicalEncoding();
     }
 
     private static void append(StringBuilder out, String value) {

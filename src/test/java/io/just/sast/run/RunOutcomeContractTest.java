@@ -22,9 +22,9 @@ class RunOutcomeContractTest {
 
     @Test
     void scanClassificationSeparatesPartialFromProcessFailure() {
-        RunOutcome complete = RunOutcome.forScan("COMPLETE", "COMPLETE", List.of());
-        RunOutcome partial = RunOutcome.forScan("PARTIAL", "COMPLETE", List.of());
-        RunOutcome unknown = RunOutcome.forScan("COMPLETE", "UNKNOWN", List.of("TIMEOUT"));
+        RunOutcome complete = RunOutcome.forScan("COMPLETE", "COMPLETE");
+        RunOutcome partial = RunOutcome.forScan("PARTIAL", "COMPLETE");
+        RunOutcome unknown = RunOutcome.forScan("COMPLETE", "UNKNOWN");
 
         assertEquals(RunOutcome.Status.SUCCESS, complete.status());
         assertEquals(0, complete.exitCode());
@@ -34,7 +34,7 @@ class RunOutcomeContractTest {
         assertFalse(partial.cacheable());
         assertEquals(SupportStatus.UNKNOWN, unknown.supportStatus());
         assertTrue(unknown.reasonCodes().contains("ANALYSIS_STATUS_UNKNOWN"));
-        assertTrue(unknown.reasonCodes().contains("DYNAMIC_INCOMPLETE"));
+        assertFalse(unknown.reasonCodes().contains("DYNAMIC_INCOMPLETE"));
     }
 
     @Test

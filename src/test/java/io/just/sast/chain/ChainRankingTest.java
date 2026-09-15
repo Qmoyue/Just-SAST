@@ -3,18 +3,16 @@ package io.just.sast.chain;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
-import io.just.sast.blackboard.VerificationSummary;
+import io.just.sast.blackboard.ObjectGraphPlan;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.Arrays;
 
-import io.just.sast.blackboard.ObjectGraphPlan;
-
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ChainRankingTest {
 
@@ -23,48 +21,35 @@ class ChainRankingTest {
         Chain terminal = chain("terminal", "TERMINAL");
         Chain capability = chain("capability", "CAPABILITY");
 
-        assertTrue(ChainRanking.compare(terminal, capability, Map.of(), Map.of(), Set.of()) < 0);
+        assertTrue(ChainRanking.compare(terminal, capability, Map.of(), Set.of()) < 0);
     }
 
     @Test
-    void exactDynamicBoundaryPrecedesUnselectedCandidateAndExplainsWhy() {
-        Chain confirmed = chain("confirmed", "TERMINAL");
-        Chain unselected = chain("unselected", "TERMINAL");
-        VerificationSummary.ChainResult result = new VerificationSummary.ChainResult(
-                1, confirmed.key(), "SINK_BLOCKED", "canary", "FEASIBLE", 10, 1, 1,
-                "SINK_BOUNDARY_REACHED", "TEST", "17", "sha256:test", false, true, "CLEAN");
+    void staticConstructionEvidencePrecedesAnUnannotatedCandidateAndExplainsWhy() {
+        Chain constructed = chain("constructed", "TERMINAL");
+        Chain plain = chain("plain", "TERMINAL");
 
-        assertTrue(ChainRanking.compare(confirmed, unselected, Map.of(),
-                Map.of(confirmed.key(), result), Set.of()) < 0);
-        String explanation = ChainRanking.evidence(confirmed, Map.of(),
-                Map.of(confirmed.key(), result), Set.of()).explanation();
-        assertTrue(explanation.contains("dynamic=SINK_BLOCKED"));
+        assertTrue(ChainRanking.compare(constructed, plain,
+                Map.of(constructed.key(), List.of("static:constructible")), Set.of()) < 0);
+        String explanation = ChainRanking.evidence(constructed,
+                Map.of(constructed.key(), List.of("static:constructible")), Set.of()).explanation();
+        assertTrue(explanation.contains("construction=CONSTRUCTIBLE"));
         assertTrue(explanation.contains("sink_role=TERMINAL"));
     }
 
     @Test
-    void safeEffectNoteKeepsItsOwnDynamicMeaning() {
-        Chain chain = chain("safe", "TERMINAL");
-        String explanation = ChainRanking.evidence(chain,
-                Map.of(chain.key(), List.of("verify:safe-effect-observed")), Map.of(), Set.of())
-                .explanation();
-
-        assertTrue(explanation.contains("dynamic=SAFE_EFFECT_OBSERVED"));
-    }
-
-    @Test
-    void compatibilityAndSegmentNotesUseSharedDynamicTiers() {
-        Chain legacy = chain("legacy", "TERMINAL");
-        Chain segment = chain("segment", "TERMINAL");
+    void constructionAndDegradationNotesUseSharedStaticTiers() {
+        Chain constructed = chain("constructed", "TERMINAL");
+        Chain degraded = chain("degraded", "TERMINAL");
         Chain plain = chain("plain", "TERMINAL");
 
-        assertTrue(ChainRanking.compare(legacy, plain,
-                Map.of(legacy.key(), List.of("verify:confirmed")), Map.of(), Set.of()) < 0);
-        assertTrue(ChainRanking.compare(segment, plain,
-                Map.of(segment.key(), List.of("verify:segment-confirmed")), Map.of(), Set.of()) < 0);
-        assertTrue(ChainRanking.compare(legacy, segment,
-                Map.of(legacy.key(), List.of("verify:confirmed"),
-                        segment.key(), List.of("verify:segment-confirmed")), Map.of(), Set.of()) < 0);
+        assertTrue(ChainRanking.compare(constructed, plain,
+                Map.of(constructed.key(), List.of("static:constructible")), Set.of()) < 0);
+        assertTrue(ChainRanking.compare(degraded, plain,
+                Map.of(degraded.key(), List.of("degrade:partial-construct")), Set.of()) > 0);
+        assertTrue(ChainRanking.compare(constructed, degraded,
+                Map.of(constructed.key(), List.of("static:constructible"),
+                        degraded.key(), List.of("degrade:partial-construct")), Set.of()) < 0);
     }
 
     @Test
@@ -91,8 +76,8 @@ class ChainRankingTest {
                         HopKind.DIRECT_CALL, null, "fragment-activation-deserialize", "()V", null)), 0,
                 "()V", "TERMINAL");
 
-        assertTrue(ChainRanking.compare(typed, generic, Map.of(), Map.of(), Set.of()) < 0);
-        ChainRanking.Evidence evidence = ChainRanking.evidence(typed, Map.of(), Map.of(), Set.of());
+        assertTrue(ChainRanking.compare(typed, generic, Map.of(), Set.of()) < 0);
+        ChainRanking.Evidence evidence = ChainRanking.evidence(typed, Map.of(), Set.of());
         assertEquals(0, evidence.semanticRank());
         assertTrue(evidence.explanation().contains("semantic=TYPED_NESTED_DESERIALIZATION"));
     }
@@ -106,9 +91,9 @@ class ChainRankingTest {
                         HopKind.VIRTUAL_DISPATCH, null, "serialized-proxy-interface", "()V", null)), 0,
                 "()V", "TERMINAL");
 
-        assertTrue(ChainRanking.compare(complete, incomplete, Map.of(), Map.of(), Set.of()) < 0);
-        assertTrue(ChainRanking.evidence(incomplete, Map.of(), Map.of(), Set.of()).incompleteness()
-                > ChainRanking.evidence(complete, Map.of(), Map.of(), Set.of()).incompleteness());
+        assertTrue(ChainRanking.compare(complete, incomplete, Map.of(), Set.of()) < 0);
+        assertTrue(ChainRanking.evidence(incomplete, Map.of(), Set.of()).incompleteness()
+                > ChainRanking.evidence(complete, Map.of(), Set.of()).incompleteness());
     }
 
     @Test
@@ -122,9 +107,8 @@ class ChainRankingTest {
                         HopKind.DIRECT_CALL, null, "bridge-deser", "()V", null)), 1,
                 "()V", "TERMINAL");
 
-        assertTrue(ChainRanking.compare(complete, partialNested, Map.of(), Map.of(), Set.of()) < 0);
-        assertEquals(1, ChainRanking.evidence(partialNested, Map.of(), Map.of(), Set.of())
-                .semanticRank());
+        assertTrue(ChainRanking.compare(complete, partialNested, Map.of(), Set.of()) < 0);
+        assertEquals(1, ChainRanking.evidence(partialNested, Map.of(), Set.of()).semanticRank());
     }
 
     @Test
@@ -144,7 +128,7 @@ class ChainRankingTest {
                         HopKind.DIRECT_CALL, null, "bridge", "()V", null)), 0,
                 "()V", "TERMINAL");
 
-        assertTrue(ChainRanking.compare(shortChain, longChain, Map.of(), Map.of(), Set.of()) < 0);
+        assertTrue(ChainRanking.compare(shortChain, longChain, Map.of(), Set.of()) < 0);
     }
 
     @Test
@@ -171,49 +155,29 @@ class ChainRankingTest {
                         HopKind.ENTRY, null, "reflectiveTarget", "()V", null)), 0,
                 "()V", "TERMINAL", connectedPlan);
 
-        assertEquals(0, ChainRanking.evidence(compact, Map.of(), Map.of(), Set.of())
-                .compactTerminalRank());
-        assertTrue(ChainRanking.compare(compact, connected, Map.of(), Map.of(), Set.of()) < 0);
+        assertEquals(0, ChainRanking.evidence(compact, Map.of(), Set.of()).compactTerminalRank());
+        assertTrue(ChainRanking.compare(compact, connected, Map.of(), Set.of()) < 0);
     }
 
     @Test
-    void malformedDeclaredPlanDoesNotReceiveConstructibleRank() {
+    void malformedPlansAndNullNotesRemainExplicitAndSortable() {
         ObjectGraphPlan partial = new ObjectGraphPlan(
                 List.of(new ObjectGraphPlan.Node("entry", "app/Entry",
                         ObjectGraphPlan.NodeKind.ALLOCATE,
                         List.of(ObjectGraphPlan.Value.ref("missing")))), List.of());
-        Chain chain = new Chain("RULE-partial", "COMMAND_EXEC", "HIGH", "app/Entry",
+        Chain candidate = new Chain("RULE-partial", "COMMAND_EXEC", "HIGH", "app/Entry",
                 "readObject", "readObject", "java/lang/Runtime", "exec", List.of(), 0,
                 "(Ljava/lang/String;)Ljava/lang/Process;", "TERMINAL", partial);
 
-        ChainRanking.Evidence evidence = ChainRanking.evidence(chain, Map.of(), Map.of(), Set.of());
-
+        ChainRanking.Evidence evidence = ChainRanking.evidence(candidate, Map.of(), Set.of());
         assertEquals(2, evidence.constructionRank());
         assertTrue(evidence.explanation().contains("construction=PLAN_PARTIAL"));
-    }
 
-    @Test
-    void nullCompatibilityNotesRemainAWeakButSortableCandidate() {
-        Chain candidate = chain("null-note", "TERMINAL");
-
-        ChainRanking.Evidence evidence = ChainRanking.evidence(candidate,
-                Map.of(candidate.key(), Arrays.asList(null, "degrade:partial-construct")),
-                Map.of(), Set.of());
-
-        assertEquals(2, evidence.constructionRank());
-        assertTrue(evidence.explanation().contains("construction=PARTIAL")
-                || evidence.explanation().contains("construction=PLAN_PARTIAL"));
-    }
-
-    @Test
-    void nullNoteListIsTreatedAsNoEvidence() {
-        Chain candidate = chain("null-list", "TERMINAL");
-
-        ChainRanking.Evidence evidence = ChainRanking.evidence(candidate,
-                java.util.Collections.singletonMap(candidate.key(), null), Map.of(), Set.of());
-
-        assertEquals(3, evidence.constructionRank());
-        assertTrue(evidence.explanation().contains("construction=UNKNOWN"));
+        Chain nullCandidate = chain("null-list", "TERMINAL");
+        ChainRanking.Evidence nullEvidence = ChainRanking.evidence(nullCandidate,
+                java.util.Collections.singletonMap(nullCandidate.key(), null), Set.of());
+        assertEquals(3, nullEvidence.constructionRank());
+        assertTrue(nullEvidence.explanation().contains("construction=UNKNOWN"));
     }
 
     private static Chain chain(String name, String role) {

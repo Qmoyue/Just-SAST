@@ -11,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ObjectGraphPlanTest {
 
     @Test
-    void wireFormIsDeterministicAndLengthPrefixed() {
+    void canonicalFormIsDeterministicAndLengthPrefixed() {
         ObjectGraphPlan plan = new ObjectGraphPlan(
                 List.of(new ObjectGraphPlan.Node("entry", "a/Entry",
                         ObjectGraphPlan.NodeKind.ALLOCATE, List.of()),
@@ -22,11 +22,10 @@ class ObjectGraphPlanTest {
                         List.of(new ObjectGraphPlan.Value(ObjectGraphPlan.ValueKind.STRING,
                                 "a|b:payload")))));
 
-        String encoded = plan.encodedForProbe();
+        String encoded = plan.fingerprint();
         assertTrue(encoded.startsWith("v1;N2;"));
         assertTrue(encoded.contains("11:a|b:payload"));
-        assertEquals(encoded, plan.fingerprint());
-        assertEquals(encoded, new ObjectGraphPlan(plan.nodes(), plan.fields()).encodedForProbe());
+        assertEquals(encoded, new ObjectGraphPlan(plan.nodes(), plan.fields()).fingerprint());
     }
 
     @Test
@@ -39,7 +38,7 @@ class ObjectGraphPlanTest {
     }
 
     @Test
-    void shapeSummarySeparatesDeclaredReferencesFromRuntimeConstruction() {
+    void shapeSummarySeparatesDeclaredReferencesFromConstructionProof() {
         ObjectGraphPlan plan = new ObjectGraphPlan(
                 List.of(new ObjectGraphPlan.Node("entry", "a/Entry",
                         ObjectGraphPlan.NodeKind.ALLOCATE,

@@ -2,26 +2,21 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ConstructionSummary;
-import io.just.sast.blackboard.VerificationOutcome;
-import io.just.sast.blackboard.VerificationSummary;
 
 import java.util.List;
 
-/** Shared serialization of construction and dynamic evidence dimensions. */
+/** Shared serialization of static construction and terminal evidence dimensions. */
 final class ReportEvidence {
 
     private ReportEvidence() {
     }
 
-    static ConstructionSummary construction(Chain chain, List<String> notes,
-                                             VerificationSummary.ChainResult verification) {
-        return ConstructionSummary.summarize(chain, notes, verification);
+    static ConstructionSummary construction(Chain chain, List<String> notes) {
+        return ConstructionSummary.summarize(chain, notes);
     }
 
-    static String constructionJson(Chain chain, List<String> notes,
-                                   VerificationSummary.ChainResult verification) {
-        ConstructionSummary summary = construction(chain, notes, verification);
-        return constructionJson(summary);
+    static String constructionJson(Chain chain, List<String> notes) {
+        return constructionJson(construction(chain, notes));
     }
 
     static String constructionJson(ConstructionSummary summary) {
@@ -41,38 +36,8 @@ final class ReportEvidence {
         return json.append("]}").toString();
     }
 
-    static String constructionReasons(Chain chain, List<String> notes,
-                                      VerificationSummary.ChainResult verification) {
-        return String.join("|", construction(chain, notes, verification).reasons());
-    }
-
-    /**
-     * Map the closed verifier state to one mutually-exclusive report bucket.  Reporters must
-     * not derive this from free-form detail text: a high-risk prefix is not a terminal call and
-     * a boundary canary is not a prefix confirmation.
-     */
-    static String verificationGroup(VerificationSummary.ChainResult result) {
-        if (result == null) {
-            return "not_selected";
-        }
-        VerificationOutcome outcome = result.outcome();
-        if (outcome.scope() == VerificationOutcome.Scope.TERMINAL_EXECUTED_SAFE
-                && result.terminalExecuted()
-                && (outcome.status() == VerificationOutcome.Status.SINK_EXECUTED_SAFE
-                || outcome.status() == VerificationOutcome.Status.JNI_EXECUTED_SAFE)) {
-            return "real_safe_terminal";
-        }
-        if (outcome.scope() == VerificationOutcome.Scope.PREFIX_ONLY
-                && !result.terminalExecuted()
-                && outcome.status() == VerificationOutcome.Status.PRE_SINK_CONFIRMED) {
-            return "prefix_confirmed_high_risk";
-        }
-        if (outcome.scope() == VerificationOutcome.Scope.BOUNDARY_ONLY
-                && !result.terminalExecuted()
-                && outcome.status() == VerificationOutcome.Status.SINK_BLOCKED) {
-            return "boundary_only";
-        }
-        return "unverified";
+    static String constructionReasons(Chain chain, List<String> notes) {
+        return String.join("|", construction(chain, notes).reasons());
     }
 
     static String sinkRisk(Chain chain) {

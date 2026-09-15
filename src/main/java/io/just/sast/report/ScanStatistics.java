@@ -1,7 +1,6 @@
 package io.just.sast.report;
 
 import io.just.sast.analysis.taint.FilterAnalysis;
-import io.just.sast.blackboard.VerificationSummary;
 import io.just.sast.run.RunOutcome;
 
 import java.util.Comparator;
@@ -9,20 +8,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
-/** 扫描统计。 */
+/** Immutable static-scan statistics and bounded-filter evidence. */
 public record ScanStatistics(
         int filesScanned, int classesLoaded, int diagnostics,
         int sinksMarked, int magicEntries, int chainsFound,
         long elapsedMs, long heapUsedMb, long heapPeakMb,
         String completeness, List<String> completenessReasons,
-        Map<String, Long> phaseMs, Map<String, Long> metrics, String verification,
-        VerificationSummary dynamicVerification, String chainProofCompleteness,
-        String artifactHash, Map<String, String> metricStatus,
+        Map<String, Long> phaseMs, Map<String, Long> metrics,
+        String chainProofCompleteness, String artifactHash,
+        Map<String, String> metricStatus,
         Map<String, Map<String, Long>> metricNamespaces,
         Map<String, String> metricNamespaceStatus,
         List<FilterAnalysis.Evidence> filterEvidence) {
 
-    /** Closed availability states for telemetry.  UNKNOWN is intentionally distinct from 0. */
+    /** Closed availability states for telemetry. UNKNOWN is distinct from 0. */
     public enum MetricStatus {
         OBSERVED, CANDIDATE_ONLY, UNKNOWN, NOT_APPLICABLE, NOT_REQUESTED
     }
@@ -36,9 +35,6 @@ public record ScanStatistics(
                 .distinct().sorted().toList();
         phaseMs = sortedMap(phaseMs);
         metrics = sortedMap(metrics);
-        verification = verification == null ? "UNKNOWN" : verification;
-        dynamicVerification = dynamicVerification == null
-                ? VerificationSummary.empty(verification, 0) : dynamicVerification;
         chainProofCompleteness = chainProofCompleteness == null
                 ? "UNKNOWN" : chainProofCompleteness;
         artifactHash = artifactHash == null || artifactHash.isBlank()
@@ -55,78 +51,19 @@ public record ScanStatistics(
                 .toList();
     }
 
-    /** Compatibility constructor before hotspot evidence was part of the run snapshot. */
-    public ScanStatistics(int filesScanned, int classesLoaded, int diagnostics,
-                          int sinksMarked, int magicEntries, int chainsFound,
-                          long elapsedMs, long heapUsedMb, long heapPeakMb,
-                          String completeness, List<String> completenessReasons,
-                          Map<String, Long> phaseMs, Map<String, Long> metrics,
-                          String verification, VerificationSummary dynamicVerification,
-                          String chainProofCompleteness, String artifactHash,
-                          Map<String, String> metricStatus,
-                          Map<String, Map<String, Long>> metricNamespaces,
-                          Map<String, String> metricNamespaceStatus) {
-        this(filesScanned, classesLoaded, diagnostics, sinksMarked, magicEntries, chainsFound,
-                elapsedMs, heapUsedMb, heapPeakMb, completeness, completenessReasons, phaseMs,
-                metrics, verification, dynamicVerification, chainProofCompleteness, artifactHash,
-                metricStatus, metricNamespaces, metricNamespaceStatus, List.of());
-    }
-
-    /** 兼容旧扩展点和测试构造。 */
+    /** Small compatibility constructor for callers that only have basic counters. */
     public ScanStatistics(int filesScanned, int classesLoaded, int diagnostics,
                           int sinksMarked, int magicEntries, int chainsFound,
                           long elapsedMs, long heapUsedMb) {
         this(filesScanned, classesLoaded, diagnostics, sinksMarked, magicEntries, chainsFound,
                 elapsedMs, heapUsedMb, heapUsedMb, "UNKNOWN", List.of(), Map.of(), Map.of(),
-                "UNKNOWN", VerificationSummary.empty("UNKNOWN", 0), "UNKNOWN", "UNKNOWN",
-                Map.of(), Map.of(), Map.of(), List.of());
-    }
-
-    /** Compatibility constructor retained for callers that do not sample heap peak usage. */
-    public ScanStatistics(int filesScanned, int classesLoaded, int diagnostics,
-                          int sinksMarked, int magicEntries, int chainsFound,
-                          long elapsedMs, long heapUsedMb,
-                          String completeness, List<String> completenessReasons,
-                          Map<String, Long> phaseMs, String verification,
-                          VerificationSummary dynamicVerification) {
-        this(filesScanned, classesLoaded, diagnostics, sinksMarked, magicEntries, chainsFound,
-                elapsedMs, heapUsedMb, heapUsedMb, completeness, completenessReasons, phaseMs,
-                Map.of(), verification, dynamicVerification, "UNKNOWN", "UNKNOWN",
-                Map.of(), Map.of(), Map.of());
-    }
-
-    /** Compatibility constructor retained for callers that already provide proof completeness. */
-    public ScanStatistics(int filesScanned, int classesLoaded, int diagnostics,
-                          int sinksMarked, int magicEntries, int chainsFound,
-                          long elapsedMs, long heapUsedMb, long heapPeakMb,
-                          String completeness, List<String> completenessReasons,
-                          Map<String, Long> phaseMs, Map<String, Long> metrics,
-                          String verification, VerificationSummary dynamicVerification,
-                          String chainProofCompleteness) {
-        this(filesScanned, classesLoaded, diagnostics, sinksMarked, magicEntries, chainsFound,
-                elapsedMs, heapUsedMb, heapPeakMb, completeness, completenessReasons, phaseMs,
-                metrics, verification, dynamicVerification, chainProofCompleteness, "UNKNOWN");
-    }
-
-    /** Full compatibility constructor before metric availability/namespaces were added. */
-    public ScanStatistics(int filesScanned, int classesLoaded, int diagnostics,
-                          int sinksMarked, int magicEntries, int chainsFound,
-                          long elapsedMs, long heapUsedMb, long heapPeakMb,
-                          String completeness, List<String> completenessReasons,
-                          Map<String, Long> phaseMs, Map<String, Long> metrics,
-                          String verification, VerificationSummary dynamicVerification,
-                          String chainProofCompleteness, String artifactHash) {
-        this(filesScanned, classesLoaded, diagnostics, sinksMarked, magicEntries, chainsFound,
-                elapsedMs, heapUsedMb, heapPeakMb, completeness, completenessReasons, phaseMs,
-                metrics, verification, dynamicVerification, chainProofCompleteness, artifactHash,
-                Map.of(), Map.of(), Map.of());
+                "UNKNOWN", "UNKNOWN", Map.of(), Map.of(), Map.of(), List.of());
     }
 
     public static ScanStatistics empty() {
         return new ScanStatistics(0, 0, 0, 0, 0, 0, 0, 0,
-                0, "UNKNOWN", List.of(), Map.of(), Map.of(), "UNKNOWN",
-                VerificationSummary.empty("UNKNOWN", 0), "UNKNOWN", "UNKNOWN",
-                Map.of(), Map.of(), Map.of());
+                0, "UNKNOWN", List.of(), Map.of(), Map.of(), "UNKNOWN", "UNKNOWN",
+                Map.of(), Map.of(), Map.of(), List.of());
     }
 
     /** Read an optional numeric metric without exposing a mutable map to callers. */
@@ -138,7 +75,7 @@ public record ScanStatistics(
         return value == null ? fallback : value;
     }
 
-    /** Availability is a separate axis from the numeric value; missing telemetry is not zero. */
+    /** Availability is separate from the numeric value; missing telemetry is not zero. */
     public String metricStatus(String name) {
         if (name == null) {
             return MetricStatus.UNKNOWN.name();
@@ -180,8 +117,7 @@ public record ScanStatistics(
 
     /** Canonical run classification shared by cache, CLI and report consumers. */
     public RunOutcome runOutcome() {
-        return RunOutcome.forScan(completeness, chainProofCompleteness,
-                dynamicVerification == null ? List.of() : dynamicVerification.statusCounts().keySet());
+        return RunOutcome.forScan(completeness, chainProofCompleteness);
     }
 
     private static long saturatedAdd(long left, long right) {
@@ -219,7 +155,6 @@ public record ScanStatistics(
                 MetricStatus.valueOf(normalized);
                 sorted.put(key, normalized);
             } catch (IllegalArgumentException ignored) {
-                // Unknown producer states are made explicit instead of leaking an open enum.
                 sorted.put(key, MetricStatus.UNKNOWN.name());
             }
         });
@@ -234,10 +169,9 @@ public record ScanStatistics(
         }
         Map<String, Map<String, Long>> sorted = new TreeMap<>();
         values.forEach((namespace, metrics) -> {
-            if (namespace == null || namespace.isBlank()) {
-                return;
+            if (namespace != null && !namespace.isBlank()) {
+                sorted.put(namespace, sortedMap(metrics));
             }
-            sorted.put(namespace, sortedMap(metrics));
         });
         return sorted.isEmpty() ? Map.of()
                 : java.util.Collections.unmodifiableMap(sorted);

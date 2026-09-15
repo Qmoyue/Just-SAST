@@ -21,7 +21,7 @@ class BaselineSuppressionWriterTest {
         Chain chain = new Chain("rule-a", "COMMAND", "HIGH", "app/Entry", "read",
                 "readObject", "java/lang/Runtime", "exec", List.of(), 0);
         ReportLayout oldLayout = ReportLayout.create(tmp.resolve("old"));
-        new CsvReporter().write(oldLayout, List.of(chain), Map.of(), Map.of(), Map.of());
+        writeCanonical(oldLayout, chain);
 
         Path suppressions = tmp.resolve("suppressions.txt");
         Files.writeString(suppressions, "rule:rule-a\nrule:does-not-exist\n");
@@ -44,7 +44,7 @@ class BaselineSuppressionWriterTest {
         Path suppressions = tmp.resolve("invalid-suppressions.txt");
         Files.writeString(suppressions, "rule:\nnot-a-selector\n");
 
-        new CsvReporter().write(currentLayout, List.of(chain), Map.of(), Map.of(), Map.of());
+        writeCanonical(currentLayout, chain);
         new BaselineSuppressionWriter().write(currentLayout, null, suppressions,
                 List.of(chain), Map.of());
 
@@ -52,26 +52,29 @@ class BaselineSuppressionWriterTest {
         String summary = Files.readString(currentLayout.meta().resolve("baseline.json"));
         assertTrue(baseline.contains("\"NEW\""), baseline);
         assertTrue(summary.contains("not-a-selector"), summary);
-        assertTrue(Files.exists(currentLayout.findings().resolve("findings.csv")),
-                "baseline/suppression must not delete the primary findings evidence");
+        assertTrue(Files.exists(currentLayout.root().resolve("report.json")),
+                "baseline/suppression must not delete the canonical report");
     }
 
     @Test
-    void baselineAndSuppressionShareCallerInputBudget(@TempDir Path tmp) throws Exception {
-        String header = "rule_id,entry_class,entry_method,entry_descriptor,entry_kind,"
-                + "sink_class,sink_method,sink_descriptor\n";
-        Path baseline = tmp.resolve("baseline.csv");
+    void baselineReportRespectsCallerInputBudget(@TempDir Path tmp) throws Exception {
+        Path baseline = tmp.resolve("baseline.json");
         Path suppressions = tmp.resolve("suppressions.txt");
-        Files.writeString(baseline, header);
+        Files.writeString(baseline, "x".repeat(2048));
         Files.writeString(suppressions, "rule:rule-a\n");
-        long baselineBytes = Files.size(baseline);
         InputBudget defaults = InputBudget.defaults();
         InputBudget budget = defaults.withArchiveLimits(
-                1024, 1024, baselineBytes + 1, 1024, 16,
+                1024, 1024, 1024, 1024, 16,
                 defaults.maxArchiveNesting(), defaults.maxClassEntries());
 
         ReportLayout layout = ReportLayout.create(tmp.resolve("current"));
         assertThrows(java.io.IOException.class, () -> new BaselineSuppressionWriter().write(
                 layout, baseline, suppressions, List.of(), Map.of(), budget));
+    }
+
+    private static void writeCanonical(ReportLayout layout, Chain chain) throws Exception {
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(chain), Map.of(), Map.of(), Map.of());
+        new ConciseReportWriter().write(layout, "component", snapshot, ScanStatistics.empty());
     }
 }
