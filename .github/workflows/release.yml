@@ -1,28 +1,33 @@
 name: release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Existing version tag to publish'
+      ref:
+        description: 'Validated branch or commit to release'
         required: true
+        default: main
         type: string
 
 permissions:
   contents: write
   id-token: write
 
+concurrency:
+  group: just-release
+  cancel-in-progress: false
+
 jobs:
   release:
+    name: release (JDK 17)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Check out release ref
+      - name: Check out the validated ref
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -31,33 +36,69 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Verify tag and project version
+      - name: Verify version, ref identity, and tag availability
         id: project
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
           version="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
-          test "${tag#v}" = "$version"
+          if [[ "$version" == *SNAPSHOT* || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "unsupported release version: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --refs origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "release tag already exists: $tag" >&2
+            exit 1
+          fi
+          commit="$(git rev-parse HEAD)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
-      - name: Test and package
-        run: mvn -B test package -DskipTests=false
+      - name: Run tests
+        run: mvn -B test
 
-      - name: Verify shaded launcher
+      - name: Package the exact release artifacts
+        run: mvn -B package -DskipTests
+
+      - name: Static CLI smoke (two modes, target JDK, online then offline)
         shell: bash
         run: |
           set -euo pipefail
-          version="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
-          test -f "target/just-sast-${version}-shaded.jar"
-          java -jar "target/just-sast-${version}-shaded.jar" --help >/dev/null
+          shaded="target/just-sast-${{ steps.project.outputs.version }}-shaded.jar"
+          fixture="$RUNNER_TEMP/just-static-smoke.jar"
+          cache="$RUNNER_TEMP/just-static-smoke-cache"
+          component="$RUNNER_TEMP/just-static-smoke-component"
+          application="$RUNNER_TEMP/just-static-smoke-application"
+          pom="src/test/resources/ci-smoke/pom.xml"
+          mkdir -p "$cache"
+          jar --create --file "$fixture" \
+            -C target/test-classes fixture/CiSmokeEntry.class \
+            -C target/test-classes org/springframework/web/bind/annotation/RestController.class \
+            -C target/test-classes org/springframework/web/bind/annotation/PostMapping.class
+          java -jar "$shaded" scan --jar "$fixture" --mode component --pom "$pom" \
+            --jdk-home "$JAVA_HOME" --output "$component" --cache "$cache"
+          java -jar "$shaded" scan --jar "$fixture" --mode application --pom "$pom" \
+            --jdk-home "$JAVA_HOME" --offline --output "$application" --cache "$cache"
+          grep -q '"target_code_executed":false' "$component/report.json"
+          grep -q '"target_code_executed":false' "$application/report.json"
+          grep -q '"mode":"application"' "$application/report.json"
 
-      - name: Create release checksums
+      - name: Create checksums and verify licenses
         shell: bash
         run: |
           set -euo pipefail
-          version="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
-          sha256sum "target/just-sast-${version}-shaded.jar" > target/SHA256SUMS
+          shaded="target/just-sast-${{ steps.project.outputs.version }}-shaded.jar"
+          test -s "$shaded"
+          test -s LICENSE
+          test -s THIRD-PARTY-NOTICES.md
+          (cd target && sha256sum "just-sast-${{ steps.project.outputs.version }}-shaded.jar" > SHA256SUMS)
+          (cd target && sha256sum --check SHA256SUMS)
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v2
@@ -66,13 +107,25 @@ jobs:
             target/just-sast-${{ steps.project.outputs.version }}-shaded.jar
             target/SHA256SUMS
 
+      - name: Create immutable version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "${{ steps.project.outputs.tag }}" "${{ steps.project.outputs.commit }}" \
+            -m "Just ${{ steps.project.outputs.version }}"
+          git push origin "${{ steps.project.outputs.tag }}"
+
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          generate_release_notes: true
-          files: |
-            target/just-sast-${{ steps.project.outputs.version }}-shaded.jar
-            target/SHA256SUMS
-            LICENSE
-            THIRD-PARTY-NOTICES.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.project.outputs.tag }}" \
+            --verify-tag \
+            --title "Just ${{ steps.project.outputs.version }}" \
+            --generate-notes \
+            "target/just-sast-${{ steps.project.outputs.version }}-shaded.jar" \
+            target/SHA256SUMS LICENSE THIRD-PARTY-NOTICES.md

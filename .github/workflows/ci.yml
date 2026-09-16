@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Fast feedback: ordinary tests and a reproducible, attached shaded launcher.
-  # Benchmark and performance studies are maintained outside the CI workflow.
+  # Fast feedback: ordinary tests, a reproducible launcher, and a harmless end-to-end
+  # static scan that exercises both product modes and the dependency cache boundary.
   fast:
     name: fast (${{ matrix.os }}, JDK ${{ matrix.java }})
     strategy:
@@ -59,8 +59,45 @@ jobs:
           $main = & jar tf $shaded.FullName
           if (-not ($main -contains 'META-INF/MANIFEST.MF')) { throw 'shaded manifest missing' }
           if (-not ($main -contains 'picocli/CommandLine.class')) { throw 'shaded dependency content missing' }
+      - name: Static CLI smoke (two modes, target JDK, online then offline)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shaded = (Resolve-Path 'target/just-sast-0.2.0-shaded.jar').Path
+          $fixture = Join-Path $env:RUNNER_TEMP 'just-static-smoke.jar'
+          $cache = Join-Path $env:RUNNER_TEMP 'just-static-smoke-cache'
+          $componentOutput = Join-Path $env:RUNNER_TEMP 'just-static-smoke-component'
+          $applicationOutput = Join-Path $env:RUNNER_TEMP 'just-static-smoke-application'
+          $pom = (Resolve-Path 'src/test/resources/ci-smoke/pom.xml').Path
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          & jar --create --file $fixture `
+            -C 'target/test-classes' fixture/CiSmokeEntry.class `
+            -C 'target/test-classes' org/springframework/web/bind/annotation/RestController.class `
+            -C 'target/test-classes' org/springframework/web/bind/annotation/PostMapping.class
+          if ($LASTEXITCODE -ne 0) { throw "fixture packaging failed: $LASTEXITCODE" }
+          & java -jar $shaded scan --jar $fixture --mode component --pom $pom `
+            --jdk-home $env:JAVA_HOME --output $componentOutput --cache $cache
+          if ($LASTEXITCODE -ne 0) { throw "component smoke failed: $LASTEXITCODE" }
+          & java -jar $shaded scan --jar $fixture --mode application --pom $pom `
+            --jdk-home $env:JAVA_HOME --offline --output $applicationOutput --cache $cache
+          if ($LASTEXITCODE -ne 0) { throw "application offline smoke failed: $LASTEXITCODE" }
+          foreach ($report in @(
+              (Join-Path $componentOutput 'report.json'),
+              (Join-Path $applicationOutput 'report.json'))) {
+            if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
+              throw "smoke report missing: $report"
+            }
+            $text = Get-Content -LiteralPath $report -Raw
+            if ($text -notmatch '"target_code_executed":false') {
+              throw "static execution disclosure missing: $report"
+            }
+          }
+          $applicationText = Get-Content -LiteralPath (Join-Path $applicationOutput 'report.json') -Raw
+          if ($applicationText -notmatch '"mode":"application"') {
+            throw 'application mode was not recorded in the smoke report'
+          }
       - name: Upload fast build artifacts
-        if: runner.os == 'Linux' && matrix.java == '17'
+        if: always() && runner.os == 'Linux' && matrix.java == '17'
         uses: actions/upload-artifact@v4
         with:
           name: just-sast-fast
