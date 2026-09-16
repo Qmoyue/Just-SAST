@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeSet;
 
 /**
  * The report-facing projection of an application-entry join.
@@ -33,7 +34,98 @@ public record ApplicationTrace(
         String entryPrefixPath,
         String dependencyOwner,
         String terminalOwner,
-        String terminalMethod) {
+        String terminalMethod,
+        JoinEvidence joinEvidence) {
+
+    /** Compatibility constructor for callers that only provide the path projection. */
+    public ApplicationTrace(String applicationEntryClass, String applicationEntryMethod,
+                            String applicationSiteClass, String applicationSiteMethod,
+                            String applicationSiteKind, String joinKind,
+                            String chainEntryMethod, String entryPrefixPath,
+                            String dependencyOwner, String terminalOwner,
+                            String terminalMethod) {
+        this(applicationEntryClass, applicationEntryMethod, applicationSiteClass,
+                applicationSiteMethod, applicationSiteKind, joinKind, chainEntryMethod,
+                entryPrefixPath, dependencyOwner, terminalOwner, terminalMethod, null);
+    }
+
+    /** Stable typed references from a raw chain key to the immutable application evidence graph. */
+    public record JoinEvidence(
+            String evidenceGraphDigest,
+            String joinId,
+            String applicationChainId,
+            String entryAtomId,
+            String siteAtomId,
+            String dependencySegmentId,
+            String valueFlow,
+            String objectIdentity,
+            String callbackSemantics,
+            String runtimeTypeProof,
+            String artifactCompatibility,
+            String filterDominance,
+            String constructionConstraint,
+            List<String> bridgeEvidenceIds) {
+
+        public JoinEvidence {
+            evidenceGraphDigest = required(evidenceGraphDigest, "evidenceGraphDigest");
+            joinId = required(joinId, "joinId");
+            applicationChainId = required(applicationChainId, "applicationChainId");
+            entryAtomId = required(entryAtomId, "entryAtomId");
+            siteAtomId = required(siteAtomId, "siteAtomId");
+            dependencySegmentId = required(dependencySegmentId, "dependencySegmentId");
+            valueFlow = required(valueFlow, "valueFlow");
+            objectIdentity = required(objectIdentity, "objectIdentity");
+            callbackSemantics = required(callbackSemantics, "callbackSemantics");
+            runtimeTypeProof = required(runtimeTypeProof, "runtimeTypeProof");
+            artifactCompatibility = required(artifactCompatibility, "artifactCompatibility");
+            filterDominance = required(filterDominance, "filterDominance");
+            constructionConstraint = required(constructionConstraint, "constructionConstraint");
+            if (bridgeEvidenceIds == null
+                    || bridgeEvidenceIds.stream().anyMatch(value -> value == null || value.isBlank())) {
+                throw new IllegalArgumentException("bridge evidence IDs must be non-null and non-blank");
+            }
+            bridgeEvidenceIds = List.copyOf(new TreeSet<>(bridgeEvidenceIds));
+        }
+
+        public String toCanonicalJson() {
+            StringBuilder json = new StringBuilder("{\"evidence_graph_digest\":\"")
+                    .append(esc(evidenceGraphDigest)).append("\",\"join_id\":\"")
+                    .append(esc(joinId)).append("\",\"application_chain_id\":\"")
+                    .append(esc(applicationChainId)).append("\",\"entry_atom_id\":\"")
+                    .append(esc(entryAtomId)).append("\",\"site_atom_id\":\"")
+                    .append(esc(siteAtomId)).append("\",\"dependency_segment_id\":\"")
+                    .append(esc(dependencySegmentId)).append("\",\"value_flow\":\"")
+                    .append(esc(valueFlow)).append("\",\"object_identity\":\"")
+                    .append(esc(objectIdentity)).append("\",\"callback_semantics\":\"")
+                    .append(esc(callbackSemantics)).append("\",\"runtime_type_proof\":\"")
+                    .append(esc(runtimeTypeProof)).append("\",\"artifact_compatibility\":\"")
+                    .append(esc(artifactCompatibility)).append("\",\"filter_dominance\":\"")
+                    .append(esc(filterDominance)).append("\",\"construction_constraint\":\"")
+                    .append(esc(constructionConstraint)).append("\",\"bridge_evidence_ids\":[");
+            for (int index = 0; index < bridgeEvidenceIds.size(); index++) {
+                if (index > 0) {
+                    json.append(',');
+                }
+                json.append('"').append(esc(bridgeEvidenceIds.get(index))).append('"');
+            }
+            return json.append("]}").toString();
+        }
+
+        public String display() {
+            return "join=" + joinId + "; value=" + valueFlow + "; object=" + objectIdentity
+                    + "; callback=" + callbackSemantics + "; type=" + runtimeTypeProof
+                    + "; artifact=" + artifactCompatibility + "; filter=" + filterDominance
+                    + "; construction=" + constructionConstraint + "; bridges="
+                    + String.join(",", bridgeEvidenceIds);
+        }
+
+        private static String required(String value, String name) {
+            if (value == null || value.isBlank()) {
+                throw new IllegalArgumentException(name + " must be non-blank");
+            }
+            return value.trim();
+        }
+    }
 
     public ApplicationTrace {
         applicationEntryClass = normalize(applicationEntryClass);
@@ -100,7 +192,17 @@ public record ApplicationTrace(
                             attribute(entry, "entry_prefix_path"),
                             dependency == null ? "UNKNOWN" : dependency.owner(),
                             terminal == null ? "UNKNOWN" : terminal.owner(),
-                            terminal == null ? "UNKNOWN" : terminal.member());
+                            terminal == null ? "UNKNOWN" : terminal.member(),
+                            new JoinEvidence(evidence.graph().canonicalDigest(), join.id(),
+                                    join.applicationChainId().value(),
+                                    join.applicationEntryAtomId(), join.applicationSiteAtomId(),
+                                    join.dependencySegmentId().value(), join.valueFlow().name(),
+                                    join.objectIdentity().name(), join.callbackSemantics().name(),
+                                    join.runtimeTypeProof().name(),
+                                    join.artifactCompatibility().name(),
+                                    join.filterDominance().name(),
+                                    join.constructionConstraint().name(),
+                                    join.bridgeEvidenceIds()));
                     traces.putIfAbsent(chainKey, trace);
                 });
         return Map.copyOf(traces);
@@ -149,7 +251,9 @@ public record ApplicationTrace(
                 + "\",\"entry_prefix_path\":\"" + esc(entryPrefixPath)
                 + "\",\"dependency_owner\":\"" + esc(dependencyOwner)
                 + "\",\"terminal_owner\":\"" + esc(terminalOwner)
-                + "\",\"terminal_method\":\"" + esc(terminalMethod) + "\"}";
+                + "\",\"terminal_method\":\"" + esc(terminalMethod)
+                + "\",\"join_evidence\":"
+                + (joinEvidence == null ? "null" : joinEvidence.toCanonicalJson()) + "}";
     }
 
     private static EvidenceAtom dependencyFor(io.just.sast.blackboard.EntryChainJoinEvidence join,

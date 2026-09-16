@@ -261,6 +261,10 @@ public final class ConciseReportWriter {
             if (trace != null) {
                 out.append("- Application path: `").append(md(trace.entryDisplay()))
                         .append("` → site `").append(md(trace.siteDisplay())).append("`\n");
+                if (trace.joinEvidence() != null) {
+                    out.append("- Join evidence: `")
+                            .append(md(trace.joinEvidence().display())).append("`\n");
+                }
             }
             if (!finding.notes().isEmpty()) {
                 out.append("- Notes: ").append(finding.notes().stream().map(ConciseReportWriter::md)

@@ -212,9 +212,11 @@ class ConciseReportContractTest {
         String finding = Files.readString(Path.of("docs/schemas/finding-output-v1.schema.json"));
         assertTrue(concise.contains("\"static_analysis\"")
                         && concise.contains("\"display_limit\"")
-                        && concise.contains("\"filter_evidence\""), concise);
+                        && concise.contains("\"filter_evidence\"")
+                        && concise.contains("\"join_evidence\""), concise);
         assertTrue(finding.contains("\"entry_descriptor\"")
-                        && finding.contains("\"application_trace\""), finding);
+                        && finding.contains("\"application_trace\"")
+                        && finding.contains("\"join_evidence\""), finding);
         assertFalse(concise.contains("verification"), concise);
         assertFalse(finding.contains("verification"), finding);
     }

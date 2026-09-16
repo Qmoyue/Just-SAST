@@ -84,7 +84,12 @@ class ApplicationPathReportContractTest {
 
         String expectedEntry = "app/ApiController";
         String expectedPath = "app/ApiController#putNote()Ljava/lang/Object;";
-        assertTrue(Files.readString(layout.meta().resolve("finding-output.json")).contains(expectedEntry));
+        String findingOutput = Files.readString(layout.meta().resolve("finding-output.json"));
+        assertTrue(findingOutput.contains(expectedEntry));
+        assertTrue(findingOutput.contains(join.id()));
+        assertTrue(findingOutput.contains("\"dependency_segment_id\":\""
+                + join.dependencySegmentId().value() + "\""));
+        assertTrue(findingOutput.contains("\"construction_constraint\":\"SAT\""));
         assertTrue(Files.readString(layout.evidence().resolve("chains.csv")).contains(expectedPath));
         assertTrue(Files.readString(layout.findings().resolve("findings.csv")).contains(expectedEntry));
         assertTrue(Files.readString(layout.findings().resolve("findings.json")).contains(expectedEntry));
