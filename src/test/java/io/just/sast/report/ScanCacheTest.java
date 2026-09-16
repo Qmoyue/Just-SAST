@@ -2,6 +2,7 @@ package io.just.sast.report;
 
 import io.just.sast.run.InputBudget;
 import io.just.sast.util.ArtifactFingerprint;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -114,6 +115,25 @@ class ScanCacheTest {
 
         assertThrows(java.io.IOException.class, () -> ScanCache.preflight(artifact,
                 List.of(dependency), null, null, false, "component", budget));
+    }
+
+    @Test
+    void preflightAcceptsManagedJdkHomeAlias(@TempDir Path tmp) throws Exception {
+        Path artifact = tmp.resolve("app.jar");
+        Files.writeString(artifact, "stable-input");
+        Path realJdk = Files.createDirectories(tmp.resolve("jdk-real"));
+        Files.writeString(realJdk.resolve("release"), "JAVA_VERSION=\"17\"\n");
+        Path jdkAlias = tmp.resolve("jdk-alias");
+        try {
+            Files.createSymbolicLink(jdkAlias, realJdk.getFileName());
+        } catch (UnsupportedOperationException | java.io.IOException | SecurityException unsupported) {
+            Assumptions.assumeTrue(false,
+                    "symbolic links unavailable: " + unsupported.getMessage());
+        }
+
+        ScanCache.Preflight preflight = ScanCache.preflight(artifact, List.of(), null, jdkAlias,
+                false, "component");
+        assertTrue(preflight.cacheKey().matches("[0-9a-f]{64}"));
     }
 
     @Test

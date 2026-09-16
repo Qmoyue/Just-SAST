@@ -97,7 +97,7 @@ public final class ScanCache {
             validateInput(rules, false);
         }
         if (jdkHome != null) {
-            validateInput(jdkHome, true);
+            validateJdkHome(jdkHome);
         }
         InputBudget.Tracker sharedTracker = policy.tracker();
         String artifactHash = ArtifactFingerprint.sha256(target, sharedTracker);
@@ -757,6 +757,32 @@ public final class ScanCache {
                 || (!Files.isRegularFile(normalized, LinkOption.NOFOLLOW_LINKS)
                 && !(allowDirectory && Files.isDirectory(normalized, LinkOption.NOFOLLOW_LINKS)))) {
             throw new IOException("cache input is not a supported real path");
+        }
+    }
+
+    /**
+     * JDK homes are trusted toolchain aliases, unlike artifact/rule inputs.  The frontend and
+     * identity writer both resolve a managed symlink/junction to its concrete home before
+     * opening release metadata or JRT files; cache preflight must use the same boundary or a
+     * platform-specific alias fails before the actual scan can start.
+     */
+    private static void validateJdkHome(Path path) throws IOException {
+        Path normalized = normalize(path);
+        if (!Files.isDirectory(normalized)) {
+            throw new IOException("cache JDK home is not a directory: " + normalized);
+        }
+        Path effective = normalized;
+        if (ArchiveLimits.isLinkOrReparsePoint(normalized)) {
+            try {
+                effective = normalized.toRealPath();
+            } catch (IOException | RuntimeException failure) {
+                throw new IOException("cache JDK home alias cannot be resolved: " + normalized,
+                        failure);
+            }
+        }
+        if (!Files.isDirectory(effective)
+                || ArchiveLimits.isLinkOrReparsePoint(effective)) {
+            throw new IOException("cache JDK home is not a safe directory: " + effective);
         }
     }
 
