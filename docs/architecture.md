@@ -1,6 +1,6 @@
 # Just 目标架构
 
-契约：JUST-LIGHT-MINING-V3，2026-09-13。本文是开发前目标设计，不是已完成的实现说明。保留稳定分析实现，沿真实能力缺口逐步迁移，最终发布前按实际代码再次校准。
+契约：JUST-LIGHT-MINING-V3，2026-09-13。本文是按当前实现校准的架构说明；完整语料、远程 CI 和发布状态仍由唯一执行清单及实际回执证明。
 
 ## 1. 用户流程与分层
 
@@ -19,9 +19,10 @@ CLI：mode / input / deps / pom / repository / offline / target JDK
 依赖下载是输入准备，bounded static filtering 是分析内部操作，两者不拥有另一套求解器。框架规则是分析知识，不能替代目标实际版本字节码。
 
 主扫描的最简公开入口是 jar、mode、deps/pom/repository、offline、jdk-home、output 和 rules，
-overwrite 只负责输出安全。verify、no-verify、verify-budget、safe-exec、safe-real-sink 和
-require-os-isolation 不属于产品接口；stats、fast、baseline、suppressions、cache 必须有独立
-消费者和测试后才能作为高级工作流出现。CLI help 不描述已删除的目标执行、Job Object 或 payload。
+overwrite 只负责输出安全。stats、fast、baseline、suppressions 和 cache 是独立的高级工作流；
+cache 与 baseline/suppressions 互斥，缓存预检、恢复或写入错误直接失败。verify、no-verify、
+verify-budget、safe-exec、safe-real-sink 和 require-os-isolation 不属于产品接口；CLI help 不描述
+目标执行、Job Object 或 payload。
 
 ## 2. 所有权和迁移入口
 
@@ -76,7 +77,9 @@ PROVABLY_UNREACHABLE 是唯一可以阻断路径的状态；其余状态保留�
 链是否完整、结构可行性、控制、应用暴露和分析完整性独立；ranking只排序不证明，UNKNOWN不变SAT；组件候选不生成应用漏洞结论。
 生成一个规范报告快照，report.md/json共享ID/证据/计数/排序。JSON包含发现的有效候选和重要变体，Markdown前10展开，其余简表；displayLimit与searchBudget各自说明。
 schema边界保持最小且单向：公共 schema 只描述 concise report、finding output、rules、input digest 和 evidence-graph telemetry；动态验证/运行信任边界与 v1/v2 shadow schema 不再是产品契约。动态筛选状态由分析模型和同一报告快照承载，不另写验证目录或兼容旁路。
-旧 payload/verification writer、verify phase 和 Job Object 文案在迁移完成前只能列为残留，不得进入 README、help、稳定缓存身份或发布报告。
+旧 payload/verification writer、verify phase 和 Job Object 文案不属于当前实现，不得进入 README、
+help、稳定缓存身份或发布报告。报告的主文件是 report.md/report.json，index.md、evidence/ 和
+meta/ 是同一快照的可追溯 sidecar。
 依赖解析与网络墙钟在输入准备计时；analysis包括filter；report和total单列。并行下载的request duration汇总不当墙钟相加。首次有用结果在报告可消费时记录。
 缺失依赖、未知条件、截断/取消及写入错误直接影响相应状态；不能产生伪COMPLETE，不为美化报告隐藏难例。
 
@@ -94,6 +97,9 @@ schema边界保持最小且单向：公共 schema 只描述 concise report、fin
 八组CTF完整WP链、低误报Q-01、Apache正负/相关Gleipner与性能联合验收；不能以实现结构或测试数量证明产品正确。
 ai-slop-taste和test-doctor在开发全程及最终全面检查：所有权/状态/兜底/表面复杂度、能力→测试映射、重复/脆弱/高成本测试；所有本轮问题落实修复。
 开发前目标设计、过程中实际变化同步、最后requirements/architecture/README一致；本地commit贯穿。
-Release验证与发布职责分开：Windows/JDK17只读校验同一提交和产物，必要检查成功后最小权限publish job创建tag和Release；不假设tag事件会再触发发布、不重新构建未验产物，不上传旧probe或通配JAR。最终核对远程SHA/资产hash/下载可用性。
+Release workflow 接收手动指定的已验证 branch/commit，在 JDK17 上重新执行测试、打包、受控
+component online/application offline smoke、版本和 tag 冲突校验，再由同一最小权限 job 创建唯一
+tag 并发布精确 shaded JAR、SHA256SUMS 和许可证文件；不依赖 tag 事件再次触发发布，不上传旧
+probe 或通配 JAR。最终核对远程 SHA、tag commit、资产 hash 和下载可用性。
 
 实现时参考：[Maven Resolver职责边界](https://maven.apache.org/components/resolver/how-resolver-works.html)（还需Maven模型/描述提供方完成POM语义）、[GitHub workflow触发规则](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)（不要依赖发布token创建tag后再触发另一次发布）。

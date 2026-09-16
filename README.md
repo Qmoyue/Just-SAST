@@ -2,7 +2,7 @@
 
 Just 是一个面向 Java JAR、WAR 和 class 目录的轻量级反序列化链扫描器。它从字节码中提取入口、字段、调用、控制流和 sink 事实，组合出可解释的候选链，并输出可供人工或工具继续处理的证据。
 
-本仓库正在按 V3 重构。下述最简参数、报告布局和四态筛选是本轮目标契约；CLI/help、旧输出清理及筛选证据仍在迁移，具体可用选项须核对当前构建的 `scan --help`。文档更新不代表这些迁移已验收。
+当前仓库实现的是 `JUST-LIGHT-MINING-V3` 静态分析契约。完整 WP/Apache 语料验收、远程 CI 和发布状态仍以唯一执行清单中的实际证据为准；本文只描述已实现的用户接口和边界。
 
 ## 工作流
 
@@ -37,6 +37,8 @@ JAR / WAR / class 目录 + 可选依赖 + 目标 JDK
 - 静态筛选只在高成本或高噪声位置求值 Just 自有的有限操作；它不加载、初始化、构造或调用目标代码。
 - 只有完整有限域证明的矛盾可以剪枝；UNKNOWN、预算耗尽和缺依赖均保留静态候选并在报告中说明。
 - 不使用 Job Object、SecurityManager、子 JVM、canary 或 payload 验证路径；资源风险由输入、图扩展、筛选和报告预算处理。
+- 默认从显式 POM 的 Maven Central 补齐精确 compile/runtime 依赖；`--offline` 只使用显式输入和已有完整缓存。
+- 报告记录目标 JDK、制品/依赖身份、筛选 telemetry 以及 dependency、network、analysis、report、total 分段计时。
 - 通过 `KnowledgeSource`、Blackboard、YAML 规则和 ServiceLoader 扩展分析语义。
 
 ## 构建与运行
@@ -44,7 +46,8 @@ JAR / WAR / class 目录 + 可选依赖 + 目标 JDK
 主程序使用 JDK 17 和 Maven 3.6+。
 
 ```bash
-mvn package -DskipTests
+mvn -B test
+mvn -B package -DskipTests
 java -jar target/just-sast-0.2.0-shaded.jar scan \
   --jar app.jar \
   --jdk-home /path/to/jdk \
@@ -74,19 +77,28 @@ java -jar target/just-sast-0.2.0-shaded.jar scan \
 | --output | 报告目录，默认 just-out |
 | --rules | 自定义 YAML 规则 |
 | --overwrite | 显式允许替换既有输出目录 |
+| --stats | 在 stderr 输出扫描统计和分段计时 |
+| --fast | 不加载目标 JDK 全量库；结果可能不完整 |
+| --baseline | 对已有扫描目录按语义链身份标记新增/不变/消失 |
+| --suppressions | 按链身份、sha256 或 rule 标记抑制项，不删除发现 |
+| --cache | 显式启用完整报告增量缓存；与 baseline/suppressions 互斥 |
 
-no-verify、verify-budget、safe-exec、safe-real-sink 和 require-os-isolation 已从目标契约退役，现存接口残留需在本轮清理，不应重新加入主扫描接口。动态测试已经删除，静态筛选不通过参数切换。
-stats、fast、baseline、suppressions 和 cache 只有在有独立消费者和测试后才作为高级工作流保留。
+`--repository` 可重复但必须显式提供 `--pom`；`--offline` 禁止包括元数据解析在内的网络请求。无 POM 时不会按类名猜包。`--cache` 只缓存完整、无内部失败终态的报告；缓存预检/恢复/写入失败会明确失败，不静默退回完整扫描。
+
+`no-verify`、`verify-budget`、`safe-exec`、`safe-real-sink` 和 `require-os-isolation` 已退役，传入会得到 usage exit 2。动态测试不属于扫描接口，静态筛选由分析阶段统一决定。
 
 ## 输出
 
 ```text
 just-out/
 ├─ report.md       # 人和 agent 的主阅读入口
-└─ report.json     # 与 report.md 同源的机器入口
+├─ report.json     # 与 report.md 同源的机器入口
+├─ index.md        # 计时、依赖来源和结果摘要
+├─ evidence/       # 依赖清单及可追溯证据
+└─ meta/            # finding、input digest、应用证据、身份和运行元数据
 ```
 
-旧 verification、payload、动态信任边界和运行时隔离字段不是稳定报告接口。迁移期间若旧代码仍产生这些文件，它们只能作为待清理残留，不能作为能力证明或下游输入。
+报告不生成 `verification/`、payload、动态信任边界或运行时隔离旁路。`report.md`/`report.json` 与 meta/evidence sidecar 来自同一冻结快照；筛选状态、UNKNOWN、预算和输入完整性都留在这套报告中。
 
 静态筛选状态：
 
@@ -106,9 +118,12 @@ UNKNOWN 和 BUDGET_EXCEEDED 不能作为拒绝理由，也不能被排名转换�
 ## 验证
 
 ~~~powershell
-mvn test
-mvn package -DskipTests
+mvn -B test
+mvn -B package -DskipTests
+java -jar target/just-sast-0.2.0-shaded.jar --help
 ~~~
+
+CI 还会用仓库内无害 fixture 执行 component online 与 application offline 两次扫描，显式传入目标 JDK，并确认目标代码执行披露为 `false`。
 
 架构约定见 [docs/architecture.md](docs/architecture.md)，需求契约见 [docs/requirements.md](docs/requirements.md)。
 

@@ -1,6 +1,6 @@
 # Just 产品需求
 
-契约：JUST-LIGHT-MINING-V3，2026-09-13。状态：开发前目标契约，尚未全部实现或验收；最终发布前按真实行为再次校准本文。本文定义产品，开发任务由本地唯一执行清单管理。
+契约：JUST-LIGHT-MINING-V3，2026-09-13。状态：按当前实现校准；完整语料、远程 CI 和发布仍必须以唯一执行清单中的实际证据关闭。本文定义产品行为，不替代验收证据。
 
 ## 1. 定位与交付
 
@@ -37,12 +37,11 @@ scan --jar <jar|war|class-dir>
      [--jdk-home <path>] [--output <path>] [--rules <path>]
 ```
 --repository允许重复；--offline禁止包括元数据解析在内的网络请求，只使用明确输入和缓存。预算/诊断等已有参数只在有实际用途且语义清楚时保留，help准确说明范围。
-这些是目标接口，不宣称当前CLI已经支持全部选项。
+当前 CLI 已实现上述最简接口；`--stats`、`--fast`、`--baseline`、`--suppressions` 和 `--cache` 是有独立消费者的高级选项。`--cache` 与 baseline/suppressions 互斥，缓存异常直接失败。
 
 主扫描接口不保留 no-verify、verify-budget、safe-exec、safe-real-sink 或
 require-os-isolation。动态测试已经退役；静态筛选由分析阶段统一决定，不用一个旧 verifier
-开关或独立验证预算切换。stats、fast、baseline、suppressions 和 cache 只有在有明确消费者、
-失败语义和回归测试后才能成为高级参数，不进入最简使用路径。
+开关或独立验证预算切换。传入退役选项必须返回 usage exit 2，不得被忽略或映射为动态执行。
 
 每次显式 jdk-home 测试和报告必须记录解析后的绝对路径、目标 Java 版本、java.exe 摘要、
 JDK home/release 或实际运行库 digest；这只是目标字节码来源，不改变 Just 主程序的 JDK17。
@@ -69,13 +68,12 @@ PROVEN_RETAINED 表示局部事实支持但不证明完整链；UNKNOWN 和 BUDG
 
 ## 5. 输出与耗时
 
-默认只生成report.md和report.json，由同一规范结果生成；日志stderr，stdout只用于明确约定的机器输出，详细诊断显式开启。
+默认主入口为同一规范快照生成的report.md和report.json，同时生成可追溯的 index.md、evidence/ 和 meta/ sidecar；日志写 stderr，stdout 只用于明确约定的机器输出，详细诊断显式开启。
 Markdown按价值展示前10组代表链并列出其他候选概要；JSON保留去重有效候选、重要变体和共享证据，所有引用可解析。不同对象身份/触发/条件/终点不可被错误合并。
 报告提供精确方法签名/字节码位置、逐跳依据、对象字段连接、类型/控制/构造/过滤/JDK条件、依赖来源、关键假设与未解决点。没有源码行号则不捏造。
 展示限制、搜索预算、结果截断分别说明，不能静默少报或把片段计入完整链。默认不输出payload计划、verification目录或旧五格式。
 公共契约只保留 concise report、finding output、rules、input digest 和 evidence-graph telemetry；动态验证披露、运行信任边界和 v1/v2 shadow schema 已退役。动态筛选的局部状态属于分析结果与统一报告的一部分，不再创建第二套验证报告或旁路 schema。
-当前代码若仍生成旧 verification/payload 文件、verification phase 或动态信任边界文案，属于迁移残留，
-必须在P4.3/P5.1清理；它们不能写入 README、help、稳定缓存身份或下游消费契约。
+实现不得生成旧 verification/payload 文件、verification phase 或动态信任边界文案；它们不能写入 README、help、稳定缓存身份或下游消费契约。
 计时分别记录依赖解析、网络下载墙钟、静态analysis、report、total；dynamicFilter是analysis子耗时。并发请求时间总和单列，不能与墙钟混用或重复相加。下载时间不得混入扫描性能。
 首次有用结果以完整链可由消费者读取为准，不能用内存命中或旧缓存时间代替。
 
@@ -94,4 +92,4 @@ Markdown按价值展示前10组代表链并列出其他候选概要；JSON保留
 ASM限于frontend；后续使用稳定不可变模型和artifact provenance，每层事实一个owner；规则是数据，求解与约束是通用语义，无样本名/hash/路径特判。
 开发全程及最终全面使用ai-slop-taste和test-doctor，围绕真实用户流程控制复杂度和测试成本；不为删行数重写稳定代码，不为测试镜像实现。
 开发前写需求/架构，过程中同步真实变化，最后按验收行为修订需求/架构/README。验证通过的批次本地commit，日常不push。
-最终全部本地任务通过后push，由Release流程在同提交验证通过后创建tag和发布可用JAR、SHA256、许可及发布说明。构建只读权限，发布最小权限，失败阻断发布；必须核对真实远程回执和资产，不能以workflow存在或RELEASE_READY冒充已发布。
+最终全部本地任务通过后，Release workflow 以手动指定的已验证 branch/commit 为输入，在 JDK17 上重跑测试、打包、两模式 online/offline smoke、版本/tag 冲突和 checksum/许可检查；全部通过后由同一 job 创建唯一 `v<version>` tag 并发布 shaded launcher、SHA256SUMS、LICENSE 和第三方说明。构建只读权限，发布最小权限，失败阻断发布；必须核对真实远程回执和资产，不能以 workflow 存在或 RELEASE_READY 冒充已发布。
