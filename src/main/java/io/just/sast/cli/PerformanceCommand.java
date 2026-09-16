@@ -36,7 +36,8 @@ import java.util.regex.Pattern;
  * repeated-run cost.  {@code hot} measures repeated scans in one JVM; {@code cold} starts a
  * fresh scan process for every warmup/sample and is the useful approximation for cold-start CI.
  */
-@Command(name = "perf", description = "在固定 runner 上测量扫描 p50/p95 与结果稳定性")
+@Command(name = "perf", description = "在固定 runner 上测量扫描 p50/p95 与结果稳定性",
+        mixinStandardHelpOptions = true)
 public final class PerformanceCommand implements Callable<Integer> {
 
     /*

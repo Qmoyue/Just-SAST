@@ -25,7 +25,8 @@ import java.util.TreeSet;
  * 链身份键 = rule_id + 入口类/方法/描述符/种类 + sink 类/方法/描述符——不含 chain_id 序号（组序号随排序变化，
  * 两次扫描只要发现相同链集合与语义，diff 应报告零差异）。
  */
-@Command(name = "diff", description = "对比两次扫描结果，报告链变更")
+@Command(name = "diff", description = "对比两次扫描结果，报告链变更",
+        mixinStandardHelpOptions = true)
 public final class DiffCommand implements Callable<Integer> {
 
     private final InputBudget inputBudget;

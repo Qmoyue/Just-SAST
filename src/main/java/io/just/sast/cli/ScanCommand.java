@@ -20,7 +20,8 @@ import java.util.stream.Collectors;
 import java.util.concurrent.Callable;
 
 /** scan 子命令：深度扫描 JAR/目录并输出 canonical static report。 */
-@Command(name = "scan", description = "深度扫描 JAR/class 目录并输出静态链报告")
+@Command(name = "scan", description = "深度扫描 JAR/class 目录并输出静态链报告",
+        mixinStandardHelpOptions = true)
 public final class ScanCommand implements Callable<Integer> {
 
     @Option(names = "--jar", required = true, paramLabel = "<jar|dir>",

@@ -57,6 +57,13 @@ class VerificationCliContractTest {
     }
 
     @Test
+    void subcommandHelpDoesNotRequireOperationalInputs() {
+        assertEquals(0, new CommandLine(new JustMain()).execute("scan", "--help"));
+        assertEquals(0, new CommandLine(new JustMain()).execute("perf", "--help"));
+        assertEquals(0, new CommandLine(new JustMain()).execute("diff", "--help"));
+    }
+
+    @Test
     void scanAndPerformanceDoNotExposeVerifierConfiguration() {
         CommandLine root = new CommandLine(new JustMain());
         StringWriter scanOutput = new StringWriter();
