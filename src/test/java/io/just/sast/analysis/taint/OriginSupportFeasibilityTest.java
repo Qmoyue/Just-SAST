@@ -99,6 +99,19 @@ class OriginSupportFeasibilityTest {
     }
 
     @Test
+    void unknownBranchThroughBackwardLoopKeepsSinkPath() {
+        MethodInfo method = backwardLoopBranchMethod();
+        int sinkOffset = method.instructions().stream()
+                .filter(insn -> insn.op() == Op.NOP)
+                .findFirst()
+                .orElseThrow()
+                .offset();
+
+        assertFalse(supportFor(method).sinkPathProvablyUnreachable(method, sinkOffset),
+                "a sink reachable through one side of a loop must remain reachable when the branch is unknown");
+    }
+
+    @Test
     void branchTruthUsesTheSameAbstractStateAsTheSinkGuard() throws Exception {
         OriginSupport support = emptySupport();
         MethodInfo method = constantBranchMethod();
@@ -552,6 +565,22 @@ class OriginSupportFeasibilityTest {
         method.instructions.add(new InsnNode(Op.NOP.code()));
         method.instructions.add(new InsnNode(Op.RETURN.code()));
         return extract("fixture/StringGuard", method);
+    }
+
+    private static MethodInfo backwardLoopBranchMethod() {
+        LabelNode loop = new LabelNode();
+        LabelNode sink = new LabelNode();
+        MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "loopGuard",
+                "(Z)V", null, null);
+        method.instructions.add(new JumpInsnNode(Op.GOTO.code(), loop));
+        method.instructions.add(loop);
+        method.instructions.add(new VarInsnNode(Op.ILOAD.code(), 0));
+        method.instructions.add(new JumpInsnNode(Op.IFNE.code(), sink));
+        method.instructions.add(new JumpInsnNode(Op.GOTO.code(), loop));
+        method.instructions.add(sink);
+        method.instructions.add(new InsnNode(Op.NOP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+        return extract("fixture/LoopGuard", method);
     }
 
     private static OriginSupport supportFor(MethodInfo method) {

@@ -37,6 +37,8 @@ public final class Cfg {
         private final boolean valid;
         private static final CfgLabel[] LABELS = CfgLabel.values();
         private volatile List<List<CfgEdge>> legacyView;
+        /** Built only by the bounded sink-path proof, then shared by all proof sites. */
+        private volatile ReverseEdges reverseEdges;
 
         public Indexed(List<List<CfgEdge>> successors) {
             List<List<CfgEdge>> safe = successors == null ? List.of() : successors;
@@ -100,6 +102,91 @@ public final class Cfg {
 
         public CfgLabel labelAt(int edgeIndex) {
             return LABELS[labels[edgeIndex]];
+        }
+
+        /**
+         * Lazily materialized reverse CSR for analyses that walk toward one target instruction.
+         * Invalid targets remain in the forward table for compatibility, but are omitted here so
+         * callers can iterate predecessors without repeating bounds checks for every edge.
+         */
+        public ReverseEdges reverseEdges() {
+            ReverseEdges view = reverseEdges;
+            if (view != null) {
+                return view;
+            }
+            synchronized (this) {
+                view = reverseEdges;
+                if (view == null) {
+                    view = ReverseEdges.build(instructionCount, edgeOffsets, targets);
+                    reverseEdges = view;
+                }
+                return view;
+            }
+        }
+
+        /** Reverse CSR view keyed by target instruction index. */
+        public static final class ReverseEdges {
+            private final int[] predecessorOffsets;
+            private final int[] sources;
+            private final int[] edgeIndexes;
+
+            private ReverseEdges(int[] predecessorOffsets, int[] sources, int[] edgeIndexes) {
+                this.predecessorOffsets = predecessorOffsets;
+                this.sources = sources;
+                this.edgeIndexes = edgeIndexes;
+            }
+
+            private static ReverseEdges build(int instructionCount, int[] edgeOffsets,
+                                              int[] targets) {
+                int[] counts = new int[instructionCount];
+                for (int source = 0; source < instructionCount; source++) {
+                    for (int edgeIndex = edgeOffsets[source];
+                         edgeIndex < edgeOffsets[source + 1]; edgeIndex++) {
+                        int target = targets[edgeIndex];
+                        if (target >= 0 && target < instructionCount) {
+                            counts[target]++;
+                        }
+                    }
+                }
+                int[] offsets = new int[instructionCount + 1];
+                for (int target = 0; target < instructionCount; target++) {
+                    offsets[target + 1] = offsets[target] + counts[target];
+                }
+                int[] sources = new int[offsets[instructionCount]];
+                int[] edgeIndexes = new int[sources.length];
+                int[] cursors = java.util.Arrays.copyOf(offsets, instructionCount);
+                for (int source = 0; source < instructionCount; source++) {
+                    for (int edgeIndex = edgeOffsets[source];
+                         edgeIndex < edgeOffsets[source + 1]; edgeIndex++) {
+                        int target = targets[edgeIndex];
+                        if (target < 0 || target >= instructionCount) {
+                            continue;
+                        }
+                        int reverseIndex = cursors[target]++;
+                        sources[reverseIndex] = source;
+                        edgeIndexes[reverseIndex] = edgeIndex;
+                    }
+                }
+                return new ReverseEdges(offsets, sources, edgeIndexes);
+            }
+
+            public int predecessorStart(int target) {
+                return target >= 0 && target + 1 < predecessorOffsets.length
+                        ? predecessorOffsets[target] : 0;
+            }
+
+            public int predecessorEnd(int target) {
+                return target >= 0 && target + 1 < predecessorOffsets.length
+                        ? predecessorOffsets[target + 1] : 0;
+            }
+
+            public int sourceAt(int predecessorIndex) {
+                return sources[predecessorIndex];
+            }
+
+            public int edgeIndexAt(int predecessorIndex) {
+                return edgeIndexes[predecessorIndex];
+            }
         }
 
         public List<CfgEdge> successorsAt(int offset) {

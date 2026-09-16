@@ -4198,30 +4198,27 @@ public final class OriginSupport {
             int size = method.instructions().size();
             boolean[] canReachSink = new boolean[size];
             canReachSink[sinkOffset] = true;
-            boolean changed;
-            do {
-                changed = false;
-                for (int source = size - 1; source >= 0; source--) {
+            Cfg.Indexed.ReverseEdges reverse = cfg.reverseEdges();
+            Deque<Integer> work = new ArrayDeque<>();
+            work.addLast(sinkOffset);
+            while (!work.isEmpty()) {
+                int target = work.removeFirst();
+                for (int predecessorIndex = reverse.predecessorStart(target);
+                     predecessorIndex < reverse.predecessorEnd(target); predecessorIndex++) {
+                    int source = reverse.sourceAt(predecessorIndex);
                     if (canReachSink[source]) {
                         continue;
                     }
-                    for (int edgeIndex = cfg.edgeStart(source); edgeIndex < cfg.edgeEnd(source); edgeIndex++) {
-                        int target = cfg.targetAt(edgeIndex);
-                        CfgLabel label = cfg.labelAt(edgeIndex);
-                        if (target < 0 || target >= size
-                                || !feasibleCfgEdge(method, result, source, label)) {
-                            continue;
-                        }
-                        if (canReachSink[target]) {
-                            canReachSink[source] = true;
-                            constantProof.get().expanded(method, method.insnAt(source));
-                            finiteFilterExpanded.increment();
-                            changed = true;
-                            break;
-                        }
+                    int edgeIndex = reverse.edgeIndexAt(predecessorIndex);
+                    if (!feasibleCfgEdge(method, result, source, cfg.labelAt(edgeIndex))) {
+                        continue;
                     }
+                    canReachSink[source] = true;
+                    constantProof.get().expanded(method, method.insnAt(source));
+                    finiteFilterExpanded.increment();
+                    work.addLast(source);
                 }
-            } while (changed);
+            }
             ConstantProofContext context = constantProof.get();
             boolean complete = !context.budgetExceeded;
             if (context.budgetExceeded) {
