@@ -3,6 +3,7 @@ package io.just.sast.report;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
+import io.just.sast.chain.ChainIds;
 
 /** Owns the stable chain identity shared by reports and report consumers. */
 public final class ChainIdentity {
@@ -24,6 +25,25 @@ public final class ChainIdentity {
         return String.join("|", safe(ruleId), safe(entryClass), safe(entryMethod),
                 safe(entryDescriptor), safe(entryKind), safe(sinkClass), safe(sinkMethod),
                 safe(sinkDescriptor));
+    }
+
+    /**
+     * Keep path/object variants addressable without changing the legacy semantic identity.
+     * Reports written before chain_key existed continue to use the base identity.
+     */
+    public static String variantOf(Chain chain) {
+        if (chain == null) {
+            throw new IllegalArgumentException("chain is required");
+        }
+        return variantOf(of(chain), chain.key());
+    }
+
+    public static String variantOf(String identity, String chainKey) {
+        String base = safe(identity);
+        if (chainKey == null || chainKey.isBlank()) {
+            return base;
+        }
+        return base + "|variant=" + ChainIds.sha256(chainKey);
     }
 
     public static String entryDescriptor(Chain chain) {

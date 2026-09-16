@@ -2,6 +2,7 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ConstructionSummary;
+import io.just.sast.analysis.taint.FilterAnalysis;
 
 import java.util.List;
 
@@ -38,6 +39,32 @@ final class ReportEvidence {
 
     static String constructionReasons(Chain chain, List<String> notes) {
         return String.join("|", construction(chain, notes).reasons());
+    }
+
+    /** One canonical JSON projection for bounded-filter evidence shared by all report views. */
+    static String filterEvidenceJson(List<FilterAnalysis.Evidence> evidence) {
+        StringBuilder json = new StringBuilder("[");
+        List<FilterAnalysis.Evidence> values = evidence == null ? List.of() : evidence;
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            FilterAnalysis.Evidence item = values.get(i);
+            json.append("{\"kind\":\"").append(escape(item.kind().name()))
+                    .append("\",\"location\":\"").append(escape(item.location()))
+                    .append("\",\"status\":\"").append(escape(item.status().name()))
+                    .append("\",\"reason_code\":\"").append(escape(item.reasonCode()))
+                    .append("\",\"domain_digest\":\"").append(escape(item.domainDigest()))
+                    .append("\",\"semantic_digest\":\"").append(escape(item.semanticDigest()))
+                    .append("\",\"budget\":").append(item.budget())
+                    .append(",\"evaluated\":").append(item.evaluated())
+                    .append(",\"retained\":").append(item.retained())
+                    .append(",\"rejected\":").append(item.rejected())
+                    .append(",\"expanded\":").append(item.expanded())
+                    .append(",\"filter_cost_nanos\":").append(item.filterCostNanos())
+                    .append('}');
+        }
+        return json.append(']').toString();
     }
 
     static String sinkRisk(Chain chain) {

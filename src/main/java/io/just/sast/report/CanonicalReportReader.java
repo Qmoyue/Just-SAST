@@ -20,13 +20,14 @@ import java.util.Objects;
 /** Reads the stable {@code report.json} chain array for downstream static consumers. */
 public final class CanonicalReportReader {
 
-    public record ChainRecord(String id, String ruleId, String category, String severity,
+    public record ChainRecord(String id, String chainKey, String ruleId, String category, String severity,
                               String entryClass, String entryMethod, String entryDescriptor,
                               String entryKind, String sinkClass, String sinkMethod,
                               String sinkDescriptor, String rawSemantic, boolean exported) {
 
         public ChainRecord {
             id = required(id, "id");
+            chainKey = chainKey == null ? "" : chainKey;
             ruleId = required(ruleId, "rule_id");
             category = required(category, "category");
             severity = required(severity, "severity");
@@ -43,6 +44,11 @@ public final class CanonicalReportReader {
         public String identity() {
             return ChainIdentity.of(ruleId, entryClass, entryMethod, entryDescriptor, entryKind,
                     sinkClass, sinkMethod, sinkDescriptor);
+        }
+
+        /** Stable identity that keeps distinct path/object variants independently addressable. */
+        public String variantIdentity() {
+            return ChainIdentity.variantOf(identity(), chainKey);
         }
 
         public String semanticFingerprint() {
@@ -69,11 +75,11 @@ public final class CanonicalReportReader {
         /** Stable digest of the chain evidence, independent of report summary timing. */
         public String digest() {
             List<ChainRecord> ordered = new ArrayList<>(chains);
-            ordered.sort(Comparator.comparing(ChainRecord::identity)
+            ordered.sort(Comparator.comparing(ChainRecord::variantIdentity)
                     .thenComparing(ChainRecord::id));
             StringBuilder canonical = new StringBuilder();
             for (ChainRecord chain : ordered) {
-                canonical.append(chain.identity()).append('\n')
+                canonical.append(chain.variantIdentity()).append('\n')
                         .append(chain.semanticFingerprint()).append('\n');
             }
             return ChainIds.sha256(canonical.toString());
@@ -121,8 +127,10 @@ public final class CanonicalReportReader {
             ObjectNode item = object(node, "chains[]");
             ObjectNode entry = object(required(item, "entry"), "entry");
             ObjectNode sink = object(required(item, "sink"), "sink");
+            Node chainKeyNode = item.fields().get("chain_key");
             ChainRecord record = new ChainRecord(
                     string(required(item, "id"), "id"),
+                    chainKeyNode == null ? "" : string(chainKeyNode, "chain_key"),
                     string(required(item, "rule_id"), "rule_id"),
                     string(required(item, "category"), "category"),
                     string(required(item, "severity"), "severity"),
@@ -135,9 +143,9 @@ public final class CanonicalReportReader {
                     string(required(sink, "descriptor"), "sink.descriptor"),
                     canonicalWithoutId(item),
                     bool(required(item, "exported"), "exported"));
-            if (byIdentity.put(record.identity(), record) != null) {
+            if (byIdentity.put(record.variantIdentity(), record) != null) {
                 throw new IllegalArgumentException("duplicate canonical chain identity: "
-                        + record.identity());
+                        + record.variantIdentity());
             }
             records.add(record);
         }

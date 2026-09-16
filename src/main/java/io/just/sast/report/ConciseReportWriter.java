@@ -3,6 +3,7 @@ package io.just.sast.report;
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.FindingState;
+import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ChainRanking;
 
 import java.io.IOException;
@@ -22,6 +23,7 @@ import java.util.Objects;
 public final class ConciseReportWriter {
 
     public static final String SCHEMA_VERSION = "JUST-REPORT-V1";
+    public static final int MARKDOWN_DISPLAY_LIMIT = 10;
 
     public void write(ReportLayout layout, String mode,
                       FindingOutputReader.Snapshot snapshot,
@@ -76,7 +78,11 @@ public final class ConciseReportWriter {
                 .append(",\"files_scanned\":").append(stats.filesScanned())
                 .append(",\"classes_loaded\":").append(stats.classesLoaded())
                 .append(",\"elapsed_ms\":").append(stats.elapsedMs()).append('}')
-                .append(",\"result_explanation\":");
+                .append(",\"presentation\":");
+        appendPresentation(out, stats, findings);
+        out.append(",\"filter_evidence\":");
+        out.append(ReportEvidence.filterEvidenceJson(stats.filterEvidence()));
+        out.append(",\"result_explanation\":");
         appendResultExplanation(out, stats, findings);
         out.append(",\"chains\":[");
         for (int i = 0; i < findings.size(); i++) {
@@ -92,6 +98,7 @@ public final class ConciseReportWriter {
         FindingState state = finding.state();
         out.append('{')
                 .append("\"id\":").append(quote(finding.id()))
+                .append(",\"chain_key\":").append(quote(chain.key()))
                 .append(",\"exported\":").append(finding.exported())
                 .append(",\"rule_id\":").append(quote(chain.ruleId()))
                 .append(",\"category\":").append(quote(chain.category()))
@@ -102,7 +109,7 @@ public final class ConciseReportWriter {
                 .append(",\"kind\":").append(quote(chain.entryKind())).append('}')
                 .append(",\"sink\":{\"class\":").append(quote(chain.sinkClass()))
                 .append(",\"method\":").append(quote(chain.sinkMethod()))
-                .append(",\"descriptor\":").append(quote(chain.sinkDescriptor()))
+                .append(",\"descriptor\":").append(quote(ChainIdentity.sinkDescriptor(chain)))
                 .append(",\"role\":").append(quote(chain.sinkRole()))
                 .append(",\"risk\":").append(quote(chain.sinkRisk().name())).append('}')
                 .append(",\"state\":{\"entry_status\":")
@@ -126,6 +133,16 @@ public final class ConciseReportWriter {
                 .append(",\"precision_rank\":").append(finding.ranking().precisionRank())
                 .append(",\"explanation\":").append(quote(finding.ranking().explanation()))
                 .append('}')
+                .append(",\"confidence\":{\"bucket\":")
+                .append(quote(finding.confidence().bucket()))
+                .append(",\"reason\":").append(quote(finding.confidence().reasonCode()))
+                .append(",\"static_rank\":")
+                .append(finding.confidence().features().staticRank())
+                .append(",\"total_score\":")
+                .append(finding.confidence().features().totalScore()).append('}')
+                .append(",\"precision\":")
+                .append(ChainPrecision.toJson(finding.precision(), ConciseReportWriter::escape,
+                        finding.highConfidence()))
                 .append(",\"construction\":")
                 .append(ReportEvidence.constructionJson(finding.construction()))
                 .append(",\"notes\":");
@@ -154,7 +171,10 @@ public final class ConciseReportWriter {
         for (int i = 0; i < hops.size(); i++) {
             if (i > 0) out.append(',');
             ChainHop hop = hops.get(i);
-            out.append("{\"from\":").append(quote(member(hop.fromOwner(), hop.fromName())))
+            out.append("{\"hop_index\":").append(i + 1)
+                    .append(",\"from\":").append(quote(member(hop.fromOwner(), hop.fromName())))
+                    .append(",\"from_descriptor\":")
+                    .append(nullableQuote(hopFromDescriptor(hops, i)))
                     .append(",\"to\":").append(quote(member(hop.toOwner(), hop.toName())))
                     .append(",\"kind\":").append(quote(hop.kind() == null
                             ? "UNKNOWN" : hop.kind().name()))
@@ -192,6 +212,18 @@ public final class ConciseReportWriter {
                 .append("- Candidates: ").append(findings.size())
                 .append("; exported: ").append(findings.stream()
                         .filter(FindingOutputReader.Finding::exported).count()).append('\n')
+                .append("- Display limit: `").append(MARKDOWN_DISPLAY_LIMIT)
+                .append("` detailed; detailed: ").append(Math.min(MARKDOWN_DISPLAY_LIMIT,
+                        findings.size()))
+                .append("; compact: ").append(Math.max(0, findings.size()
+                        - MARKDOWN_DISPLAY_LIMIT))
+                .append("; JSON candidates: ").append(findings.size())
+                .append("; JSON truncation: `NO`\n")
+                .append("- Search budget: `").append(md(searchBudgetSummary(stats)))
+                .append("` (independent of display limit)\n")
+                .append("- Filter evidence: `").append(stats.filterEvidence().size())
+                .append("` rows; full status, proof scope, digests, counts and cost are in "
+                        + "report.json and meta/scan-metadata.json\n")
                 .append("- Result: ").append(md(resultMessage(findings))).append('\n')
                 .append("- Reason codes: `").append(md(String.join(",", resultReasonCodes(stats,
                         findings)))).append("`\n\n");
@@ -206,11 +238,14 @@ public final class ConciseReportWriter {
         }
         out.append("## Chains\n\n");
         int number = 1;
-        for (FindingOutputReader.Finding finding : findings) {
+        int detailedCount = Math.min(MARKDOWN_DISPLAY_LIMIT, findings.size());
+        for (int index = 0; index < detailedCount; index++) {
+            FindingOutputReader.Finding finding = findings.get(index);
             Chain chain = finding.chain();
             out.append("### ").append(number++).append(". ")
                     .append(finding.exported() ? "EXPORTED" : "CANDIDATE")
                     .append(" — `").append(md(chain.ruleId())).append("`\n\n")
+                    .append("- Finding ID: `").append(md(finding.id())).append("`\n")
                     .append('`').append(md(member(chain.entryClass(), chain.entryMethod())))
                     .append("` → `").append(md(member(chain.sinkClass(), chain.sinkMethod())))
                     .append("`\n\n")
@@ -229,9 +264,11 @@ public final class ConciseReportWriter {
                 out.append("- Notes: ").append(finding.notes().stream().map(ConciseReportWriter::md)
                         .reduce((left, right) -> left + "; " + right).orElse("")).append("\n");
             }
-            if (!chain.hops().isEmpty()) {
+            List<ChainHop> orderedHops = orderedHops(chain);
+            if (!orderedHops.isEmpty()) {
                 out.append("- Hops:\n");
-                for (ChainHop hop : orderedHops(chain)) {
+                for (int hopIndex = 0; hopIndex < orderedHops.size(); hopIndex++) {
+                    ChainHop hop = orderedHops.get(hopIndex);
                     out.append("  - `").append(md(member(hop.fromOwner(), hop.fromName())))
                             .append("` — ").append(md(hop.kind() == null
                                     ? "UNKNOWN" : hop.kind().name()))
@@ -246,6 +283,10 @@ public final class ConciseReportWriter {
                     if (hop.argOrdinal() != null) {
                         out.append("; arg ").append(hop.argOrdinal());
                     }
+                    String fromDescriptor = hopFromDescriptor(orderedHops, hopIndex);
+                    if (fromDescriptor != null && !fromDescriptor.isBlank()) {
+                        out.append("; from descriptor `").append(md(fromDescriptor)).append('`');
+                    }
                     if (hop.desc() != null && !hop.desc().isBlank()) {
                         out.append("; descriptor `").append(md(hop.desc())).append('`');
                     }
@@ -257,7 +298,77 @@ public final class ConciseReportWriter {
             }
             out.append('\n');
         }
+        if (findings.size() > detailedCount) {
+            out.append("## Remaining candidate summaries\n\n")
+                    .append("The JSON report retains every candidate and variant; these rows are "
+                            + "compact display only.\n\n")
+                    .append("| # | Finding ID | Rule | Entry | Sink | Eligibility |\n")
+                    .append("|---:|---|---|---|---|---|\n");
+            for (int index = detailedCount; index < findings.size(); index++) {
+                FindingOutputReader.Finding finding = findings.get(index);
+                Chain chain = finding.chain();
+                out.append('|').append(number++).append('|').append(md(finding.id())).append('|')
+                        .append(md(chain.ruleId())).append('|')
+                        .append(md(member(chain.entryClass(), chain.entryMethod()))).append('|')
+                        .append(md(member(chain.sinkClass(), chain.sinkMethod()))).append('|')
+                        .append(md(finding.state().eligibility().name())).append('|').append('\n');
+            }
+            out.append('\n');
+        }
         return out.toString();
+    }
+
+    private static void appendPresentation(StringBuilder out, ScanStatistics stats,
+                                           List<FindingOutputReader.Finding> findings) {
+        int count = findings.size();
+        out.append("{\"display_limit\":").append(MARKDOWN_DISPLAY_LIMIT)
+                .append(",\"detailed_count\":").append(Math.min(MARKDOWN_DISPLAY_LIMIT, count))
+                .append(",\"compact_count\":").append(Math.max(0, count - MARKDOWN_DISPLAY_LIMIT))
+                .append(",\"json_candidate_count\":").append(count)
+                .append(",\"json_truncated\":false")
+                .append(",\"search_budget\":");
+        appendSearchBudget(out, stats);
+        out.append('}');
+    }
+
+    private static void appendSearchBudget(StringBuilder out, ScanStatistics stats) {
+        long stepLimit = stats.metric("forward_step_limit", -1L);
+        long methodPassLimit = stats.metric("forward_method_pass_limit", -1L);
+        long roundLimit = stats.metric("forward_round_limit", -1L);
+        boolean bounded = stepLimit >= 0L || methodPassLimit >= 0L || roundLimit >= 0L;
+        out.append("{\"source\":\"meta/scan-metadata.json\",\"status\":")
+                .append(quote(bounded ? "BOUNDED" : "UNKNOWN"))
+                .append(",\"step_limit\":");
+        appendNullableLong(out, stepLimit);
+        out.append(",\"method_pass_limit\":");
+        appendNullableLong(out, methodPassLimit);
+        out.append(",\"round_limit\":");
+        appendNullableLong(out, roundLimit);
+        out.append('}');
+    }
+
+    private static String searchBudgetSummary(ScanStatistics stats) {
+        long stepLimit = stats.metric("forward_step_limit", -1L);
+        long methodPassLimit = stats.metric("forward_method_pass_limit", -1L);
+        long roundLimit = stats.metric("forward_round_limit", -1L);
+        if (stepLimit < 0L && methodPassLimit < 0L && roundLimit < 0L) {
+            return "UNKNOWN; see meta/scan-metadata.json";
+        }
+        return "step_limit=" + nullableMetric(stepLimit)
+                + ",method_pass_limit=" + nullableMetric(methodPassLimit)
+                + ",round_limit=" + nullableMetric(roundLimit);
+    }
+
+    private static String nullableMetric(long value) {
+        return value < 0L ? "UNKNOWN" : Long.toString(value);
+    }
+
+    private static void appendNullableLong(StringBuilder out, long value) {
+        if (value < 0L) {
+            out.append("null");
+        } else {
+            out.append(value);
+        }
     }
 
     private static void appendResultExplanation(StringBuilder out, ScanStatistics stats,
@@ -329,6 +440,26 @@ public final class ConciseReportWriter {
         return left + "#" + right;
     }
 
+    /** Derive a source descriptor only when the adjacent typed hop proves the same method. */
+    private static String hopFromDescriptor(List<ChainHop> hops, int index) {
+        ChainHop hop = hops.get(index);
+        if (hop.fromOwner() != null && hop.fromName() != null
+                && hop.fromOwner().equals(hop.toOwner()) && hop.fromName().equals(hop.toName())
+                && hop.desc() != null && !hop.desc().isBlank()) {
+            return hop.desc();
+        }
+        if (index > 0) {
+            ChainHop previous = hops.get(index - 1);
+            if (hop.fromOwner() != null && hop.fromName() != null
+                    && hop.fromOwner().equals(previous.toOwner())
+                    && hop.fromName().equals(previous.toName())
+                    && previous.desc() != null && !previous.desc().isBlank()) {
+                return previous.desc();
+            }
+        }
+        return null;
+    }
+
     private static void appendStrings(StringBuilder out, List<String> values) {
         out.append('[');
         if (values != null) {
@@ -341,8 +472,12 @@ public final class ConciseReportWriter {
     }
 
     private static String quote(String value) {
-        if (value == null) return "\"\"";
-        StringBuilder out = new StringBuilder(value.length() + 8).append('"');
+        return "\"" + escape(value) + "\"";
+    }
+
+    private static String escape(String value) {
+        if (value == null) return "";
+        StringBuilder out = new StringBuilder(value.length() + 8);
         for (int i = 0; i < value.length(); i++) {
             char ch = value.charAt(i);
             switch (ch) {
@@ -358,7 +493,7 @@ public final class ConciseReportWriter {
                 }
             }
         }
-        return out.append('"').toString();
+        return out.toString();
     }
 
     private static String nullableQuote(String value) {
@@ -367,6 +502,7 @@ public final class ConciseReportWriter {
 
     private static String md(String value) {
         return value == null ? "" : value.replace("`", "'")
-                .replace("\r", " ").replace("\n", " ");
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("|", "\\|").replace("\r", " ").replace("\n", " ");
     }
 }

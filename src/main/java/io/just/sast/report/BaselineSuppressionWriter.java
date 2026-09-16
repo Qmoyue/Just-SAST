@@ -60,12 +60,17 @@ public final class BaselineSuppressionWriter {
             }
         }
         Set<String> old = baseline == null ? Set.of() : readBaseline(baseline, policy, tracker);
+        Set<String> currentSemantic = new TreeSet<>();
+        for (Chain chain : current.values()) {
+            currentSemantic.add(ChainIdentity.of(chain));
+        }
         List<Selector> selectors = suppressions == null ? List.of()
                 : readSelectors(suppressions, policy, tracker);
         Set<String> usedSelectors = new LinkedHashSet<>();
         List<Row> rows = new ArrayList<>();
         for (Map.Entry<String, Chain> entry : current.entrySet()) {
-            boolean baselineMatch = old.contains(entry.getKey());
+            boolean baselineMatch = old.contains(entry.getKey())
+                    || old.contains(ChainIdentity.of(entry.getValue()));
             boolean suppressionMatch = matches(entry.getKey(), entry.getValue(), selectors, usedSelectors);
             String status = suppressionMatch
                     ? baselineMatch ? "SUPPRESSED_BASELINE" : "SUPPRESSED_NEW"
@@ -73,7 +78,7 @@ public final class BaselineSuppressionWriter {
             rows.add(new Row(entry.getKey(), entry.getValue(), status));
         }
         for (String removed : new TreeSet<>(old)) {
-            if (!current.containsKey(removed)) {
+            if (!current.containsKey(removed) && !currentSemantic.contains(removed)) {
                 rows.add(new Row(removed, null, "REMOVED"));
             }
         }
@@ -84,7 +89,7 @@ public final class BaselineSuppressionWriter {
     }
 
     static String identity(Chain chain) {
-        return ChainIdentity.of(chain);
+        return ChainIdentity.variantOf(chain);
     }
 
     private static Set<String> readBaseline(Path baseline, InputBudget policy,
@@ -102,7 +107,7 @@ public final class BaselineSuppressionWriter {
                 tracker);
         Set<String> identities = new TreeSet<>();
         for (CanonicalReportReader.ChainRecord chain : snapshot.chains()) {
-            identities.add(chain.identity());
+            identities.add(chain.variantIdentity());
         }
         return Set.copyOf(identities);
     }
@@ -173,8 +178,11 @@ public final class BaselineSuppressionWriter {
         String digest = ChainIds.sha256(identity);
         for (Selector selector : selectors) {
             boolean match = switch (selector.kind()) {
-                case "identity" -> selector.value().equals(identity);
-                case "sha256" -> selector.value().equalsIgnoreCase(digest);
+                case "identity" -> selector.value().equals(identity)
+                        || selector.value().equals(ChainIdentity.of(chain));
+                case "sha256" -> selector.value().equalsIgnoreCase(digest)
+                        || selector.value().equalsIgnoreCase(ChainIds.sha256(
+                        ChainIdentity.of(chain)));
                 case "rule" -> selector.value().equals(safe(chain.ruleId()));
                 default -> false;
             };

@@ -3,18 +3,16 @@
   "$id": "https://just.invalid/schema/concise-report-v1.schema.json",
   "title": "Just concise static report",
   "type": "object",
-  "required": ["schema_version", "mode", "static_safety", "artifact_sha256", "run", "summary", "result_explanation", "chains"],
+  "required": ["schema_version", "mode", "static_analysis", "artifact_sha256", "run", "summary", "presentation", "filter_evidence", "result_explanation", "chains"],
   "properties": {
     "schema_version": { "const": "JUST-REPORT-V1" },
     "mode": { "enum": ["component", "application"] },
-    "static_safety": {
+    "static_analysis": {
       "type": "object",
-      "required": ["verification_mode", "target_code_execution_possible", "target_code_executed", "dynamic_filtering"],
+      "required": ["target_code_executed", "filter_evidence"],
       "properties": {
-        "verification_mode": { "const": "STATIC_ONLY" },
-        "target_code_execution_possible": { "const": false },
-        "target_code_executed": { "const": "NO" },
-        "dynamic_filtering": { "const": "ANALYSIS_ONLY" }
+        "target_code_executed": { "const": false },
+        "filter_evidence": { "const": "meta/scan-metadata.json" }
       },
       "additionalProperties": false
     },
@@ -29,6 +27,23 @@
         "reason_codes": { "type": "array", "items": { "type": "string" } }
       },
       "additionalProperties": false
+    },
+    "presentation": {
+      "type": "object",
+      "required": ["display_limit", "detailed_count", "compact_count", "json_candidate_count", "json_truncated", "search_budget"],
+      "properties": {
+        "display_limit": { "type": "integer", "minimum": 0 },
+        "detailed_count": { "type": "integer", "minimum": 0 },
+        "compact_count": { "type": "integer", "minimum": 0 },
+        "json_candidate_count": { "type": "integer", "minimum": 0 },
+        "json_truncated": { "const": false },
+        "search_budget": { "$ref": "#/$defs/search_budget" }
+      },
+      "additionalProperties": false
+    },
+    "filter_evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/filter_evidence" }
     },
     "summary": {
       "type": "object",
@@ -59,17 +74,18 @@
   "$defs": {
     "chain": {
       "type": "object",
-      "required": ["id", "exported", "rule_id", "category", "severity", "entry", "sink", "state", "constraints", "ranking", "construction", "notes", "object_relations", "hops", "application_trace"],
+      "required": ["id", "chain_key", "exported", "rule_id", "category", "severity", "entry", "sink", "state", "constraints", "ranking", "confidence", "precision", "construction", "notes", "object_relations", "hops", "application_trace"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "chain_key": { "type": "string", "minLength": 1 },
         "exported": { "type": "boolean" },
         "rule_id": { "type": "string" },
         "category": { "type": "string" },
         "severity": { "type": "string" },
         "entry": {
           "type": "object",
-          "required": ["class", "method", "kind"],
-          "properties": { "class": { "type": "string" }, "method": { "type": "string" }, "kind": { "type": "string" } },
+          "required": ["class", "method", "descriptor", "kind"],
+          "properties": { "class": { "type": "string" }, "method": { "type": "string" }, "descriptor": { "type": "string" }, "kind": { "type": "string" } },
           "additionalProperties": false
         },
         "sink": {
@@ -80,11 +96,33 @@
         },
         "state": {
           "type": "object",
-          "required": ["entry_status", "chain_progress", "feasibility", "completeness", "verification", "risk", "eligibility", "violations"],
+          "required": ["entry_status", "chain_progress", "feasibility", "completeness", "risk", "eligibility", "violations"],
           "properties": {
             "entry_status": { "type": "string" }, "chain_progress": { "type": "string" }, "feasibility": { "type": "string" },
-            "completeness": { "type": "string" }, "verification": { "type": "string" }, "risk": { "type": "string" },
+            "completeness": { "type": "string" }, "risk": { "type": "string" },
             "eligibility": { "type": "string" }, "violations": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        },
+        "confidence": {
+          "type": "object",
+          "required": ["bucket", "reason", "static_rank", "total_score"],
+          "properties": {
+            "bucket": { "type": "string" }, "reason": { "type": "string" },
+            "static_rank": { "type": "integer", "minimum": 0 },
+            "total_score": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "precision": {
+          "type": "object",
+          "required": ["controllability", "dispatch_precision", "field_precision", "reflection_precision", "construction", "completeness", "rank", "high_confidence", "reasons"],
+          "properties": {
+            "controllability": { "type": "string" }, "dispatch_precision": { "type": "string" },
+            "field_precision": { "type": "string" }, "reflection_precision": { "type": "string" },
+            "construction": { "type": "string" }, "completeness": { "type": "string" },
+            "rank": { "type": "integer", "minimum": 0 }, "high_confidence": { "type": "boolean" },
+            "reasons": { "type": "array", "items": { "type": "string" } }
           },
           "additionalProperties": false
         },
@@ -126,9 +164,9 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["from", "to", "kind", "field", "reason", "descriptor", "arg_ordinal", "field_owner"],
+            "required": ["hop_index", "from", "from_descriptor", "to", "kind", "field", "reason", "descriptor", "arg_ordinal", "field_owner"],
             "properties": {
-              "from": { "type": "string" }, "to": { "type": "string" }, "kind": { "type": "string" }, "field": { "type": "string" },
+              "hop_index": { "type": "integer", "minimum": 1 }, "from": { "type": "string" }, "from_descriptor": { "type": ["string", "null"] }, "to": { "type": "string" }, "kind": { "type": "string" }, "field": { "type": "string" },
               "reason": { "type": "string" }, "descriptor": { "type": "string" }, "arg_ordinal": { "type": ["integer", "null"] }, "field_owner": { "type": ["string", "null"] }
             },
             "additionalProperties": false
@@ -136,6 +174,7 @@
         },
         "application_trace": {
           "type": ["object", "null"],
+          "required": ["application_entry_class", "application_entry_method", "application_site_class", "application_site_method", "application_site_kind", "join_kind", "chain_entry_method", "entry_prefix_path", "dependency_owner", "terminal_owner", "terminal_method"],
           "properties": {
             "application_entry_class": { "type": "string" }, "application_entry_method": { "type": "string" },
             "application_site_class": { "type": "string" }, "application_site_method": { "type": "string" },
@@ -144,6 +183,32 @@
           },
           "additionalProperties": false
         }
+      },
+      "additionalProperties": false
+    }
+    ,"filter_evidence": {
+      "type": "object",
+      "required": ["kind", "location", "status", "reason_code", "domain_digest", "semantic_digest", "budget", "evaluated", "retained", "rejected", "expanded", "filter_cost_nanos"],
+      "properties": {
+        "kind": { "type": "string" }, "location": { "type": "string" },
+        "status": { "enum": ["PROVABLY_UNREACHABLE", "PROVEN_RETAINED", "UNKNOWN", "BUDGET_EXCEEDED"] },
+        "reason_code": { "type": "string" }, "domain_digest": { "type": "string" },
+        "semantic_digest": { "type": "string" }, "budget": { "type": "integer", "minimum": 0 },
+        "evaluated": { "type": "integer", "minimum": 0 }, "retained": { "type": "integer", "minimum": 0 },
+        "rejected": { "type": "integer", "minimum": 0 }, "expanded": { "type": "integer", "minimum": 0 },
+        "filter_cost_nanos": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "search_budget": {
+      "type": "object",
+      "required": ["source", "status", "step_limit", "method_pass_limit", "round_limit"],
+      "properties": {
+        "source": { "const": "meta/scan-metadata.json" },
+        "status": { "enum": ["BOUNDED", "UNKNOWN"] },
+        "step_limit": { "type": ["integer", "null"], "minimum": 0 },
+        "method_pass_limit": { "type": ["integer", "null"], "minimum": 0 },
+        "round_limit": { "type": ["integer", "null"], "minimum": 0 }
       },
       "additionalProperties": false
     }

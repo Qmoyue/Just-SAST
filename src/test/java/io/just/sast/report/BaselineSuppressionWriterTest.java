@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -72,9 +73,38 @@ class BaselineSuppressionWriterTest {
                 layout, baseline, suppressions, List.of(), Map.of(), budget));
     }
 
+    @Test
+    void baselineKeepsDistinctPathVariantsUnderOneSemanticIdentity(@TempDir Path tmp)
+            throws Exception {
+        Chain first = variant("field-a", "reason-a");
+        Chain second = variant("field-b", "reason-b");
+        ReportLayout oldLayout = ReportLayout.create(tmp.resolve("old-variant"));
+        writeCanonical(oldLayout, first);
+
+        ReportLayout currentLayout = ReportLayout.create(tmp.resolve("current-variant"));
+        new BaselineSuppressionWriter().write(currentLayout, oldLayout.root(), null,
+                List.of(first, second), Map.of());
+
+        String csv = Files.readString(currentLayout.evidence().resolve("baseline.csv"));
+        String json = Files.readString(currentLayout.meta().resolve("baseline.json"));
+        assertEquals(3, csv.lines().count(), csv);
+        assertTrue(csv.contains("\"UNCHANGED\""), csv);
+        assertTrue(csv.contains("\"NEW\""), csv);
+        assertTrue(json.contains("\"added\":1"), json);
+        assertTrue(json.contains("\"unchanged\":1"), json);
+    }
+
     private static void writeCanonical(ReportLayout layout, Chain chain) throws Exception {
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
                 List.of(chain), Map.of(), Map.of(), Map.of());
         new ConciseReportWriter().write(layout, "component", snapshot, ScanStatistics.empty());
+    }
+
+    private static Chain variant(String field, String reason) {
+        return new Chain("rule-variant", "COMMAND", "HIGH", "app/Entry", "read",
+                "readObject", "java/lang/Runtime", "exec",
+                List.of(new io.just.sast.blackboard.ChainHop("app/Entry", "read",
+                        "java/lang/Runtime", "exec", io.just.sast.blackboard.HopKind.FIELD_FLOW,
+                        field, reason, "()V", null)), 0);
     }
 }

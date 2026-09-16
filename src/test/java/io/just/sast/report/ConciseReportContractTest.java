@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -39,6 +40,8 @@ class ConciseReportContractTest {
         assertTrue(firstJson.contains("\"target_code_executed\":false"));
         assertTrue(firstJson.contains("\"result_explanation\":{\"kind\":\"EXPORTED_CANDIDATES\""));
         assertTrue(firstJson.contains("\"arg_ordinal\":0"));
+        assertTrue(firstJson.contains("\"hop_index\":1"));
+        assertTrue(firstMarkdown.contains("Finding ID:"));
         assertTrue(firstJson.contains("\"constraints\":{"));
         assertTrue(firstMarkdown.contains("dep/Gadget#readObject` → `java/lang/Runtime#exec"));
         assertFalse(firstJson.contains("generated_bytes"));
@@ -140,6 +143,80 @@ class ConciseReportContractTest {
                 "concise report must preserve ChainRanking semantic order");
     }
 
+    @Test
+    void displayLimitDoesNotTruncateJsonOrVariantRows(@TempDir Path temp) throws Exception {
+        List<Chain> chains = new ArrayList<>();
+        for (int index = 0; index < 12; index++) {
+            String owner = "dep/Gadget" + index;
+            chains.add(new Chain("RULE-VARIANT-" + index, "COMMAND", "HIGH", owner,
+                    "readObject", "readObject", "java/lang/Runtime", "exec",
+                    List.of(new ChainHop(owner, "readObject", "java/lang/Runtime", "exec",
+                            HopKind.DIRECT_CALL, "value" + index, "variant", "()V", index)),
+                    0, "()V", "TERMINAL"));
+        }
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                chains, Map.of(), Map.of(), Map.of());
+        Path output = temp.resolve("display");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                ScanStatistics.empty());
+
+        String json = Files.readString(output.resolve("report.json"));
+        String markdown = Files.readString(output.resolve("report.md"));
+        assertEquals(12, occurrences(json, "\"chain_key\":"));
+        assertTrue(json.contains("\"display_limit\":10"));
+        assertTrue(json.contains("\"json_truncated\":false"));
+        assertTrue(markdown.contains("detailed: 10; compact: 2; JSON candidates: 12"));
+        assertTrue(markdown.contains("Remaining candidate summaries"));
+    }
+
+    @Test
+    void hostileTextIsEscapedWithoutInventingOrDroppingEvidence(@TempDir Path temp)
+            throws Exception {
+        String hostile = "<script>alert(\"x\")</script>|`\n" + (char) 1;
+        Chain chain = new Chain("RULE-" + hostile, "COMMAND", "HIGH",
+                "app/" + hostile, "readObject", "readObject", "java/lang/Runtime", "exec",
+                List.of(new ChainHop("app/" + hostile, "readObject", "java/lang/Runtime",
+                        "exec", HopKind.DIRECT_CALL, hostile, hostile, "()V", null)), 0,
+                "()V", "TERMINAL");
+        FindingOutputReader.Snapshot base = new FindingOutputReader().read(
+                List.of(chain), Map.of(), Map.of(chain.key(), List.of(hostile)), Map.of());
+        ApplicationTrace trace = new ApplicationTrace(hostile, hostile, hostile, hostile,
+                "BINDING_SITE", "TYPED_BINDING_TARGET", hostile, hostile, hostile, hostile,
+                hostile);
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader.Snapshot(
+                base.schemaVersion(), base.findings(), base.byChainKey(),
+                Map.of(chain.key(), trace));
+        Path output = temp.resolve("hostile");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                ScanStatistics.empty());
+        new MultiFormatReporter().write(ReportLayout.flat(output.resolve("detailed")), snapshot);
+
+        String json = Files.readString(output.resolve("report.json"));
+        String markdown = Files.readString(output.resolve("report.md"));
+        String html = Files.readString(output.resolve("detailed/findings.html"));
+        assertTrue(json.contains("\\u0001"), json);
+        assertTrue(markdown.contains("&lt;script&gt;"), markdown);
+        assertFalse(markdown.contains("<script>"), markdown);
+        assertTrue(html.contains("&lt;script&gt;"), html);
+        CanonicalReportReader.Snapshot parsed = new CanonicalReportReader().read(
+                output.resolve("report.json"), io.just.sast.run.InputBudget.defaults(),
+                io.just.sast.run.InputBudget.defaults().tracker());
+        assertEquals(1, parsed.chains().size());
+    }
+
+    @Test
+    void activeReportSchemasDescribeTheStaticV3Surface() throws Exception {
+        String concise = Files.readString(Path.of("docs/schemas/concise-report-v1.schema.json"));
+        String finding = Files.readString(Path.of("docs/schemas/finding-output-v1.schema.json"));
+        assertTrue(concise.contains("\"static_analysis\"")
+                        && concise.contains("\"display_limit\"")
+                        && concise.contains("\"filter_evidence\""), concise);
+        assertTrue(finding.contains("\"entry_descriptor\"")
+                        && finding.contains("\"application_trace\""), finding);
+        assertFalse(concise.contains("verification"), concise);
+        assertFalse(finding.contains("verification"), finding);
+    }
+
     private static ScanStatistics stats(String artifactHash) {
         return new ScanStatistics(1, 2, 0, 1, 1, 1, 42, 3, 4,
                 "COMPLETE", List.of(), Map.of(), Map.of(), "COMPLETE", artifactHash,
@@ -154,5 +231,15 @@ class ConciseReportContractTest {
                         HopKind.DIRECT_CALL, "", "bytecode",
                         "(Ljava/lang/String;)Ljava/lang/Process;", 0)), 0,
                 "(Ljava/lang/String;)Ljava/lang/Process;");
+    }
+
+    private static int occurrences(String text, String needle) {
+        int count = 0;
+        int offset = 0;
+        while ((offset = text.indexOf(needle, offset)) >= 0) {
+            count++;
+            offset += needle.length();
+        }
+        return count;
     }
 }

@@ -216,7 +216,13 @@ public record ApplicationTrace(
                 case '\n' -> out.append("\\n");
                 case '\r' -> out.append("\\r");
                 case '\t' -> out.append("\\t");
-                default -> out.append(ch);
+                default -> {
+                    if (ch < 0x20) {
+                        out.append(String.format(java.util.Locale.ROOT, "\\u%04x", (int) ch));
+                    } else {
+                        out.append(ch);
+                    }
+                }
             }
         }
         return out.toString();

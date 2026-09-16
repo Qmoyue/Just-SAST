@@ -118,8 +118,9 @@ public final class DiffCommand implements Callable<Integer> {
                 tracker);
         Map<String, String> map = new LinkedHashMap<>();
         for (CanonicalReportReader.ChainRecord chain : snapshot.chains()) {
-            if (map.put(chain.identity(), chain.semanticFingerprint()) != null) {
-                throw new IllegalArgumentException("report.json 存在重复链身份: " + chain.identity());
+            if (map.put(chain.variantIdentity(), chain.semanticFingerprint()) != null) {
+                throw new IllegalArgumentException("report.json 存在重复链身份: "
+                        + chain.variantIdentity());
             }
         }
         return map;

@@ -79,6 +79,7 @@ public final class ReportIndexWriter {
 
     private static String markdown(String value) {
         return value == null ? "" : value.replace("`", "'")
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 .replace("|", "\\|").replace("\r", " ").replace("\n", " ");
     }
 }

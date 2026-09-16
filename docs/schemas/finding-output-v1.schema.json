@@ -4,10 +4,9 @@
   "title": "Just SAST typed finding output reader snapshot",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "structured_verification", "findings"],
+  "required": ["schema_version", "findings"],
   "properties": {
     "schema_version": {"const": "JUST-FINDING-OUTPUT-D004-V1"},
-    "structured_verification": {"type": "boolean"},
     "findings": {
       "type": "array",
       "items": {"$ref": "#/$defs/finding"}
@@ -18,39 +17,59 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id", "chain_key", "rule_id", "entry_class", "entry_method", "entry_kind",
-        "sink_class", "sink_method", "sink_role", "sink_risk", "entry_status",
-        "chain_progress", "feasibility", "completeness", "verification", "risk",
-        "eligibility", "violations", "confidence", "confidence_reason", "static_rank",
-        "total_score", "verification_status", "verification_group", "exported", "calibration"
+        "id", "chain_key", "rule_id", "entry_class", "entry_method", "entry_descriptor",
+        "entry_kind", "sink_class", "sink_method", "sink_role", "sink_risk", "entry_status",
+        "chain_progress", "feasibility", "completeness", "risk", "eligibility", "violations",
+        "confidence", "confidence_reason", "static_rank", "total_score", "exported", "calibration",
+        "application_trace"
       ],
       "properties": {
         "id": {"type": "string", "pattern": "^finding-[0-9a-f]{16,64}$"},
-        "chain_key": {"type": "string"},
+        "chain_key": {"type": "string", "minLength": 1},
         "rule_id": {"type": "string"},
         "entry_class": {"type": "string"},
         "entry_method": {"type": "string"},
+        "entry_descriptor": {"type": "string"},
         "entry_kind": {"type": "string"},
         "sink_class": {"type": "string"},
         "sink_method": {"type": "string"},
         "sink_role": {"type": "string"},
-        "sink_risk": {"type": "string", "enum": ["SAFE_CALLABLE", "CONTROLLED_EFFECT", "HIGH_RISK_TERMINAL"]},
-        "entry_status": {"type": "string", "enum": ["NO_APPLICATION_ENTRY", "APPLICATION_ENTRY", "EXTERNAL_ENTRY"]},
-        "chain_progress": {"type": "string", "enum": ["ENTRY_IDENTIFIED", "BOUNDARY_REACHED", "DEPENDENCY_JOINED", "IMPACT_CHAIN_COMPLETE"]},
-        "feasibility": {"type": "string", "enum": ["SAT", "UNSAT", "UNKNOWN"]},
-        "completeness": {"type": "string", "enum": ["COMPLETE", "PARTIAL", "UNKNOWN"]},
-        "verification": {"type": "string", "enum": ["NOT_REQUESTED", "NOT_ATTEMPTED", "DYNAMIC_SEGMENT_CONFIRMED", "DYNAMIC_BOUNDARY_CONFIRMED", "SAFE_TERMINAL_CONFIRMED", "CONTRADICTION_OBSERVED", "UNKNOWN", "FAILED", "UNSUPPORTED"]},
-        "risk": {"type": "string", "enum": ["NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL", "UNKNOWN"]},
-        "eligibility": {"type": "string", "enum": ["ELIGIBLE_APPLICATION_CHAIN", "NO_APPLICATION_ENTRY", "APPLICATION_ENTRY_NOT_EXTERNAL", "CHAIN_NOT_IMPACT_COMPLETE", "CONSTRAINTS_UNSAT", "CONSTRAINTS_UNKNOWN", "ANALYSIS_INCOMPLETE", "RISK_UNKNOWN", "RISK_NOT_ACTIONABLE"]},
+        "sink_risk": {"enum": ["SAFE_CALLABLE", "CONTROLLED_EFFECT", "HIGH_RISK_TERMINAL"]},
+        "entry_status": {"enum": ["NO_APPLICATION_ENTRY", "APPLICATION_ENTRY", "EXTERNAL_ENTRY"]},
+        "chain_progress": {"enum": ["ENTRY_IDENTIFIED", "BOUNDARY_REACHED", "DEPENDENCY_JOINED", "IMPACT_CHAIN_COMPLETE"]},
+        "feasibility": {"enum": ["SAT", "UNSAT", "UNKNOWN"]},
+        "completeness": {"enum": ["COMPLETE", "PARTIAL", "UNKNOWN"]},
+        "risk": {"enum": ["NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL", "UNKNOWN"]},
+        "eligibility": {"enum": ["ELIGIBLE_APPLICATION_CHAIN", "NO_APPLICATION_ENTRY", "APPLICATION_ENTRY_NOT_EXTERNAL", "CHAIN_NOT_IMPACT_COMPLETE", "CONSTRAINTS_UNSAT", "CONSTRAINTS_UNKNOWN", "ANALYSIS_INCOMPLETE", "RISK_UNKNOWN", "RISK_NOT_ACTIONABLE"]},
         "violations": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "string"},
         "confidence_reason": {"type": "string"},
         "static_rank": {"type": "integer", "minimum": 0},
         "total_score": {"type": "integer", "minimum": 0},
-        "verification_status": {"type": "string"},
-        "verification_group": {"type": "string"},
         "exported": {"type": "boolean"},
-        "calibration": {"type": "string"}
+        "calibration": {"type": "string"},
+        "application_trace": {
+          "type": ["object", "null"],
+          "properties": {
+            "application_entry_class": {"type": "string"},
+            "application_entry_method": {"type": "string"},
+            "application_site_class": {"type": "string"},
+            "application_site_method": {"type": "string"},
+            "application_site_kind": {"type": "string"},
+            "join_kind": {"type": "string"},
+            "chain_entry_method": {"type": "string"},
+            "entry_prefix_path": {"type": "string"},
+            "dependency_owner": {"type": "string"},
+            "terminal_owner": {"type": "string"},
+            "terminal_method": {"type": "string"}
+          },
+          "required": [
+            "application_entry_class", "application_entry_method", "application_site_class",
+            "application_site_method", "application_site_kind", "join_kind", "chain_entry_method",
+            "entry_prefix_path", "dependency_owner", "terminal_owner", "terminal_method"
+          ],
+          "additionalProperties": false
+        }
       }
     }
   }

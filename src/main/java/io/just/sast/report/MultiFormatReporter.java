@@ -102,12 +102,15 @@ public final class MultiFormatReporter {
             FindingOutputReader.Finding finding = findings.get(i);
             Chain chain = finding.chain();
             out.append("  {\"id\":").append(quote(finding.id()))
+                    .append(",\"chain_key\":").append(quote(chain.key()))
                     .append(",\"rule_id\":").append(quote(chain.ruleId()))
                     .append(",\"category\":").append(quote(chain.category()))
                     .append(",\"severity\":").append(quote(chain.severity()))
                     .append(",\"confidence\":").append(quote(finding.confidence().bucket()))
                     .append(",\"entry_class\":").append(quote(chain.entryClass()))
                     .append(",\"entry_method\":").append(quote(chain.entryMethod()))
+                    .append(",\"entry_descriptor\":")
+                    .append(quote(ChainIdentity.entryDescriptor(chain)))
                     .append(",\"entry_kind\":").append(quote(chain.entryKind()))
                     .append(",\"sink_class\":").append(quote(chain.sinkClass()))
                     .append(",\"sink_method\":").append(quote(chain.sinkMethod()))
@@ -149,7 +152,7 @@ public final class MultiFormatReporter {
                 .append("<title>Just SAST Findings</title></head><body>\n")
                 .append("<h1>Just SAST Findings</h1>\n")
                 .append("<p>Static evidence only; no target code or attack bytes are executed.</p>\n")
-                .append("<table><thead><tr><th>#</th><th>Rule</th><th>Confidence</th>")
+                .append("<table><thead><tr><th>#</th><th>Finding ID</th><th>Rule</th><th>Confidence</th>")
                 .append("<th>Entry</th><th>Application path</th><th>Sink</th><th>State</th>")
                 .append("</tr></thead><tbody>\n");
         int index = 1;
@@ -157,6 +160,7 @@ public final class MultiFormatReporter {
             Chain chain = finding.chain();
             ApplicationTrace trace = snapshot.applicationTrace(chain.key());
             out.append("<tr><td>").append(index++).append("</td><td>")
+                    .append(escapeHtml(finding.id())).append("</td><td>")
                     .append(escapeHtml(chain.ruleId())).append("</td><td>")
                     .append(escapeHtml(finding.confidence().bucket())).append("</td><td>")
                     .append(escapeHtml(chain.entryClass() + "#" + chain.entryMethod()))
@@ -175,13 +179,14 @@ public final class MultiFormatReporter {
                                       FindingOutputReader.Snapshot snapshot) throws IOException {
         StringBuilder out = new StringBuilder("# Just findings\n\n")
                 .append("Static evidence only; no target code or attack bytes are executed.\n\n")
-                .append("| # | Rule | Confidence | Entry | Application path | Sink | Eligibility |\n")
-                .append("|---:|---|---|---|---|---|---|\n");
+                .append("| # | Finding ID | Rule | Confidence | Entry | Application path | Sink | Eligibility |\n")
+                .append("|---:|---|---|---|---|---|---|---|\n");
         int index = 1;
         for (FindingOutputReader.Finding finding : findings) {
             Chain chain = finding.chain();
             ApplicationTrace trace = snapshot.applicationTrace(chain.key());
-            out.append('|').append(index++).append('|').append(md(chain.ruleId())).append('|')
+            out.append('|').append(index++).append('|').append(md(finding.id())).append('|')
+                    .append(md(chain.ruleId())).append('|')
                     .append(md(finding.confidence().bucket())).append('|')
                     .append(md(chain.entryClass() + "#" + chain.entryMethod())).append('|')
                     .append(md(trace == null ? "" : trace.applicationPath(chain))).append('|')
@@ -193,25 +198,7 @@ public final class MultiFormatReporter {
 
     private static void appendFilterEvidenceJson(StringBuilder out,
                                                   List<FilterAnalysis.Evidence> evidence) {
-        out.append('[');
-        for (int i = 0; i < evidence.size(); i++) {
-            if (i > 0) out.append(',');
-            FilterAnalysis.Evidence item = evidence.get(i);
-            out.append("{\"kind\":").append(quote(item.kind().name()))
-                    .append(",\"location\":").append(quote(item.location()))
-                    .append(",\"status\":").append(quote(item.status().name()))
-                    .append(",\"reason_code\":").append(quote(item.reasonCode()))
-                    .append(",\"domain_digest\":").append(quote(item.domainDigest()))
-                    .append(",\"semantic_digest\":").append(quote(item.semanticDigest()))
-                    .append(",\"budget\":").append(item.budget())
-                    .append(",\"evaluated\":").append(item.evaluated())
-                    .append(",\"retained\":").append(item.retained())
-                    .append(",\"rejected\":").append(item.rejected())
-                    .append(",\"expanded\":").append(item.expanded())
-                    .append(",\"filter_cost_nanos\":").append(item.filterCostNanos())
-                    .append('}');
-        }
-        out.append(']');
+        out.append(ReportEvidence.filterEvidenceJson(evidence));
     }
 
     private static void appendLongMap(StringBuilder out, Map<String, Long> values) {
@@ -261,17 +248,37 @@ public final class MultiFormatReporter {
 
     private static String escape(String value) {
         if (value == null) return "";
-        return value.replace("\\", "\\\\").replace("\"", "\\\"")
-                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+        StringBuilder out = new StringBuilder(value.length() + 8);
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (ch < 0x20) {
+                        out.append(String.format(java.util.Locale.ROOT, "\\u%04x", (int) ch));
+                    } else {
+                        out.append(ch);
+                    }
+                }
+            }
+        }
+        return out.toString();
     }
 
     private static String escapeHtml(String value) {
         return value == null ? "" : value.replace("&", "&amp;").replace("<", "&lt;")
-                .replace(">", "&gt;").replace("\"", "&quot;");
+                .replace(">", "&gt;").replace("\"", "&quot;")
+                .replace("'", "&#39;");
     }
 
     private static String md(String value) {
-        return value == null ? "" : value.replace("|", "\\|")
+        return value == null ? "" : value.replace("&", "&amp;")
+                .replace("<", "&lt;").replace(">", "&gt;")
+                .replace("|", "\\|")
                 .replace("\r", " ").replace("\n", " ");
     }
 
