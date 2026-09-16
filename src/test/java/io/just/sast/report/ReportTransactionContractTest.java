@@ -38,7 +38,7 @@ class ReportTransactionContractTest {
             completeStaging = transaction.stagingRoot();
             AtomicFiles.writeUtf8(transaction.layout().evidence().resolve("marker.txt"), "staged");
         }
-        AtomicFiles.writeUtf8(completeStaging.resolve("run.json"),
+        AtomicFiles.writeUtf8(completeStaging.resolve("meta/transaction.json"),
                 "{\"schema_version\":\"just-run-v1\",\"run_id\":\"crash\","
                         + "\"state\":\"COMPLETE\"}\n");
         ReportTransaction.RecoveryReport complete =
@@ -74,7 +74,7 @@ class ReportTransactionContractTest {
             completeStaging = transaction.stagingRoot();
             AtomicFiles.writeUtf8(transaction.layout().evidence().resolve("marker.txt"), "staged");
         }
-        AtomicFiles.writeUtf8(completeStaging.resolve("run.json"),
+        AtomicFiles.writeUtf8(completeStaging.resolve("meta/transaction.json"),
                 "{\"schema_version\":\"just-run-v1\",\"run_id\":\"crash\","
                         + "\"state\":\"COMPLETE\"}\n");
         ReportTransaction.RecoveryReport complete =
@@ -103,8 +103,10 @@ class ReportTransactionContractTest {
 
         assertTrue(Files.isDirectory(output));
         assertEquals("new", Files.readString(output.resolve("evidence/marker.txt")));
-        String state = Files.readString(output.resolve("run.json"));
+        String state = Files.readString(output.resolve("meta/transaction.json"));
         assertTrue(state.contains("\"state\":\"COMPLETE\""), state);
+        assertFalse(Files.exists(output.resolve("run.json")),
+                "transaction state is metadata, not a third report entry");
         assertFalse(hasSiblingWithPrefix(tmp, ".report.staging-"),
                 "成功 commit 后不能残留 staging 目录");
     }
@@ -123,7 +125,7 @@ class ReportTransactionContractTest {
 
         assertFalse(Files.exists(output), "报告写失败不得发布 output 根目录");
         assertTrue(Files.isDirectory(failedStaging), "失败 staging 必须可供恢复审计");
-        assertTrue(Files.readString(failedStaging.resolve("run.json"))
+        assertTrue(Files.readString(failedStaging.resolve("meta/transaction.json"))
                 .contains("\"state\":\"FAILED\""));
     }
 
@@ -151,7 +153,7 @@ class ReportTransactionContractTest {
 
         assertFalse(Files.exists(output.resolve("old.txt")), "旧版本文件不得混入新报告");
         assertEquals("new", Files.readString(output.resolve("evidence/new.txt")));
-        assertTrue(Files.readString(output.resolve("run.json"))
+        assertTrue(Files.readString(output.resolve("meta/transaction.json"))
                 .contains("\"state\":\"COMPLETE\""));
     }
 

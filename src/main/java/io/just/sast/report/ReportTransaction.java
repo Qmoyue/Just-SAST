@@ -136,7 +136,9 @@ public final class ReportTransaction implements AutoCloseable {
                               String runId) {
         this.target = target;
         this.staging = staging;
-        this.runState = staging.resolve("run.json");
+        // Keep the transaction marker separate from the report metadata written by
+        // MultiFormatReporter.  Both are internal meta files; neither is a third report entry.
+        this.runState = layout.meta().resolve("transaction.json");
         this.layout = layout;
         this.overwrite = overwrite;
         this.parentSnapshot = parentSnapshot;
@@ -187,7 +189,8 @@ public final class ReportTransaction implements AutoCloseable {
             // Keep a visible, bounded recovery directory when possible.  It is never published
             // as the requested output and therefore cannot look like a complete report.
             try {
-                AtomicFiles.writeUtf8(staging.resolve("run.json"), stateJson(
+                AtomicFiles.writeUtf8(staging.resolve("meta").resolve("transaction.json"),
+                        stateJson(
                         PROCESS_TOKEN, State.FAILED));
             } catch (IOException ignored) {
                 // The original construction error is the useful failure; no unsafe cleanup is
@@ -426,7 +429,7 @@ public final class ReportTransaction implements AutoCloseable {
 
     private static String readRunState(Path root) throws IOException {
         Path normalizedRoot = root.toAbsolutePath().normalize();
-        Path state = normalizedRoot.resolve("run.json").normalize();
+        Path state = normalizedRoot.resolve("meta").resolve("transaction.json").normalize();
         if (!state.startsWith(normalizedRoot)
                 || !Files.isRegularFile(state, LinkOption.NOFOLLOW_LINKS)
                 || ArchiveLimits.isLinkOrReparsePoint(state)) {
@@ -475,7 +478,7 @@ public final class ReportTransaction implements AutoCloseable {
                 return false;
             }
         }
-        Path state = root.resolve("run.json");
+        Path state = root.resolve("meta").resolve("transaction.json");
         return Files.isRegularFile(state, LinkOption.NOFOLLOW_LINKS)
                 && !ArchiveLimits.isLinkOrReparsePoint(state);
     }

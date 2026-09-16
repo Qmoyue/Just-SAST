@@ -1027,6 +1027,8 @@ class ScanPipelineTest {
                         && Files.exists(output.resolve("report.json"))
                         && Files.exists(output.resolve("report.md"))
                         && Files.exists(output.resolve("meta").resolve("finding-output.json"))
+                        && !Files.exists(output.resolve("run.json"))
+                        && Files.exists(output.resolve("meta").resolve("transaction.json"))
                         && !Files.exists(output.resolve("verification"))
                         && !Files.exists(output.resolve("findings")),
                 "生产扫描必须生成两个主报告和可追溯快照，不生成重复索引或空 findings 目录");

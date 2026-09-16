@@ -8,6 +8,7 @@ import io.just.sast.cpg.graph.Graph;
 import io.just.sast.model.ArtifactProvenance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.yaml.snakeyaml.Yaml;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -55,6 +57,33 @@ class ConciseReportContractTest {
         assertTrue(firstMarkdown.contains("DIRECT_CALL — bytecode"));
         assertFalse(firstJson.contains("generated_bytes"));
         assertFalse(firstJson.contains("verification"));
+    }
+
+    @Test
+    void publicJsonIsValidatedAsAStructuredDocument(@TempDir Path temp) throws Exception {
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(chain()), Map.of(), Map.of(), Map.of());
+        Path output = temp.resolve("structured");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                stats("A".repeat(64)));
+
+        Map<?, ?> document = assertInstanceOf(Map.class,
+                new Yaml().load(Files.readString(output.resolve("report.json"))));
+        assertEquals("JUST-REPORT-V1", document.get("schema_version"));
+        Map<?, ?> analysis = assertInstanceOf(Map.class, document.get("analysis"));
+        assertEquals("STATIC_ONLY", analysis.get("mode"));
+        Map<?, ?> run = assertInstanceOf(Map.class, document.get("run"));
+        assertEquals("FINDINGS_AVAILABLE", run.get("outcome"));
+        assertEquals("COMPLETE", run.get("coverage"));
+        List<?> chains = assertInstanceOf(List.class, document.get("chains"));
+        Map<?, ?> finding = assertInstanceOf(Map.class, chains.get(0));
+        Map<?, ?> graph = assertInstanceOf(Map.class, finding.get("graph"));
+        List<?> nodes = assertInstanceOf(List.class, graph.get("nodes"));
+        List<?> edges = assertInstanceOf(List.class, graph.get("edges"));
+        assertTrue(nodes.size() >= 2);
+        assertTrue(edges.stream().allMatch(Map.class::isInstance));
+        assertFalse(document.containsKey("target_code_executed"));
+        assertFalse(document.containsKey("verification"));
     }
 
     @Test
