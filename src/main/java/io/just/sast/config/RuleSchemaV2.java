@@ -229,6 +229,12 @@ public final class RuleSchemaV2 {
                                 Set.of(Boundary.DESERIALIZATION), Set.of(), Set.of(),
                                 Set.of(Filter.TYPE_ALLOWLIST), Set.of(Callback.METHOD_SUMMARY)));
             }
+            if (condition.spec() instanceof Rule.SerializationClassNameGuard) {
+                return new Definition(condition.id(), RuleKind.CONDITION, "", "",
+                        new Semantics(Set.of(Capability.DESERIALIZATION), Set.of(),
+                                Set.of(Boundary.DESERIALIZATION), Set.of(), Set.of(),
+                                Set.of(Filter.TYPE_ALLOWLIST), Set.of(Callback.METHOD_SUMMARY)));
+            }
             return new Definition(condition.id(), RuleKind.CONDITION, "", "",
                     new Semantics(Set.of(Capability.REFLECTION), Set.of(),
                             Set.of(Boundary.BINDING), Set.of(), Set.of(),

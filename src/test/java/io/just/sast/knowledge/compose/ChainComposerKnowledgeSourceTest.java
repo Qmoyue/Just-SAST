@@ -128,6 +128,65 @@ class ChainComposerKnowledgeSourceTest {
     }
 
     @Test
+    void applicationScopeAdmitsCapabilitySecondDeserializationFragment() {
+        Blackboard bb = deferredPolicyBlackboard();
+        String descriptor = "()Ljava/lang/Object;";
+        Chain front = new Chain("nested-input", "DESERIALIZE", "HIGH",
+                "app/Entry", "handle", "deserialize", "java/io/ObjectInput", "readObject",
+                List.of(
+                        new ChainHop("app/Entry", "handle", "java/io/ObjectInput", "readObject",
+                                HopKind.DIRECT_CALL, null, "direct", descriptor, null),
+                        new ChainHop("app/Entry", "handle", "app/Entry", "handle",
+                                HopKind.ENTRY, null, "deserialize", "()V", null)), 0,
+                descriptor, "CAPABILITY");
+        ObjectGraphPlan plan = new ObjectGraphPlan(List.of(
+                new ObjectGraphPlan.Node("entry", "app/Helper",
+                        ObjectGraphPlan.NodeKind.ALLOCATE, List.of())), List.of());
+        Chain fragment = new Chain("nested-fragment", "DESERIALIZE", "HIGH",
+                "app/Helper", "getObject", "secondDeserialization", "java/io/ObjectInput",
+                "readObject", List.of(
+                        new ChainHop("java/io/ObjectInputStream", "<init>", "java/io/ObjectInput",
+                                "readObject", HopKind.DIRECT_CALL, null,
+                                "fragment-activation-deserialize", descriptor, null),
+                        new ChainHop("app/Helper", "getObject", "java/io/ObjectInputStream", "<init>",
+                                HopKind.DIRECT_CALL, null,
+                                "fragment-activation-deserialize", "", null),
+                        new ChainHop("app/Helper", "getObject", "app/Helper", "getObject",
+                                HopKind.ENTRY, null, "secondDeserialization", descriptor, null)), 0,
+                descriptor, "CAPABILITY", plan);
+        String terminalDescriptor = "(Ljava/lang/String;)Ljava/lang/Process;";
+        Chain terminal = new Chain("runtime-exec", "CODE_EXEC", "CRITICAL",
+                "dep/Terminal", "readObject", "readObject", "java/lang/Runtime", "exec",
+                List.of(
+                        new ChainHop("dep/Terminal", "readObject", "java/lang/Runtime", "exec",
+                                HopKind.DIRECT_CALL, null, "direct", terminalDescriptor, null),
+                        new ChainHop("dep/Terminal", "readObject", "dep/Terminal", "readObject",
+                                HopKind.ENTRY, null, "readObject", "()V", null)), 0,
+                terminalDescriptor, "TERMINAL");
+        bb.addChain(front);
+        bb.addChain(fragment);
+        bb.addChain(terminal);
+
+        new ChainComposerKnowledgeSource().onEvent(bb,
+                Event.of(EventType.SCAN_ANALYZED, -1, null));
+
+        assertTrue(bb.chains().stream().anyMatch(chain ->
+                        "app/Entry".equals(chain.entryClass())
+                                && "java/io/ObjectInput".equals(chain.sinkClass())
+                                && chain.hops().stream().anyMatch(hop ->
+                                "bridge-deser".equals(hop.reason())
+                                        && "app/Helper".equals(hop.toOwner()))),
+                "a known application scope must retain a capability-shaped "
+                        + "secondary-deserialization fragment for the typed DESER bridge");
+        assertTrue(bb.chains().stream().anyMatch(chain ->
+                        "app/Entry".equals(chain.entryClass())
+                                && "java/lang/Runtime".equals(chain.sinkClass())
+                                && chain.hops().stream().filter(hop ->
+                                "bridge-deser".equals(hop.reason())).count() >= 2),
+                "the bounded frontier must continue a capability fragment to a terminal suffix");
+    }
+
+    @Test
     void deserializationOnlyRomeFragmentCannotBeSelectedByInvoke() {
         Chain invokeFront = chain("T-INVOKE", "REFLECTION", "app/Front", "lifecycle",
                 "java/lang/reflect/Method", "invoke");

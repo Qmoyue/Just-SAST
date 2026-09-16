@@ -522,8 +522,7 @@ public final class ApplicationChainJoiner {
                 continue;
             }
             EntryMatch candidate = new EntryMatch(root, chainEntryKey, path, null, false);
-            if (resolved == null || candidate.applicationEntryKey()
-                    .compareTo(resolved.applicationEntryKey()) < 0) {
+            if (resolved == null || compareApplicationEntryMatches(index, candidate, resolved) < 0) {
                 resolved = candidate;
             }
         }
@@ -532,6 +531,45 @@ public final class ApplicationChainJoiner {
                     ? EntryMatch.NOT_FOUND : resolved);
         }
         return resolved == EntryMatch.NOT_FOUND ? null : resolved;
+    }
+
+    /**
+     * Prefer the strongest immutable external-boundary evidence when several application roots
+     * can reach the same dependency helper.  A lexical root order is deterministic but can
+     * select an internal lifecycle/helper path and hide a concrete servlet/service route.  The
+     * score is deliberately owned by the typed application index; no artifact, package, or
+     * benchmark name participates in the decision.
+     */
+    private static int compareApplicationEntryMatches(ApplicationEntryIndex index,
+                                                       EntryMatch left, EntryMatch right) {
+        int leftScore = applicationEntryEvidenceScore(index, left.applicationEntryKey());
+        int rightScore = applicationEntryEvidenceScore(index, right.applicationEntryKey());
+        if (leftScore != rightScore) {
+            return Integer.compare(rightScore, leftScore);
+        }
+        if (left.path().size() != right.path().size()) {
+            return Integer.compare(left.path().size(), right.path().size());
+        }
+        return left.applicationEntryKey().compareTo(right.applicationEntryKey());
+    }
+
+    private static int applicationEntryEvidenceScore(ApplicationEntryIndex index,
+                                                      String methodKey) {
+        if (index == null || methodKey == null || methodKey.isBlank()) {
+            return 0;
+        }
+        int score = 0;
+        if (index.isExternalEntryMethod(methodKey)) {
+            score += 100;
+        }
+        if (index.routeBindingsFor(methodKey).stream()
+                .anyMatch(ApplicationResourceFacts.RouteBinding::externalControlProven)) {
+            score += 1_000;
+        }
+        if (!index.serviceEndpointsFor(methodKey).isEmpty()) {
+            score += 500;
+        }
+        return score;
     }
 
     /**

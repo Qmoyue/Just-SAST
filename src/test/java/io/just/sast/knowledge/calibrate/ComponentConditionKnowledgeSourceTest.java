@@ -95,6 +95,53 @@ class ComponentConditionKnowledgeSourceTest {
     }
 
     @Test
+    void serializationClassNameGuardRejectsAnExactBlockedLiteralAtDeserializationBoundary() {
+        String owner = "fixture/GuardedOis";
+        MethodInfo resolver = method(owner, "resolveClass", List.of(
+                new InsnFact(0, Op.LDC, List.of("java.rmi.server")),
+                new InsnFact(1, Op.INVOKEVIRTUAL, List.of(new MethodRef(
+                        "java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z")))));
+        Rule.SerializationClassNameGuard guard = new Rule.SerializationClassNameGuard(
+                new Rule.CallMatcher(Match.of("java/lang/String"), Match.of("contains"),
+                        Match.of("(Ljava/lang/CharSequence;)Z")),
+                "java.rmi.server");
+        Rule.ConditionRule condition = new Rule.ConditionRule("RMI-BLOCK",
+                Match.of(owner), guard);
+        Blackboard blackboard = blackboard(Map.of(owner, classInfo(owner, List.of(), List.of(resolver))),
+                List.of(condition));
+        Chain chain = chain(owner, "resolveClass", "deserialize", null);
+        blackboard.addChain(chain);
+
+        calibrate(blackboard);
+
+        assertEquals("condition-class-name-guard:RMI-BLOCK:java.rmi.server",
+                blackboard.calibrationOf(chain.key()));
+    }
+
+    @Test
+    void serializationClassNameGuardRetainsWhenTheBlockedLiteralIsNotProven() {
+        String owner = "fixture/GuardedOis";
+        MethodInfo resolver = method(owner, "resolveClass", List.of(
+                new InsnFact(0, Op.LDC, List.of("org.apache.commons.fileupload")),
+                new InsnFact(1, Op.INVOKEVIRTUAL, List.of(new MethodRef(
+                        "java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z")))));
+        Rule.ConditionRule condition = new Rule.ConditionRule("RMI-BLOCK",
+                Match.of(owner), new Rule.SerializationClassNameGuard(
+                        new Rule.CallMatcher(Match.of("java/lang/String"), Match.of("contains"),
+                                Match.of("(Ljava/lang/CharSequence;)Z")),
+                        "java.rmi.server"));
+        Blackboard blackboard = blackboard(Map.of(owner, classInfo(owner, List.of(), List.of(resolver))),
+                List.of(condition));
+        Chain chain = chain(owner, "resolveClass", "deserialize", null);
+        blackboard.addChain(chain);
+
+        calibrate(blackboard);
+
+        assertNull(blackboard.calibrationOf(chain.key()),
+                "a different literal must not deny a static candidate");
+    }
+
+    @Test
     void packagePolicyRejectsOnlyKnownSerializableTypeOutsideTrustedPrefixes() {
         String policyOwner = "fixture/PolicyOis";
         MethodInfo resolver = new MethodInfo(policyOwner, "resolveClass",

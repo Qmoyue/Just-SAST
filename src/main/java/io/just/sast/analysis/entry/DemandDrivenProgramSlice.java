@@ -417,6 +417,8 @@ public final class DemandDrivenProgramSlice {
                 addLiteralOwner(anchors, guard.guardCall());
             } else if (rule.spec() instanceof Rule.SerializationPackagePolicy policy) {
                 addLiteralOwner(anchors, policy.policyCall());
+            } else if (rule.spec() instanceof Rule.SerializationClassNameGuard guard) {
+                addLiteralOwner(anchors, guard.guardCall());
             } else if (rule.spec() instanceof Rule.PropertyFilterDecl filter) {
                 addName(anchors, filter.registrationOwner().isRegex()
                         ? null : filter.registrationOwner().pattern());
@@ -1033,6 +1035,9 @@ public final class DemandDrivenProgramSlice {
         }
         if (rule.spec() instanceof Rule.SerializationPackagePolicy policy) {
             return policy.policyCall();
+        }
+        if (rule.spec() instanceof Rule.SerializationClassNameGuard guard) {
+            return guard.guardCall();
         }
         return null;
     }

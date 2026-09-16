@@ -444,6 +444,8 @@ public final class YamlRuleLoader {
             case "serializable" -> parseSerializableRequirement(id, targetClass, condition);
             case "serialization-package-policy" -> parseSerializationPackagePolicy(id, targetClass,
                     condition);
+            case "serialization-class-name-guard" -> parseSerializationClassNameGuard(id,
+                    targetClass, condition);
             case "property-filter" -> parsePropertyFilter(id, targetClass, condition);
             default -> throw new IOException("condition 规则 " + id + " 的 type 无效: " + type);
         };
@@ -502,6 +504,23 @@ public final class YamlRuleLoader {
         }
         return new Rule.ConditionRule(id, targetClass,
                 new Rule.SerializationPackagePolicy(policyCall, trusted));
+    }
+
+    private Rule.ConditionRule parseSerializationClassNameGuard(String id, Match targetClass,
+                                                                  Map<?, ?> condition)
+            throws IOException {
+        rejectUnknownKeys(condition, Set.of("type", "call", "blocked-literal"),
+                "condition rule " + id + " serialization-class-name-guard");
+        Map<?, ?> call = requiredMap(condition, "call",
+                "condition 规则 " + id + " 缺少 class-name guard call",
+                "condition 规则 " + id + " 的 class-name guard call 必须是 map");
+        rejectUnknownKeys(call, CALL_KEYS, "condition rule " + id + " class-name guard call");
+        Rule.CallMatcher guard = new Rule.CallMatcher(matchOf(call.get("owner")),
+                matchOf(call.get("name")), matchNullable(call.get("descriptor")));
+        return new Rule.ConditionRule(id, targetClass,
+                new Rule.SerializationClassNameGuard(guard,
+                        requiredString(condition, "blocked-literal",
+                                "condition 规则 " + id + " 缺少 blocked-literal")));
     }
 
     private Rule.ConditionRule parsePropertyFilter(String id, Match targetClass,

@@ -80,6 +80,7 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
         int guarded = 0;
         int propertyNotes = 0;
         int packagePolicyRejected = 0;
+        int classNameGuardRejected = 0;
         List<Rule.ConditionRule> conditions = blackboard.rules().conditions();
         if (conditions.isEmpty()) {
             return;
@@ -127,6 +128,16 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
                             + ";trusted-packages=" + String.join(",", policy.trustedPackagePrefixes()));
                     continue;
                 }
+                if (condition.spec() instanceof Rule.SerializationClassNameGuard guard
+                        && deserializationSource(chain)
+                        && targets.stream().anyMatch(target -> classNameGuardPresent(target, guard))) {
+                    blackboard.calibrateChain(chain.key(),
+                            "condition-class-name-guard:" + condition.id() + ":"
+                                    + guard.blockedLiteral());
+                    rejected++;
+                    classNameGuardRejected++;
+                    break;
+                }
                 if (condition.spec() instanceof Rule.PropertyFilterDecl filter
                         && propertyFilterInstalled(filter)) {
                     if (explicitBlockedProperty(chain, targets, filter)) {
@@ -143,8 +154,9 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
                 }
             }
         }
-        JustLogger.info("组件条件校准：拒绝 {}（包策略 {}），序列化保护条件 {}，属性过滤条件 {}（规则 {}）",
-                rejected, packagePolicyRejected, guarded, propertyNotes, conditions.size());
+        JustLogger.info("组件条件校准：拒绝 {}（包策略 {}，类名保护 {}），序列化保护条件 {}，属性过滤条件 {}（规则 {}）",
+                rejected, packagePolicyRejected, classNameGuardRejected, guarded, propertyNotes,
+                conditions.size());
     }
 
     private String firstNonSerializable(List<String> targets, String interfaceType) {
@@ -198,6 +210,34 @@ public final class ComponentConditionKnowledgeSource implements KnowledgeSource 
                     continue;
                 }
                 if (filter.markerClass().matches(ref.owner())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Prove an exact class-name rejection call and literal in one loaded method body. */
+    private boolean classNameGuardPresent(String target, Rule.SerializationClassNameGuard guard) {
+        ClassInfo info = bb.hierarchy().classInfo(target);
+        if (info == null) {
+            return false;
+        }
+        for (MethodInfo method : info.methods()) {
+            int literalOffset = -1;
+            for (InsnFact instruction : method.instructions()) {
+                if (instruction.op() == Op.LDC && instruction.constant() instanceof String value
+                        && guard.blockedLiteral().equals(value)) {
+                    literalOffset = instruction.offset();
+                    continue;
+                }
+                if (!instruction.op().isInvoke() || instruction.operands().isEmpty()
+                        || !(instruction.operands().get(0) instanceof MethodRef ref)
+                        || !guard.guardCall().matches(ref.owner(), ref.name(), ref.descriptor())) {
+                    continue;
+                }
+                if (literalOffset >= 0 && instruction.offset() > literalOffset
+                        && instruction.offset() - literalOffset <= 8) {
                     return true;
                 }
             }

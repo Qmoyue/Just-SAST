@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 规则装载契约：默认规则文件可装载、四类齐全、access/safe-config 字段解析、坏规则报错。 */
+/** 规则装载契约：默认规则文件可装载、各类齐全、access/safe-config 字段解析、坏规则报错。 */
 class YamlRuleLoaderTest {
 
     @Test
@@ -30,7 +30,7 @@ class YamlRuleLoaderTest {
         assertTrue(set.sources().size() >= 42, "source 规则能力退化：实际 " + set.sources().size());
         assertTrue(set.models().size() >= 21, "model 规则能力退化：实际 " + set.models().size());
         assertTrue(set.magicEntries().size() >= 14, "magic-entry 含序列化侧入口，实际 " + set.magicEntries().size());
-        assertEquals(4, set.conditions().size(), "默认 Apache 条件规则必须全部装载");
+        assertEquals(5, set.conditions().size(), "默认 Apache 条件规则必须全部装载");
         assertTrue(set.conditions().stream().anyMatch(rule ->
                 rule.spec() instanceof Rule.SerializationGuard));
         assertTrue(set.conditions().stream().anyMatch(rule ->
@@ -39,6 +39,8 @@ class YamlRuleLoaderTest {
                 rule.spec() instanceof Rule.SerializationPackagePolicy));
         assertTrue(set.conditions().stream().anyMatch(rule ->
                 rule.spec() instanceof Rule.PropertyFilterDecl));
+        assertTrue(set.conditions().stream().anyMatch(rule ->
+                rule.spec() instanceof Rule.SerializationClassNameGuard));
         Rule.ModelRule defineClassReturn = set.models().stream()
                 .filter(rule -> "MODEL-CLASSLOADER-DEFINECLASS-RETURN".equals(rule.id()))
                 .findFirst().orElseThrow();
@@ -132,6 +134,31 @@ class YamlRuleLoaderTest {
         assertEquals(Rule.SinkRole.CAPABILITY, inputSink.role());
         assertEquals("java/io/ObjectInput", inputSink.call().ownerType());
         assertEquals("()Ljava/lang/Object;", inputSink.call().descriptor().pattern());
+    }
+
+    @Test
+    void ofbizSoapAndUtilObjectRulesKeepTypedStaticBoundaries() throws IOException {
+        RuleSet set = new YamlRuleLoader().load(Files.newInputStream(
+                Path.of("src/main/resources/rules/default-rules.yaml")));
+
+        Rule.SourceRule soap = set.sources().stream()
+                .filter(candidate -> "JUST-SOURCE-OFBIZ-SOAP-SERIALIZER".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        assertEquals("deserialize", soap.bridge());
+        assertEquals("org/apache/ofbiz/service/engine/SoapSerializer", soap.call().ownerType());
+        assertEquals("deserialize", soap.call().name().pattern());
+
+        Rule.FragmentRule fragment = set.fragments().stream()
+                .filter(candidate -> "FRAG-OFBIZ-UTILOBJECT-SECOND-DESERIALIZE".equals(candidate.id()))
+                .findFirst().orElseThrow();
+        assertEquals("org/apache/ofbiz/base/util/UtilObject", fragment.entryClass());
+        assertEquals("secondDeserialization", fragment.entryKind());
+        assertEquals("getObjectException", fragment.entryMethod());
+        assertEquals("([B)Ljava/lang/Object;", fragment.entryDescriptor());
+        assertEquals("deserialize", fragment.activation());
+        assertEquals("org/apache/ofbiz/base/util/SafeObjectInputStream", fragment.hops().get(0).cls());
+        assertEquals("java/io/ObjectInput", fragment.sinkOwner());
+        assertEquals("readObject", fragment.sinkName());
     }
 
     @Test

@@ -175,7 +175,7 @@ public sealed interface Rule {
      * reject it only when the selected condition is statically disproved.
      */
     sealed interface ConditionSpec permits SerializationGuard, SerializableRequirement,
-            SerializationPackagePolicy, PropertyFilterDecl {
+            SerializationPackagePolicy, SerializationClassNameGuard, PropertyFilterDecl {
     }
 
     /** A callback calls a guard whose configuration must equal the declared value. */
@@ -220,6 +220,20 @@ public sealed interface Rule {
         }
     }
 
+    /**
+     * A deserializer rejects one exact class-name literal through a declared guard call.
+     * Calibration only rejects a path when the call and literal occur in the same loaded
+     * target method; missing bodies and unknown values remain candidates.
+     */
+    record SerializationClassNameGuard(CallMatcher guardCall, String blockedLiteral)
+            implements ConditionSpec {
+        public SerializationClassNameGuard {
+            if (guardCall == null || blockedLiteral == null || blockedLiteral.isBlank()) {
+                throw new IllegalArgumentException("serialization class-name guard is incomplete");
+            }
+        }
+    }
+
     /** A default property filter is proven by a registration method and marker class. */
     record PropertyFilterDecl(Match registrationOwner, Match registrationMethod,
                               Match markerClass, String propertyField, String blockedValue)
@@ -257,6 +271,9 @@ public sealed interface Rule {
             }
             if (spec instanceof SerializationPackagePolicy) {
                 return "serialization-package-policy";
+            }
+            if (spec instanceof SerializationClassNameGuard) {
+                return "serialization-class-name-guard";
             }
             return "property-filter";
         }

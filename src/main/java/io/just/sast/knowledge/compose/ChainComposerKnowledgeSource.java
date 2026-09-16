@@ -162,6 +162,18 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         String key = chain.entryClass() + "#" + chain.entryMethod() + descriptor;
         var index = target.applicationEntryIndex();
         int score = index.isApplicationEntryMethod(key) ? 1_000 : 0;
+        if (index.isExternalEntryMethod(key)) {
+            score += 4_096;
+        }
+        if (index.routeBindingsFor(key).stream()
+                .anyMatch(binding -> binding != null && binding.externalControlProven())) {
+            score += 8_192;
+        } else if (!index.routeBindingsFor(key).isEmpty()) {
+            score += 4_096;
+        }
+        if (!index.serviceEndpointsFor(key).isEmpty()) {
+            score += 2_048;
+        }
         if (index.isApplicationOwner(chain.entryClass())) {
             score += 64;
         }
@@ -438,6 +450,22 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (fronts.isEmpty()) {
             return 0;
         }
+        long eligibleExternal = eligibleFronts.stream()
+                .filter(chain -> hasExternalBoundary(target, chain)).count();
+        long selectedExternal = fronts.stream()
+                .filter(chain -> hasExternalBoundary(target, chain)).count();
+        long eligibleDeserializeCapability = eligibleFronts.stream()
+                .filter(ChainComposerKnowledgeSource::isDeserializationCapability).count();
+        long selectedDeserializeCapability = fronts.stream()
+                .filter(ChainComposerKnowledgeSource::isDeserializationCapability).count();
+        long selectedExternalDeserializeCapability = fronts.stream()
+                .filter(chain -> hasExternalBoundary(target, chain))
+                .filter(ChainComposerKnowledgeSource::isDeserializationCapability).count();
+        JustLogger.info("链组装应用边界前缀：候选外部 {}，有限前沿外部 {}（候选 {}，前沿 {}），"
+                        + "反序列化能力候选 {}，前沿 {}，外部前沿 {}",
+                eligibleExternal, selectedExternal, eligibleFronts.size(), fronts.size(),
+                eligibleDeserializeCapability, selectedDeserializeCapability,
+                selectedExternalDeserializeCapability);
         Set<Chain> allBacks = new LinkedHashSet<>();
         if (publicEntries != null) {
             allBacks.addAll(publicEntries);
@@ -454,6 +482,12 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         List<Chain> overlapBacks = backs.stream()
                 .filter(chain -> isSecondaryDeserializationBack(target, chain))
                 .toList();
+        long secondaryBacks = backs.stream()
+                .filter(chain -> isDeclaredSecondaryDeserializationFragment(chain)).count();
+        JustLogger.info("链组装二次反序列化后缀：候选 {}，有限后缀 {}，重叠后缀 {}",
+                publicEntries.stream().filter(chain ->
+                        isDeclaredSecondaryDeserializationFragment(chain)).count(),
+                secondaryBacks, overlapBacks.size());
         int composed = 0;
         Set<String> seenFrontDepth = new HashSet<>();
         List<ComposedDepth> frontier = new ArrayList<>();
@@ -516,11 +550,16 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
             frontier = next;
         }
         // Round-robin roots, not back-first: one noisy root cannot exhaust the reserved
-        // frontier before every application entry has a chance to acquire a suffix.
-        for (int round = 0; round < backs.size() && composed < MAX_APPLICATION_PRIORITY_COMPOSED;
+        // frontier before every application entry has a chance to acquire a suffix.  Leave a
+        // bounded continuation reserve so a newly-created DESER capability can consume one
+        // more typed suffix in the finite-depth pass below.
+        int ordinaryCompositionLimit = Math.max(composed,
+                MAX_APPLICATION_PRIORITY_COMPOSED - MAX_APPLICATION_PRIORITY_FRONTS);
+        List<ComposedDepth> ordinaryFrontier = new ArrayList<>();
+        for (int round = 0; round < backs.size() && composed < ordinaryCompositionLimit;
              round++) {
             for (int frontIndex = 0; frontIndex < fronts.size()
-                    && composed < MAX_APPLICATION_PRIORITY_COMPOSED; frontIndex++) {
+                    && composed < ordinaryCompositionLimit; frontIndex++) {
                 Chain front = fronts.get(frontIndex);
                 Chain back = backs.get(Math.floorMod(round + frontIndex, backs.size()));
                 Chain merged = admitComposed(target,
@@ -530,10 +569,59 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                     continue;
                 }
                 composed++;
-                frontier.add(new ComposedDepth(merged, 1));
+                ordinaryFrontier.add(new ComposedDepth(merged, 1));
             }
         }
+        // Ordinary bridge products are also typed frontiers.  Expand them after the reserved
+        // one-step pass so a DESER front can consume a declared secondary-deserialization
+        // capability and then a terminal suffix without reopening an unbounded fixed point.
+        for (int depth = 1; depth < MAX_APPLICATION_COMPOSITION_DEPTH
+                && !ordinaryFrontier.isEmpty()
+                && composed < MAX_APPLICATION_PRIORITY_COMPOSED; depth++) {
+            List<ComposedDepth> next = new ArrayList<>();
+            for (ComposedDepth item : ordinaryFrontier) {
+                if (item.depth() != depth || composed >= MAX_APPLICATION_PRIORITY_COMPOSED) {
+                    continue;
+                }
+                FrontFeatures features = frontFeaturesCached(target, item.chain(),
+                        frontFeaturesCache);
+                if (!features.deserialize() && !features.invoke() && !features.jndiRmi()) {
+                    continue;
+                }
+                for (Chain back : backs) {
+                    if (composed >= MAX_APPLICATION_PRIORITY_COMPOSED) {
+                        break;
+                    }
+                    Chain merged = admitComposed(target,
+                            composeIfBridgeable(target, item.chain(), back, seenFrontDepth,
+                                    frontFeaturesCache));
+                    if (merged == null) {
+                        continue;
+                    }
+                    composed++;
+                    next.add(new ComposedDepth(merged, depth + 1));
+                }
+            }
+            ordinaryFrontier = next;
+        }
         return composed;
+    }
+
+    private boolean hasExternalBoundary(Blackboard target, Chain chain) {
+        if (target == null || chain == null || target.applicationEntryIndex() == null) {
+            return false;
+        }
+        String key = chain.entryClass() + "#" + chain.entryMethod() + entryDescriptor(chain);
+        var index = target.applicationEntryIndex();
+        return index.isExternalEntryMethod(key)
+                || index.routeBindingsFor(key).stream()
+                .anyMatch(binding -> binding != null && binding.externalControlProven())
+                || !index.serviceEndpointsFor(key).isEmpty();
+    }
+
+    private static boolean isDeserializationCapability(Chain chain) {
+        return chain != null && "DESERIALIZE".equalsIgnoreCase(chain.category())
+                && "CAPABILITY".equalsIgnoreCase(chain.sinkRole());
     }
 
     /**
@@ -647,6 +735,12 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (target == null || chain == null) {
             return false;
         }
+        // A declared secondary-deserialization fragment is a typed continuation endpoint.  An
+        // application-owned helper may appear in the same artifact, but it must not consume
+        // the finite application-prefix budget as if it were an external execution root.
+        if (isDeclaredSecondaryDeserializationFragment(chain)) {
+            return false;
+        }
         if (target.applicationEntryIndex() == null
                 || !target.applicationEntryIndex().applicationScopeKnown()) {
             return applicationFrontPriority(target, chain) > 0;
@@ -680,12 +774,19 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
                                              Map<ContinuationAdmissionKey, Boolean>
                                                      continuationAdmissionCache) {
         if (chain == null || (!isPublicEntry(chain) && !isDeclaredContinuationFragment(chain)
-                && !isDeclaredDirectFragment(chain))
+                && !isDeclaredDirectFragment(chain)
+                && !isDeclaredSecondaryDeserializationFragment(chain))
                 || target == null || target.applicationEntryIndex() == null) {
             return false;
         }
         var index = target.applicationEntryIndex();
-        if (!index.applicationScopeKnown() || index.isApplicationOwner(chain.entryClass())) {
+        if (!index.applicationScopeKnown()) {
+            return false;
+        }
+        if (isDeclaredSecondaryDeserializationFragment(chain)) {
+            return true;
+        }
+        if (index.isApplicationOwner(chain.entryClass())) {
             return false;
         }
         if (isDeclaredContinuationFragment(chain)) {
@@ -898,6 +999,11 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
         if (chain == null) {
             return score;
         }
+        if (isDeclaredSecondaryDeserializationFragment(chain)) {
+            // A capability fragment is not a terminal suffix, but it is the typed continuation
+            // that a DESERIALIZE front must consume before any terminal back can be reached.
+            score += 2_000;
+        }
         // A terminal deserialization is a typed continuation point, not merely an effect;
         // reserve it ahead of unrelated file/reflective terminals so nested input can be
         // composed in the next round.  Rule category/role is data-driven and applies equally
@@ -964,6 +1070,9 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     }
 
     private boolean isSecondaryDeserializationBack(Blackboard target, Chain chain) {
+        if (isDeclaredSecondaryDeserializationFragment(chain)) {
+            return true;
+        }
         if (chain == null || !chain.terminalSink()
                 || !"DESERIALIZE".equalsIgnoreCase(chain.category())
                 || !isPublicEntry(chain)) {
@@ -1932,7 +2041,27 @@ public final class ChainComposerKnowledgeSource implements KnowledgeSource {
     }
 
     private static boolean isDeclaredStaticFragmentTerminal(Chain chain) {
-        return isDeclaredContinuationFragment(chain) || isDeclaredDirectFragment(chain);
+        return isDeclaredContinuationFragment(chain) || isDeclaredDirectFragment(chain)
+                || isDeclaredSecondaryDeserializationFragment(chain);
+    }
+
+    /**
+     * A secondary-deserialization fragment is a typed continuation even when its first sink is
+     * the capability-shaped ObjectInput.readObject rather than a terminal impact.  The fragment
+     * producer has already proved the concrete nested stream endpoint from bytecode; this
+     * predicate only preserves that declaration through application composition. It is
+     * independent of artifact ownership so an application-packaged helper can serve the same
+     * semantic role as a library helper.
+     */
+    private static boolean isDeclaredSecondaryDeserializationFragment(Chain chain) {
+        return chain != null
+                && "secondDeserialization".equals(chain.entryKind())
+                && isFragmentChain(chain)
+                && chain.unresolvedHops() == 0
+                && ("java/io/ObjectInput".equals(chain.sinkClass())
+                || "java/io/ObjectInputStream".equals(chain.sinkClass()))
+                && "readObject".equals(chain.sinkMethod())
+                && activationAllows(chain, "deserialize");
     }
 
     private static boolean isFragmentChain(Chain chain) {

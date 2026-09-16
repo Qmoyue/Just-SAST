@@ -317,6 +317,21 @@ rules:
       field: property
       blocked-value: class
 
+  # OFBiz 17.12.06 rejects RMI class names in the deserializer.  The condition is generic:
+  # calibration proves the exact String guard/literal in the loaded class body and only then
+  # denies a path that actually contains that deserializer.  Unknown bodies remain candidates.
+  - id: CONDITION-OFBIZ-RMI-CLASS-BLOCK
+    kind: condition
+    match:
+      class: org/apache/ofbiz/base/util/SafeObjectInputStream
+    condition:
+      type: serialization-class-name-guard
+      call:
+        owner: java/lang/String
+        name: contains
+        descriptor: "(Ljava/lang/CharSequence;)Z"
+      blocked-literal: java.rmi.server
+
   - id: JUST-SINK-SQL-EXECUTE
     kind: sink
     category: SQLI
@@ -456,6 +471,15 @@ rules:
     match:
       call: { owner: "org/springframework/util/SerializationUtils", name: deserialize, descriptor: "([B)Ljava/lang/Object;" }
     tainted: [{arg: 0}]
+
+  # OFBiz's SOAP facade is a reusable framework deserialization boundary.  The route/site
+  # proof remains owned by application resource facts; this rule only identifies the bytecode
+  # API and lets the generic source/OIS/object-graph composition reason about its result.
+  - id: JUST-SOURCE-OFBIZ-SOAP-SERIALIZER
+    kind: source
+    bridge: deserialize
+    match:
+      call: { owner: "org/apache/ofbiz/service/engine/SoapSerializer", name: deserialize }
 
   - id: JUST-SERIALIZE-JACKSON-MAPPER
     kind: source
@@ -937,6 +961,22 @@ rules:
     activation: invoke
     hops:
       - { class: "java/io/ObjectInputStream", method: "<init>" }
+    sinkOwner: "java/io/ObjectInput"
+    sinkName: readObject
+    sinkDescriptor: "()Ljava/lang/Object;"
+
+  # OFBiz's XML custom-object branch allocates SafeObjectInputStream and reads the decoded
+  # object.  The fragment endpoint is admitted only after the loaded method body proves both
+  # operations; no object stream or payload is constructed by Just.
+  - id: FRAG-OFBIZ-UTILOBJECT-SECOND-DESERIALIZE
+    kind: chain-fragment
+    entryClass: "org/apache/ofbiz/base/util/UtilObject"
+    entryKind: secondDeserialization
+    entryMethod: getObjectException
+    entryDescriptor: "([B)Ljava/lang/Object;"
+    activation: deserialize
+    hops:
+      - { class: "org/apache/ofbiz/base/util/SafeObjectInputStream", method: "<init>" }
     sinkOwner: "java/io/ObjectInput"
     sinkName: readObject
     sinkDescriptor: "()Ljava/lang/Object;"

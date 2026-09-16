@@ -34,7 +34,8 @@ class RuleSchemaV2ContractTest {
         assertEquals(Set.of("CONDITION-CC3-UNSAFE-SERIALIZATION",
                         "CONDITION-CC4-FUNCTOR-SERIALIZABLE",
                         "CONDITION-BEANUTILS-CLASS-PROPERTY",
-                        "CONDITION-SERIALIZATION-PACKAGE-ALLOWLIST"),
+                        "CONDITION-SERIALIZATION-PACKAGE-ALLOWLIST",
+                        "CONDITION-OFBIZ-RMI-CLASS-BLOCK"),
                 catalog.rules().stream()
                         .filter(rule -> rule.kind() == RuleSchemaV2.RuleKind.CONDITION)
                         .map(RuleSchemaV2.Definition::id)
