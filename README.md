@@ -26,19 +26,34 @@ mvn -B package -DskipTests
 扫描组件：
 
 ~~~bash
-java -jar target/just-sast-0.2.0-shaded.jar scan +  --jar component.jar +  --jdk-home /path/to/target-jdk +  --output just-out
+java -jar target/just-sast-0.2.0-shaded.jar scan \
+  --jar component.jar \
+  --jdk-home /path/to/target-jdk \
+  --output just-out
 ~~~
 
 扫描应用并使用准确的 Maven 依赖：
 
 ~~~bash
-java -jar target/just-sast-0.2.0-shaded.jar scan +  --jar app.jar +  --mode application +  --pom pom.xml +  --jdk-home /path/to/target-jdk +  --output just-out
+java -jar target/just-sast-0.2.0-shaded.jar scan \
+  --jar app.jar \
+  --mode application \
+  --pom pom.xml \
+  --jdk-home /path/to/target-jdk \
+  --output just-out
 ~~~
 
 使用已准备好的依赖进行离线扫描：
 
 ~~~bash
-java -jar target/just-sast-0.2.0-shaded.jar scan +  --jar app.jar +  --mode application +  --deps lib +  --pom pom.xml +  --offline +  --jdk-home /path/to/target-jdk +  --output just-out
+java -jar target/just-sast-0.2.0-shaded.jar scan \
+  --jar app.jar \
+  --mode application \
+  --deps lib \
+  --pom pom.xml \
+  --offline \
+  --jdk-home /path/to/target-jdk \
+  --output just-out
 ~~~
 
 ## 扫描模式
