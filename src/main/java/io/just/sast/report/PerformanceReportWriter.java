@@ -94,10 +94,17 @@ public final class PerformanceReportWriter {
             out.append("null");
             return;
         }
+        boolean p95Eligible = result.samples() >= 20;
         out.append('{')
                 .append("\"samples\":").append(result.samples())
                 .append(",\"p50_ms\":").append(result.p50Ms())
-                .append(",\"p95_ms\":").append(result.p95Ms())
+                .append(",\"p95_ms\":");
+        if (p95Eligible) {
+            out.append(result.p95Ms());
+        } else {
+            out.append("null");
+        }
+        out.append(",\"p95_eligible\":").append(p95Eligible)
                 .append(",\"p50_limit_ms\":");
         appendLimit(out, result.p50LimitMs());
         out.append(",\"p95_limit_ms\":");
