@@ -152,6 +152,9 @@ class FindingOutputReaderContractTest {
         assertEquals("app/ApiController", trace.applicationSiteClass());
         assertEquals("TYPED_BINDING_TARGET", trace.joinKind());
         assertEquals(entryMethod, trace.entryPrefixPath());
+        assertEquals("UNKNOWN", trace.joinEvidence().artifactDigest());
+        assertEquals("UNKNOWN", trace.joinEvidence().applicationIndexDigest());
+        assertEquals(join.id(), trace.joinEvidence().joinId());
         assertTrue(snapshot.toCanonicalJson().contains("application_trace"));
     }
 }

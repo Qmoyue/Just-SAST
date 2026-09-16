@@ -78,6 +78,7 @@ class ApplicationPathReportContractTest {
         ReportLayout layout = ReportLayout.create(tmp.resolve("report"));
 
         new FindingOutputWriter().write(layout, snapshot);
+        new ApplicationChainEvidenceWriter().write(layout, evidence);
         new CsvReporter().write(layout, Map.of(), snapshot, new java.util.LinkedHashMap<>());
         new MultiFormatReporter().write(layout, snapshot);
         new SarifReporter().write(layout, snapshot);
@@ -85,11 +86,18 @@ class ApplicationPathReportContractTest {
         String expectedEntry = "app/ApiController";
         String expectedPath = "app/ApiController#putNote()Ljava/lang/Object;";
         String findingOutput = Files.readString(layout.meta().resolve("finding-output.json"));
+        String applicationEvidence = Files.readString(
+                layout.meta().resolve("application-chain-evidence.json"));
         assertTrue(findingOutput.contains(expectedEntry));
         assertTrue(findingOutput.contains(join.id()));
+        assertTrue(findingOutput.contains("\"artifact_digest\":\"UNKNOWN\""));
+        assertTrue(findingOutput.contains("\"application_index_digest\":\"UNKNOWN\""));
         assertTrue(findingOutput.contains("\"dependency_segment_id\":\""
                 + join.dependencySegmentId().value() + "\""));
         assertTrue(findingOutput.contains("\"construction_constraint\":\"SAT\""));
+        assertTrue(applicationEvidence.contains("\"graph_digest\":\""
+                + graph.canonicalDigest() + "\""));
+        assertTrue(applicationEvidence.contains(join.id()));
         assertTrue(Files.readString(layout.evidence().resolve("chains.csv")).contains(expectedPath));
         assertTrue(Files.readString(layout.findings().resolve("findings.csv")).contains(expectedEntry));
         assertTrue(Files.readString(layout.findings().resolve("findings.json")).contains(expectedEntry));

@@ -182,9 +182,10 @@
             "entry_prefix_path": { "type": "string" }, "dependency_owner": { "type": "string" }, "terminal_owner": { "type": "string" }, "terminal_method": { "type": "string" },
             "join_evidence": {
               "type": ["object", "null"],
-              "required": ["evidence_graph_digest", "join_id", "application_chain_id", "entry_atom_id", "site_atom_id", "dependency_segment_id", "value_flow", "object_identity", "callback_semantics", "runtime_type_proof", "artifact_compatibility", "filter_dominance", "construction_constraint", "bridge_evidence_ids"],
+              "required": ["evidence_graph_digest", "artifact_digest", "application_index_digest", "join_id", "application_chain_id", "entry_atom_id", "site_atom_id", "dependency_segment_id", "value_flow", "object_identity", "callback_semantics", "runtime_type_proof", "artifact_compatibility", "filter_dominance", "construction_constraint", "bridge_evidence_ids"],
               "properties": {
-                "evidence_graph_digest": { "type": "string" }, "join_id": { "type": "string" }, "application_chain_id": { "type": "string" },
+                "evidence_graph_digest": { "type": "string" }, "artifact_digest": { "type": "string" }, "application_index_digest": { "type": "string" },
+                "join_id": { "type": "string" }, "application_chain_id": { "type": "string" },
                 "entry_atom_id": { "type": "string" }, "site_atom_id": { "type": "string" }, "dependency_segment_id": { "type": "string" },
                 "value_flow": { "type": "string" }, "object_identity": { "type": "string" }, "callback_semantics": { "type": "string" },
                 "runtime_type_proof": { "type": "string" }, "artifact_compatibility": { "type": "string" }, "filter_dominance": { "type": "string" },

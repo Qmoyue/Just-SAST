@@ -52,6 +52,8 @@ public record ApplicationTrace(
     /** Stable typed references from a raw chain key to the immutable application evidence graph. */
     public record JoinEvidence(
             String evidenceGraphDigest,
+            String artifactDigest,
+            String applicationIndexDigest,
             String joinId,
             String applicationChainId,
             String entryAtomId,
@@ -68,6 +70,8 @@ public record ApplicationTrace(
 
         public JoinEvidence {
             evidenceGraphDigest = required(evidenceGraphDigest, "evidenceGraphDigest");
+            artifactDigest = required(artifactDigest, "artifactDigest");
+            applicationIndexDigest = required(applicationIndexDigest, "applicationIndexDigest");
             joinId = required(joinId, "joinId");
             applicationChainId = required(applicationChainId, "applicationChainId");
             entryAtomId = required(entryAtomId, "entryAtomId");
@@ -89,7 +93,9 @@ public record ApplicationTrace(
 
         public String toCanonicalJson() {
             StringBuilder json = new StringBuilder("{\"evidence_graph_digest\":\"")
-                    .append(esc(evidenceGraphDigest)).append("\",\"join_id\":\"")
+                    .append(esc(evidenceGraphDigest)).append("\",\"artifact_digest\":\"")
+                    .append(esc(artifactDigest)).append("\",\"application_index_digest\":\"")
+                    .append(esc(applicationIndexDigest)).append("\",\"join_id\":\"")
                     .append(esc(joinId)).append("\",\"application_chain_id\":\"")
                     .append(esc(applicationChainId)).append("\",\"entry_atom_id\":\"")
                     .append(esc(entryAtomId)).append("\",\"site_atom_id\":\"")
@@ -193,7 +199,8 @@ public record ApplicationTrace(
                             dependency == null ? "UNKNOWN" : dependency.owner(),
                             terminal == null ? "UNKNOWN" : terminal.owner(),
                             terminal == null ? "UNKNOWN" : terminal.member(),
-                            new JoinEvidence(evidence.graph().canonicalDigest(), join.id(),
+                            new JoinEvidence(evidence.graph().canonicalDigest(),
+                                    evidence.artifactDigest(), evidence.applicationIndexDigest(), join.id(),
                                     join.applicationChainId().value(),
                                     join.applicationEntryAtomId(), join.applicationSiteAtomId(),
                                     join.dependencySegmentId().value(), join.valueFlow().name(),
