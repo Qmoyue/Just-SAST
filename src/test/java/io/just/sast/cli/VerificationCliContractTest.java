@@ -106,6 +106,27 @@ class VerificationCliContractTest {
     }
 
     @Test
+    void cacheCannotBeSilentlySkippedWhenReportPoliciesAreRequested(@TempDir Path temp) {
+        Path missing = temp.resolve("not-an-input.jar");
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int code;
+        try {
+            System.setErr(new PrintStream(captured, true, StandardCharsets.UTF_8));
+            code = new CommandLine(new JustMain()).execute(
+                    "scan", "--jar", missing.toString(),
+                    "--cache", temp.resolve("cache").toString(),
+                    "--baseline", temp.resolve("baseline").toString());
+        } finally {
+            System.setErr(original);
+        }
+
+        assertEquals(2, code);
+        assertTrue(captured.toString(StandardCharsets.UTF_8)
+                .contains("--cache 不能与 --baseline 或 --suppressions 同时使用"));
+    }
+
+    @Test
     void explicitPomRepositoryAndOfflineOptionsFeedTheStaticPipeline(@TempDir Path temp)
             throws Exception {
         Path repository = temp.resolve("repository");

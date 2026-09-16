@@ -6,11 +6,9 @@ import java.util.Set;
 /**
  * Immutable policy for the two product scan modes.
  *
- * <p>The mode owns the demand boundary and export rule together.  Keeping these decisions in
- * one value prevents a caller from accidentally combining component demand with application
- * export (or the reverse), which was the source of several compatibility seams during the
- * migration.  It does not change the solver: it only tells the pipeline which already-parsed
- * classes represent an application execution scope and which finding boundary is requested.</p>
+ * <p>The mode owns the demand boundary and application export requirement together. It does not
+ * change the solver: it tells the pipeline which already-parsed classes represent an application
+ * execution scope and which finding boundary is requested.</p>
  */
 public record ModeDemandPolicy(ScanMode mode) {
 
@@ -22,41 +20,14 @@ public record ModeDemandPolicy(ScanMode mode) {
         return new ModeDemandPolicy(mode);
     }
 
-    /** Compatibility mapping for library callers that still pass the old export enum. */
-    public static ModeDemandPolicy fromExportPolicy(ScanPipeline.ExportPolicy policy) {
-        Objects.requireNonNull(policy, "policy");
-        return new ModeDemandPolicy(policy == ScanPipeline.ExportPolicy.STRICT_PRODUCT
-                ? ScanMode.APPLICATION : ScanMode.COMPONENT);
-    }
-
-    /** Component mode keeps kernel candidates; application mode requires a real join to export. */
-    public boolean retainKernelCandidates() {
-        return mode == ScanMode.COMPONENT;
-    }
-
     /** Whether the target artifact is an application-owned execution scope. */
     public boolean applicationScopeKnown() {
         return mode == ScanMode.APPLICATION;
     }
 
-    /**
-     * The shared static solver knows which classes belong to the scanned target in both modes.
-     * Application provenance is gated separately by {@link #applicationScopeKnown()} and
-     * {@link #requireApplicationJoin()} so component roots can seed mechanism analysis without
-     * being rendered as application findings.
-     */
-    public boolean solverScopeKnown() {
-        return true;
-    }
-
     /** Application reports use the typed entry/site/join/terminal export contract. */
     public boolean requireApplicationJoin() {
         return mode == ScanMode.APPLICATION;
-    }
-
-    public ScanPipeline.ExportPolicy exportPolicy() {
-        return requireApplicationJoin() ? ScanPipeline.ExportPolicy.STRICT_PRODUCT
-                : ScanPipeline.ExportPolicy.AUDIT_COMPATIBILITY;
     }
 
     /**

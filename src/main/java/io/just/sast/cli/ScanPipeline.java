@@ -58,22 +58,6 @@ public final class ScanPipeline {
 
     private ScanPipeline() {}
 
-    /**
-     * Controls which rows are exported by the report boundary.
-     *
-     * <p>The historical library entry points intentionally keep the audit snapshot
-     * available to callers that use {@link #run} as a characterization harness.
-     * The user-facing scan command must opt into {@link #STRICT_PRODUCT}; this
-     * makes the product boundary explicit without weakening the application-entry
-     * contract in the CLI.</p>
-     */
-    public enum ExportPolicy {
-        /** Keep all semantically produced rows in the compatibility/audit report. */
-        AUDIT_COMPATIBILITY,
-        /** Export only the default application-anchored product findings. */
-        STRICT_PRODUCT
-    }
-
     public static final class UsageException extends Exception {
         public UsageException(String message) {
             super(message);
@@ -125,26 +109,8 @@ public final class ScanPipeline {
             }
         }
 
-        /** Compatibility constructor for library callers using the former integer result. */
-        public ScanResult(int exitCode, List<Chain> chains, ScanStatistics stats) {
-            this(compatibilityOutcome(exitCode, stats), chains, stats);
-        }
-
         public int exitCode() {
             return outcome.exitCode();
-        }
-
-        private static RunOutcome compatibilityOutcome(int exitCode, ScanStatistics stats) {
-            if (stats != null && exitCode == 0) {
-                return stats.runOutcome();
-            }
-            return switch (io.just.sast.run.ExitReason.fromCode(exitCode)) {
-                case OK -> RunOutcome.success();
-                case USAGE -> RunOutcome.usage("USAGE_ERROR", "legacy scan result");
-                case UNSUPPORTED_RUNTIME -> RunOutcome.unsupported("UNSUPPORTED_RUNTIME",
-                        "legacy scan result");
-                case INTERNAL -> RunOutcome.failed("SCAN_FAILURE", "legacy scan result");
-            };
         }
     }
 
@@ -409,9 +375,9 @@ public final class ScanPipeline {
         }
         phaseMs.put("analysis", elapsedMs(analysisStart));
         phaseMs.put("filter", blackboard.originSupport().finiteFilterMs());
-        // The joiner normally publishes this typed product before report assembly. Keep a
-        // report-boundary fallback for callers that omit the application-entry source: absence
-        // must remain an explicit empty/unknown product, never a renderer-inferred finding.
+        // The application-entry joiner owns this product. Build it once at the phase boundary
+        // when the controller did not publish a newer instance; an empty application product is
+        // a valid negative result and remains explicit in the evidence report.
         ApplicationChainEvidence applicationEvidence = latestApplicationChainEvidence(blackboard);
         if (applicationEvidence == null) {
             applicationEvidence = ApplicationChainJoiner.build(blackboard);

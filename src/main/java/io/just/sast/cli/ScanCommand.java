@@ -86,19 +86,15 @@ public final class ScanCommand implements Callable<Integer> {
     public Integer call() {
         try {
             ScanMode selectedMode = ScanMode.parse(mode);
+            if (cache != null && (baseline != null || suppressions != null)) {
+                throw new ScanPipeline.UsageException(
+                        "--cache 不能与 --baseline 或 --suppressions 同时使用");
+            }
             ModeDemandPolicy modePolicy = ModeDemandPolicy.forMode(selectedMode);
             printStaticAnalysisDisclosure();
             PreparedDependencies prepared = resolveDependencies();
             List<Path> scanDeps = prepared.paths();
-            boolean useCache = selectedMode == ScanMode.APPLICATION
-                    && cache != null && baseline == null && suppressions == null;
-            if (selectedMode == ScanMode.COMPONENT && cache != null) {
-                System.err.println("[just:info] component 模式暂不复用旧 cache；模式身份纳入新缓存契约后启用");
-            }
-            if (cache != null && !useCache) {
-                System.err.println("[just:info] --cache 与 baseline/suppressions 同时使用时跳过缓存，"
-                        + "避免复用未应用当前差异策略的报告");
-            }
+            boolean useCache = cache != null;
             ScanCache.Preflight preflight = null;
             if (useCache) {
                 try {
@@ -109,8 +105,7 @@ public final class ScanCommand implements Callable<Integer> {
                         return RunOutcome.success().exitCode();
                     }
                 } catch (java.io.IOException | RuntimeException cacheFailure) {
-                    System.err.println("[just:warn] 增量缓存不可用，继续完整扫描: "
-                            + cacheFailure.getClass().getSimpleName());
+                    throw new CacheFailure(cacheFailure);
                 }
             }
             ScanPipeline.ScanResult result = ScanPipeline.run(target, scanDeps, output, rules, stats,
@@ -124,17 +119,26 @@ public final class ScanCommand implements Callable<Integer> {
                             result.stats());
                     ScanCache.recordEvent(output, preflight.cacheKey(), stored ? "stored" : "not-stored");
                 } catch (java.io.IOException | RuntimeException cacheFailure) {
-                    System.err.println("[just:warn] 增量缓存未写入: "
-                            + cacheFailure.getClass().getSimpleName());
+                    throw new CacheFailure(cacheFailure);
                 }
             }
             return result.exitCode();
         } catch (ScanPipeline.UsageException e) {
             System.err.println("[just:error] " + e.getMessage());
             return RunOutcome.usage("USAGE_ERROR", e.getMessage()).exitCode();
+        } catch (CacheFailure e) {
+            System.err.println("[just:error] " + e.getMessage());
+            return RunOutcome.failed("CACHE_FAILURE", e.getMessage()).exitCode();
         } catch (Exception e) {
             System.err.println("[just:error] 扫描失败: " + e);
             return RunOutcome.failed("SCAN_FAILURE", e.getClass().getSimpleName()).exitCode();
+        }
+    }
+
+    private static final class CacheFailure extends Exception {
+        private CacheFailure(Throwable cause) {
+            super("缓存操作失败: " + (cause.getMessage() == null
+                    ? cause.getClass().getSimpleName() : cause.getMessage()), cause);
         }
     }
 

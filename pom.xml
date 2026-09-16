@@ -23,8 +23,8 @@
       Keep source/target instead of the release flag. The Jabba JDKs used by the
       supported development environment return a spurious compiler-resource
       failure after successfully writing classes when the release flag is present.
-      The project requires JDK 17 at runtime, and the verifier source below is
-      checked separately for Java 8 bytecode/API compatibility.
+      The project requires JDK 17 at runtime; target bytecode compatibility is
+      checked by the target-JDK frontend contracts.
     -->
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
