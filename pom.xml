@@ -110,6 +110,12 @@
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
+        <configuration>
+          <!-- Windows/JDK17 may put the long test classpath in a manifest JAR. The
+               workspace and Maven cache can be on different volumes; without this
+               JDK URLClassPath rejects the manifest before tests load production classes. -->
+          <argLine>-Djdk.net.URLClassPath.disableClassPathURLCheck=true</argLine>
+        </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
