@@ -39,7 +39,12 @@ import java.util.regex.Pattern;
 @Command(name = "perf", description = "在固定 runner 上测量扫描 p50/p95 与结果稳定性")
 public final class PerformanceCommand implements Callable<Integer> {
 
-    private static final InputBudget OUTPUT_INPUT_POLICY = InputBudget.defaults();
+    /*
+     * A generated report is an aggregate projection rather than one archive entry.  Keep the
+     * ordinary scan budget for the total read, but allow the performance runner to consume one
+     * report up to that same aggregate bound.
+     */
+    private static final InputBudget OUTPUT_INPUT_POLICY = performanceOutputPolicy();
 
     private static final long DISABLED_LIMIT = Long.MAX_VALUE;
     private static final Pattern NUMBER = Pattern.compile(
@@ -121,6 +126,18 @@ public final class PerformanceCommand implements Callable<Integer> {
     Path limitsFile;
 
     private PerformanceProfile.Limits profileLimits;
+
+    static InputBudget outputInputPolicyForContract() {
+        return OUTPUT_INPUT_POLICY;
+    }
+
+    private static InputBudget performanceOutputPolicy() {
+        InputBudget defaults = InputBudget.defaults();
+        return defaults.withArchiveLimits(defaults.maxPhysicalBytes(), defaults.maxCompressedBytes(),
+                defaults.maxUncompressedBytes(), defaults.maxUncompressedBytes(),
+                defaults.maxArchiveEntries(), defaults.maxArchiveNesting(),
+                defaults.maxClassEntries());
+    }
 
     @Override
     public Integer call() {

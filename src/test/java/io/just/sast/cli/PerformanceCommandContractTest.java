@@ -8,12 +8,23 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Contract tests for performance-runner output cleanup boundaries. */
 class PerformanceCommandContractTest {
+
+    @Test
+    void generatedReportPolicyKeepsAggregateReadWithinTheScanBudget() {
+        InputBudget defaults = InputBudget.defaults();
+        InputBudget output = PerformanceCommand.outputInputPolicyForContract();
+
+        assertTrue(output.maxEntryBytes() > defaults.maxEntryBytes());
+        assertTrue(output.maxEntryBytes() <= defaults.maxUncompressedBytes());
+        assertEquals(defaults.maxUncompressedBytes(), output.maxUncompressedBytes());
+    }
 
     @Test
     void cleanupRemovesBoundedTreeWithoutFollowingLinks(@TempDir Path temp) throws Exception {
