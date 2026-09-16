@@ -380,8 +380,10 @@ public final class ScanPipeline {
         // a valid negative result and remains explicit in the evidence report.
         ApplicationChainEvidence applicationEvidence = latestApplicationChainEvidence(blackboard);
         if (applicationEvidence == null) {
-            applicationEvidence = ApplicationChainJoiner.build(blackboard);
-            blackboard.publishFact(applicationEvidence);
+            applicationEvidence = modePolicy.requireApplicationJoin()
+                    ? ApplicationChainJoiner.build(blackboard)
+                    : ApplicationChainEvidence.empty(false,
+                            List.of("COMPONENT_MODE_KERNEL_ONLY"));
         }
         // Re-check immutable input identities after analysis.  The digest pass uses the same
         // scan-boundary tracker and therefore cannot silently obtain a second aggregate budget;
@@ -396,10 +398,6 @@ public final class ScanPipeline {
         // immutable product exactly once with the scan-boundary target digest so every exported
         // application chain can be traced back to the bytes that were analyzed.
         applicationEvidence = applicationEvidence.withArtifactDigest(targetArtifactHash);
-        if (!modePolicy.requireApplicationJoin()) {
-            applicationEvidence = ApplicationChainEvidence.empty(false,
-                    List.of("COMPONENT_MODE_KERNEL_ONLY"));
-        }
         blackboard.publishFact(applicationEvidence);
         // Publish one static phase for the performance harness. The complete pre-report
         // interval is static analysis.
