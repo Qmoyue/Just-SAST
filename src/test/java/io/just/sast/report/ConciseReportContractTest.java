@@ -87,9 +87,40 @@ class ConciseReportContractTest {
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
         assertTrue(json.contains("\"role\":\"CAPABILITY\""));
+        assertTrue(json.contains("\"label\":\"java/lang/reflect/Method#invoke\",\"role\":\"BOUNDARY\""));
+        assertTrue(markdown.contains("[BOUNDARY] java/lang/reflect/Method#invoke"));
         assertTrue(markdown.contains("Capability boundary: java/lang/reflect/Method#invoke"));
         assertTrue(markdown.contains("target unresolved, so no terminal is claimed"));
         assertFalse(markdown.contains("Terminal: java/lang/reflect/Method#invoke"));
+    }
+
+    @Test
+    void composedSuffixIsConnectedWithoutBecomingABytecodeClaim(@TempDir Path temp)
+            throws Exception {
+        Chain chain = new Chain("JUST-SINK-TEMPLATES", "COMMAND", "HIGH",
+                "app/Entry", "readObject", "readObject",
+                "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                "newTransformer",
+                List.of(
+                        new ChainHop("java/lang/reflect/Method", "invoke",
+                                "com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl",
+                                "newTransformer", HopKind.DIRECT_CALL, null,
+                                "terminal suffix", "()V", null),
+                        new ChainHop("app/Entry", "readObject",
+                                "app/Bridge", "wagTail", HopKind.DIRECT_CALL,
+                                null, "application prefix", "()V", null)),
+                0, "()V", "TERMINAL");
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(chain), Map.of(), Map.of(), Map.of());
+        Path output = temp.resolve("composed");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "application", snapshot,
+                stats("C".repeat(64)));
+        String json = Files.readString(output.resolve("report.json"));
+        String markdown = Files.readString(output.resolve("report.md"));
+        assertTrue(json.contains("\"kind\":\"CHAIN_JOIN\""));
+        assertTrue(markdown.contains("[STEP] java/lang/reflect/Method#invoke"));
+        assertTrue(markdown.contains("[TERMINAL] com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl#newTransformer"));
+        assertFalse(markdown.contains("FIELD_FLOW —"));
     }
 
     @Test

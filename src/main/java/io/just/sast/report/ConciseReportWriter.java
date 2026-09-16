@@ -193,7 +193,7 @@ public final class ConciseReportWriter {
                 .append(",\"notes\":");
         appendStrings(out, finding.notes());
         out.append(",\"graph\":");
-        appendGraphJson(out, graph(hops));
+        appendGraphJson(out, graph(chain, hops));
         out.append(",\"object_relations\":[");
         boolean firstRelation = true;
         for (ChainHop hop : hops) {
@@ -296,44 +296,74 @@ public final class ConciseReportWriter {
         out.append("~~~\n");
     }
 
-    private static GraphProjection graph(List<ChainHop> hops) {
+    /**
+     * Build a readable linear projection of one chain without changing its evidence.
+     *
+     * <p>The solver stores some composed chains as ordered fragments: the application/mechanism
+     * prefix ends at a capability and the terminal suffix begins at that capability. Rendering
+     * only the raw hop endpoints makes the graph appear disconnected. A {@code CHAIN_JOIN}
+     * edge exposes that presentation join, while the exact raw hops remain available below it.
+     * This is deliberately a presentation edge, not a new call-graph claim.</p>
+     */
+    private static GraphProjection graph(Chain chain, List<ChainHop> hops) {
         java.util.LinkedHashMap<String, String> nodeIds = new java.util.LinkedHashMap<>();
         List<String> labels = new ArrayList<>();
         List<GraphEdge> edges = new ArrayList<>();
+        String current = member(chain.entryClass(), chain.entryMethod());
+        ensureGraphNode(nodeIds, labels, current);
         for (ChainHop hop : hops) {
             String from = member(hop.fromOwner(), hop.fromName());
             String to = member(hop.toOwner(), hop.toName());
             String kind = hop.kind() == null ? "UNKNOWN" : hop.kind().name();
-            // ENTRY is represented by the first node.  The underlying reverse-search model
-            // also stores an ENTRY self-hop for identity/provenance; rendering it as an edge
-            // produces a misleading loop in the human gadget graph.
-            if ("ENTRY".equals(kind) && from.equals(to)) {
-                nodeIds.computeIfAbsent(from, ignored -> {
-                    String id = "n" + (nodeIds.size() + 1);
-                    labels.add(from);
-                    return id;
-                });
+            if (from.equals(to)) {
+                // Identity and field-flow self hops are useful in exact JSON evidence, but a
+                // self-loop makes a human gadget graph look cyclic when no traversal occurs.
+                ensureGraphNode(nodeIds, labels, from);
                 continue;
             }
-            String fromId = nodeIds.computeIfAbsent(from, ignored -> {
-                String id = "n" + (nodeIds.size() + 1);
-                labels.add(from);
-                return id;
-            });
-            String toId = nodeIds.computeIfAbsent(to, ignored -> {
-                String id = "n" + (nodeIds.size() + 1);
-                labels.add(to);
-                return id;
-            });
-            edges.add(new GraphEdge(fromId, toId,
-                    kind, graphEdgeReason(hop)));
+            if (!current.equals(from)) {
+                String currentId = ensureGraphNode(nodeIds, labels, current);
+                String fromId = ensureGraphNode(nodeIds, labels, from);
+                edges.add(new GraphEdge(currentId, fromId, "CHAIN_JOIN",
+                        "presentation join; exact endpoints remain in hops"));
+            }
+            String fromId = ensureGraphNode(nodeIds, labels, from);
+            String toId = ensureGraphNode(nodeIds, labels, to);
+            edges.add(new GraphEdge(fromId, toId, kind, graphEdgeReason(hop)));
+            current = to;
+        }
+        String sink = member(chain.sinkClass(), chain.sinkMethod());
+        if (!current.equals(sink)) {
+            String currentId = ensureGraphNode(nodeIds, labels, current);
+            String sinkId = ensureGraphNode(nodeIds, labels, sink);
+            String kind = chain.terminalSink() ? "SINK_BOUNDARY" : "CAPABILITY_BOUNDARY";
+            String reason = chain.terminalSink()
+                    ? "declared sink; exact terminal evidence is in hops"
+                    : "target-unresolved; no terminal is claimed";
+            edges.add(new GraphEdge(currentId, sinkId, kind, reason));
         }
         List<GraphNode> nodes = new ArrayList<>();
         for (int i = 0; i < labels.size(); i++) {
-            String role = i == 0 ? "ENTRY" : (i == labels.size() - 1 ? "TERMINAL" : "STEP");
+            String role;
+            if (i == 0) {
+                role = "ENTRY";
+            } else if (i == labels.size() - 1) {
+                role = chain.terminalSink() ? "TERMINAL" : "BOUNDARY";
+            } else {
+                role = "STEP";
+            }
             nodes.add(new GraphNode("n" + (i + 1), labels.get(i), role));
         }
         return new GraphProjection(nodes, edges);
+    }
+
+    private static String ensureGraphNode(java.util.Map<String, String> nodeIds,
+                                          List<String> labels, String label) {
+        return nodeIds.computeIfAbsent(label, ignored -> {
+            String id = "n" + (nodeIds.size() + 1);
+            labels.add(label);
+            return id;
+        });
     }
 
     private record GraphProjection(List<GraphNode> nodes, List<GraphEdge> edges) {
@@ -427,7 +457,7 @@ public final class ConciseReportWriter {
             }
             out.append("Gadget graph:\n");
             List<ChainHop> orderedHops = orderedHops(chain);
-            appendMarkdownGraph(out, graph(orderedHops));
+            appendMarkdownGraph(out, graph(chain, orderedHops));
             if (chain.terminalSink()) {
                 out.append("Terminal: ").append(md(member(chain.sinkClass(), chain.sinkMethod())))
                         .append("; exact hop evidence: report.json\n");
