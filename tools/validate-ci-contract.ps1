@@ -82,6 +82,11 @@ function Test-Contracts {
         'CI does not depend on ignored local tools.'
     Add-Check $checks 'CI_NO_PRIVATE_INPUTS' (-not (Has-Pattern $CiText '(?i)(^|[/\\])benchmark[/\\]')) `
         'CI does not require private benchmark inputs.'
+    Add-Check $checks 'CI_REPORT_CONTRACT_SCRIPT' (Test-Path -LiteralPath (Join-Path $RepoRoot '.github/scripts/validate-static-report.ps1') -PathType Leaf) `
+        'CI uses a tracked static report contract assertion script.'
+    Add-Check $checks 'CI_REPORT_CONTRACT_CALL' ((Has-Pattern $CiText '(?i)validate-static-report\.ps1') -and `
+        (Has-Pattern $ReleaseText '(?i)validate-static-report\.ps1')) `
+        'CI and Release enforce the public report tree and static-only fields.'
     Add-Check $checks 'CI_ARTIFACT_ALWAYS' (Has-Pattern $CiText '(?i)if:\s*always\(\)') `
         'diagnostic build artifacts remain available when a required step fails.'
     Add-Check $checks 'CI_NO_CONTINUE_ON_ERROR' (-not (Has-Pattern $CiText '(?m)continue-on-error:\s*true')) `
@@ -126,6 +131,7 @@ jobs:
       - run: mvn -B package -DskipTests
       - run: Static CLI smoke --mode component --mode application --jdk-home --offline --cache
       - run: src/test/resources/ci-smoke/pom.xml fixture/CiSmokeEntry.class
+      - run: validate-static-report.ps1
       - run: if: always()
 '@
     $release = @'
@@ -135,6 +141,7 @@ java-version: '17'
 if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 git ls-remote origin refs/tags/$tag
 sha256sum target/just-sast-${{ steps.project.outputs.version }}-shaded.jar
+pwsh -File .github/scripts/validate-static-report.ps1
 LICENSE THIRD-PARTY-NOTICES.md
 '@
     $failed = @(Test-Contracts $ci $release | Where-Object { $_.status -ne 'PASS' -and $_.severity -eq 'required' })

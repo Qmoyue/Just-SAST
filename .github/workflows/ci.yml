@@ -87,15 +87,13 @@ jobs:
             if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
               throw "smoke report missing: $report"
             }
-            $text = Get-Content -LiteralPath $report -Raw
-            if ($text -notmatch '"analysis":\{"mode":"STATIC_ONLY"') {
-              throw "static-only report contract missing: $report"
-            }
           }
-          $applicationText = Get-Content -LiteralPath (Join-Path $applicationOutput 'report.json') -Raw
-          if ($applicationText -notmatch '"mode":"application"') {
-            throw 'application mode was not recorded in the smoke report'
-          }
+          & pwsh -NoProfile -File .github/scripts/validate-static-report.ps1 `
+            -ReportDirectory $componentOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & pwsh -NoProfile -File .github/scripts/validate-static-report.ps1 `
+            -ReportDirectory $applicationOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload fast build artifacts
         if: always() && runner.os == 'Linux' && matrix.java == '17'
         uses: actions/upload-artifact@v4

@@ -85,9 +85,10 @@ jobs:
             --jdk-home "$JAVA_HOME" --output "$component" --cache "$cache"
           java -jar "$shaded" scan --jar "$fixture" --mode application --pom "$pom" \
             --jdk-home "$JAVA_HOME" --offline --output "$application" --cache "$cache"
-          grep -q '"analysis":{"mode":"STATIC_ONLY"' "$component/report.json"
-          grep -q '"analysis":{"mode":"STATIC_ONLY"' "$application/report.json"
-          grep -q '"mode":"application"' "$application/report.json"
+          pwsh -NoProfile -File .github/scripts/validate-static-report.ps1 \
+            -ReportDirectory "$component"
+          pwsh -NoProfile -File .github/scripts/validate-static-report.ps1 \
+            -ReportDirectory "$application"
 
       - name: Create checksums and verify licenses
         shell: bash
