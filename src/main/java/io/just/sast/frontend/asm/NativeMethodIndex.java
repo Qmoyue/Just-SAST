@@ -9,8 +9,6 @@ import org.objectweb.asm.Opcodes;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URISyntaxException;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -72,19 +70,5 @@ public final class NativeMethodIndex {
             }
         }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
         return List.copyOf(result);
-    }
-
-    /** Locate the ASM code source for the lifecycle test-probe classpath, if present. */
-    public static Path asmCodeSource(ClassLoader loader) {
-        try {
-            Class<?> asm = Class.forName("org.objectweb.asm.ClassVisitor", false, loader);
-            if (asm.getProtectionDomain() == null
-                    || asm.getProtectionDomain().getCodeSource() == null) {
-                return null;
-            }
-            return Path.of(asm.getProtectionDomain().getCodeSource().getLocation().toURI());
-        } catch (ClassNotFoundException | URISyntaxException | RuntimeException | LinkageError ignored) {
-            return null;
-        }
     }
 }
