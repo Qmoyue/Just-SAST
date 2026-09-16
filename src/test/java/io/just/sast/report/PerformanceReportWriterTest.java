@@ -31,6 +31,7 @@ class PerformanceReportWriterTest {
         assertTrue(json.contains("\"completeness\":\"COMPLETE\""));
         assertTrue(json.contains("\"result_digest_stable\":true"));
         assertTrue(json.contains("\"phase_ms\":{}"));
+        assertTrue(json.contains("\"time_to_first_useful_ms\":null"));
         assertTrue(json.contains("\"resource_metrics\":{}"));
         assertTrue(json.contains("\"phase_gates\":{}"));
         assertTrue(json.contains("\"filter\""));
@@ -38,6 +39,20 @@ class PerformanceReportWriterTest {
         assertFalse(json.contains("dynamic"));
         assertFalse(json.contains("verification_candidate"));
         assertFalse(json.contains("C:\\"), "性能产物不得写入本机绝对路径");
+    }
+
+    @Test
+    void writesObservedFirstUsefulResultTime() {
+        PerformanceHarness.Sample sample = new PerformanceHarness.Sample(1, 20, 10, 2,
+                4, 5, -1, 2, "COMPLETE", "digest", java.util.Map.of(),
+                java.util.Map.of(), 17);
+        PerformanceHarness.Report report = PerformanceHarness.report(0, List.of(sample),
+                new PerformanceHarness.Limits(Long.MAX_VALUE, Long.MAX_VALUE,
+                        Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE));
+
+        String json = PerformanceReportWriter.json(report, "cold");
+
+        assertTrue(json.contains("\"time_to_first_useful_ms\":17"));
     }
 
     @Test

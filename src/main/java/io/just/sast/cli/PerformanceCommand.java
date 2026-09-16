@@ -303,10 +303,19 @@ public final class PerformanceCommand implements Callable<Integer> {
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
                 .start();
-        boolean finished = process.waitFor(processTimeoutMs, TimeUnit.MILLISECONDS);
-        if (!finished) {
-            terminateProcessTree(process);
-            throw new IOException("cold scan timed out after " + processTimeoutMs + " ms");
+        long timeToFirstUsefulMs = -1L;
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(processTimeoutMs);
+        while (!process.waitFor(100L, TimeUnit.MILLISECONDS)) {
+            if (timeToFirstUsefulMs < 0L) {
+                timeToFirstUsefulMs = firstUsefulReportMs(output, started);
+            }
+            if (System.nanoTime() >= deadline) {
+                terminateProcessTree(process);
+                throw new IOException("cold scan timed out after " + processTimeoutMs + " ms");
+            }
+        }
+        if (timeToFirstUsefulMs < 0L) {
+            timeToFirstUsefulMs = firstUsefulReportMs(output, started);
         }
         if (process.exitValue() != ExitReason.OK.code()) {
             throw new IOException("cold scan exited with code " + process.exitValue());
@@ -330,8 +339,27 @@ public final class PerformanceCommand implements Callable<Integer> {
         PerformanceHarness.Sample sample = new PerformanceHarness.Sample(iteration, wall, staticMs,
                 filterMs, heapUsed, heapPeak, rss, chains, completeness,
                 resultDigest(output, OUTPUT_INPUT_POLICY, outputBudget), objectNumbers(json, "phase_ms"),
-                resourceNumbers(json, "metrics"));
+                resourceNumbers(json, "metrics"), timeToFirstUsefulMs);
         return sample;
+    }
+
+    /**
+     * The report writer publishes the complete canonical report with an atomic move.  Observing
+     * its first non-empty regular file therefore records the first result a consumer can read,
+     * without parsing target-owned bytes or executing any target code.
+     */
+    private static long firstUsefulReportMs(Path output, long started) throws IOException {
+        Path report = output.resolve("report.json");
+        try {
+            BasicFileAttributes attributes = Files.readAttributes(report,
+                    BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (attributes.isRegularFile() && attributes.size() > 0L) {
+                return elapsedMs(started);
+            }
+            return -1L;
+        } catch (java.nio.file.NoSuchFileException missing) {
+            return -1L;
+        }
     }
 
     /**

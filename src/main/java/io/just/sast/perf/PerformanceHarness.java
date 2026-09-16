@@ -41,13 +41,14 @@ public final class PerformanceHarness {
     public record Sample(int iteration, long wallMs, long staticMs, long filterMs,
                          long heapUsedMb, long heapPeakMb, long rssPeakMb,
                          int chainsFound, String completeness, String resultDigest,
-                         Map<String, Long> phaseMs, Map<String, Long> resourceMetrics) {
+                         Map<String, Long> phaseMs, Map<String, Long> resourceMetrics,
+                         long timeToFirstUsefulMs) {
         /** Compatibility constructor for callers that do not provide canonical output bytes. */
         public Sample(int iteration, long wallMs, long staticMs, long filterMs,
                       long heapUsedMb, long heapPeakMb, long rssPeakMb,
                       int chainsFound, String completeness) {
             this(iteration, wallMs, staticMs, filterMs, heapUsedMb, heapPeakMb, rssPeakMb,
-                    chainsFound, completeness, "UNKNOWN", Map.of(), Map.of());
+                    chainsFound, completeness, "UNKNOWN", Map.of(), Map.of(), -1L);
         }
 
         /** Compatibility constructor for callers that already provide a result digest. */
@@ -55,7 +56,7 @@ public final class PerformanceHarness {
                       long heapUsedMb, long heapPeakMb, long rssPeakMb,
                       int chainsFound, String completeness, String resultDigest) {
             this(iteration, wallMs, staticMs, filterMs, heapUsedMb, heapPeakMb, rssPeakMb,
-                    chainsFound, completeness, resultDigest, Map.of(), Map.of());
+                    chainsFound, completeness, resultDigest, Map.of(), Map.of(), -1L);
         }
 
         /** Compatibility constructor for callers that already provide phase telemetry. */
@@ -64,7 +65,16 @@ public final class PerformanceHarness {
                       int chainsFound, String completeness, String resultDigest,
                       Map<String, Long> phaseMs) {
             this(iteration, wallMs, staticMs, filterMs, heapUsedMb, heapPeakMb, rssPeakMb,
-                    chainsFound, completeness, resultDigest, phaseMs, Map.of());
+                    chainsFound, completeness, resultDigest, phaseMs, Map.of(), -1L);
+        }
+
+        /** Compatibility constructor for callers that already provide runner resources. */
+        public Sample(int iteration, long wallMs, long staticMs, long filterMs,
+                      long heapUsedMb, long heapPeakMb, long rssPeakMb,
+                      int chainsFound, String completeness, String resultDigest,
+                      Map<String, Long> phaseMs, Map<String, Long> resourceMetrics) {
+            this(iteration, wallMs, staticMs, filterMs, heapUsedMb, heapPeakMb, rssPeakMb,
+                    chainsFound, completeness, resultDigest, phaseMs, resourceMetrics, -1L);
         }
 
         public Sample {
@@ -76,6 +86,8 @@ public final class PerformanceHarness {
             heapPeakMb = Math.max(heapUsedMb, heapPeakMb);
             rssPeakMb = rssPeakMb < 0L ? -1L : rssPeakMb;
             chainsFound = Math.max(0, chainsFound);
+            timeToFirstUsefulMs = timeToFirstUsefulMs < 0L
+                    ? -1L : Math.max(0L, timeToFirstUsefulMs);
             completeness = completeness == null || completeness.isBlank()
                     ? "UNKNOWN" : completeness;
             resultDigest = resultDigest == null || resultDigest.isBlank()
@@ -262,6 +274,14 @@ public final class PerformanceHarness {
     public static Sample sample(int iteration, long wallMs, ScanStatistics statistics,
                                 String resultDigest, Map<String, Long> phaseMs,
                                 Map<String, Long> resourceMetrics) {
+        return sample(iteration, wallMs, statistics, resultDigest, phaseMs, resourceMetrics, -1L);
+    }
+
+    /** Build a sample with an observed first atomically consumable report time. */
+    public static Sample sample(int iteration, long wallMs, ScanStatistics statistics,
+                                String resultDigest, Map<String, Long> phaseMs,
+                                Map<String, Long> resourceMetrics,
+                                long timeToFirstUsefulMs) {
         Objects.requireNonNull(statistics, "statistics");
         long staticMs = statistics.phaseMs("static", -1L);
         if (staticMs < 0L) {
@@ -273,7 +293,7 @@ public final class PerformanceHarness {
         return new Sample(iteration, wallMs, staticMs, filterMs,
                 statistics.heapUsedMb(), statistics.heapPeakMb(), rssPeak,
                 statistics.chainsFound(), statistics.completeness(), resultDigest, phaseMs,
-                resourceMetrics);
+                resourceMetrics, timeToFirstUsefulMs);
     }
 
     private static Map<String, Long> resourceMetrics(ScanStatistics statistics) {

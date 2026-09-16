@@ -71,7 +71,13 @@ public final class PerformanceReportWriter {
                     .append(",\"chains_found\":").append(sample.chainsFound())
                     .append(",\"completeness\":\"").append(escape(sample.completeness()))
                     .append("\",\"result_digest\":\"")
-                    .append(escape(sample.resultDigest())).append("\",\"phase_ms\":");
+                    .append(escape(sample.resultDigest())).append("\",\"time_to_first_useful_ms\":");
+            if (sample.timeToFirstUsefulMs() < 0L) {
+                out.append("null");
+            } else {
+                out.append(sample.timeToFirstUsefulMs());
+            }
+            out.append(",\"phase_ms\":");
             appendPhases(out, sample.phaseMs());
             out.append(",\"resource_metrics\":");
             appendMetrics(out, sample.resourceMetrics());
