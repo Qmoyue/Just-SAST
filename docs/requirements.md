@@ -77,10 +77,10 @@ out/
 ├─ report.json       # agent 唯一主入口
 ├─ report.md         # 人唯一主入口
 ├─ evidence/         # 静态逐跳、依赖、桥和可选格式
-└─ meta/             # provenance、digest、诊断和内部快照
+└─ meta/             # provenance、digest、诊断、run.json 和 transaction.json
 ~~~
 
-不得默认创建空 findings/，不得生成重复的 index.md 主报告，不得生成 verification/、payload 或动态测试旁路。事务状态文件是实现细节，不是报告入口。
+不得默认创建空 findings/，不得生成重复的 index.md 主报告，不得生成 verification/、payload 或动态测试旁路。`meta/run.json` 是扫描元数据，`meta/transaction.json` 是事务状态；它们都是内部追溯文件，不是第三个报告入口。
 
 ### 6.2 JSON
 
@@ -172,6 +172,8 @@ scan --jar <jar|war|class-dir>
 ~~~
 
 stats、fast、baseline、suppressions 和 cache 只在有真实消费者、失败语义和回归测试时保留。参数错误、依赖/缓存失败、输出冲突和内部错误必须有明确退出状态。
+
+知识源通过 ServiceLoader 装配。provider 枚举、实例化或版本/元数据校验失败必须使扫描失败；知识源已经启动后的单源错误才由 Controller 隔离并在 coverage/completeness 中披露。
 
 ## 10. 交付
 

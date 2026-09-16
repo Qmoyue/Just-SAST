@@ -74,14 +74,14 @@ just-out/
 ├─ report.json       # agent 的机器可读主报告，包含全部候选和重要变体
 ├─ report.md         # 人的主报告，结论、主链和 Gadget 图
 ├─ evidence/         # 可选的静态逐跳、依赖和桥证据
-└─ meta/             # provenance、digest、诊断和内部快照
+└─ meta/             # provenance、digest、诊断、run.json 和 transaction.json
 ~~~
 
 默认不生成空 findings/、重复的 index.md、verification/ 或 payload 文件。CSV、SARIF 等格式如果有明确消费者，只作为 evidence/ 下的附加导出，不替代两个主报告。
 
 report.json 与 report.md 来自同一个冻结快照。JSON 不截断候选；Markdown 先展示主链和重要变体，详细位置、descriptor、字段关系、预算和 provenance 可以继续在 JSON/evidence 中追溯。
 
-主链图采用稳定的文本形式：
+主链图采用稳定的文本形式。下面是阅读格式示意；具体 entry/site、节点角色和证据以本次 report.json 为准：
 
 ~~~text
 HTTP entry

@@ -27,7 +27,7 @@ Frozen finding snapshot
   └─ meta/        identity and diagnostics
 ~~~
 
-没有 index.md、findings/ 或动态验证旁路参与默认产品流程。事务状态只服务于安全发布，不是用户报告。
+没有 index.md、findings/ 或动态验证旁路参与默认产品流程。扫描元数据写入 meta/run.json，事务状态写入 meta/transaction.json；二者都只服务于追溯和安全发布，不是用户报告。
 
 ## 2. Owner boundaries
 
@@ -128,12 +128,12 @@ WP 外部恶意类的 Runtime.getRuntime().exec 不在 demo.jar 内，另一个�
 
 ## 8. 事务、缓存和错误
 
-ReportTransaction 先在唯一 staging 目录写完整报告，确认状态后发布，避免两个运行的文件混合。最终布局只需要 report 文件及有内容的 evidence/meta；空的 findings/ 不再是事务完整性的前置条件。staging、backup、失败状态和缓存错误必须显式可诊断，不能自动把不完整目录当成功。
+ReportTransaction 先在唯一 staging 目录写完整报告，确认状态后发布，避免两个运行的文件混合。最终布局只需要两个 report 文件及有内容的 evidence/meta；扫描元数据 `meta/run.json` 与事务 marker `meta/transaction.json` 由各自 owner 写入，根目录不放第三个状态入口。空的 findings/ 不再是事务完整性的前置条件。staging、backup、失败状态和缓存错误必须显式可诊断，不能自动把不完整目录当成功。
 
 缓存只接受完整输入身份和完整静态报告。报告、缓存、依赖和 JDK 身份变化会使相关结果失效；不隐藏缺依赖、预算或 UNKNOWN。
 
 ## 9. 扩展和质量
 
-规则是 YAML 数据；知识源通过既有 Blackboard/ServiceLoader 边界交换 typed facts，不直接互调。新增字段必须声明 owner、消费者、缓存键、失败语义和测试。
+规则是 YAML 数据；知识源通过既有 Blackboard/ServiceLoader 边界交换 typed facts，不直接互调。ServiceLoader provider 的枚举、实例化或契约元数据错误会让扫描显式失败，不能跳过后伪装成完整；已成功装配的知识源在分析阶段运行失败则由 Controller 隔离，并把 PRODUCT/SOURCE failure 写入完整性状态。新增字段必须声明 owner、消费者、缓存键、失败语义和测试。
 
 质量保护按用户能力而不是类数量组织：两模式、真实 entry/site/join/bridge/terminal、8 组 WP、Apache 正负、依赖/offline、未知/预算、无目标执行、报告同源、错误/恢复和发布资产。测试要优先验证公开 JSON/Markdown/目录和真实无害 fixture，避免私有实现快照、字符串堆砌和重复 fake。
