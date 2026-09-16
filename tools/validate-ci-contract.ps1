@@ -106,6 +106,8 @@ function Test-Contracts {
         'release assets include license notices.'
     Add-Check $checks 'RELEASE_WRITE_PERMISSION' (Has-Pattern $ReleaseText '(?m)^  contents:\s*write\s*$') `
         'only the release workflow requests contents write permission.'
+    Add-Check $checks 'RELEASE_ATTESTATION_PERMISSION' (Has-Pattern $ReleaseText '(?m)^  attestations:\s*write\s*$') `
+        'release provenance attestation has the minimum repository permission.'
     $workflowText = $CiText + "`n" + $ReleaseText
     Add-Check $checks 'NO_RETIRED_EXECUTION_TERMS' (-not (Has-Pattern $workflowText '(?i)Job Object|SecurityManager|WindowsRealVerificationContractTest|--no-verify|verify8|payload_bytes')) `
         'workflows contain no retired execution or isolation contract.'
@@ -137,6 +139,7 @@ jobs:
     $release = @'
 permissions:
   contents: write
+  attestations: write
 java-version: '17'
 if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 git ls-remote origin refs/tags/$tag
