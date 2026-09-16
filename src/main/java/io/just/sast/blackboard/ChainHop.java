@@ -9,7 +9,16 @@ public record ChainHop(
         String fromOwner, String fromName,
         String toOwner, String toName,
         HopKind kind, String field, String reason, String desc,
-        Integer argOrdinal, String fieldOwner) {
+        Integer argOrdinal, String fieldOwner, HopProvenance provenance) {
+
+    /** Compatibility constructor for callers that already provide field ownership. */
+    public ChainHop(String fromOwner, String fromName,
+                    String toOwner, String toName,
+                    HopKind kind, String field, String reason, String desc,
+                    Integer argOrdinal, String fieldOwner) {
+        this(fromOwner, fromName, toOwner, toName, kind, field, reason, desc,
+                argOrdinal, fieldOwner, null);
+    }
 
     /** Compatibility constructor for extensions written before precise field identity. */
     public ChainHop(String fromOwner, String fromName,
@@ -17,6 +26,11 @@ public record ChainHop(
                     HopKind kind, String field, String reason, String desc,
                     Integer argOrdinal) {
         this(fromOwner, fromName, toOwner, toName, kind, field, reason, desc,
-                argOrdinal, null);
+                argOrdinal, null, null);
+    }
+
+    public ChainHop withProvenance(HopProvenance value) {
+        return new ChainHop(fromOwner, fromName, toOwner, toName, kind, field, reason, desc,
+                argOrdinal, fieldOwner, value);
     }
 }

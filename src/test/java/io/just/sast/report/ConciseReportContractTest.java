@@ -4,6 +4,8 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.ObjectGraphPlan;
+import io.just.sast.cpg.graph.Graph;
+import io.just.sast.model.ArtifactProvenance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -215,6 +217,60 @@ class ConciseReportContractTest {
                         && finding.contains("\"application_trace\""), finding);
         assertFalse(concise.contains("verification"), concise);
         assertFalse(finding.contains("verification"), finding);
+    }
+
+    @Test
+    void uniqueCpgCallSiteBecomesProvenHopLocation(@TempDir Path temp) throws Exception {
+        Graph graph = new Graph();
+        graph.methodNode("app/Entry", "readObject", "()V", false);
+        graph.addCallNode("java/lang/Runtime", "exec", "()V", "INVOKEVIRTUAL", null,
+                17, "app/Entry", "readObject", "()V");
+        graph.freeze();
+        Chain raw = new Chain("RULE-PROVENANCE", "COMMAND", "HIGH", "app/Entry",
+                "readObject", "readObject", "java/lang/Runtime", "exec",
+                List.of(
+                        new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
+                                HopKind.DIRECT_CALL, null, "call", "()V", null),
+                        new ChainHop("app/Entry", "readObject", "app/Entry", "readObject",
+                                HopKind.ENTRY, null, "readObject", "()V", null)), 0, "()V");
+        Chain enriched = HopProvenanceResolver.enrich(List.of(raw), graph,
+                Map.of("app/Entry", new ArtifactProvenance("fixture.jar",
+                        ArtifactProvenance.Role.APPLICATION, "A".repeat(64), 12))).get(0);
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(enriched), Map.of(), Map.of(), Map.of());
+        Path output = temp.resolve("provenance");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                ScanStatistics.empty());
+        String json = Files.readString(output.resolve("report.json"));
+        assertTrue(json.contains("\"status\":\"PROVEN\""), json);
+        assertTrue(json.contains("\"basis\":\"CALLSITE_EXACT\""), json);
+        assertTrue(json.contains("\"bytecode_offset\":17"), json);
+        assertTrue(json.contains("\"logical_name\":\"fixture.jar\""), json);
+        assertTrue(Files.readString(output.resolve("report.md")).contains("@17"));
+    }
+
+    @Test
+    void ambiguousCpgCallSiteRemainsUnknown() throws Exception {
+        Graph graph = new Graph();
+        graph.methodNode("app/Entry", "readObject", "()V", false);
+        graph.addCallNode("java/lang/Runtime", "exec", "()V", "INVOKEVIRTUAL", null,
+                17, "app/Entry", "readObject", "()V");
+        graph.addCallNode("java/lang/Runtime", "exec", "()V", "INVOKEVIRTUAL", null,
+                23, "app/Entry", "readObject", "()V");
+        graph.freeze();
+        Chain raw = new Chain("RULE-AMBIGUOUS", "COMMAND", "HIGH", "app/Entry",
+                "readObject", "readObject", "java/lang/Runtime", "exec",
+                List.of(
+                        new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
+                                HopKind.DIRECT_CALL, null, "call", "()V", null),
+                        new ChainHop("app/Entry", "readObject", "app/Entry", "readObject",
+                                HopKind.ENTRY, null, "readObject", "()V", null)), 0, "()V");
+        Chain enriched = HopProvenanceResolver.enrich(List.of(raw), graph, Map.of()).get(0);
+        assertEquals(io.just.sast.blackboard.HopProvenance.Status.UNKNOWN,
+                enriched.hops().get(0).provenance().status());
+        assertEquals(io.just.sast.blackboard.HopProvenance.Basis.CALLSITE_AMBIGUOUS,
+                enriched.hops().get(0).provenance().basis());
+        assertEquals(2, enriched.hops().get(0).provenance().candidateCount());
     }
 
     private static ScanStatistics stats(String artifactHash) {

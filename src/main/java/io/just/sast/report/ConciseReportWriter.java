@@ -184,6 +184,8 @@ public final class ConciseReportWriter {
                     .append(",\"arg_ordinal\":").append(hop.argOrdinal() == null
                             ? "null" : hop.argOrdinal())
                     .append(",\"field_owner\":").append(nullableQuote(hop.fieldOwner()))
+                    .append(",\"location\":")
+                    .append(ReportEvidence.hopLocationJson(hop.provenance()))
                     .append('}');
         }
         out.append(']');
@@ -293,6 +295,9 @@ public final class ConciseReportWriter {
                     if (hop.reason() != null && !hop.reason().isBlank()) {
                         out.append("; ").append(md(hop.reason()));
                     }
+                    out.append("; location `")
+                            .append(md(ReportEvidence.hopLocationSummary(hop.provenance())))
+                            .append('`');
                     out.append('\n');
                 }
             }

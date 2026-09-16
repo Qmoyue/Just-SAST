@@ -167,7 +167,7 @@
             "required": ["hop_index", "from", "from_descriptor", "to", "kind", "field", "reason", "descriptor", "arg_ordinal", "field_owner"],
             "properties": {
               "hop_index": { "type": "integer", "minimum": 1 }, "from": { "type": "string" }, "from_descriptor": { "type": ["string", "null"] }, "to": { "type": "string" }, "kind": { "type": "string" }, "field": { "type": "string" },
-              "reason": { "type": "string" }, "descriptor": { "type": "string" }, "arg_ordinal": { "type": ["integer", "null"] }, "field_owner": { "type": ["string", "null"] }
+              "reason": { "type": "string" }, "descriptor": { "type": "string" }, "arg_ordinal": { "type": ["integer", "null"] }, "field_owner": { "type": ["string", "null"] }, "location": { "$ref": "#/$defs/hop_location" }
             },
             "additionalProperties": false
           }
@@ -183,6 +183,30 @@
           },
           "additionalProperties": false
         }
+      },
+      "additionalProperties": false
+    }
+    ,"hop_location": {
+      "type": ["object", "null"],
+      "required": ["status", "basis", "method_descriptor", "bytecode_offset", "candidate_count", "artifact"],
+      "properties": {
+        "status": { "enum": ["PROVEN", "UNKNOWN"] },
+        "basis": { "type": "string" },
+        "method_descriptor": { "type": "string" },
+        "bytecode_offset": { "type": ["integer", "null"], "minimum": 0 },
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "artifact": { "$ref": "#/$defs/artifact" }
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": ["object", "null"],
+      "required": ["logical_name", "role", "sha256", "size_bytes"],
+      "properties": {
+        "logical_name": { "type": "string" },
+        "role": { "type": "string" },
+        "sha256": { "type": "string" },
+        "size_bytes": { "type": "integer", "minimum": -1 }
       },
       "additionalProperties": false
     }

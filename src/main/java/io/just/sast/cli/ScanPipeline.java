@@ -31,6 +31,7 @@ import io.just.sast.report.ReportIndexWriter;
 import io.just.sast.report.ReportLayout;
 import io.just.sast.report.ReportTransaction;
 import io.just.sast.report.ScanStatistics;
+import io.just.sast.report.HopProvenanceResolver;
 import io.just.sast.run.RunOutcome;
 import io.just.sast.run.InputBudget;
 import io.just.sast.util.ArchiveLimits;
@@ -43,6 +44,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -375,6 +377,8 @@ public final class ScanPipeline {
         }
         ProgramUniverse universe = ProgramUniverse.of(load, applicationArtifacts,
                 artifactInputs, dependencyGraph);
+        Map<String, ArtifactProvenance> hopArtifacts = hopArtifactOwners(
+                scopedApplication, artifactInputs);
 
         long cpgStart = System.nanoTime();
         ClassHierarchy hierarchy = new ClassHierarchy(universe.classes(), jdkSource);
@@ -448,7 +452,8 @@ public final class ScanPipeline {
         // enter composition and strict product export still requires the typed application
         // finding state, but retaining them here preserves an explainable
         // no-trigger/rejection row instead of silently dropping a solver observation.
-        List<Chain> reportChains = blackboard.reportChains();
+        List<Chain> reportChains = HopProvenanceResolver.enrich(blackboard.reportChains(),
+                cpg.graph(), hopArtifacts);
         Map<Long, io.just.sast.blackboard.SinkOutcome> reportOutcomes = blackboard.sinkOutcomes();
         Map<String, String> reportCalibrations = blackboard.chainCalibrations();
         Map<String, List<String>> reportNotes = blackboardNotes(blackboard);
@@ -613,6 +618,26 @@ public final class ScanPipeline {
                     ArtifactProvenance.Role.JDK));
         }
         return List.copyOf(result);
+    }
+
+    private static Map<String, ArtifactProvenance> hopArtifactOwners(
+            BytecodeFrontend.ScopedLoad scopedLoad, List<ArtifactProvenance> artifacts) {
+        if (scopedLoad == null || scopedLoad.classArtifactIndexes().isEmpty()
+                || artifacts == null || artifacts.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, ArtifactProvenance> result = new LinkedHashMap<>();
+        scopedLoad.classArtifactIndexes().forEach((className, index) -> {
+            if (className == null || className.isBlank() || index == null
+                    || index < 0 || index >= artifacts.size()) {
+                return;
+            }
+            ArtifactProvenance artifact = artifacts.get(index);
+            if (artifact != null) {
+                result.putIfAbsent(className, artifact);
+            }
+        });
+        return Map.copyOf(result);
     }
 
     private static String logicalArtifactName(Path path) {

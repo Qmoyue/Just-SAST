@@ -2,6 +2,7 @@ package io.just.sast.report;
 
 import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ConstructionSummary;
+import io.just.sast.blackboard.HopProvenance;
 import io.just.sast.analysis.taint.FilterAnalysis;
 
 import java.util.List;
@@ -65,6 +66,46 @@ final class ReportEvidence {
                     .append('}');
         }
         return json.append(']').toString();
+    }
+
+    static String hopLocationJson(HopProvenance location) {
+        if (location == null) {
+            return "null";
+        }
+        StringBuilder json = new StringBuilder("{\"status\":\"")
+                .append(escape(location.status().name()))
+                .append("\",\"basis\":\"").append(escape(location.basis().name()))
+                .append("\",\"method_descriptor\":\"")
+                .append(escape(location.methodDescriptor()))
+                .append("\",\"bytecode_offset\":")
+                .append(location.bytecodeOffset() == null ? "null" : location.bytecodeOffset())
+                .append(",\"candidate_count\":").append(location.candidateCount())
+                .append(",\"artifact\":");
+        if (location.artifact() == null) {
+            json.append("null");
+        } else {
+            json.append("{\"logical_name\":\"")
+                    .append(escape(location.artifact().logicalName()))
+                    .append("\",\"role\":\"")
+                    .append(escape(location.artifact().role().name()))
+                    .append("\",\"sha256\":\"")
+                    .append(escape(location.artifact().sha256()))
+                    .append("\",\"size_bytes\":")
+                    .append(location.artifact().sizeBytes()).append('}');
+        }
+        return json.append('}').toString();
+    }
+
+    static String hopLocationSummary(HopProvenance location) {
+        if (location == null) {
+            return "UNKNOWN";
+        }
+        String offset = location.bytecodeOffset() == null
+                ? "UNKNOWN" : String.valueOf(location.bytecodeOffset());
+        String artifact = location.artifact() == null
+                ? "UNKNOWN" : location.artifact().logicalName();
+        return location.status().name() + ":" + location.basis().name()
+                + ":" + artifact + "@" + offset;
     }
 
     static String sinkRisk(Chain chain) {
