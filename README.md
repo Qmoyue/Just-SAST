@@ -81,6 +81,8 @@ just-out/
 
 report.json 与 report.md 来自同一个冻结快照。JSON 不截断候选；Markdown 先展示主链和重要变体，详细位置、descriptor、字段关系、预算和 provenance 可以继续在 JSON/evidence 中追溯。
 
+如果只能到达 `Method.invoke` 等中间反射 API，Markdown 会单独列出 capability boundary，并明确没有声明最终影响；这类候选仍完整保存在 report.json。
+
 主链图采用稳定的文本形式。下面是阅读格式示意；具体 entry/site、节点角色和证据以本次 report.json 为准：
 
 ~~~text

@@ -114,6 +114,8 @@ report.md 第一屏只保留：
 4. 入口/site、对象/控制条件、terminal 和阻断点；
 5. report.json 和 evidence 的追溯位置。
 
+如果反射或其他中间 API 只形成 capability boundary，Markdown 必须至少列出每类边界及其候选数量，并明确“未声明 terminal”；不能因为它不在前十条详细链中而让用户误以为扫描遗漏。
+
 长 ranking 解释、筛选 telemetry、完整 reason code、descriptor 表和低优先级候选放入折叠详情或 JSON/evidence。主链图使用稳定文本，不依赖图片服务：
 
 ~~~text

@@ -98,7 +98,7 @@ report.md
   └─ compact alternatives with JSON/evidence references
 ~~~
 
-report.json 是 agent 入口，不能因 Markdown 展示上限丢候选；report.md 是人的入口，不能把 ranking、telemetry 和全部内部状态堆在首屏。两者必须共享 chain identity、计数、顺序和 graph projection。
+report.json 是 agent 入口，不能因 Markdown 展示上限丢候选；report.md 是人的入口，不能把 ranking、telemetry 和全部内部状态堆在首屏。两者必须共享 chain identity、计数、顺序和 graph projection。详细链展示之外，Markdown 还要汇总 capability boundary，让被截到候选表后的反射断点仍然可见。
 
 公开状态拆为：
 

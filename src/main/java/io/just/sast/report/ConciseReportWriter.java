@@ -11,8 +11,10 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 
 /**
@@ -473,6 +475,7 @@ public final class ConciseReportWriter {
             }
             out.append('\n');
         }
+        appendCapabilityBoundarySummary(out, findings);
         if (findings.size() > detailedCount) {
             out.append("## Remaining candidate summaries\n\n")
                     .append("The JSON report retains every candidate and variant.\n\n")
@@ -490,6 +493,30 @@ public final class ConciseReportWriter {
             out.append('\n');
         }
         return out.toString();
+    }
+
+    private static void appendCapabilityBoundarySummary(
+            StringBuilder out, List<FindingOutputReader.Finding> findings) {
+        Map<String, Integer> boundaries = new TreeMap<>();
+        for (FindingOutputReader.Finding finding : findings) {
+            Chain chain = finding.chain();
+            if (!chain.terminalSink()) {
+                String sink = member(chain.sinkClass(), chain.sinkMethod());
+                boundaries.merge(sink, 1, Integer::sum);
+            }
+        }
+        if (boundaries.isEmpty()) {
+            return;
+        }
+        out.append("## Capability boundaries\n\n")
+                .append("These endpoints are static capabilities, not claimed terminal impacts. "
+                        + "The JSON report retains every candidate and exact hop evidence.\n\n");
+        for (Map.Entry<String, Integer> boundary : boundaries.entrySet()) {
+            out.append("- Capability boundary: ").append(md(boundary.getKey()))
+                    .append(" — ").append(boundary.getValue())
+                    .append(" candidate(s); no terminal is claimed; see report.json\n");
+        }
+        out.append('\n');
     }
 
     private static void appendMarkdownLocations(StringBuilder out, List<ChainHop> hops) {

@@ -244,6 +244,11 @@ class ConciseReportContractTest {
                             HopKind.DIRECT_CALL, "value" + index, "variant", "()V", index)),
                     0, "()V", "TERMINAL"));
         }
+        chains.add(new Chain("RULE-BOUNDARY", "REFLECTION", "HIGH", "app/Reflective",
+                "readObject", "readObject", "java/lang/reflect/Method", "invoke",
+                List.of(new ChainHop("app/Reflective", "readObject",
+                        "java/lang/reflect/Method", "invoke", HopKind.DIRECT_CALL,
+                        null, "capability", "()V", null)), 0, "()V", "CAPABILITY"));
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
                 chains, Map.of(), Map.of(), Map.of());
         Path output = temp.resolve("display");
@@ -252,10 +257,11 @@ class ConciseReportContractTest {
 
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        assertEquals(12, occurrences(json, "\"chain_key\":"));
+        assertEquals(13, occurrences(json, "\"chain_key\":"));
         assertTrue(json.contains("\"display_limit\":10"));
         assertTrue(json.contains("\"json_truncated\":false"));
-        assertTrue(markdown.contains("Candidates: 12; exported: 12"));
+        assertTrue(markdown.contains("Candidates: 13; exported: 13"));
+        assertTrue(markdown.contains("Capability boundary: java/lang/reflect/Method#invoke"));
         assertTrue(markdown.contains("Remaining candidate summaries"));
     }
 
