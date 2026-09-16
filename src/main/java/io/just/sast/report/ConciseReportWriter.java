@@ -5,20 +5,21 @@ import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.FindingState;
 import io.just.sast.chain.ChainPrecision;
 import io.just.sast.chain.ChainRanking;
+import io.just.sast.run.RunOutcome;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.Objects;
 
 /**
- * Writes the small, stable reading surface for a scan.
+ * Writes the two public report entries from one frozen finding snapshot.
  *
- * <p>The canonical {@link FindingOutputReader.Snapshot} is the only source for both files.
- * This pair contains no executable material and no format-specific re-ranking.</p>
+ * <p>JSON keeps all candidates and evidence. Markdown is a small reading surface that renders
+ * the same ordered graph and points to the machine report for exact detail.</p>
  */
 public final class ConciseReportWriter {
 
@@ -61,17 +62,18 @@ public final class ConciseReportWriter {
         StringBuilder out = new StringBuilder(4096);
         out.append("{\"schema_version\":").append(quote(SCHEMA_VERSION))
                 .append(",\"mode\":").append(quote(mode))
-                .append(",\"static_analysis\":{\"target_code_executed\":false")
+                .append(",\"analysis\":{\"mode\":\"STATIC_ONLY\"")
                 .append(",\"filter_evidence\":\"meta/scan-metadata.json\"}")
                 .append(",\"artifact_sha256\":").append(quote(stats.artifactHash()))
                 .append(",\"run\":{")
-                .append("\"status\":").append(quote(stats.runOutcome().status().name()))
-                .append(",\"completeness\":").append(quote(stats.completeness()))
-                .append(",\"chain_proof_completeness\":")
-                .append(quote(stats.chainProofCompleteness()))
-                .append(",\"reason_codes\":");
-        appendStrings(out, stats.runOutcome().reasonCodes());
-        out.append("}")
+                .append("\"outcome\":").append(quote(publicOutcome(stats, findings)))
+                .append(",\"coverage\":").append(quote(coverage(stats)))
+                .append(",\"chain_proof_coverage\":")
+                .append(quote(coverage(stats.chainProofCompleteness())))
+                .append(",\"coverage_reasons\":");
+        appendStrings(out, coverageReasons(stats));
+        out.append(",\"exit_code\":").append(stats.runOutcome().exitCode())
+                .append("}")
                 .append(",\"summary\":{\"candidates\":").append(findings.size())
                 .append(",\"exported\":").append(findings.stream()
                         .filter(FindingOutputReader.Finding::exported).count())
@@ -86,16 +88,59 @@ public final class ConciseReportWriter {
         appendResultExplanation(out, stats, findings);
         out.append(",\"chains\":[");
         for (int i = 0; i < findings.size(); i++) {
-            if (i > 0) out.append(',');
+            if (i > 0) {
+                out.append(',');
+            }
             appendFinding(out, snapshot, findings.get(i));
         }
         return out.append("]}").toString();
+    }
+
+    private static String publicOutcome(ScanStatistics stats,
+                                        List<FindingOutputReader.Finding> findings) {
+        RunOutcome.Status status = stats.runOutcome().status();
+        return switch (status) {
+            case FAILED, USAGE_ERROR, UNSUPPORTED, NOT_RUN -> status.name();
+            case SUCCESS, PARTIAL -> findings.isEmpty()
+                    ? "NO_FINDINGS" : "FINDINGS_AVAILABLE";
+        };
+    }
+
+    private static String coverage(ScanStatistics stats) {
+        String completeness = coverage(stats.completeness());
+        String chainProof = coverage(stats.chainProofCompleteness());
+        if ("UNKNOWN".equals(completeness) || "UNKNOWN".equals(chainProof)) {
+            return "UNKNOWN";
+        }
+        return "COMPLETE".equals(completeness) && "COMPLETE".equals(chainProof)
+                ? "COMPLETE" : "BOUNDED";
+    }
+
+    private static String coverage(String value) {
+        String normalized = value == null ? "UNKNOWN"
+                : value.trim().toUpperCase(java.util.Locale.ROOT);
+        return switch (normalized) {
+            case "COMPLETE" -> "COMPLETE";
+            case "UNKNOWN" -> "UNKNOWN";
+            default -> "BOUNDED";
+        };
+    }
+
+    private static List<String> coverageReasons(ScanStatistics stats) {
+        Set<String> reasons = new TreeSet<>();
+        reasons.addAll(stats.runOutcome().reasonCodes());
+        reasons.addAll(stats.completenessReasons());
+        if (!"COMPLETE".equals(coverage(stats)) && reasons.isEmpty()) {
+            reasons.add("ANALYSIS_INCOMPLETE");
+        }
+        return List.copyOf(reasons);
     }
 
     private static void appendFinding(StringBuilder out, FindingOutputReader.Snapshot snapshot,
                                       FindingOutputReader.Finding finding) {
         Chain chain = finding.chain();
         FindingState state = finding.state();
+        List<ChainHop> hops = orderedHops(chain);
         out.append('{')
                 .append("\"id\":").append(quote(finding.id()))
                 .append(",\"chain_key\":").append(quote(chain.key()))
@@ -147,7 +192,8 @@ public final class ConciseReportWriter {
                 .append(ReportEvidence.constructionJson(finding.construction()))
                 .append(",\"notes\":");
         appendStrings(out, finding.notes());
-        List<ChainHop> hops = orderedHops(chain);
+        out.append(",\"graph\":");
+        appendGraphJson(out, graph(hops));
         out.append(",\"object_relations\":[");
         boolean firstRelation = true;
         for (ChainHop hop : hops) {
@@ -169,7 +215,9 @@ public final class ConciseReportWriter {
         out.append(']');
         out.append(",\"hops\":[");
         for (int i = 0; i < hops.size(); i++) {
-            if (i > 0) out.append(',');
+            if (i > 0) {
+                out.append(',');
+            }
             ChainHop hop = hops.get(i);
             out.append("{\"hop_index\":").append(i + 1)
                     .append(",\"from\":").append(quote(member(hop.fromOwner(), hop.fromName())))
@@ -198,45 +246,158 @@ public final class ConciseReportWriter {
         out.append('}');
     }
 
+    private static void appendGraphJson(StringBuilder out, GraphProjection graph) {
+        out.append("{\"nodes\":[");
+        for (int i = 0; i < graph.nodes().size(); i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            GraphNode node = graph.nodes().get(i);
+            out.append("{\"id\":").append(quote(node.id()))
+                    .append(",\"label\":").append(quote(node.label()))
+                    .append(",\"role\":").append(quote(node.role()))
+                    .append('}');
+        }
+        out.append("],\"edges\":[");
+        for (int i = 0; i < graph.edges().size(); i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            GraphEdge edge = graph.edges().get(i);
+            out.append("{\"from\":").append(quote(edge.from()))
+                    .append(",\"to\":").append(quote(edge.to()))
+                    .append(",\"kind\":").append(quote(edge.kind()))
+                    .append(",\"reason\":").append(quote(edge.reason()))
+                    .append('}');
+        }
+        out.append("]}");
+    }
+
+    private static void appendMarkdownGraph(StringBuilder out, GraphProjection graph) {
+        out.append("~~~text\n");
+        if (graph.nodes().isEmpty()) {
+            out.append("[UNKNOWN] no graph nodes\n");
+        } else {
+            GraphNode first = graph.nodes().get(0);
+            out.append('[').append(first.role()).append("] ")
+                    .append(md(first.label())).append('\n');
+            for (GraphEdge edge : graph.edges()) {
+                GraphNode target = graph.nodes().stream()
+                        .filter(node -> node.id().equals(edge.to()))
+                        .findFirst()
+                        .orElseThrow(() -> new IllegalStateException(
+                                "graph edge target is missing: " + edge.to()));
+                out.append("    │ ").append(md(graphEdgeLabel(edge))).append("\n")
+                        .append("    ▼\n")
+                        .append('[').append(target.role()).append("] ")
+                        .append(md(target.label())).append('\n');
+            }
+        }
+        out.append("~~~\n");
+    }
+
+    private static GraphProjection graph(List<ChainHop> hops) {
+        java.util.LinkedHashMap<String, String> nodeIds = new java.util.LinkedHashMap<>();
+        List<String> labels = new ArrayList<>();
+        List<GraphEdge> edges = new ArrayList<>();
+        for (ChainHop hop : hops) {
+            String from = member(hop.fromOwner(), hop.fromName());
+            String to = member(hop.toOwner(), hop.toName());
+            String kind = hop.kind() == null ? "UNKNOWN" : hop.kind().name();
+            // ENTRY is represented by the first node.  The underlying reverse-search model
+            // also stores an ENTRY self-hop for identity/provenance; rendering it as an edge
+            // produces a misleading loop in the human gadget graph.
+            if ("ENTRY".equals(kind) && from.equals(to)) {
+                nodeIds.computeIfAbsent(from, ignored -> {
+                    String id = "n" + (nodeIds.size() + 1);
+                    labels.add(from);
+                    return id;
+                });
+                continue;
+            }
+            String fromId = nodeIds.computeIfAbsent(from, ignored -> {
+                String id = "n" + (nodeIds.size() + 1);
+                labels.add(from);
+                return id;
+            });
+            String toId = nodeIds.computeIfAbsent(to, ignored -> {
+                String id = "n" + (nodeIds.size() + 1);
+                labels.add(to);
+                return id;
+            });
+            edges.add(new GraphEdge(fromId, toId,
+                    kind, graphEdgeReason(hop)));
+        }
+        List<GraphNode> nodes = new ArrayList<>();
+        for (int i = 0; i < labels.size(); i++) {
+            String role = i == 0 ? "ENTRY" : (i == labels.size() - 1 ? "TERMINAL" : "STEP");
+            nodes.add(new GraphNode("n" + (i + 1), labels.get(i), role));
+        }
+        return new GraphProjection(nodes, edges);
+    }
+
+    private record GraphProjection(List<GraphNode> nodes, List<GraphEdge> edges) {
+        private GraphProjection {
+            nodes = List.copyOf(nodes);
+            edges = List.copyOf(edges);
+        }
+    }
+
+    private record GraphNode(String id, String label, String role) {
+    }
+
+    private record GraphEdge(String from, String to, String kind, String reason) {
+    }
+
+    private static String graphEdgeReason(ChainHop hop) {
+        String reason = hop.reason() == null ? "" : hop.reason();
+        if (hop.field() == null || hop.field().isBlank()) {
+            return reason;
+        }
+        String field = "field=" + hop.field();
+        return reason.isBlank() ? field : field + "; " + reason;
+    }
+
+    private static String graphEdgeLabel(GraphEdge edge) {
+        if (edge.reason() == null || edge.reason().isBlank()) {
+            return edge.kind();
+        }
+        return edge.kind() + " — " + edge.reason();
+    }
+
     private static String markdown(String mode, FindingOutputReader.Snapshot snapshot,
                                    ScanStatistics stats,
                                    List<FindingOutputReader.Finding> findings) {
+        long exported = findings.stream().filter(FindingOutputReader.Finding::exported).count();
         StringBuilder out = new StringBuilder(4096)
                 .append("# Just report\n\n")
-                .append("This report is static-only and contains no generated attack bytes.\n\n")
-                .append("## Run\n\n")
-                .append("- Mode: `").append(md(mode)).append("`\n")
-                .append("- Status: `").append(md(stats.runOutcome().status().name())).append("`\n")
-                .append("- Completeness: `").append(md(stats.completeness())).append("`\n")
-                .append("- Chain proof: `").append(md(stats.chainProofCompleteness())).append("`\n")
-                .append("- Artifact SHA-256: `").append(md(stats.artifactHash())).append("`\n")
-                .append("- Target code executed: `NO`\n")
+                .append("## Result\n\n")
+                .append("- Outcome: ").append(md(publicOutcome(stats, findings))).append('\n')
+                .append("- Coverage: ").append(md(coverage(stats))).append('\n')
+                .append("- Mode: ").append(md(mode)).append('\n')
                 .append("- Candidates: ").append(findings.size())
-                .append("; exported: ").append(findings.stream()
-                        .filter(FindingOutputReader.Finding::exported).count()).append('\n')
-                .append("- Display limit: `").append(MARKDOWN_DISPLAY_LIMIT)
-                .append("` detailed; detailed: ").append(Math.min(MARKDOWN_DISPLAY_LIMIT,
-                        findings.size()))
-                .append("; compact: ").append(Math.max(0, findings.size()
-                        - MARKDOWN_DISPLAY_LIMIT))
-                .append("; JSON candidates: ").append(findings.size())
-                .append("; JSON truncation: `NO`\n")
-                .append("- Search budget: `").append(md(searchBudgetSummary(stats)))
-                .append("` (independent of display limit)\n")
-                .append("- Filter evidence: `").append(stats.filterEvidence().size())
-                .append("` rows; full status, proof scope, digests, counts and cost are in "
-                        + "report.json and meta/scan-metadata.json\n")
-                .append("- Result: ").append(md(resultMessage(findings))).append('\n')
-                .append("- Reason codes: `").append(md(String.join(",", resultReasonCodes(stats,
-                        findings)))).append("`\n\n");
+                .append("; exported: ").append(exported).append('\n')
+                .append("- Artifact SHA-256: ").append(md(stats.artifactHash())).append('\n')
+                .append("- Read next: report.json for all candidates and exact evidence\n");
+        List<String> reasons = coverageReasons(stats);
+        if (!"COMPLETE".equals(coverage(stats)) && !reasons.isEmpty()) {
+            out.append("- Coverage notes: ").append(md(String.join(", ",
+                    reasons.subList(0, Math.min(3, reasons.size())))));
+            if (reasons.size() > 3) {
+                out.append(" (and ").append(reasons.size() - 3).append(" more in report.json)");
+            }
+            out.append('\n');
+        }
+        out.append('\n');
         if (findings.isEmpty()) {
-            out.append("No static chain candidate was produced. Check completeness and reason codes; ")
-                    .append("an empty result is not proof that the artifact is safe.\n");
+            out.append("No static chain candidate was produced. An empty result is not proof that "
+                    + "the artifact is safe.\n")
+                    .append("Reason: NO_CANDIDATES\n");
             return out.toString();
         }
-        if (findings.stream().noneMatch(FindingOutputReader.Finding::exported)) {
+        if (exported == 0) {
             out.append("Candidates were retained as audit evidence, but none met the selected "
-                    + "mode's export contract.\n\n");
+                    + "mode export contract.\n\n");
         }
         out.append("## Chains\n\n");
         int number = 1;
@@ -246,71 +407,45 @@ public final class ConciseReportWriter {
             Chain chain = finding.chain();
             out.append("### ").append(number++).append(". ")
                     .append(finding.exported() ? "EXPORTED" : "CANDIDATE")
-                    .append(" — `").append(md(chain.ruleId())).append("`\n\n")
-                    .append("- Finding ID: `").append(md(finding.id())).append("`\n")
-                    .append('`').append(md(member(chain.entryClass(), chain.entryMethod())))
-                    .append("` → `").append(md(member(chain.sinkClass(), chain.sinkMethod())))
-                    .append("`\n\n")
-                    .append("- State: `").append(md(finding.state().eligibility().name()))
-                    .append("`; feasibility `").append(md(finding.state().feasibility().name()))
-                    .append("`; completeness `").append(md(finding.state().completeness().name()))
-                    .append("`\n")
-                    .append("- Rank: ").append(finding.ranking().staticScore())
-                    .append("; ").append(md(finding.ranking().explanation())).append("\n");
+                    .append(" — ").append(md(chain.ruleId())).append("\n\n")
+                    .append("Finding ID: ").append(md(finding.id())).append("\n\n")
+                    .append("State: ").append(md(finding.state().eligibility().name()))
+                    .append("; feasibility ").append(md(finding.state().feasibility().name()))
+                    .append("; chain completeness ")
+                    .append(md(finding.state().completeness().name())).append("\n\n");
             ApplicationTrace trace = snapshot.applicationTrace(chain.key());
             if (trace != null) {
-                out.append("- Application path: `").append(md(trace.entryDisplay()))
-                        .append("` → site `").append(md(trace.siteDisplay())).append("`\n");
+                out.append("Application path: ").append(md(trace.entryDisplay()))
+                        .append(" → site ").append(md(trace.siteDisplay())).append("\n");
                 if (trace.joinEvidence() != null) {
-                    out.append("- Join evidence: `")
-                            .append(md(trace.joinEvidence().display())).append("`\n");
+                    out.append("Join: ").append(md(trace.joinEvidence().display())).append("\n");
                 }
+            } else {
+                out.append("Chain: ").append(md(member(chain.entryClass(), chain.entryMethod())))
+                        .append(" → ")
+                        .append(md(member(chain.sinkClass(), chain.sinkMethod()))).append("\n");
             }
-            if (!finding.notes().isEmpty()) {
-                out.append("- Notes: ").append(finding.notes().stream().map(ConciseReportWriter::md)
-                        .reduce((left, right) -> left + "; " + right).orElse("")).append("\n");
-            }
+            out.append("Gadget graph:\n");
             List<ChainHop> orderedHops = orderedHops(chain);
-            if (!orderedHops.isEmpty()) {
-                out.append("- Hops:\n");
-                for (int hopIndex = 0; hopIndex < orderedHops.size(); hopIndex++) {
-                    ChainHop hop = orderedHops.get(hopIndex);
-                    out.append("  - `").append(md(member(hop.fromOwner(), hop.fromName())))
-                            .append("` — ").append(md(hop.kind() == null
-                                    ? "UNKNOWN" : hop.kind().name()))
-                            .append(" → `").append(md(member(hop.toOwner(), hop.toName())))
-                            .append('`');
-                    if (hop.field() != null && !hop.field().isBlank()) {
-                        out.append("; field `").append(md(hop.field())).append('`');
-                        if (hop.fieldOwner() != null && !hop.fieldOwner().isBlank()) {
-                            out.append(" declared by `").append(md(hop.fieldOwner())).append('`');
-                        }
-                    }
-                    if (hop.argOrdinal() != null) {
-                        out.append("; arg ").append(hop.argOrdinal());
-                    }
-                    String fromDescriptor = hopFromDescriptor(orderedHops, hopIndex);
-                    if (fromDescriptor != null && !fromDescriptor.isBlank()) {
-                        out.append("; from descriptor `").append(md(fromDescriptor)).append('`');
-                    }
-                    if (hop.desc() != null && !hop.desc().isBlank()) {
-                        out.append("; descriptor `").append(md(hop.desc())).append('`');
-                    }
-                    if (hop.reason() != null && !hop.reason().isBlank()) {
-                        out.append("; ").append(md(hop.reason()));
-                    }
-                    out.append("; location `")
-                            .append(md(ReportEvidence.hopLocationSummary(hop.provenance())))
-                            .append('`');
-                    out.append('\n');
-                }
+            appendMarkdownGraph(out, graph(orderedHops));
+            if (chain.terminalSink()) {
+                out.append("Terminal: ").append(md(member(chain.sinkClass(), chain.sinkMethod())))
+                        .append("; exact hop evidence: report.json\n");
+            } else {
+                out.append("Capability boundary: ")
+                        .append(md(member(chain.sinkClass(), chain.sinkMethod())))
+                        .append("; target unresolved, so no terminal is claimed; exact hop evidence: report.json\n");
+            }
+            appendMarkdownLocations(out, orderedHops);
+            if (!finding.notes().isEmpty()) {
+                out.append("Notes: ").append(finding.notes().stream().map(ConciseReportWriter::md)
+                        .reduce((left, right) -> left + "; " + right).orElse("")).append('\n');
             }
             out.append('\n');
         }
         if (findings.size() > detailedCount) {
             out.append("## Remaining candidate summaries\n\n")
-                    .append("The JSON report retains every candidate and variant; these rows are "
-                            + "compact display only.\n\n")
+                    .append("The JSON report retains every candidate and variant.\n\n")
                     .append("| # | Finding ID | Rule | Entry | Sink | Eligibility |\n")
                     .append("|---:|---|---|---|---|---|\n");
             for (int index = detailedCount; index < findings.size(); index++) {
@@ -325,6 +460,20 @@ public final class ConciseReportWriter {
             out.append('\n');
         }
         return out.toString();
+    }
+
+    private static void appendMarkdownLocations(StringBuilder out, List<ChainHop> hops) {
+        List<String> locations = new ArrayList<>();
+        for (ChainHop hop : hops) {
+            String summary = ReportEvidence.hopLocationSummary(hop.provenance());
+            if (!locations.contains(summary)) {
+                locations.add(summary);
+            }
+        }
+        if (!locations.isEmpty()) {
+            out.append("Location evidence: ").append(md(String.join(", ", locations)))
+                    .append('\n');
+        }
     }
 
     private static void appendPresentation(StringBuilder out, ScanStatistics stats,
@@ -356,30 +505,6 @@ public final class ConciseReportWriter {
         out.append('}');
     }
 
-    private static String searchBudgetSummary(ScanStatistics stats) {
-        long stepLimit = stats.metric("forward_step_limit", -1L);
-        long methodPassLimit = stats.metric("forward_method_pass_limit", -1L);
-        long roundLimit = stats.metric("forward_round_limit", -1L);
-        if (stepLimit < 0L && methodPassLimit < 0L && roundLimit < 0L) {
-            return "UNKNOWN; see meta/scan-metadata.json";
-        }
-        return "step_limit=" + nullableMetric(stepLimit)
-                + ",method_pass_limit=" + nullableMetric(methodPassLimit)
-                + ",round_limit=" + nullableMetric(roundLimit);
-    }
-
-    private static String nullableMetric(long value) {
-        return value < 0L ? "UNKNOWN" : Long.toString(value);
-    }
-
-    private static void appendNullableLong(StringBuilder out, long value) {
-        if (value < 0L) {
-            out.append("null");
-        } else {
-            out.append(value);
-        }
-    }
-
     private static void appendResultExplanation(StringBuilder out, ScanStatistics stats,
                                                 List<FindingOutputReader.Finding> findings) {
         long exported = findings.stream().filter(FindingOutputReader.Finding::exported).count();
@@ -390,6 +515,14 @@ public final class ConciseReportWriter {
                 .append(",\"reason_codes\":");
         appendStrings(out, resultReasonCodes(stats, findings));
         out.append('}');
+    }
+
+    private static void appendNullableLong(StringBuilder out, long value) {
+        if (value < 0L) {
+            out.append("null");
+        } else {
+            out.append(value);
+        }
     }
 
     private static String resultKind(List<FindingOutputReader.Finding> findings, long exported) {
@@ -424,7 +557,6 @@ public final class ConciseReportWriter {
         return List.copyOf(reasons);
     }
 
-    /** Chains are built by reverse sink search; reports present the readable entry-to-sink path. */
     private static List<ChainHop> orderedHops(Chain chain) {
         List<ChainHop> hops = chain == null || chain.hops() == null
                 ? new ArrayList<>() : new ArrayList<>(chain.hops());
@@ -449,7 +581,6 @@ public final class ConciseReportWriter {
         return left + "#" + right;
     }
 
-    /** Derive a source descriptor only when the adjacent typed hop proves the same method. */
     private static String hopFromDescriptor(List<ChainHop> hops, int index) {
         ChainHop hop = hops.get(index);
         if (hop.fromOwner() != null && hop.fromName() != null
@@ -473,7 +604,9 @@ public final class ConciseReportWriter {
         out.append('[');
         if (values != null) {
             for (int i = 0; i < values.size(); i++) {
-                if (i > 0) out.append(',');
+                if (i > 0) {
+                    out.append(',');
+                }
                 out.append(quote(values.get(i)));
             }
         }
@@ -485,7 +618,9 @@ public final class ConciseReportWriter {
     }
 
     private static String escape(String value) {
-        if (value == null) return "";
+        if (value == null) {
+            return "";
+        }
         StringBuilder out = new StringBuilder(value.length() + 8);
         for (int i = 0; i < value.length(); i++) {
             char ch = value.charAt(i);
@@ -496,9 +631,12 @@ public final class ConciseReportWriter {
                 case '\r' -> out.append("\\r");
                 case '\t' -> out.append("\\t");
                 default -> {
-                    if (ch < 0x20) out.append(String.format(java.util.Locale.ROOT,
-                            "\\u%04x", (int) ch));
-                    else out.append(ch);
+                    if (ch < 0x20) {
+                        out.append(String.format(java.util.Locale.ROOT,
+                                "\\u%04x", (int) ch));
+                    } else {
+                        out.append(ch);
+                    }
                 }
             }
         }
@@ -510,8 +648,8 @@ public final class ConciseReportWriter {
     }
 
     private static String md(String value) {
-        return value == null ? "" : value.replace("`", "'")
-                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return value == null ? "" : value.replace("&", "&amp;")
+                .replace("<", "&lt;").replace(">", "&gt;")
                 .replace("|", "\\|").replace("\r", " ").replace("\n", " ");
     }
 }

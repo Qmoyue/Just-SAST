@@ -36,7 +36,7 @@ class ReportTransactionContractTest {
         Path completeStaging;
         try (ReportTransaction transaction = ReportTransaction.begin(completeOutput, false)) {
             completeStaging = transaction.stagingRoot();
-            AtomicFiles.writeUtf8(transaction.layout().findings().resolve("marker.txt"), "staged");
+            AtomicFiles.writeUtf8(transaction.layout().evidence().resolve("marker.txt"), "staged");
         }
         AtomicFiles.writeUtf8(completeStaging.resolve("run.json"),
                 "{\"schema_version\":\"just-run-v1\",\"run_id\":\"crash\","
@@ -72,7 +72,7 @@ class ReportTransactionContractTest {
         Path completeStaging;
         try (ReportTransaction transaction = ReportTransaction.begin(completeOutput, false)) {
             completeStaging = transaction.stagingRoot();
-            AtomicFiles.writeUtf8(transaction.layout().findings().resolve("marker.txt"), "staged");
+            AtomicFiles.writeUtf8(transaction.layout().evidence().resolve("marker.txt"), "staged");
         }
         AtomicFiles.writeUtf8(completeStaging.resolve("run.json"),
                 "{\"schema_version\":\"just-run-v1\",\"run_id\":\"crash\","
@@ -97,12 +97,12 @@ class ReportTransactionContractTest {
         try (ReportTransaction transaction = ReportTransaction.begin(output, false)) {
             assertEquals("WRITING", Files.readString(transaction.runStateFile()).trim()
                     .replaceAll(".*\"state\"\\s*:\\s*\"([^\"]+)\".*", "$1"));
-            AtomicFiles.writeUtf8(transaction.layout().findings().resolve("marker.txt"), "new");
+            AtomicFiles.writeUtf8(transaction.layout().evidence().resolve("marker.txt"), "new");
             transaction.commit();
         }
 
         assertTrue(Files.isDirectory(output));
-        assertEquals("new", Files.readString(output.resolve("findings/marker.txt")));
+        assertEquals("new", Files.readString(output.resolve("evidence/marker.txt")));
         String state = Files.readString(output.resolve("run.json"));
         assertTrue(state.contains("\"state\":\"COMPLETE\""), state);
         assertFalse(hasSiblingWithPrefix(tmp, ".report.staging-"),
@@ -116,9 +116,9 @@ class ReportTransactionContractTest {
         Path failedStaging;
         try (ReportTransaction transaction = ReportTransaction.begin(output, false)) {
             failedStaging = transaction.stagingRoot();
-            Files.createDirectory(transaction.layout().findings().resolve("collision"));
+            Files.createDirectory(transaction.layout().evidence().resolve("collision"));
             assertThrows(IOException.class, () -> AtomicFiles.writeUtf8(
-                    transaction.layout().findings().resolve("collision"), "partial"));
+                    transaction.layout().evidence().resolve("collision"), "partial"));
         }
 
         assertFalse(Files.exists(output), "报告写失败不得发布 output 根目录");
@@ -145,12 +145,12 @@ class ReportTransactionContractTest {
         Files.writeString(output.resolve("old.txt"), "old");
 
         try (ReportTransaction transaction = ReportTransaction.begin(output, true)) {
-            AtomicFiles.writeUtf8(transaction.layout().findings().resolve("new.txt"), "new");
+            AtomicFiles.writeUtf8(transaction.layout().evidence().resolve("new.txt"), "new");
             transaction.commit();
         }
 
         assertFalse(Files.exists(output.resolve("old.txt")), "旧版本文件不得混入新报告");
-        assertEquals("new", Files.readString(output.resolve("findings/new.txt")));
+        assertEquals("new", Files.readString(output.resolve("evidence/new.txt")));
         assertTrue(Files.readString(output.resolve("run.json"))
                 .contains("\"state\":\"COMPLETE\""));
     }
@@ -160,14 +160,14 @@ class ReportTransactionContractTest {
         Path output = tmp.resolve("report");
         try (ReportTransaction first = ReportTransaction.begin(output, false);
              ReportTransaction second = ReportTransaction.begin(output, false)) {
-            AtomicFiles.writeUtf8(first.layout().findings().resolve("winner.txt"), "first");
+            AtomicFiles.writeUtf8(first.layout().evidence().resolve("winner.txt"), "first");
             first.commit();
-            AtomicFiles.writeUtf8(second.layout().findings().resolve("loser.txt"), "second");
+            AtomicFiles.writeUtf8(second.layout().evidence().resolve("loser.txt"), "second");
             assertThrows(IOException.class, second::commit);
         }
 
-        assertEquals("first", Files.readString(output.resolve("findings/winner.txt")));
-        assertFalse(Files.exists(output.resolve("findings/loser.txt")));
+        assertEquals("first", Files.readString(output.resolve("evidence/winner.txt")));
+        assertFalse(Files.exists(output.resolve("evidence/loser.txt")));
     }
 
     private static boolean hasSiblingWithPrefix(Path parent, String prefix) throws IOException {

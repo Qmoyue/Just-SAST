@@ -240,7 +240,7 @@ public final class ScanCommand implements Callable<Integer> {
 
     private static void printStaticAnalysisDisclosure() {
         System.err.println("[just:info] analysisMode=STATIC_ONLY; "
-                + "targetCodeExecution=DISABLED; boundedFiltering=ANALYSIS_ONLY; "
+                + "boundedFiltering=ANALYSIS_ONLY; "
                 + "recommendedForUntrustedArtifacts=true");
     }
 

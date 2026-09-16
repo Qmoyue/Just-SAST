@@ -65,7 +65,7 @@ public final class SarifReporter {
         for (FindingOutputReader.Finding finding : output.findings()) {
             stableNotes.putIfAbsent(finding.chain().key(), finding.notes());
         }
-        Files.createDirectories(layout.findings());
+        Files.createDirectories(layout.evidence());
         StringBuilder sb = new StringBuilder();
         sb.append("{\n")
                 .append("  \"version\": \"2.1.0\",\n")
@@ -158,7 +158,7 @@ public final class SarifReporter {
                     + "      }");
         }
         sb.append(String.join(",", results)).append("\n    ]\n  }]\n}");
-        AtomicFiles.writeUtf8(layout.findings().resolve("findings.sarif"), sb.toString());
+        AtomicFiles.writeUtf8(layout.evidence().resolve("findings.sarif"), sb.toString());
     }
 
     private String regionOf(Chain chain) {

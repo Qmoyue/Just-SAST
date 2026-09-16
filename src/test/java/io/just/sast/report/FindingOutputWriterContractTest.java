@@ -52,8 +52,8 @@ class FindingOutputWriterContractTest {
         new CsvReporter().write(layout, Map.of(), snapshot, new java.util.LinkedHashMap<>());
         new SarifReporter().write(layout, snapshot);
 
-        assertTrue(Files.exists(layout.findings().resolve("findings.json")));
-        assertTrue(Files.exists(layout.findings().resolve("findings.csv")));
-        assertTrue(Files.exists(layout.findings().resolve("findings.sarif")));
+        assertTrue(Files.exists(layout.evidence().resolve("findings.json")));
+        assertTrue(Files.exists(layout.evidence().resolve("findings.csv")));
+        assertTrue(Files.exists(layout.evidence().resolve("findings.sarif")));
     }
 }

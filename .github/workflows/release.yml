@@ -85,8 +85,8 @@ jobs:
             --jdk-home "$JAVA_HOME" --output "$component" --cache "$cache"
           java -jar "$shaded" scan --jar "$fixture" --mode application --pom "$pom" \
             --jdk-home "$JAVA_HOME" --offline --output "$application" --cache "$cache"
-          grep -q '"target_code_executed":false' "$component/report.json"
-          grep -q '"target_code_executed":false' "$application/report.json"
+          grep -q '"analysis":{"mode":"STATIC_ONLY"' "$component/report.json"
+          grep -q '"analysis":{"mode":"STATIC_ONLY"' "$application/report.json"
           grep -q '"mode":"application"' "$application/report.json"
 
       - name: Create checksums and verify licenses

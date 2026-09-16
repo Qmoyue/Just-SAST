@@ -27,7 +27,6 @@ import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.DependencyGraph;
 import io.just.sast.model.ProgramUniverse;
 import io.just.sast.report.ConsoleSummary;
-import io.just.sast.report.ReportIndexWriter;
 import io.just.sast.report.ReportLayout;
 import io.just.sast.report.ReportTransaction;
 import io.just.sast.report.ScanStatistics;
@@ -498,7 +497,6 @@ public final class ScanPipeline {
                 targetArtifactHash, metricCapture.status(), metricCapture.namespaces(),
                 metricCapture.namespaceStatus(), blackboard.originSupport().finiteFilterEvidence());
         new io.just.sast.report.MultiFormatReporter().writeMetadata(reportLayout, scanStats);
-        new ReportIndexWriter().write(reportLayout, scanStats);
         new io.just.sast.report.ConciseReportWriter().write(reportLayout,
                 modePolicy.wireName(),
                 findingOutput, scanStats);

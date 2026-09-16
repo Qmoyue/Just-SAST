@@ -30,14 +30,14 @@ class MultiFormatReporterTest {
                 List.of(chain), Map.of(), Map.of(), Map.of());
         new MultiFormatReporter().write(ReportLayout.create(temp), snapshot);
 
-        String json = Files.readString(temp.resolve("findings/findings.json"));
+        String json = Files.readString(temp.resolve("evidence/findings.json"));
         assertTrue(json.startsWith("[\n") && json.endsWith("\n]\n"));
         assertTrue(json.contains("\"construction\":"));
         assertTrue(json.contains("\"sink_control\":\"STATIC_UNCERTAIN\""));
         assertFalse(json.contains("verification"));
-        assertTrue(Files.readString(temp.resolve("findings/findings.html"))
+        assertTrue(Files.readString(temp.resolve("evidence/findings.html"))
                 .contains("Static evidence only"));
-        assertTrue(Files.readString(temp.resolve("findings/findings.md"))
+        assertTrue(Files.readString(temp.resolve("evidence/findings.md"))
                 .contains("java.lang.reflect.Method"));
     }
 
@@ -62,25 +62,18 @@ class MultiFormatReporterTest {
     }
 
     @Test
-    void metadataAndIndexExposeTimingAndDependencySourceSnapshot(@TempDir Path temp)
+    void metadataExposesTimingAndDependencySourceSnapshot(@TempDir Path temp)
             throws Exception {
         ScanStatistics stats = stats();
         ReportLayout layout = ReportLayout.create(temp);
         new MultiFormatReporter().writeMetadata(layout, stats);
-        new ReportIndexWriter().write(layout, stats);
 
         String metadata = Files.readString(temp.resolve("meta/scan-metadata.json"));
-        String index = Files.readString(temp.resolve("index.md"));
         assertTrue(metadata.contains("\"dependency_resolution_ms\":8")
                         && metadata.contains("\"network_download_wall_ms\":12")
                         && metadata.contains("\"filter_ms\":0")
                         && metadata.contains("\"total_wall_ms\":49"), metadata);
-        assertTrue(index.contains("| Dependency resolution | 8 ms (OBSERVED) |")
-                        && index.contains("| Bounded filter | 0 ms (NOT_APPLICABLE) |")
-                        && index.contains("actual_application=1")
-                        && index.contains("pom_derived=4")
-                        && index.contains("jdk=7"), index);
-        assertFalse(index.contains("verification"));
+        assertFalse(metadata.contains("verification"));
     }
 
     private static ScanStatistics stats() {

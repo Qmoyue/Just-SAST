@@ -1023,21 +1023,13 @@ class ScanPipelineTest {
         assertTrue(dependencies.contains("application")
                         && Files.exists(output.resolve("meta").resolve("dependencies.sbom.json")),
                 "依赖报告必须来自扫描阶段冻结的实际制品图：\n" + dependencies);
-        assertTrue(Files.exists(output.resolve("index.md"))
+        assertTrue(!Files.exists(output.resolve("index.md"))
                         && Files.exists(output.resolve("report.json"))
                         && Files.exists(output.resolve("report.md"))
                         && Files.exists(output.resolve("meta").resolve("finding-output.json"))
-                        && !Files.exists(output.resolve("verification")),
-                "生产扫描必须生成单一静态报告和可追溯快照");
-        String index = Files.readString(output.resolve("index.md"));
-        assertTrue(!index.contains("Payload")
-                        && !index.contains("verification")
-                        && index.contains("| Dependency resolution | ")
-                        && index.contains("| Network download wall | ")
-                        && index.contains("| Bounded filter | ")
-                        && index.contains("| Total wall | ")
-                        && index.contains("| Dependency sources | "),
-                "根索引必须暴露人类/agent 两条阅读入口：\n" + index);
+                        && !Files.exists(output.resolve("verification"))
+                        && !Files.exists(output.resolve("findings")),
+                "生产扫描必须生成两个主报告和可追溯快照，不生成重复索引或空 findings 目录");
     }
 
     @Test

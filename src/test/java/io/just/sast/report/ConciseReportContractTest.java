@@ -39,13 +39,20 @@ class ConciseReportContractTest {
         assertEquals(firstJson, Files.readString(second.resolve("report.json")));
         assertEquals(firstMarkdown, Files.readString(second.resolve("report.md")));
         assertTrue(firstJson.contains("\"schema_version\":\"JUST-REPORT-V1\""));
-        assertTrue(firstJson.contains("\"target_code_executed\":false"));
+        assertTrue(firstJson.contains("\"analysis\":{\"mode\":\"STATIC_ONLY\""));
+        assertTrue(firstJson.contains("\"outcome\":\"FINDINGS_AVAILABLE\""));
+        assertTrue(firstJson.contains("\"coverage\":\"COMPLETE\""));
+        assertTrue(firstJson.contains("\"graph\":{\"nodes\":["));
         assertTrue(firstJson.contains("\"result_explanation\":{\"kind\":\"EXPORTED_CANDIDATES\""));
         assertTrue(firstJson.contains("\"arg_ordinal\":0"));
         assertTrue(firstJson.contains("\"hop_index\":1"));
         assertTrue(firstMarkdown.contains("Finding ID:"));
+        assertTrue(firstMarkdown.contains("Gadget graph:"));
         assertTrue(firstJson.contains("\"constraints\":{"));
-        assertTrue(firstMarkdown.contains("dep/Gadget#readObject` → `java/lang/Runtime#exec"));
+        assertTrue(firstMarkdown.contains("[ENTRY] dep/Gadget#readObject"));
+        assertTrue(firstMarkdown.contains("[TERMINAL] java/lang/Runtime#exec"));
+        assertFalse(firstMarkdown.contains("[ENTRY] dep/Gadget#readObject\n    │ ENTRY"));
+        assertTrue(firstMarkdown.contains("DIRECT_CALL — bytecode"));
         assertFalse(firstJson.contains("generated_bytes"));
         assertFalse(firstJson.contains("verification"));
     }
@@ -63,6 +70,26 @@ class ConciseReportContractTest {
         assertTrue(json.contains("\"mode\":\"application\""));
         assertTrue(json.contains("\"exported\":false"));
         assertTrue(Files.readString(output.resolve("report.md")).contains("CANDIDATE"));
+    }
+
+    @Test
+    void capabilityBoundaryDoesNotInventATerminal(@TempDir Path temp) throws Exception {
+        Chain chain = new Chain("JUST-SINK-REFLECTIVE-INVOKE", "REFLECTION", "HIGH",
+                "app/Entry", "readObject", "readObject", "java/lang/reflect/Method", "invoke",
+                List.of(new ChainHop("app/Entry", "readObject", "java/lang/reflect/Method",
+                        "invoke", HopKind.DIRECT_CALL, null, "reflective capability", "()V", 0)),
+                0, "()V", "CAPABILITY");
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(chain), Map.of(), Map.of(), Map.of());
+        Path output = temp.resolve("capability");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                ScanStatistics.empty());
+        String json = Files.readString(output.resolve("report.json"));
+        String markdown = Files.readString(output.resolve("report.md"));
+        assertTrue(json.contains("\"role\":\"CAPABILITY\""));
+        assertTrue(markdown.contains("Capability boundary: java/lang/reflect/Method#invoke"));
+        assertTrue(markdown.contains("target unresolved, so no terminal is claimed"));
+        assertFalse(markdown.contains("Terminal: java/lang/reflect/Method#invoke"));
     }
 
     @Test
@@ -104,7 +131,8 @@ class ConciseReportContractTest {
         assertTrue(json.contains("\"object_relations\":[{\"from\":\"app/Entry#readObject\""));
         assertTrue(json.contains("\"field_owner\":\"app/Holder\""));
         assertTrue(json.contains("\"arg_ordinal\":0"));
-        assertTrue(markdown.contains("declared by `app/Holder`"));
+        assertTrue(markdown.contains("[ENTRY] app/Entry#readObject"));
+        assertTrue(markdown.contains("FIELD_FLOW"));
     }
 
     @Test
@@ -167,7 +195,7 @@ class ConciseReportContractTest {
         assertEquals(12, occurrences(json, "\"chain_key\":"));
         assertTrue(json.contains("\"display_limit\":10"));
         assertTrue(json.contains("\"json_truncated\":false"));
-        assertTrue(markdown.contains("detailed: 10; compact: 2; JSON candidates: 12"));
+        assertTrue(markdown.contains("Candidates: 12; exported: 12"));
         assertTrue(markdown.contains("Remaining candidate summaries"));
     }
 
@@ -210,15 +238,17 @@ class ConciseReportContractTest {
     void activeReportSchemasDescribeTheStaticV3Surface() throws Exception {
         String concise = Files.readString(Path.of("docs/schemas/concise-report-v1.schema.json"));
         String finding = Files.readString(Path.of("docs/schemas/finding-output-v1.schema.json"));
-        assertTrue(concise.contains("\"static_analysis\"")
+        assertTrue(concise.contains("\"analysis\"")
                         && concise.contains("\"display_limit\"")
                         && concise.contains("\"filter_evidence\"")
-                        && concise.contains("\"join_evidence\""), concise);
+                        && concise.contains("\"join_evidence\"")
+                        && concise.contains("\"graph\""), concise);
         assertTrue(finding.contains("\"entry_descriptor\"")
                         && finding.contains("\"application_trace\"")
                         && finding.contains("\"join_evidence\""), finding);
         assertFalse(concise.contains("verification"), concise);
         assertFalse(finding.contains("verification"), finding);
+        assertFalse(concise.contains("target_code_executed"), concise);
     }
 
     @Test

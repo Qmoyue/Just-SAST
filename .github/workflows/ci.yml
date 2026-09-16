@@ -88,8 +88,8 @@ jobs:
               throw "smoke report missing: $report"
             }
             $text = Get-Content -LiteralPath $report -Raw
-            if ($text -notmatch '"target_code_executed":false') {
-              throw "static execution disclosure missing: $report"
+            if ($text -notmatch '"analysis":\{"mode":"STATIC_ONLY"') {
+              throw "static-only report contract missing: $report"
             }
           }
           $applicationText = Get-Content -LiteralPath (Join-Path $applicationOutput 'report.json') -Raw

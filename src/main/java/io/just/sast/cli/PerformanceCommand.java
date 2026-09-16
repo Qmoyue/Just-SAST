@@ -610,7 +610,7 @@ public final class PerformanceCommand implements Callable<Integer> {
 
     private static void printStaticOnlyDisclosure() {
         System.err.println("[just:info] perf analysisMode=STATIC_ONLY; "
-                + "targetCodeExecution=DISABLED; boundedFiltering=ANALYSIS_ONLY; "
+                + "boundedFiltering=ANALYSIS_ONLY; "
                 + "recommendedForUntrustedArtifacts=true");
     }
 }

@@ -91,7 +91,6 @@ class VerificationCliContractTest {
         String error = captured.toString(StandardCharsets.UTF_8);
         assertEquals(2, code);
         assertTrue(error.contains("analysisMode=STATIC_ONLY"), error);
-        assertTrue(error.contains("targetCodeExecution=DISABLED"), error);
         assertTrue(error.contains("boundedFiltering=ANALYSIS_ONLY"), error);
         assertFalse(error.contains("verificationMode=AUTO"), error);
     }
@@ -172,7 +171,6 @@ class VerificationCliContractTest {
         String inventory = Files.readString(output.resolve("evidence/dependencies.csv"));
         String bom = Files.readString(output.resolve("meta/dependencies.sbom.json"));
         String metadata = Files.readString(output.resolve("meta/scan-metadata.json"));
-        String index = Files.readString(output.resolve("index.md"));
         assertTrue(inventory.contains("derived"));
         assertTrue(inventory.contains("maven:repository=repository-1"), inventory);
         assertTrue(inventory.contains("DECLARED_ENVIRONMENT"), inventory);
@@ -182,8 +180,6 @@ class VerificationCliContractTest {
                         && metadata.contains("\"analysis_ms\"")
                         && metadata.contains("\"report_ms\"")
                         && metadata.contains("\"total_wall_ms\""), metadata);
-        assertTrue(index.contains("| Dependency resolution | ")
-                        && index.contains("| Dependency sources | "), index);
     }
 
     @Test

@@ -92,7 +92,6 @@ public final class CsvReporter {
             throw new IOException("finding output snapshot is null");
         }
         regions.attach(cpgGraph);
-        Files.createDirectories(layout.findings());
         Files.createDirectories(layout.evidence());
         recordTiming(timings, "prepare", phaseStart);
         // 按 (entry, sink, category) 折叠：代表链取最短路径，其余计入 variant_count
@@ -144,7 +143,7 @@ public final class CsvReporter {
         // file; materializing findings + edges + every variant duplicated large strings and
         // made reporting a second memory peak after analysis had already completed.
         phaseStart = System.nanoTime();
-        writeFindings(layout.findings().resolve("findings.csv"), sortedGroups, stableChainNotes,
+        writeFindings(layout.evidence().resolve("findings.csv"), sortedGroups, stableChainNotes,
                 output);
         recordTiming(timings, "findings", phaseStart);
         phaseStart = System.nanoTime();

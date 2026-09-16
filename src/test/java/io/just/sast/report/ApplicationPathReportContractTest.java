@@ -99,10 +99,10 @@ class ApplicationPathReportContractTest {
                 + graph.canonicalDigest() + "\""));
         assertTrue(applicationEvidence.contains(join.id()));
         assertTrue(Files.readString(layout.evidence().resolve("chains.csv")).contains(expectedPath));
-        assertTrue(Files.readString(layout.findings().resolve("findings.csv")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.findings().resolve("findings.json")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.findings().resolve("findings.html")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.findings().resolve("findings.md")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.findings().resolve("findings.sarif")).contains(expectedEntry));
+        assertTrue(Files.readString(layout.evidence().resolve("findings.csv")).contains(expectedEntry));
+        assertTrue(Files.readString(layout.evidence().resolve("findings.json")).contains(expectedEntry));
+        assertTrue(Files.readString(layout.evidence().resolve("findings.html")).contains(expectedEntry));
+        assertTrue(Files.readString(layout.evidence().resolve("findings.md")).contains(expectedEntry));
+        assertTrue(Files.readString(layout.evidence().resolve("findings.sarif")).contains(expectedEntry));
     }
 }

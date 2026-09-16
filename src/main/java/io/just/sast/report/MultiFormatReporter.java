@@ -36,15 +36,15 @@ public final class MultiFormatReporter {
         if (snapshot == null) {
             throw new IOException("finding output snapshot is null");
         }
-        Files.createDirectories(layout.findings());
+        Files.createDirectories(layout.evidence());
         List<FindingOutputReader.Finding> findings = new ArrayList<>(snapshot.findings());
         findings.sort((left, right) -> {
             int comparison = ChainRankingSupport.compare(left, right);
             return comparison != 0 ? comparison : left.id().compareTo(right.id());
         });
-        writeJson(layout.findings().resolve("findings.json"), findings, snapshot);
-        writeHtml(layout.findings().resolve("findings.html"), findings, snapshot);
-        writeMarkdown(layout.findings().resolve("findings.md"), findings, snapshot);
+        writeJson(layout.evidence().resolve("findings.json"), findings, snapshot);
+        writeHtml(layout.evidence().resolve("findings.html"), findings, snapshot);
+        writeMarkdown(layout.evidence().resolve("findings.md"), findings, snapshot);
     }
 
     /** Write static scan metadata, including bounded-filter telemetry. */

@@ -56,7 +56,7 @@ class CsvReporterTest {
         new CsvReporter().write(layout, Map.of(), snapshot,
                 new java.util.LinkedHashMap<>());
 
-        String findings = Files.readString(layout.findings().resolve("findings.csv"));
+        String findings = Files.readString(layout.evidence().resolve("findings.csv"));
         String chains = Files.readString(layout.evidence().resolve("chains.csv"));
         assertTrue(findings.contains("app/Entry"));
         assertTrue(chains.contains("app/Entry"));

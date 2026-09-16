@@ -1,109 +1,139 @@
 # Just 架构
 
-产品契约：`JUST-LIGHT-MINING-V3`。
+产品契约：JUST-LIGHT-MINING-V3。
 
-Just 采用面向证据的分层静态分析架构：输入准备建立制品与依赖身份，ASM 前端生成程序事实，共享求解器组合组件链或应用链，报告层从一个冻结快照导出所有结果。
+Just 是一个证据驱动的静态分析器。它先冻结输入制品、依赖和目标 JDK 的身份，再由 ASM 前端建立不可变程序事实，最后用共享求解器组合 component 或 application 链。报告层只消费一次冻结快照，不重新求解、不执行目标代码。
 
-## 1. 用户流程
+## 1. 唯一用户流程
 
-```text
-CLI 配置
-  │  输入 / 模式 / 依赖 / POM / 仓库 / 离线 / 目标 JDK / 输出
+~~~text
+CLI
+  │  input / mode / dependencies / target JDK / output
   ▼
-输入准备与 provenance
-  │  制品、依赖图、缓存、下载、hash、目标 JDK
+Input preparation
+  │  artifact + dependency graph + provenance + cache/network identity
   ▼
-ASM 字节码前端
-  │  不可变类、方法、字段、位置和制品事实
+ASM frontend
+  │  classes + methods + fields + calls + CFG + locations
   ▼
-共享静态求解器
-  │  入口、站点、类型、字段、控制、回调、反射、桥和终点
-  ├─ 有界静态筛选
+Shared static solver
+  │  origins + types + fields + callbacks + control + bridges + terminals
+  ├─ bounded finite filtering
   ▼
-链证据与导出策略
-  ▼
-统一报告快照
-  ├─ report.md / report.json
-  ├─ index.md
-  ├─ evidence/
-  └─ meta/
-```
+Frozen finding snapshot
+  ├─ report.json  agent entry
+  ├─ report.md    human entry and Gadget graph
+  ├─ evidence/    drill-down facts
+  └─ meta/        identity and diagnostics
+~~~
 
-依赖下载属于输入准备；有界筛选属于分析内部操作。规则提供事实与语义数据，求解器、约束、控制和组合逻辑保持通用。
+没有 index.md、findings/ 或动态验证旁路参与默认产品流程。事务状态只服务于安全发布，不是用户报告。
 
-## 2. 层次与所有权
+## 2. Owner boundaries
 
-| 层 | 主要职责 | 所有权边界 |
+| Owner | 负责 | 不负责 |
 | --- | --- | --- |
-| CLI | 解析参数、模式和输出策略 | 生成一次明确配置，不保存隐式全局状态 |
-| 输入准备 | 读取制品、解析依赖、取得目标 JDK、建立 provenance | 负责输入身份、来源、hash、缓存和网络计时 |
-| ASM 前端 | 读取 class/JAR/WAR/JDK 字节码 | 只生成程序事实，不执行目标代码 |
-| 程序模型 | 保存类、方法、字段、调用、CFG、类型、异常和位置 | 提供稳定不可变事实，携带制品身份 |
-| 入口与来源索引 | 识别 application entry、component trigger、site、origin 和对象关系 | 各类来源由明确索引负责，不互相隐藏求解 |
-| 共享求解器 | 执行传播、分发、约束、桥接和链组合 | 只消费模型与规则数据，产出结构化证据 |
-| 有界筛选 | 计算局部有限域、证明和 UNKNOWN | 只在完整矛盾时阻断，不负责排名或漏洞确认 |
-| 导出策略 | 区分 component 与 application 的完整性和暴露要求 | 不把组件候选声明为应用漏洞 |
-| 报告层 | 生成 Markdown、JSON、索引、证据和元数据 | 只消费冻结快照，不重新求解 |
+| CLI | 解析参数，生成一次明确配置 | 保存运行状态、求解链或决定报告结论 |
+| Input preparation | 读取制品、POM、依赖、缓存、仓库和目标 JDK，记录 provenance | 猜版本、执行 Maven 插件或加载目标类 |
+| ASM frontend | 读取 class/JAR/WAR/JDK，生成方法、调用、字段、CFG 和位置事实 | 解释 payload、调用目标代码或反序列化流 |
+| Program model | 保存稳定、不可变、带制品身份的程序事实 | 修改输入身份或隐藏缺失事实 |
+| Entry/origin indexes | 识别 component trigger、application entry/site、来源和对象关系 | 直接调用其他知识源或将共现升级为可达 |
+| Shared solver | 传播、分发、约束、控制、callback、bridge 和链组合 | 使用题名、路径、SHA 或 benchmark 答案特判 |
+| Bounded filter | 对有限域做受限精确求值，输出证明/保留/UNKNOWN/预算 | 执行目标方法、排名或确认漏洞 |
+| Finding snapshot | 冻结候选、状态、证据和稳定 ID | 为每个格式重新求解或丢弃重要变体 |
+| Report writer | 从同一 snapshot 生成 JSON、Markdown 和显式附加证据 | 写动态结果、生成 payload 或制造第三种主入口 |
 
-典型实现入口包括 `ScanCommand`、`ScanPipeline`、`BytecodeFrontend`、`ArtifactProvenance`、`ApplicationEntryIndex`、`ForwardEngine`、`FilterAnalysis`、`FindingState` 和 `ConciseReportWriter`。新增模块需要明确消费者、生命周期、缓存键和失败语义。
+一个事实只有一个 owner。跨层数据使用 typed model、digest、ID 和 provenance，不通过自由文本或隐式全局状态传递。
 
-## 3. 输入与依赖模型
+## 3. 输入、依赖和 JDK
 
-输入准备区分应用类、组件根、内置库、显式依赖和目标 JDK。读取 Boot/WAR 嵌套路径时保留每个制品身份，避免把嵌套库误作应用入口。
+输入准备按实际优先级处理内置制品、显式依赖、准确 POM、完整缓存和远程制品。Maven Model/Resolver 负责父 POM、属性、BOM、dependencyManagement、scope、optional、exclusions、classifier、type、传递依赖和版本仲裁。缺失、冲突、不确定版本和下载失败进入结果状态，不换版本、不静默重试。
 
-POM 模型解析父 POM、属性、BOM、`dependencyManagement`、scope、optional、exclusions、classifier、type、传递关系和 Maven 版本仲裁。内置与显式字节码优先；POM 推导依赖携带来源和条件，不能直接代表实际部署。
+JDK 17 运行 Just；--jdk-home 只提供被分析的目标字节码和运行库。Java 8 读取 rt.jar，Java 9 及以上读取 JRT/JDK 布局。目标 JDK 不进入 Just 的应用执行 classpath，因为目标应用根本不启动。
 
-依赖记录包含坐标、具体版本、来源、SHA-256、引入边和仲裁原因。重复类、重定位、classloader 顺序或缺失元数据会在 provenance 与报告中披露。`--offline` 禁止网络；缓存只发布完整制品和完整报告，任何预检、恢复或写入错误都直接失败。
+所有制品记录逻辑名或坐标、角色、版本、来源、SHA-256、大小和引入关系。依赖解析、网络墙钟、分析、筛选、报告和 total 计时分开；筛选耗时属于分析子集。
 
-目标 JDK 作为输入字节码来源读取。主程序使用 JDK 17，目标 JDK 的 `rt.jar` 或 JRT 布局通过 `--jdk-home` 独立解析，相关绝对路径、版本和 digest 进入运行元数据。
+## 4. 共享求解器和两种模式
 
-## 4. 共享求解器与两种模式
+ASM 事实进入共享程序模型后，由传播、类型层次、字段 alias、CFG、调用分发、对象图和 bridge 逻辑组合链。
 
-ASM 完成事实提取后，传播、接收者分发、CFG/摘要、字段对象关系、类型层次和桥接逻辑由共享求解器消费。
+- component 从机制触发点开始，要求 gadget、对象关系、控制条件、依赖/JDK 条件和真正 terminal。
+- application 从真实应用执行边界和可控输入开始，要求 site、entry join、必要桥和 terminal suffix；EntryChainJoinEvidence 与 BridgeEvidence 必须可以从结构化图重建。
 
-- `component` 从反序列化机制、触发器或规则入口开始，沿 gadget、对象、控制、依赖和终点求解。
-- `application` 从真实执行边界与可控输入开始，连接站点、依赖/JDK、必要 bridge 和最终影响。
+lookup、connect、构造器、解码、二次解析和类定义可能是 bridge，不自动是终点。只到中间 API 的候选应保留断点和状态，不能被报告为完整影响。
 
-lookup、connect、构造器、解码和二次解析是可能的桥。桥证据需要对象、协议、制品和控制条件；危险 API 名称本身不构成终点。`EntryChainJoinEvidence` 与 `BridgeEvidence` 必须由可解析的结构化关系构成。
+## 5. 静态边界和有限筛选
 
-## 5. 有界静态筛选
+所有模式都只读取输入并进行受限静态求值。禁止加载/初始化/构造目标类和对象，禁止反射调用目标方法、反序列化攻击流、启动应用、访问危险 sink、执行目标 native 或构建插件。内部错误直接失败。
 
-筛选输入是支持的 Just 自有操作、常量或保持关联的完整有限域、程序位置和局部预算。求值在进程内完成，不加载、初始化、构造、反射调用或执行目标类，不执行目标 decode、序列化或 native 代码。
+筛选 owner 只处理可证明的有限字符串、算术、比较、分支和有限名称。状态如下：
 
-结果分为：
-
-| 状态 | 作用 |
+| 状态 | 后续动作 |
 | --- | --- |
-| `PROVABLY_UNREACHABLE` | 局部完整矛盾证明，唯一可以阻断路径 |
-| `PROVEN_RETAINED` | 局部事实支持保留，不证明完整链 |
-| `UNKNOWN` | 事实不足，保留候选 |
-| `BUDGET_EXCEEDED` | 达到局部限制，保留候选并标记完整性 |
+| PROVABLY_UNREACHABLE | 有完整局部矛盾，允许剪枝 |
+| PROVEN_RETAINED | 保留候选，不证明完整链 |
+| UNKNOWN | 保留候选并披露缺口 |
+| BUDGET_EXCEEDED | 保留候选并披露边界 |
 
-筛选预算按 proof/site 管理，记录操作数、域规模、评估数、保留数、拒绝数、原因和语义 digest。求值异常遵循分析语义；内部不变量错误直接失败。筛选尽量在高扇出展开前介入，无法精确判断时保留相关性并延迟组合。
+筛选必须保持值之间的关联性，并记录位置、域摘要、语义 digest、预算、评估/保留/拒绝/展开数和自身耗时。一次采样成功、目标异常或未知值都不能当作全域反证。
 
-## 6. 证据与报告
+## 6. Snapshot 和公开报告
 
-每个 hop 保存制品、精确方法/指令位置、连接依据、字段/对象关系和控制条件。链的完整性、结构可行性、控制状态、应用暴露和分析完整性彼此独立；排名只影响展示顺序。
+FindingOutputReader 在报告边界生成一次 typed snapshot。它保存稳定 finding ID、chain key、导出状态、entry/sink、链状态、对象关系、hop provenance、application trace、筛选状态和 notes。排序只决定展示顺序，不改变证据。
 
-报告流水线使用一个规范快照：
+ConciseReportWriter 从同一 snapshot 写出：
 
-```text
-analysis snapshot
-  ├─ report.md       人工阅读
-  ├─ report.json     机器消费
-  ├─ index.md        摘要与计时
-  ├─ evidence/       依赖与图证据
-  └─ meta/           finding、digest、身份和运行条件
-```
+~~~text
+report.json
+  ├─ all candidates and important variants
+  ├─ outcome / coverage / per-chain completeness
+  ├─ entry, site, bridge, terminal and constraints
+  ├─ node/edge graph and precise hop provenance
+  └─ dependency/JDK/filter evidence references
 
-Markdown 与 JSON 共享链身份、证据、计数和排序。公共数据边界包括 concise report、finding output、rules、input digest 和 evidence-graph telemetry。动态筛选状态属于统一分析结果，不创建第二套报告状态。
+report.md
+  ├─ concise outcome and coverage limitation
+  ├─ primary chain Gadget graph
+  ├─ object/control/bridge/terminal explanation
+  └─ compact alternatives with JSON/evidence references
+~~~
 
-依赖解析、网络、analysis、report 和 total 使用独立计时；筛选成本计入 analysis。缺失依赖、未知条件、预算、截断、取消和写入错误保留在相应状态中，不产生伪完整结果。
+report.json 是 agent 入口，不能因 Markdown 展示上限丢候选；report.md 是人的入口，不能把 ranking、telemetry 和全部内部状态堆在首屏。两者必须共享 chain identity、计数、顺序和 graph projection。
 
-## 7. 安全、扩展与交付
+公开状态拆为：
 
-Just 的安全边界是静态读取和受限求值：目标代码不执行，不启动目标进程，不访问目标 sink，不生成攻击 payload。外部输入在 CLI、输入准备和资源预算边界校验；内部错误直接暴露。
+- outcome：有没有可审阅的结果，或发生失败/参数/运行库错误；
+- coverage：静态分析 COMPLETE、BOUNDED 或 UNKNOWN；
+- chain completeness：单条链的证据完整性；
+- feasibility：单条链的 SAT、UNSAT 或 UNKNOWN。
 
-规则通过 YAML 数据和 `KnowledgeSource`/ServiceLoader 扩展。知识源通过 Blackboard 交换事实和事件，不直接调用其他知识源；样本名称、路径、SHA-256、预期答案和 benchmark 结果不进入求解分支。
+内部 RunOutcome.PARTIAL 仍可表达不可缓存或不完整扫描，但不能被解释为动态测试。
 
-行为测试覆盖组件与应用模式、依赖补齐与离线、目标不执行、有限域筛选、报告同源、资源限制和错误暴露。`tools/` 与 `benchmark/` 是开发验证支持，不是运行时依赖，也不参与 launcher 的用户使用路径。
+## 7. Gadget 图和 demo
+
+图使用 entry、site、callback、bridge、terminal 角色节点以及有方向的 typed edge。文本图比图片更稳定，适合 Markdown、终端和 agent 读取；精确 descriptor、offset、字段和 artifact provenance 保存在 JSON/evidence。
+
+demo.jar 的静态主链必须由真实字节码和 WP 共同支持：
+
+~~~text
+DogController#importDogs
+  → ObjectInputStream#readObject
+  → Dog#hashCode
+  → DogModel#wagTail
+  → Method#invoke
+  → TemplatesImpl#newTransformer
+~~~
+
+WP 外部恶意类的 Runtime.getRuntime().exec 不在 demo.jar 内，另一个手工对象图方案中的 invoke → Runtime.exec 也不由应用 JAR 自动证明。输入制品真实调用 java/lang/Runtime#exec 时，规则正常产生 sink；没有该字节码时，报告只能写制品外后续影响说明，不能伪造 terminal。
+
+## 8. 事务、缓存和错误
+
+ReportTransaction 先在唯一 staging 目录写完整报告，确认状态后发布，避免两个运行的文件混合。最终布局只需要 report 文件及有内容的 evidence/meta；空的 findings/ 不再是事务完整性的前置条件。staging、backup、失败状态和缓存错误必须显式可诊断，不能自动把不完整目录当成功。
+
+缓存只接受完整输入身份和完整静态报告。报告、缓存、依赖和 JDK 身份变化会使相关结果失效；不隐藏缺依赖、预算或 UNKNOWN。
+
+## 9. 扩展和质量
+
+规则是 YAML 数据；知识源通过既有 Blackboard/ServiceLoader 边界交换 typed facts，不直接互调。新增字段必须声明 owner、消费者、缓存键、失败语义和测试。
+
+质量保护按用户能力而不是类数量组织：两模式、真实 entry/site/join/bridge/terminal、8 组 WP、Apache 正负、依赖/offline、未知/预算、无目标执行、报告同源、错误/恢复和发布资产。测试要优先验证公开 JSON/Markdown/目录和真实无害 fixture，避免私有实现快照、字符串堆砌和重复 fake。

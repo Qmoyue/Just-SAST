@@ -3,15 +3,15 @@
   "$id": "https://just.invalid/schema/concise-report-v1.schema.json",
   "title": "Just concise static report",
   "type": "object",
-  "required": ["schema_version", "mode", "static_analysis", "artifact_sha256", "run", "summary", "presentation", "filter_evidence", "result_explanation", "chains"],
+  "required": ["schema_version", "mode", "analysis", "artifact_sha256", "run", "summary", "presentation", "filter_evidence", "result_explanation", "chains"],
   "properties": {
     "schema_version": { "const": "JUST-REPORT-V1" },
     "mode": { "enum": ["component", "application"] },
-    "static_analysis": {
+    "analysis": {
       "type": "object",
-      "required": ["target_code_executed", "filter_evidence"],
+      "required": ["mode", "filter_evidence"],
       "properties": {
-        "target_code_executed": { "const": false },
+        "mode": { "const": "STATIC_ONLY" },
         "filter_evidence": { "const": "meta/scan-metadata.json" }
       },
       "additionalProperties": false
@@ -19,12 +19,13 @@
     "artifact_sha256": { "type": "string", "minLength": 1 },
     "run": {
       "type": "object",
-      "required": ["status", "completeness", "chain_proof_completeness", "reason_codes"],
+      "required": ["outcome", "coverage", "chain_proof_coverage", "coverage_reasons", "exit_code"],
       "properties": {
-        "status": { "enum": ["SUCCESS", "PARTIAL", "FAILED", "USAGE_ERROR", "UNSUPPORTED", "NOT_RUN"] },
-        "completeness": { "type": "string", "minLength": 1 },
-        "chain_proof_completeness": { "type": "string", "minLength": 1 },
-        "reason_codes": { "type": "array", "items": { "type": "string" } }
+        "outcome": { "enum": ["FINDINGS_AVAILABLE", "NO_FINDINGS", "FAILED", "USAGE_ERROR", "UNSUPPORTED", "NOT_RUN"] },
+        "coverage": { "enum": ["COMPLETE", "BOUNDED", "UNKNOWN"] },
+        "chain_proof_coverage": { "enum": ["COMPLETE", "BOUNDED", "UNKNOWN"] },
+        "coverage_reasons": { "type": "array", "items": { "type": "string" } },
+        "exit_code": { "type": "integer" }
       },
       "additionalProperties": false
     },
@@ -74,7 +75,7 @@
   "$defs": {
     "chain": {
       "type": "object",
-      "required": ["id", "chain_key", "exported", "rule_id", "category", "severity", "entry", "sink", "state", "constraints", "ranking", "confidence", "precision", "construction", "notes", "object_relations", "hops", "application_trace"],
+      "required": ["id", "chain_key", "exported", "rule_id", "category", "severity", "entry", "sink", "state", "constraints", "ranking", "confidence", "precision", "construction", "notes", "graph", "object_relations", "hops", "application_trace"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "chain_key": { "type": "string", "minLength": 1 },
@@ -151,6 +152,7 @@
           "additionalProperties": false
         },
         "notes": { "type": "array", "items": { "type": "string" } },
+        "graph": { "$ref": "#/$defs/graph" },
         "object_relations": {
           "type": "array",
           "items": {
@@ -195,6 +197,40 @@
             }
           },
           "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+    ,"graph": {
+      "type": "object",
+      "required": ["nodes", "edges"],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "role"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "label": { "type": "string", "minLength": 1 },
+              "role": { "enum": ["ENTRY", "STEP", "TERMINAL"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to", "kind", "reason"],
+            "properties": {
+              "from": { "type": "string", "minLength": 1 },
+              "to": { "type": "string", "minLength": 1 },
+              "kind": { "type": "string", "minLength": 1 },
+              "reason": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false

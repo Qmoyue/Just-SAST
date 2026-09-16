@@ -54,7 +54,8 @@ class StaticModeBehaviorTest {
         ScanPipeline.run(jar, null, temp.resolve("out"), null, false, true, null);
         assertFalse(Files.exists(sentinel), "static analysis must not initialize target classes");
         String report = Files.readString(temp.resolve("out").resolve("report.json"));
-        assertTrue(report.contains("\"target_code_executed\":false"));
+        assertTrue(report.contains("\"analysis\":{\"mode\":\"STATIC_ONLY\""));
+        assertFalse(report.contains("target_code_executed"));
     }
 
     @Test
