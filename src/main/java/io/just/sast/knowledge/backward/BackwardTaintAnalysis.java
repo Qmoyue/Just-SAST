@@ -327,6 +327,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                     budgetAllocator.record(i, perSinkBudget, steps);
                 } catch (Throwable e) {
                     budgetAllocator.record(i, perSinkBudget, 0);
+                    bb.markIncomplete("BACKWARD_SINK_FAILURE:" + task.callId() + ":"
+                            + e.getClass().getSimpleName());
                     JustLogger.error("反向污点 sink 分析失败（已隔离）: {}", e.toString());
                 }
             }

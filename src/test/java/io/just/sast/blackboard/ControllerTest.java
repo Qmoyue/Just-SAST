@@ -64,14 +64,18 @@ class ControllerTest {
     @Test
     void ksFailureIsIsolatedIncludingError() {
         List<String> log = new ArrayList<>();
+        Blackboard blackboard = new Blackboard(new io.just.sast.cpg.graph.Graph(),
+                new io.just.sast.analysis.hierarchy.ClassHierarchy(java.util.Map.of(), null),
+                new io.just.sast.cpg.build.FieldWriterIndex(), io.just.sast.config.RuleSet.EMPTY,
+                20, Blackboard.ScanInputs.fastDefault(Path.of(".")));
         List<KnowledgeSource> sources = List.of(
                 new Probe("boom", Phase.ANALYSIS, 100, log, () -> { throw new OutOfMemoryError("simulated"); }),
                 new Probe("after", Phase.ANALYSIS, 200, log, () -> { }));
-        new Controller(new Blackboard(new io.just.sast.cpg.graph.Graph(),
-                new io.just.sast.analysis.hierarchy.ClassHierarchy(java.util.Map.of(), null),
-                new io.just.sast.cpg.build.FieldWriterIndex(), io.just.sast.config.RuleSet.EMPTY, 20, Blackboard.ScanInputs.fastDefault(Path.of("."))), sources).run();
+        new Controller(blackboard, sources).run();
         assertEquals(1, log.stream().filter(e -> e.startsWith("after:")).count(),
                 "Error 级异常隔离，同阶段后续知识源照常执行");
+        assertTrue(blackboard.completenessReasons().contains("SOURCE_FAILED:boom:EVENT"),
+                "低内存/内部 Error 必须使扫描显式不完整，不能伪装成成功");
     }
 
     @Test

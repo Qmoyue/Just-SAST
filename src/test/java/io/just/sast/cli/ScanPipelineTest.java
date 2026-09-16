@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1037,6 +1038,22 @@ class ScanPipelineTest {
                         && index.contains("| Total wall | ")
                         && index.contains("| Dependency sources | "),
                 "根索引必须暴露人类/agent 两条阅读入口：\n" + index);
+    }
+
+    @Test
+    void scanSupportsUnicodeAndSpacePaths(@TempDir Path tmp) throws Exception {
+        Path scoped = Files.createDirectories(tmp.resolve("输入 空间"));
+        Path jar = compileToJar(scoped.resolve("目标 组件.jar"),
+                Map.of("app.Gadget", GADGET));
+        Path output = scoped.resolve("报告 输出");
+
+        ScanPipeline.ScanResult result = ScanPipeline.run(jar, null, output, null,
+                false, true, null);
+
+        assertEquals(0, result.exitCode());
+        assertTrue(Files.isRegularFile(output.resolve("report.json")),
+                "Unicode/space input and output paths must publish a complete report");
+        assertTrue(Files.readString(output.resolve("report.json")).contains("app/Gadget"));
     }
 
     private static boolean containsMember(String report, String owner, String method) {
