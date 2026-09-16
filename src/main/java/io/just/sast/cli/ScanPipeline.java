@@ -395,7 +395,10 @@ public final class ScanPipeline {
                         // mechanism products are retained in the kernel store and exported by
                         // the component report.  Application mode enables the strict
                         // entry/site/join admission boundary.
-                        modePolicy.applicationScopeKnown()));
+                        modePolicy.applicationScopeKnown(),
+                        scopedApplication.applicationResourceFacts()));
+        scopedApplication.applicationResourceFacts().completenessReasons()
+                .forEach(blackboard::markIncomplete);
         new Controller(blackboard, KnowledgeSources.discover()).run();
         for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
             phaseMs.put(timing.getKey(), timing.getValue());

@@ -40,6 +40,12 @@ public final class JarReader {
         void accept(ClassBytes bytes) throws IOException;
     }
 
+    /** Bounded top-level artifact resource callback; raw bytes never leave the frontend phase. */
+    @FunctionalInterface
+    interface ResourceConsumer {
+        void accept(String path, byte[] bytes, String origin) throws IOException;
+    }
+
     /** 类文件读取结果；类列表与“是否因边界跳过内容”分开，避免把上限误当成解析成功。 */
     public record ReadResult(List<ClassBytes> classes, List<String> completenessReasons) {
         public ReadResult {
@@ -126,6 +132,19 @@ public final class JarReader {
     public StreamResult streamDetailed(Path target, ClassConsumer consumer,
                                        int targetFeature, InputBudget budget,
                                        InputBudget.Tracker tracker) throws IOException {
+        return streamDetailedWithResources(target, consumer, null, targetFeature, budget, tracker);
+    }
+
+    /**
+     * Stream classes and selected top-level XML resources in one bounded archive walk.  Nested
+     * library resources are deliberately not exposed as application resources; the caller owns
+     * the artifact index and can therefore keep deployment/configuration facts scoped to the
+     * first target artifact without reopening the archive.
+     */
+    StreamResult streamDetailedWithResources(Path target, ClassConsumer consumer,
+                                             ResourceConsumer resources,
+                                             int targetFeature, InputBudget budget,
+                                             InputBudget.Tracker tracker) throws IOException {
         if (target == null || consumer == null) {
             throw new IllegalArgumentException("target and consumer are required");
         }
@@ -133,7 +152,7 @@ public final class JarReader {
             throw new IOException("目标不存在: " + target);
         }
         ArchiveLimits.checkPathAncestors(target, budget);
-        ReaderState state = new ReaderState(consumer, targetFeature, budget, tracker);
+        ReaderState state = new ReaderState(consumer, resources, targetFeature, budget, tracker);
         // Reject a reparse point before deciding whether the path is a directory.  The
         // default Files.isDirectory call follows a directory symlink, which would let a
         // link escape the explicitly selected scan root and bypass the archive policy.
@@ -191,7 +210,7 @@ public final class JarReader {
                     java.nio.file.attribute.BasicFileAttributes after = Files.readAttributes(target,
                             java.nio.file.attribute.BasicFileAttributes.class,
                             java.nio.file.LinkOption.NOFOLLOW_LINKS);
-                    if (!sameClassFileIdentity(before, after, target)) {
+                    if (!sameRegularFileIdentity(before, after, target)) {
                         throw new IOException("CLASS_INPUT_CHANGED_DURING_READ");
                     }
                 }
@@ -205,6 +224,7 @@ public final class JarReader {
     private void readDirectory(Path dir, String origin, ReaderState state) throws IOException {
         try (Stream<Path> stream = Files.walk(dir)) {
             List<Path> ordered = new ArrayList<>();
+            List<Path> resources = new ArrayList<>();
             var paths = stream.iterator();
             while (paths.hasNext()) {
                 Path candidate = paths.next();
@@ -214,8 +234,15 @@ public final class JarReader {
                 if (Files.isRegularFile(candidate, java.nio.file.LinkOption.NOFOLLOW_LINKS)
                         && !ArchiveLimits.isLinkOrReparsePoint(candidate)
                         && candidate.getFileName() != null
-                        && candidate.getFileName().toString().endsWith(".class")) {
-                    ordered.add(candidate);
+                        ) {
+                    String name = candidate.getFileName().toString().toLowerCase(
+                            java.util.Locale.ROOT);
+                    if (name.endsWith(".class")) {
+                        ordered.add(candidate);
+                    } else if (state.resourceConsumer != null && name.endsWith(".xml")
+                            && !isNestedLibraryResource(dir.relativize(candidate).toString())) {
+                        resources.add(candidate);
+                    }
                 }
             }
             ordered.sort(Comparator.comparing(path -> dir.relativize(path).toString()
@@ -254,7 +281,7 @@ public final class JarReader {
                     java.nio.file.attribute.BasicFileAttributes after = Files.readAttributes(p,
                             java.nio.file.attribute.BasicFileAttributes.class,
                             java.nio.file.LinkOption.NOFOLLOW_LINKS);
-                    if (!sameClassFileIdentity(before, after, p)) {
+                    if (!sameRegularFileIdentity(before, after, p)) {
                         throw new IOException("CLASS_INPUT_CHANGED_DURING_READ");
                     }
                 } catch (IOException e) {
@@ -266,10 +293,49 @@ public final class JarReader {
                     }
                 }
             }
+            resources.sort(Comparator.comparing(path -> dir.relativize(path).toString()
+                    .replace('\\', '/')));
+            for (Path p : resources) {
+                if (ArchiveLimits.isLinkOrReparsePoint(p)
+                        || !Files.isRegularFile(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    state.reasons.add("LINK_OR_REPARSE_SKIPPED");
+                    continue;
+                }
+                String rel = dir.relativize(p).toString().replace('\\', '/');
+                if (!ArchiveLimits.safeEntryName(rel, state.budget)) {
+                    state.reasons.add("UNSAFE_ENTRY_PATH");
+                    continue;
+                }
+                java.nio.file.attribute.BasicFileAttributes before = Files.readAttributes(p,
+                        java.nio.file.attribute.BasicFileAttributes.class,
+                        java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                if (before.size() > state.budget.maxEntryBytes()) {
+                    state.markBudget("RESOURCE_ENTRY_CAP");
+                    continue;
+                }
+                try {
+                    state.archiveBudget.observeFile(rel, before.size());
+                    try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(p, "RESOURCE_DIRECTORY")) {
+                        state.emitResource(rel, state.readBytes(opened.stream()), origin + "!" + rel);
+                    }
+                    java.nio.file.attribute.BasicFileAttributes after = Files.readAttributes(p,
+                            java.nio.file.attribute.BasicFileAttributes.class,
+                            java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    if (!sameRegularFileIdentity(before, after, p)) {
+                        throw new IOException("RESOURCE_INPUT_CHANGED_DURING_READ");
+                    }
+                } catch (IOException e) {
+                    if (ReaderState.isBudgetFailure(e)) {
+                        state.markBudget(ReaderState.limitReason(e, state.budget));
+                    } else {
+                        state.reasons.add("RESOURCE_READ_ERROR");
+                    }
+                }
+            }
         }
     }
 
-    private static boolean sameClassFileIdentity(
+    private static boolean sameRegularFileIdentity(
             java.nio.file.attribute.BasicFileAttributes before,
             java.nio.file.attribute.BasicFileAttributes after,
             Path path) {
@@ -342,6 +408,14 @@ public final class JarReader {
                         String classPath = multiRelease.logicalPath(path);
                         state.emit(new ClassBytes(stripClassPrefix(classPath), classBytes,
                                 origin + "!" + path));
+                    } else if (state.resourceConsumer != null && depth == 0
+                            && path.toLowerCase(java.util.Locale.ROOT)
+                            .endsWith(".xml")) {
+                        byte[] resourceBytes;
+                        try (var input = zip.getInputStream(entry)) {
+                            resourceBytes = state.readEntryBytes(entry, input);
+                        }
+                        state.emitResource(path, resourceBytes, origin + "!" + path);
                     } else if (isNestedLib(path)) {
                         if (depth >= state.budget.maxArchiveNesting()) {
                             state.reasons.add("NESTING_CAP:" + state.budget.maxArchiveNesting());
@@ -547,6 +621,7 @@ public final class JarReader {
 
     private static final class ReaderState {
         private final ClassConsumer consumer;
+        private final ResourceConsumer resourceConsumer;
         private final int targetFeature;
         private final InputBudget budget;
         private final Set<String> reasons = new LinkedHashSet<>();
@@ -556,9 +631,11 @@ public final class JarReader {
         private boolean budgetExceeded;
         private int directoryEntries;
 
-        private ReaderState(ClassConsumer consumer, int targetFeature, InputBudget budget,
+        private ReaderState(ClassConsumer consumer, ResourceConsumer resourceConsumer,
+                            int targetFeature, InputBudget budget,
                             InputBudget.Tracker tracker) {
             this.consumer = consumer;
+            this.resourceConsumer = resourceConsumer;
             this.targetFeature = targetFeature > 0 ? targetFeature : runtimeFeature();
             this.budget = budget == null ? InputBudget.defaults() : budget;
             this.archiveBudget = tracker == null ? this.budget.tracker() : tracker;
@@ -754,6 +831,12 @@ public final class JarReader {
             consumer.accept(bytes);
             emitted++;
         }
+
+        private void emitResource(String path, byte[] bytes, String origin) throws IOException {
+            if (resourceConsumer != null && path != null && bytes != null) {
+                resourceConsumer.accept(path, bytes, origin);
+            }
+        }
     }
 
     /** 让递归 ZipInputStream 结束时不关闭父容器。 */
@@ -775,6 +858,13 @@ public final class JarReader {
             }
         }
         return false;
+    }
+
+    private static boolean isNestedLibraryResource(String path) {
+        String normalized = path == null ? ""
+                : path.replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
+        return normalized.startsWith("boot-inf/lib/")
+                || normalized.startsWith("web-inf/lib/");
     }
 
     private static boolean isZipSignature(byte[] signature) {

@@ -1,6 +1,7 @@
 package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.ApplicationResourceFacts;
 import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.ProgramUniverse;
@@ -118,7 +119,8 @@ public final class BytecodeFrontend {
     public record ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames,
                              Map<String, Integer> classArtifactIndexes,
                              Map<String, List<Integer>> duplicateArtifactIndexes,
-                             Map<String, List<String>> artifactDetails) {
+                             Map<String, List<String>> artifactDetails,
+                             ApplicationResourceFacts applicationResourceFacts) {
         public ScopedLoad {
             load = load == null ? new LoadResult(Map.of(), List.of(), 0, 0) : load;
             applicationClassNames = applicationClassNames == null ? java.util.Set.of()
@@ -151,11 +153,14 @@ public final class BytecodeFrontend {
                 }
             }
             artifactDetails = Map.copyOf(detailCopy);
+            applicationResourceFacts = applicationResourceFacts == null
+                    ? ApplicationResourceFacts.empty() : applicationResourceFacts;
         }
 
         /** Compatibility constructor for callers interested only in application scope. */
         public ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames) {
-            this(load, applicationClassNames, Map.of(), Map.of(), Map.of());
+            this(load, applicationClassNames, Map.of(), Map.of(), Map.of(),
+                    ApplicationResourceFacts.empty());
         }
 
         /** Compatibility constructor for callers that do not consume embedded provenance. */
@@ -163,7 +168,7 @@ public final class BytecodeFrontend {
                           Map<String, Integer> classArtifactIndexes,
                           Map<String, List<Integer>> duplicateArtifactIndexes) {
             this(load, applicationClassNames, classArtifactIndexes, duplicateArtifactIndexes,
-                    Map.of());
+                    Map.of(), ApplicationResourceFacts.empty());
         }
     }
 
@@ -226,8 +231,10 @@ public final class BytecodeFrontend {
                 Path target = targets.get(artifactIndex);
                 accumulator.setArtifactIndex(artifactIndex);
                 try {
-                    JarReader.StreamResult stream = jarReader.streamDetailed(target,
-                            accumulator::accept, targetFeature, inputBudget, inputTracker);
+                    JarReader.StreamResult stream = jarReader.streamDetailedWithResources(target,
+                            accumulator::accept, captureApplicationScope
+                                    ? accumulator::acceptResource : null,
+                            targetFeature, inputBudget, inputTracker);
                     accumulator.addReasons(stream.completenessReasons());
                 } catch (IOException e) {
                     String origin = target == null ? "<null>" : target.toString();
@@ -475,6 +482,8 @@ public final class BytecodeFrontend {
         private final Map<String, Integer> classArtifactIndexes = new LinkedHashMap<>();
         private final Map<String, List<Integer>> duplicateArtifactIndexes = new LinkedHashMap<>();
         private final Map<String, List<String>> artifactDetails = new LinkedHashMap<>();
+        private final ApplicationResourceParser.Collector resourceCollector =
+                new ApplicationResourceParser.Collector(inputBudget);
         private final List<ClassBytes> batch = new ArrayList<>(STREAM_BATCH_SIZE);
         private int filesScanned;
         private int maxMajor;
@@ -500,6 +509,12 @@ public final class BytecodeFrontend {
         private void addReasons(List<String> reasons) {
             if (reasons != null) {
                 completenessReasons.addAll(reasons);
+            }
+        }
+
+        private void acceptResource(String path, byte[] bytes, String origin) {
+            if (captureApplicationScope && artifactIndex == 0) {
+                resourceCollector.accept(path, bytes);
             }
         }
 
@@ -542,7 +557,7 @@ public final class BytecodeFrontend {
 
         private ScopedLoad scopedResult() {
             return new ScopedLoad(result(), applicationClassNames, classArtifactIndexes,
-                    duplicateArtifactIndexes, artifactDetails);
+                    duplicateArtifactIndexes, artifactDetails, resourceCollector.finish());
         }
     }
 

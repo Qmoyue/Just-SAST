@@ -16,6 +16,7 @@ import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.Descriptor;
+import io.just.sast.model.ApplicationResourceFacts;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -49,7 +50,7 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 4;
+    public static final int MODEL_VERSION = 5;
     private static final int MAX_SLICE_METHODS = 100_000;
     private static final String FRAMEWORK_ENTRY_RULE = "builtin:framework-entry";
     private static final String FRAMEWORK_BINDING_RULE = "builtin:framework-binding";
@@ -509,6 +510,8 @@ public final class ApplicationEntryIndex {
     private final Map<String, List<ServiceEndpoint>> serviceEndpointsByMethod;
     private final List<FilterControl> filterControls;
     private final Map<String, EntryChainJoinEvidence.FilterDominance> filterDominanceByService;
+    private final List<ApplicationResourceFacts.RouteBinding> routeBindings;
+    private final Map<String, List<ApplicationResourceFacts.RouteBinding>> routeBindingsByMember;
     private final List<DeserializeSite> secondaryDeserializeSites;
     private final Set<String> applicationObjectInputHosts;
     private final List<TerminalImpact> terminalImpacts;
@@ -536,6 +539,7 @@ public final class ApplicationEntryIndex {
                                   List<DeserializeHost> deserializeHosts,
                                   List<ServiceEndpoint> serviceEndpoints,
                                   List<FilterControl> filterControls,
+                                  ApplicationResourceFacts resourceFacts,
                                   List<TerminalImpact> terminalImpacts,
                                   List<String> entryForwardSlice,
                                   List<String> sinkReverseSlice,
@@ -567,6 +571,10 @@ public final class ApplicationEntryIndex {
         this.filterControls = immutableFilterControls(filterControls);
         this.filterDominanceByService = immutableFilterDominanceIndex(this.serviceEndpoints,
                 this.filterControls);
+        ApplicationResourceFacts resources = resourceFacts == null
+                ? ApplicationResourceFacts.empty() : resourceFacts;
+        this.routeBindings = immutableRouteBindings(resources);
+        this.routeBindingsByMember = immutableRouteBindingIndex(this.routeBindings);
         this.secondaryDeserializeSites = this.deserializeSites.stream()
                 .filter(ApplicationEntryIndex::isSecondaryDeserializeSite)
                 .toList();
@@ -950,6 +958,38 @@ public final class ApplicationEntryIndex {
                 .distinct().toList();
     }
 
+    private static List<ApplicationResourceFacts.RouteBinding> immutableRouteBindings(
+            ApplicationResourceFacts resourceFacts) {
+        if (resourceFacts == null || resourceFacts.routeBindings().isEmpty()) {
+            return List.of();
+        }
+        return resourceFacts.routeBindings().stream().filter(Objects::nonNull)
+                .sorted(Comparator.comparing(ApplicationResourceFacts.RouteBinding::resourcePath)
+                        .thenComparing(ApplicationResourceFacts.RouteBinding::route)
+                        .thenComparing(ApplicationResourceFacts.RouteBinding::handlerMemberKey)
+                        .thenComparing(ApplicationResourceFacts.RouteBinding::servletClass)
+                        .thenComparing(ApplicationResourceFacts.RouteBinding::servletPattern))
+                .distinct().toList();
+    }
+
+    private static Map<String, List<ApplicationResourceFacts.RouteBinding>>
+    immutableRouteBindingIndex(List<ApplicationResourceFacts.RouteBinding> bindings) {
+        if (bindings == null || bindings.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, List<ApplicationResourceFacts.RouteBinding>> grouped = new TreeMap<>();
+        for (ApplicationResourceFacts.RouteBinding binding : bindings) {
+            if (binding == null || binding.handlerMemberKey().isBlank()) {
+                continue;
+            }
+            grouped.computeIfAbsent(binding.handlerMemberKey(), ignored -> new ArrayList<>())
+                    .add(binding);
+        }
+        Map<String, List<ApplicationResourceFacts.RouteBinding>> result = new TreeMap<>();
+        grouped.forEach((key, values) -> result.put(key, List.copyOf(values)));
+        return Map.copyOf(result);
+    }
+
     private static Map<String, EntryChainJoinEvidence.FilterDominance>
     immutableFilterDominanceIndex(List<ServiceEndpoint> endpoints,
                                   List<FilterControl> controls) {
@@ -1048,19 +1088,33 @@ public final class ApplicationEntryIndex {
     public static ApplicationEntryIndex build(Graph graph, RuleEngine rules,
                                                Set<String> applicationOwners,
                                                boolean applicationScopeKnown) {
-        return buildInternal(graph, rules, applicationOwners, applicationScopeKnown);
+        return build(graph, rules, applicationOwners, applicationScopeKnown,
+                ApplicationResourceFacts.empty());
+    }
+
+    /** Build with bounded deployment/configuration facts recovered by the static frontend. */
+    public static ApplicationEntryIndex build(Graph graph, RuleEngine rules,
+                                               Set<String> applicationOwners,
+                                               boolean applicationScopeKnown,
+                                               ApplicationResourceFacts resourceFacts) {
+        return buildInternal(graph, rules, applicationOwners, applicationScopeKnown,
+                resourceFacts);
     }
 
     private static ApplicationEntryIndex buildInternal(Graph graph, RuleEngine rules,
                                                         Set<String> applicationOwners,
-                                                        boolean applicationScopeKnown) {
+                                                        boolean applicationScopeKnown,
+                                                        ApplicationResourceFacts resourceFacts) {
         Objects.requireNonNull(graph, "graph");
         Objects.requireNonNull(rules, "rules");
+        ApplicationResourceFacts resources = resourceFacts == null
+                ? ApplicationResourceFacts.empty() : resourceFacts;
         Set<String> owners = normalizeOwners(applicationOwners);
         List<String> reasons = new ArrayList<>();
         if (!applicationScopeKnown) {
             reasons.add("APPLICATION_SCOPE_UNKNOWN");
         }
+        reasons.addAll(resources.completenessReasons());
 
         Map<String, Node> methods = new HashMap<>();
         Map<String, Set<String>> methodAnnotations = new HashMap<>();
@@ -1142,6 +1196,31 @@ public final class ApplicationEntryIndex {
                 owners, applicationScopeKnown);
         List<FilterControl> filterControls = discoverFilterControls(graph, owners,
                 applicationScopeKnown);
+        if (applicationScopeKnown) {
+            for (ApplicationResourceFacts.RouteBinding binding : resources.routeBindings()) {
+                if (!binding.externalControlProven()
+                        || !owners.contains(binding.handlerClass())) {
+                    continue;
+                }
+                String key = binding.handlerMemberKey();
+                if (key.isBlank()) {
+                    continue;
+                }
+                List<Node> handlerMethods = methods.values().stream()
+                        .filter(candidate -> binding.handlerClass().equals(candidate.owner())
+                                && binding.handlerMethod().equals(candidate.name()))
+                        .sorted(Comparator.comparing(Node::descriptor))
+                        .toList();
+                if (handlerMethods.size() != 1) {
+                    continue;
+                }
+                Node method = handlerMethods.get(0);
+                entries.add(new ExecutionEntry(methodKey(method.owner(), method.name(),
+                        method.descriptor()), method.owner(), method.name(),
+                        method.descriptor(), "builtin:resource-route", "resource-route",
+                        FindingState.EntryStatus.EXTERNAL_ENTRY, true, true));
+            }
+        }
 
         List<DeserializeSite> sites = new ArrayList<>();
         Map<String, Boolean> sourceHosts = new HashMap<>();
@@ -1321,7 +1400,8 @@ public final class ApplicationEntryIndex {
             reasons.add("NO_ENTRY_TERMINAL_INTERSECTION");
         }
         return new ApplicationEntryIndex(applicationScopeKnown, hasDeserializeRoot, owners, entries, sites,
-                List.copyOf(deserializeHosts.values()), serviceEndpoints, filterControls, impacts,
+                List.copyOf(deserializeHosts.values()), serviceEndpoints, filterControls, resources,
+                impacts,
                 forward, reverse, List.copyOf(intersection), dependency, reasons,
                 bindingCallbacks);
     }
@@ -1392,6 +1472,19 @@ public final class ApplicationEntryIndex {
     /** Immutable application-owned route filters discovered from Filter#doFilter. */
     public List<FilterControl> filterControls() {
         return filterControls;
+    }
+
+    /** Immutable deployment/configuration routes recovered from the application artifact. */
+    public List<ApplicationResourceFacts.RouteBinding> routeBindings() {
+        return routeBindings;
+    }
+
+    /** Resource routes for one exact handler member. */
+    public List<ApplicationResourceFacts.RouteBinding> routeBindingsFor(String methodKey) {
+        if (methodKey == null || methodKey.isBlank()) {
+            return List.of();
+        }
+        return routeBindingsByMember.getOrDefault(memberOfMethodKey(methodKey), List.of());
     }
 
     /** Closed filter result for a registered service operation; unknown remains explicit. */
@@ -2433,6 +2526,7 @@ public final class ApplicationEntryIndex {
             deserializeSites.forEach(value -> update(digest, "site=" + value));
             serviceEndpoints.forEach(value -> update(digest, "service=" + value));
             filterControls.forEach(value -> update(digest, "filter=" + value));
+            routeBindings.forEach(value -> update(digest, "route=" + value));
             terminalImpacts.forEach(value -> update(digest, "impact=" + value));
             entryForwardSlice.forEach(value -> update(digest, "forward=" + value));
             sinkReverseSlice.forEach(value -> update(digest, "reverse=" + value));

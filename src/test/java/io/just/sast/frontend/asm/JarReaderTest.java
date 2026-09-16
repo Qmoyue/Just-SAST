@@ -121,6 +121,45 @@ class JarReaderTest {
     }
 
     @Test
+    void resourceCallbackExposesOnlyTopLevelXml(@TempDir Path tmp) throws Exception {
+        byte[] nested = zip(Map.of("WEB-INF/dependency.xml",
+                ignored -> "<dependency/>".getBytes()));
+        Map<String, Function<String, byte[]>> root = new LinkedHashMap<>();
+        root.put("WEB-INF/web.xml", ignored -> "<web-app/>".getBytes());
+        root.put("BOOT-INF/lib/dependency.jar", ignored -> nested);
+        Path jar = tmp.resolve("resources.jar");
+        Files.write(jar, zip(root));
+
+        List<String> resources = new ArrayList<>();
+        JarReader.StreamResult result = new JarReader().streamDetailedWithResources(jar,
+                ignored -> { },
+                (path, bytes, origin) -> resources.add(path),
+                17, InputBudget.defaults(), InputBudget.defaults().tracker());
+
+        assertEquals(0, result.classesEmitted());
+        assertEquals(List.of("WEB-INF/web.xml"), resources);
+        assertTrue(result.completenessReasons().isEmpty(), result.completenessReasons().toString());
+    }
+
+    @Test
+    void directoryResourceCallbackIgnoresExplodedNestedLibraryXml(@TempDir Path tmp)
+            throws Exception {
+        Path root = tmp.resolve("exploded");
+        Files.createDirectories(root.resolve("WEB-INF/lib"));
+        Files.writeString(root.resolve("WEB-INF/web.xml"), "<web-app/>");
+        Files.writeString(root.resolve("WEB-INF/lib/dependency.xml"), "<handler/>");
+
+        List<String> resources = new ArrayList<>();
+        JarReader.StreamResult result = new JarReader().streamDetailedWithResources(root,
+                ignored -> { },
+                (path, bytes, origin) -> resources.add(path),
+                17, InputBudget.defaults(), InputBudget.defaults().tracker());
+
+        assertEquals(List.of("WEB-INF/web.xml"), resources);
+        assertTrue(result.completenessReasons().isEmpty(), result.completenessReasons().toString());
+    }
+
+    @Test
     void explicitInputBudgetControlsClassEmissionWithoutResettingArchiveAccounting(
             @TempDir Path tmp) throws Exception {
         Path jar = tmp.resolve("class-cap.jar");

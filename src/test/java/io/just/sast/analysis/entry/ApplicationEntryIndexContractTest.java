@@ -11,6 +11,7 @@ import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.ApplicationResourceFacts;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -32,6 +33,26 @@ class ApplicationEntryIndexContractTest {
     private static final String SINK_DESC = "(Ljava/lang/String;)Ljava/lang/Process;";
     private static final String APP_METHOD = APP + "#handle()V";
     private static final String GADGET_METHOD = GADGET + "#trigger()V";
+
+    @Test
+    void staticResourceRouteCreatesOnlyAnOwnedUniqueHandlerEntry() {
+        Graph graph = new Graph();
+        graph.methodNode(APP, "invoke", "()V", false);
+        graph.freeze();
+        RuleEngine engine = new RuleEngine(new RuleSet(List.of(), List.of(), List.of(),
+                List.of(), List.of()), new ClassHierarchy(Map.of(), null));
+        ApplicationResourceFacts facts = new ApplicationResourceFacts(List.of(
+                new ApplicationResourceFacts.RouteBinding("WEB-INF/controller.xml", "SOAPService",
+                        "soap", "request", APP, "invoke", "fixture/ControlServlet",
+                        "/control/*")), List.of());
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine, Set.of(APP), true,
+                facts);
+
+        assertTrue(index.isExternalEntryMethod(APP + "#invoke()V"));
+        assertEquals(1, index.routeBindingsFor(APP + "#invoke()V").size());
+        assertEquals("SOAPService", index.routeBindingsFor(APP + "#invoke()V").get(0).route());
+    }
 
     @Test
     void applicationScopeJoinsEntryForwardAndTerminalReverseSlices() {

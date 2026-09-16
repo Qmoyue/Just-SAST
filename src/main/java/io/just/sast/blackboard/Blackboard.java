@@ -2,6 +2,7 @@ package io.just.sast.blackboard;
 
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.analysis.entry.ApplicationEntryIndex;
+import io.just.sast.model.ApplicationResourceFacts;
 import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.config.Rule;
 import io.just.sast.config.RuleEngine;
@@ -264,7 +265,8 @@ public final class Blackboard {
                              Path jdkHome, int targetMajorVersion,
                              io.just.sast.run.InputBudget.Tracker inputTracker,
                              Set<String> applicationClassNames,
-                             boolean applicationScopeKnown) {
+                             boolean applicationScopeKnown,
+                             ApplicationResourceFacts applicationResourceFacts) {
         public ScanInputs {
             // Compatibility callers do not have a pipeline-owned tracker.  Give them an
             // explicit bounded capability rather than allowing an optional consumer to create
@@ -279,15 +281,30 @@ public final class Blackboard {
                                     .filter(java.util.Objects::nonNull)
                                     .filter(value -> !value.isBlank())
                                     .map(String::trim).toList()));
+            applicationResourceFacts = applicationResourceFacts == null
+                    ? ApplicationResourceFacts.empty() : applicationResourceFacts;
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast) {
-            this(target, deps, fast, null, 0, null, Set.of(), false);
+            this(target, deps, fast, null, 0, null, Set.of(), false,
+                    ApplicationResourceFacts.empty());
         }
 
         public ScanInputs(Path target, List<Path> deps, boolean fast,
                           Path jdkHome, int targetMajorVersion) {
-            this(target, deps, fast, jdkHome, targetMajorVersion, null, Set.of(), false);
+            this(target, deps, fast, jdkHome, targetMajorVersion, null, Set.of(), false,
+                    ApplicationResourceFacts.empty());
+        }
+
+        /** Compatibility constructor for callers that do not provide resource facts. */
+        public ScanInputs(Path target, List<Path> deps, boolean fast,
+                          Path jdkHome, int targetMajorVersion,
+                          io.just.sast.run.InputBudget.Tracker inputTracker,
+                          Set<String> applicationClassNames,
+                          boolean applicationScopeKnown) {
+            this(target, deps, fast, jdkHome, targetMajorVersion, inputTracker,
+                    applicationClassNames, applicationScopeKnown,
+                    ApplicationResourceFacts.empty());
         }
 
         public static ScanInputs fastDefault(Path target) {
@@ -366,7 +383,8 @@ public final class Blackboard {
                 ? ScanInputs.fastDefault(Path.of(".")) : scanInputs;
         this.ruleEngine = new RuleEngine(this.rules, hierarchy);
         this.applicationEntryIndex = ApplicationEntryIndex.build(graph, ruleEngine,
-                this.scanInputs.applicationClassNames(), this.scanInputs.applicationScopeKnown());
+                this.scanInputs.applicationClassNames(), this.scanInputs.applicationScopeKnown(),
+                this.scanInputs.applicationResourceFacts());
         this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, this.scanInputs.fast(),
                 this.cpgIndex, this.scanInputs.applicationClassNames(),
                 this.scanInputs.applicationScopeKnown(),

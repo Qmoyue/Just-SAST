@@ -19,6 +19,7 @@ import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
+import io.just.sast.model.ApplicationResourceFacts;
 import io.just.sast.model.Descriptor;
 
 import java.util.ArrayList;
@@ -247,6 +248,20 @@ public final class ApplicationChainJoiner {
             entryAttributes.put("filter_control_count",
                     Integer.toString(index.filterControls().size()));
         }
+        List<ApplicationResourceFacts.RouteBinding> routeBindings = index.routeBindingsFor(entryKey)
+                .stream().filter(ApplicationResourceFacts.RouteBinding::externalControlProven)
+                .toList();
+        if (!routeBindings.isEmpty()) {
+            ApplicationResourceFacts.RouteBinding route = routeBindings.get(0);
+            entryAttributes.put("route_uri", route.route());
+            entryAttributes.put("route_resource", route.resourcePath());
+            entryAttributes.put("route_handler", route.handlerClass() + "#"
+                    + route.handlerMethod());
+            entryAttributes.put("route_handler_name", route.handlerName());
+            entryAttributes.put("route_servlet", route.servletClass());
+            entryAttributes.put("route_pattern", route.servletPattern());
+            entryAttributes.put("route_binding", "STATIC_RESOURCE");
+        }
         ApplicationEntryIndex.DeserializeSite site = entryMatch.bindingSite() != null
                 ? entryMatch.bindingSite() : findSite(index, entryKey, chainMethods);
         if (declaredJdbcTerminal) {
@@ -271,7 +286,8 @@ public final class ApplicationChainJoiner {
         addBridgeProfileAttributes(entryAttributes, bridgeProfile);
         EvidenceAtom entry = EvidenceAtom.of(EvidenceAtom.Kind.APPLICATION_ENTRY, "UNKNOWN",
                 ownerOf(entryKey), memberOf(entryKey), entryMatch.path().isEmpty()
-                        ? "INDEX_APPLICATION_ENTRY" : entryMatch.typedBinding()
+                        ? (!routeBindings.isEmpty() ? "INDEX_RESOURCE_ROUTE"
+                        : "INDEX_APPLICATION_ENTRY") : entryMatch.typedBinding()
                         ? "INDEX_TYPED_BINDING_ENTRY" : "INDEX_APPLICATION_CALL_PREFIX",
                 entryAttributes);
         EvidenceAtom siteAtom = siteAtom(site, entryKey, chain, entryMatch, bridgeProfile);
@@ -330,6 +346,11 @@ public final class ApplicationChainJoiner {
             ApplicationEntryIndex.ServiceEndpoint endpoint = serviceEndpoints.get(0);
             addBridge(bridges, BridgeEvidence.Kind.CONFIGURATION, siteAtom.id(), terminal.id(),
                     endpoint.protocol() + ":" + endpoint.publishPath());
+        }
+        if (!routeBindings.isEmpty()) {
+            ApplicationResourceFacts.RouteBinding route = routeBindings.get(0);
+            addBridge(bridges, BridgeEvidence.Kind.CONFIGURATION, siteAtom.id(), terminal.id(),
+                    "route:" + route.resourcePath() + ":" + route.route());
         }
         if (index.hasSecondaryDeserializationHop(chain.hops())) {
             addBridge(bridges, BridgeEvidence.Kind.SECOND_DESERIALIZATION, siteAtom.id(),
