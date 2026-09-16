@@ -774,10 +774,23 @@ public final class ScanCache {
         Path effective = normalized;
         if (ArchiveLimits.isLinkOrReparsePoint(normalized)) {
             try {
-                effective = normalized.toRealPath();
+                Path linkTarget = Files.readSymbolicLink(normalized);
+                effective = (linkTarget.isAbsolute()
+                        ? linkTarget : normalized.getParent().resolve(linkTarget))
+                        .toAbsolutePath().normalize();
+                if (!Files.isDirectory(effective)
+                        || ArchiveLimits.isLinkOrReparsePoint(effective)) {
+                    throw new IOException("cache JDK home target is not a safe directory: "
+                            + effective);
+                }
             } catch (IOException | RuntimeException failure) {
-                throw new IOException("cache JDK home alias cannot be resolved: " + normalized,
-                        failure);
+                try {
+                    effective = normalized.toRealPath();
+                } catch (IOException | RuntimeException realPathFailure) {
+                    realPathFailure.addSuppressed(failure);
+                    throw new IOException("cache JDK home alias cannot be resolved: " + normalized,
+                            realPathFailure);
+                }
             }
         }
         if (!Files.isDirectory(effective)
