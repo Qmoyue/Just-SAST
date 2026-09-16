@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -74,6 +75,22 @@ class PerformanceCommandContractTest {
         IOException failure = assertThrows(IOException.class,
                 () -> PerformanceCommand.readBoundedTextForContract(second, budget, tracker));
         assertTrue(failure.getMessage().contains("PERFORMANCE_METADATA_INPUT_LIMIT"),
+                failure.getMessage());
+    }
+
+    @Test
+    void requiredColdMetadataCannotSilentlyTurnIntoZero() {
+        String valid = "{\"phase_ms\":{\"static\":11,\"filter\":3},"
+                + "\"heap_used_mb\":4,\"heap_peak_mb\":5,\"chains_found\":2,"
+                + "\"completeness\":\"COMPLETE\"}";
+        assertDoesNotThrow(() -> PerformanceCommand.validateMetadataForContract(valid));
+
+        String missingStatic = "{\"phase_ms\":{\"filter\":3},"
+                + "\"heap_used_mb\":4,\"heap_peak_mb\":5,\"chains_found\":2,"
+                + "\"completeness\":\"COMPLETE\"}";
+        IOException failure = assertThrows(IOException.class,
+                () -> PerformanceCommand.validateMetadataForContract(missingStatic));
+        assertTrue(failure.getMessage().contains("PERFORMANCE_METADATA_MISSING:phase_ms.static"),
                 failure.getMessage());
     }
 }

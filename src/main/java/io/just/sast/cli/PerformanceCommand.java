@@ -25,6 +25,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -171,7 +172,10 @@ public final class PerformanceCommand implements Callable<Integer> {
             return RunOutcome.failed("PERFORMANCE_FAILURE", e.getClass().getSimpleName()).exitCode();
         } finally {
             if (createdRoot != null) {
-                deleteTree(createdRoot);
+                if (!deleteTree(createdRoot)) {
+                    System.err.println("[just:warn] 性能临时目录未能安全清理，已保留供审计: "
+                            + createdRoot);
+                }
             }
         }
     }
@@ -329,14 +333,16 @@ public final class PerformanceCommand implements Callable<Integer> {
         String json = readBoundedText(metadata, OUTPUT_INPUT_POLICY, outputBudget,
                 "PERFORMANCE_METADATA");
         long wall = elapsedMs(started);
-        long staticMs = objectNumber(json, "phase_ms", "static", 0L);
-        long filterMs = objectNumber(json, "phase_ms", "filter", 0L);
-        long heapUsed = number(json, "heap_used_mb", 0L);
-        long heapPeak = number(json, "heap_peak_mb", heapUsed);
-        long rss = objectNumber(json, "metrics", "parent_rss_mb",
-                objectNumber(json, "metrics", "rss_peak_mb", -1L));
-        int chains = (int) Math.max(0L, number(json, "chains_found", 0L));
-        String completeness = string(json, "completeness", "UNKNOWN");
+            Metadata metadataValues = parseMetadata(json);
+            long staticMs = metadataValues.staticMs();
+            long filterMs = metadataValues.filterMs();
+            long heapUsed = metadataValues.heapUsedMb();
+            long heapPeak = metadataValues.heapPeakMb();
+            Long parentRss = objectNumber(json, "metrics", "parent_rss_mb");
+            Long rssPeak = objectNumber(json, "metrics", "rss_peak_mb");
+            long rss = parentRss != null ? parentRss : rssPeak == null ? -1L : rssPeak;
+            int chains = metadataValues.chainsFound();
+            String completeness = metadataValues.completeness();
         PerformanceHarness.Sample sample = new PerformanceHarness.Sample(iteration, wall, staticMs,
                 filterMs, heapUsed, heapPeak, rss, chains, completeness,
                 resultDigest(output, OUTPUT_INPUT_POLICY, outputBudget), objectNumbers(json, "phase_ms"),
@@ -443,33 +449,84 @@ public final class PerformanceCommand implements Callable<Integer> {
         return joined.toString();
     }
 
-    private static long number(String json, String key, long fallback) {
+    private record Metadata(long staticMs, long filterMs, long heapUsedMb, long heapPeakMb,
+                            int chainsFound, String completeness) {
+    }
+
+    private static Metadata parseMetadata(String json) throws IOException {
+        long staticMs = requiredObjectNumber(json, "phase_ms", "static");
+        long filterMs = requiredObjectNumber(json, "phase_ms", "filter");
+        long heapUsed = requiredNumber(json, "heap_used_mb");
+        long heapPeak = requiredNumber(json, "heap_peak_mb");
+        long chains = requiredNumber(json, "chains_found");
+        String completeness = requiredString(json, "completeness");
+        if (staticMs < 0L || filterMs < 0L || heapUsed < 0L || heapPeak < heapUsed
+                || chains < 0L || chains > Integer.MAX_VALUE) {
+            throw new IOException("PERFORMANCE_METADATA_VALUES_INVALID");
+        }
+        if (!Set.of("COMPLETE", "PARTIAL", "UNKNOWN").contains(completeness)) {
+            throw new IOException("PERFORMANCE_METADATA_COMPLETENESS_INVALID:" + completeness);
+        }
+        return new Metadata(staticMs, filterMs, heapUsed, heapPeak, (int) chains, completeness);
+    }
+
+    /** Package-local hostile contract seam: required metadata cannot silently become zero. */
+    static void validateMetadataForContract(String json) throws IOException {
+        parseMetadata(json);
+    }
+
+    private static long requiredNumber(String json, String key) throws IOException {
+        Long value = number(json, key);
+        if (value == null) {
+            throw new IOException("PERFORMANCE_METADATA_MISSING:" + key);
+        }
+        return value;
+    }
+
+    private static long requiredObjectNumber(String json, String object, String key)
+            throws IOException {
+        Long value = objectNumber(json, object, key);
+        if (value == null) {
+            throw new IOException("PERFORMANCE_METADATA_MISSING:" + object + "." + key);
+        }
+        return value;
+    }
+
+    private static String requiredString(String json, String key) throws IOException {
+        String value = string(json, key, null);
+        if (value == null || value.isBlank()) {
+            throw new IOException("PERFORMANCE_METADATA_MISSING:" + key);
+        }
+        return value.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static Long number(String json, String key) {
         Matcher matcher = NUMBER.matcher(json == null ? "" : json);
         while (matcher.find()) {
             if (key.equals(matcher.group(1))) {
                 try {
                     return Long.parseLong(matcher.group(2));
                 } catch (NumberFormatException ignored) {
-                    return fallback;
+                    return null;
                 }
             }
         }
-        return fallback;
+        return null;
     }
 
-    private static long objectNumber(String json, String object, String key, long fallback) {
+    private static Long objectNumber(String json, String object, String key) {
         String source = json == null ? "" : json;
         String marker = "\"" + object + "\"";
         int start = source.indexOf(marker);
         if (start < 0) {
-            return fallback;
+            return null;
         }
         int bodyStart = source.indexOf('{', start + marker.length());
         int bodyEnd = bodyStart < 0 ? -1 : source.indexOf('}', bodyStart + 1);
         if (bodyStart < 0 || bodyEnd < 0) {
-            return fallback;
+            return null;
         }
-        return number(source.substring(bodyStart, bodyEnd + 1), key, fallback);
+        return number(source.substring(bodyStart, bodyEnd + 1), key);
     }
 
     private static Map<String, Long> objectNumbers(String json, String object) {
@@ -545,8 +602,8 @@ public final class PerformanceCommand implements Callable<Integer> {
         }
     }
 
-    private static void deleteTree(Path root) {
-        deleteTreeBounded(root, OUTPUT_INPUT_POLICY);
+    private static boolean deleteTree(Path root) {
+        return deleteTreeBounded(root, OUTPUT_INPUT_POLICY);
     }
 
     /**
