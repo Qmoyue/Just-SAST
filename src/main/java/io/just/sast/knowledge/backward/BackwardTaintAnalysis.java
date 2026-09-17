@@ -28,6 +28,7 @@ import io.just.sast.model.Descriptor;
 import io.just.sast.model.HandleRef;
 import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.model.InsnFact;
+import io.just.sast.model.LambdaMetafactoryCallSite;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
@@ -77,7 +78,6 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
     private record SinkMark(String ruleId, String category, String severity, List<Rule.TaintedPos> tainted,
                             Rule.SinkRole role, io.just.sast.blackboard.SinkRisk sinkRisk,
                             Rule.SinkRule rule) {}
-    private record LambdaMetadata(List<HandleRef> implementations) {}
 
     /** 每 sink 链上限；全局黑板负责跨 sink 去重，避免并行 worker 持有大批临时链。 */
     private static final int MAX_CHAINS_PER_SINK = 20;
@@ -1240,20 +1240,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
                 continue;
             }
             Node factory = edge.from();
-            LambdaMetadata metadata = lambdaMetadata(factory);
-            if (metadata == null || !sameMethod(edge.to(), implementation)) {
+            LambdaMetafactoryCallSite site = lambdaSite(factory);
+            if (site == null || !sameMethod(edge.to(), implementation)
+                    || !sameLambdaImplementation(site.implementation(), edge.to())) {
                 continue;
             }
-            HandleRef implementationHandle = metadata.implementations().stream()
-                    .filter(handle -> handle.owner().equals(edge.to().owner())
-                            && handle.name().equals(edge.to().name())
-                            && handle.descriptor().equals(edge.to().descriptor()))
-                    .findFirst()
-                    .orElse(metadata.implementations().size() == 1
-                            ? metadata.implementations().get(0) : null);
-            if (implementationHandle == null) {
-                continue;
-            }
+            HandleRef implementationHandle = site.implementation();
             MethodInfo caller = support.enclosingMethod(factory);
             if (caller == null || !entryReaching.contains(OriginSupport.methodKey(caller))) {
                 continue;
@@ -1262,7 +1254,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             int capturedCount = Descriptor.paramCount(factory.descriptor());
             boolean receiverCapture = lambdaHasCapturedReceiver(implementationHandle.tag());
             int explicitCaptured = Math.max(0, implementation.paramCount()
-                    - Descriptor.paramCount(samDescriptor(factory, caller)));
+                    - Descriptor.paramCount(site.samDescriptor()));
 
             // An instance implementation receives its bound receiver in local slot 0, even
             // though that receiver is absent from the method descriptor.
@@ -1281,7 +1273,7 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
             }
 
             for (LambdaSamRoute route : lambdaSamRoutes(factory, caller, callerResult,
-                    samDescriptor(factory, caller))) {
+                    site.samDescriptor())) {
                 if (abortIfInterrupted(trace)) {
                     break;
                 }
@@ -1527,43 +1519,30 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         return produced;
     }
 
-    private LambdaMetadata lambdaMetadata(Node factory) {
+    private static LambdaMetafactoryCallSite lambdaSite(Node factory) {
         if (factory == null || !"DYNAMIC".equals(factory.invokeKind())) {
             return null;
         }
         Object value = factory.prop("indy");
-        if (!(value instanceof InvokeDynamicRef indy)
-                || indy.bootstrap() == null
-                || !"java/lang/invoke/LambdaMetafactory".equals(indy.bootstrap().owner())
-                || !("metafactory".equals(indy.bootstrap().name())
-                || "altMetafactory".equals(indy.bootstrap().name()))) {
+        if (!(value instanceof InvokeDynamicRef indy)) {
             return null;
         }
-        List<HandleRef> implementations = new ArrayList<>();
-        Set<String> seen = new HashSet<>();
-        for (int i = 1; i < indy.bootstrapArgs().size(); i++) {
-            Object argument = indy.bootstrapArgs().get(i);
-            if (argument instanceof HandleRef handle
-                    && seen.add(handle.tag() + "|" + handle.owner() + "#"
-                    + handle.name() + handle.descriptor())) {
-                implementations.add(handle);
-            }
-        }
-        return implementations.isEmpty() ? null
-                : new LambdaMetadata(List.copyOf(implementations));
+        LambdaMetafactoryCallSite.Resolution resolution =
+                LambdaMetafactoryCallSite.resolve(indy);
+        return resolution.resolved() ? resolution.site() : null;
     }
 
-    private String samDescriptor(Node factory, MethodInfo caller) {
-        Object value = factory.prop("indy");
-        if (!(value instanceof InvokeDynamicRef indy)) {
-            return factory.descriptor();
+    private boolean sameLambdaImplementation(HandleRef handle, Node target) {
+        if (handle == null || target == null || !handle.name().equals(target.name())
+                || !handle.descriptor().equals(target.descriptor())) {
+            return false;
         }
-        // LambdaMetafactory's first bootstrap argument is the erased SAM descriptor.  The
-        // interface call is used as a fallback for unusual compiler encodings.
-        if (!indy.bootstrapArgs().isEmpty() && indy.bootstrapArgs().get(0) instanceof io.just.sast.model.TypeRef type) {
-            return type.descriptor();
+        if (handle.owner().equals(target.owner())) {
+            return true;
         }
-        return factory.descriptor();
+        String resolved = bb.hierarchy().resolveMethod(handle.owner(), handle.name(),
+                handle.descriptor());
+        return target.owner().equals(resolved);
     }
 
     private boolean lambdaReceiverMatches(Node samCall, Node factory,

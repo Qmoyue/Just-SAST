@@ -100,7 +100,10 @@ public final class CpgBuilder {
         Object indy = null;
         if (insn.op() == Op.INVOKEDYNAMIC) {
             InvokeDynamicRef ref = (InvokeDynamicRef) insn.operands().get(0);
-            owner = ref.bootstrap().owner();
+            // Keep a missing bootstrap explicit at the model seam.  CallGraphBuilder records
+            // UNKNOWN_BOOTSTRAP from the retained InvokeDynamicRef; it must not be converted
+            // into a guessed owner or dropped call site here.
+            owner = ref.bootstrap() == null ? null : ref.bootstrap().owner();
             name = ref.name();
             desc = ref.descriptor();
             invokeKind = "DYNAMIC";

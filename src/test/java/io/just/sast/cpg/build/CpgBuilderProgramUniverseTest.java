@@ -1,14 +1,22 @@
 package io.just.sast.cpg.build;
 
+import io.just.sast.analysis.callgraph.CallGraphBuilder;
+import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.cpg.graph.Graph;
+import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.frontend.asm.FactsExtractor;
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.HandleRef;
+import io.just.sast.model.InsnFact;
+import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.Op;
 import io.just.sast.model.ProgramUniverse;
 import org.junit.jupiter.api.Test;
+import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Handle;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
@@ -20,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CpgBuilderProgramUniverseTest {
@@ -102,5 +111,85 @@ class CpgBuilderProgramUniverseTest {
                 .stream().findFirst().orElseThrow();
         assertEquals(List.of("fixture.app."), call.note("stringLiteralHints"));
         assertTrue(call.notes().containsKey("stringLiteralHints"));
+    }
+
+    @Test
+    void asmLambdaBootstrapBecomesExactCallGraphEdge() {
+        byte[] bytes = lambdaClassBytes();
+        ClassNode node = new ClassNode();
+        new ClassReader(bytes).accept(node, 0);
+        ClassInfo info = new FactsExtractor().extract(node);
+        LoadResult load = new LoadResult(Map.of(info.internalName(), info), List.of(), 1, 61);
+
+        Graph graph = new CpgBuilder().build(load).graph();
+        var call = graph.callsOfMethod("fixture/LambdaHost#make()Ljava/lang/Runnable;")
+                .stream().filter(candidate -> candidate.type() == NodeType.CALL).findFirst()
+                .orElseThrow();
+        InvokeDynamicRef indy = (InvokeDynamicRef) call.prop("indy");
+        assertEquals("metafactory", indy.bootstrap().name());
+        assertEquals("fixture/LambdaHost", ((HandleRef) indy.bootstrapArgs().get(1)).owner());
+        assertEquals("ordinary", ((HandleRef) indy.bootstrapArgs().get(1)).name());
+
+        int edges = new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph);
+
+        assertEquals(1, edges);
+        assertEquals("fixture/LambdaHost", call.out().get(0).to().owner());
+        assertEquals("ordinary", call.out().get(0).to().name());
+    }
+
+    @Test
+    void missingLambdaBootstrapRemainsVisibleAsUnknown() {
+        String owner = "fixture/MissingBootstrap";
+        String descriptor = "()Ljava/lang/Runnable;";
+        MethodInfo method = new MethodInfo(owner, "make", descriptor,
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                List.of(new InsnFact(0, Op.INVOKEDYNAMIC, List.of(new InvokeDynamicRef(
+                                "run", descriptor, null, List.of()))),
+                        new InsnFact(1, Op.ARETURN, List.of())),
+                List.of(), false);
+        ClassInfo info = new ClassInfo(owner, "java/lang/Object", List.of(), Opcodes.ACC_PUBLIC,
+                List.of(method), List.of());
+        LoadResult load = new LoadResult(Map.of(owner, info), List.of(), 1, 61);
+
+        Graph graph = new CpgBuilder().build(load).graph();
+        var call = graph.callsOfMethod(owner + "#make" + descriptor).get(0);
+        int edges = new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph);
+
+        assertNull(call.owner());
+        assertEquals(0, edges);
+        assertEquals("UNKNOWN_BOOTSTRAP", call.note("lambdaResolution"));
+        assertTrue(call.prop("indy") instanceof InvokeDynamicRef);
+    }
+
+    private static byte[] lambdaClassBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "fixture/LambdaHost", null,
+                "java/lang/Object", null);
+
+        MethodVisitor ordinary = writer.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                "ordinary", "()V", null, null);
+        ordinary.visitCode();
+        ordinary.visitInsn(Opcodes.RETURN);
+        ordinary.visitMaxs(0, 0);
+        ordinary.visitEnd();
+
+        MethodVisitor make = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "make",
+                "()Ljava/lang/Runnable;", null, null);
+        make.visitCode();
+        make.visitInvokeDynamicInsn("run", "()Ljava/lang/Runnable;",
+                new Handle(Opcodes.H_INVOKESTATIC, "java/lang/invoke/LambdaMetafactory",
+                        "metafactory",
+                        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;"
+                                + "Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;"
+                                + "Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)"
+                                + "Ljava/lang/invoke/CallSite;", false),
+                Type.getMethodType("()V"),
+                new Handle(Opcodes.H_INVOKESTATIC, "fixture/LambdaHost", "ordinary", "()V", false),
+                Type.getMethodType("()V"));
+        make.visitInsn(Opcodes.ARETURN);
+        make.visitMaxs(1, 0);
+        make.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
     }
 }

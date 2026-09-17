@@ -6,7 +6,7 @@ import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.HandleRef;
-import java.util.ArrayList;
+import io.just.sast.model.LambdaMetafactoryCallSite;
 import java.util.HashMap;
 import java.util.Map;
 import io.just.sast.model.InvokeDynamicRef;
@@ -28,7 +28,6 @@ public final class CallGraphBuilder {
 
     /** 虚调用/接口实现枚举上限（超出只取声明目标；具体实现由接口反向分发补齐）。 */
     private static final int DISPATCH_CAP = 200;
-    private static final String LAMBDA_METAFACTORY = "java/lang/invoke/LambdaMetafactory";
 
     private final ClassHierarchy hierarchy;
     /**
@@ -183,32 +182,26 @@ public final class CallGraphBuilder {
     }
 
     private int addLambda(Graph graph, Node call, InvokeDynamicRef indy) {
-        if (indy == null) {
+        LambdaMetafactoryCallSite.Resolution resolution =
+                LambdaMetafactoryCallSite.resolve(indy);
+        if (!resolution.resolved()) {
+            if (resolution.status() != LambdaMetafactoryCallSite.Status.NOT_LAMBDA_METAFACTORY) {
+                call.propsNote("lambdaResolution", resolution.status().name());
+            }
             return 0;
         }
-        if (indy.bootstrap() != null && LAMBDA_METAFACTORY.equals(indy.bootstrap().owner())) {
-            // Both metafactory and altMetafactory keep the implementation handle in the
-            // bootstrap argument list.  Scan all handle arguments after the SAM type instead
-            // of hard-coding index 1: this preserves bridge/adapter variants emitted by newer
-            // compilers and remains conservative because marker/bridge metadata is TypeRef,
-            // not HandleRef.  A stable set avoids duplicate edges for repeated handles.
-            Set<String> seen = new LinkedHashSet<>();
-            int count = 0;
-            for (int i = 1; i < indy.bootstrapArgs().size(); i++) {
-                Object impl = indy.bootstrapArgs().get(i);
-                if (impl instanceof HandleRef h && seen.add(h.owner() + "#"
-                        + h.name() + h.descriptor())) {
-                    String target = hierarchy.resolveMethod(h.owner(), h.name(), h.descriptor());
-                    // 与 SPECIAL 边同语义：用解析后的真实声明类建节点（方法引用指向继承方法时避免幽灵节点）
-                    String edgeOwner = target != null ? target : h.owner();
-                    graph.addEdge(call,
-                            graph.methodNode(edgeOwner, h.name(), h.descriptor(), target == null),
-                            EdgeType.LAMBDA, "LAMBDA");
-                    count++;
-                }
-            }
-            return count;
-        }
-        return 0;
+        LambdaMetafactoryCallSite site = resolution.site();
+        call.propsNote("lambdaResolution", resolution.status().name());
+        call.propsNote("lambdaCallSite", site);
+        HandleRef implementation = site.implementation();
+        String target = hierarchy.resolveMethod(implementation.owner(), implementation.name(),
+                implementation.descriptor());
+        // 与 SPECIAL 边同语义：用解析后的真实声明类建节点（方法引用指向继承方法时避免幽灵节点）
+        String edgeOwner = target != null ? target : implementation.owner();
+        graph.addEdge(call,
+                graph.methodNode(edgeOwner, implementation.name(), implementation.descriptor(),
+                        target == null),
+                EdgeType.LAMBDA, "LAMBDA");
+        return 1;
     }
 }

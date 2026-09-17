@@ -24,6 +24,7 @@ import io.just.sast.model.Descriptor;
 import io.just.sast.model.HandleRef;
 import io.just.sast.model.InsnFact;
 import io.just.sast.model.InvokeDynamicRef;
+import io.just.sast.model.LambdaMetafactoryCallSite;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
@@ -218,8 +219,6 @@ public final class ForwardEngine {
     private final Map<String, List<LambdaBind>> lambdaBinds = new HashMap<>();
     /** lambda 实现绑定（实现方法的定位三元组；槽位偏移在消费时按实际接口调用点计算）。 */
     private record LambdaBind(String implOwner, String implName, String implDesc) {}
-    /** LambdaMetafactory 的一个实现句柄与 SAM 描述符；仅用于通用 invokedynamic 数据流映射。 */
-    private record LambdaShape(HandleRef implementation, String samDescriptor) {}
     private final Map<Key, Candidates> dispatchCache = new HashMap<>();
     private final Map<Key, ResolvedCandidates> resolvedDispatchCache = new HashMap<>();
     private final Map<SelectionKey, ResolvedCandidates> contextualDispatchCache = new HashMap<>();
@@ -3076,8 +3075,8 @@ public final class ForwardEngine {
                 continue;
             }
             Node factory = support.callNode(result.callNodeId());
-            List<LambdaShape> shapes = lambdaShapes(factory);
-            if (shapes.isEmpty()) {
+            LambdaMetafactoryCallSite site = lambdaSite(factory);
+            if (site == null) {
                 continue;
             }
             for (Edge edge : factory.out()) {
@@ -3092,11 +3091,10 @@ public final class ForwardEngine {
                 if (implementation == null) {
                     continue;
                 }
-                LambdaShape shape = shapeFor(shapes, edge.to());
-                if (shape == null) {
+                if (!sameLambdaImplementation(site.implementation(), edge.to())) {
                     continue;
                 }
-                int slot = lambdaParameterSlot(implementation, shape, samOrdinal);
+                int slot = lambdaParameterSlot(implementation, site, samOrdinal);
                 if (slot < 0) {
                     continue;
                 }
@@ -3116,8 +3114,8 @@ public final class ForwardEngine {
     private List<ChainHop> propagateLambdaFactory(Node factory, MethodInfo caller, int depth,
                                                    Explore ex, ForwardOrigins.Result originResult,
                                                    List<ChainHop> best) {
-        List<LambdaShape> shapes = lambdaShapes(factory);
-        if (shapes.isEmpty()) {
+        LambdaMetafactoryCallSite site = lambdaSite(factory);
+        if (site == null) {
             return best;
         }
         ForwardOrigins.State state = originResult.stateBefore().get(factory.offset());
@@ -3137,13 +3135,12 @@ public final class ForwardEngine {
             if (implementation == null) {
                 continue;
             }
-            LambdaShape shape = shapeFor(shapes, edge.to());
-            if (shape == null) {
+            if (!sameLambdaImplementation(site.implementation(), edge.to())) {
                 continue;
             }
-            boolean receiverCapture = lambdaHasCapturedReceiver(shape.implementation().tag());
+            boolean receiverCapture = lambdaHasCapturedReceiver(site.implementation().tag());
             int explicitCaptured = Math.max(0, Descriptor.paramCount(implementation.descriptor())
-                    - Descriptor.paramCount(shape.samDescriptor()));
+                    - Descriptor.paramCount(site.samDescriptor()));
             for (int captureOrdinal = 0; captureOrdinal < capturedCount; captureOrdinal++) {
                 if (cancellationRequested()) {
                     return best;
@@ -3189,60 +3186,30 @@ public final class ForwardEngine {
         return best;
     }
 
-    private List<LambdaShape> lambdaShapes(Node factory) {
+    private static LambdaMetafactoryCallSite lambdaSite(Node factory) {
         if (factory == null || !"DYNAMIC".equals(factory.invokeKind())) {
-            return List.of();
-        }
-        Object value = factory.prop("indy");
-        if (!(value instanceof InvokeDynamicRef indy)
-                || indy.bootstrap() == null
-                || !"java/lang/invoke/LambdaMetafactory".equals(indy.bootstrap().owner())
-                || !("metafactory".equals(indy.bootstrap().name())
-                || "altMetafactory".equals(indy.bootstrap().name()))) {
-            return List.of();
-        }
-        String samDescriptor = null;
-        if (!indy.bootstrapArgs().isEmpty() && indy.bootstrapArgs().get(0) instanceof TypeRef type) {
-            samDescriptor = type.descriptor();
-        }
-        if (samDescriptor == null && indy.bootstrapArgs().size() > 2
-                && indy.bootstrapArgs().get(2) instanceof TypeRef type) {
-            samDescriptor = type.descriptor();
-        }
-        if (samDescriptor == null || !samDescriptor.startsWith("(")) {
-            return List.of();
-        }
-        List<LambdaShape> result = new ArrayList<>();
-        Set<String> seen = new LinkedHashSet<>();
-        for (int i = 1; i < indy.bootstrapArgs().size(); i++) {
-            Object argument = indy.bootstrapArgs().get(i);
-            if (!(argument instanceof HandleRef handle)) {
-                continue;
-            }
-            String key = handle.tag() + "|" + handle.owner() + "#"
-                    + handle.name() + handle.descriptor();
-            if (seen.add(key)) {
-                result.add(new LambdaShape(handle, samDescriptor));
-            }
-        }
-        return result.isEmpty() ? List.of() : List.copyOf(result);
-    }
-
-    private static LambdaShape shapeFor(List<LambdaShape> shapes, Node target) {
-        if (shapes == null || target == null) {
             return null;
         }
-        for (LambdaShape shape : shapes) {
-            HandleRef handle = shape.implementation();
-            if (handle.owner().equals(target.owner()) && handle.name().equals(target.name())
-                    && handle.descriptor().equals(target.descriptor())) {
-                return shape;
-            }
+        Object value = factory.prop("indy");
+        if (!(value instanceof InvokeDynamicRef indy)) {
+            return null;
         }
-        // Some hierarchy resolutions replace an inherited handle owner with the actual
-        // declaration owner. A single shape can still be used as a conservative fallback;
-        // for multiple shapes an unmatched edge is intentionally left unresolved.
-        return shapes.size() == 1 ? shapes.get(0) : null;
+        LambdaMetafactoryCallSite.Resolution resolution =
+                LambdaMetafactoryCallSite.resolve(indy);
+        return resolution.resolved() ? resolution.site() : null;
+    }
+
+    private boolean sameLambdaImplementation(HandleRef handle, Node target) {
+        if (handle == null || target == null || !handle.name().equals(target.name())
+                || !handle.descriptor().equals(target.descriptor())) {
+            return false;
+        }
+        if (handle.owner().equals(target.owner())) {
+            return true;
+        }
+        String resolved = bb.hierarchy().resolveMethod(handle.owner(), handle.name(),
+                handle.descriptor());
+        return target.owner().equals(resolved);
     }
 
     private static boolean lambdaHasCapturedReceiver(int handleTag) {
@@ -3251,9 +3218,10 @@ public final class ForwardEngine {
         return handleTag == 5 || handleTag == 7 || handleTag == 9;
     }
 
-    private int lambdaParameterSlot(MethodInfo implementation, LambdaShape shape, int samOrdinal) {
+    private int lambdaParameterSlot(MethodInfo implementation,
+                                    LambdaMetafactoryCallSite site, int samOrdinal) {
         int explicitCaptured = Math.max(0, Descriptor.paramCount(implementation.descriptor())
-                - Descriptor.paramCount(shape.samDescriptor()));
+                - Descriptor.paramCount(site.samDescriptor()));
         // The implementation descriptor does not contain the bound receiver.  The receiver is
         // represented by local slot 0 for an instance target, so adding it to the descriptor
         // ordinal shifts every SAM argument one slot too far (and drops the common no-capture
