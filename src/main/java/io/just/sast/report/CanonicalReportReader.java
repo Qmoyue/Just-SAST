@@ -16,8 +16,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
-/** Reads the stable {@code report.json} chain array for downstream static consumers. */
+/** Reads the stable JUST-REPORT-V2 finding array for downstream static consumers. */
 public final class CanonicalReportReader {
 
     public record ChainRecord(String id, String chainKey, String ruleId, String category, String severity,
@@ -65,11 +66,11 @@ public final class CanonicalReportReader {
 
     public record Snapshot(String schemaVersion, List<ChainRecord> chains) {
         public Snapshot {
-            if (!ConciseReportWriter.SCHEMA_VERSION.equals(schemaVersion)) {
+            if (!ConciseReportProjection.SCHEMA_VERSION.equals(schemaVersion)) {
                 throw new IllegalArgumentException("unsupported canonical report schema: "
                         + schemaVersion);
             }
-            chains = List.copyOf(chains == null ? List.of() : chains);
+            chains = List.copyOf(Objects.requireNonNull(chains, "canonical chains"));
         }
 
         /** Stable digest of the chain evidence, independent of report summary timing. */
@@ -119,30 +120,94 @@ public final class CanonicalReportReader {
     private static Snapshot parse(String text) {
         Node root = new Parser(text).parseDocument();
         ObjectNode object = object(root, "root");
-        String schema = string(required(object, "schema_version"), "schema_version");
-        ArrayNode chains = array(required(object, "chains"), "chains");
+        String schema = requiredString(required(object, "schema_version"), "schema_version");
+        requireFields(object, "root", "schema_version", "mode", "result", "findings",
+                "provenance");
+        String mode = requiredString(required(object, "mode"), "mode");
+        if (!"component".equals(mode) && !"application".equals(mode)) {
+            throw new IllegalArgumentException("unsupported report mode: " + mode);
+        }
+        ObjectNode result = object(required(object, "result"), "result");
+        requireFields(result, "result", "outcome", "coverage", "candidates", "exported",
+                "limits");
+        String outcome = requiredString(required(result, "outcome"), "result.outcome");
+        if (!Set.of("FINDINGS_AVAILABLE", "NO_FINDINGS", "FAILED", "UNSUPPORTED")
+                .contains(outcome)) {
+            throw new IllegalArgumentException("unsupported result outcome: " + outcome);
+        }
+        String coverage = requiredString(required(result, "coverage"), "result.coverage");
+        if (!Set.of("COMPLETE", "BOUNDED", "UNKNOWN").contains(coverage)) {
+            throw new IllegalArgumentException("unsupported result coverage: " + coverage);
+        }
+        Long candidates = optionalNonNegativeInteger(result, "candidates", "result.candidates");
+        Long exported = optionalNonNegativeInteger(result, "exported", "result.exported");
+        if (candidates != null && exported != null && exported > candidates) {
+            throw new IllegalArgumentException("result exported count exceeds candidates");
+        }
+        optionalLimits(result, "limits", "result.limits");
+        ObjectNode provenance = object(required(object, "provenance"), "provenance");
+        requireFields(provenance, "provenance", "artifact_sha256", "detail");
+        requiredString(required(provenance, "artifact_sha256"), "provenance.artifact_sha256");
+        requiredString(required(provenance, "detail"), "provenance.detail");
+        ArrayNode chains = array(required(object, "findings"), "findings");
         List<ChainRecord> records = new ArrayList<>();
         Map<String, ChainRecord> byIdentity = new LinkedHashMap<>();
+        Set<String> ids = new java.util.HashSet<>();
         for (Node node : chains.values()) {
-            ObjectNode item = object(node, "chains[]");
+            ObjectNode item = object(node, "findings[]");
+            requireFields(item, "findings[]", "id", "status", "entry", "impact", "graph",
+                    "proof", "limits");
+            String id = requiredString(required(item, "id"), "findings[].id");
+            if (!ids.add(id)) {
+                throw new IllegalArgumentException("duplicate finding id: " + id);
+            }
+            String status = requiredString(required(item, "status"), "findings[].status");
+            if (!Set.of("COMPLETE", "PARTIAL", "UNKNOWN").contains(status)) {
+                throw new IllegalArgumentException("unsupported finding status: " + status);
+            }
             ObjectNode entry = object(required(item, "entry"), "entry");
-            ObjectNode sink = object(required(item, "sink"), "sink");
-            Node chainKeyNode = item.fields().get("chain_key");
+            requireFields(entry, "entry", "owner", "method", "descriptor", "kind", "role");
+            ObjectNode impact = object(required(item, "impact"), "impact");
+            requireFields(impact, "impact", "owner", "method", "descriptor", "kind", "role");
+            ArrayNode graph = array(required(item, "graph"), "graph");
+            if (graph.values().isEmpty()) {
+                throw new IllegalArgumentException("finding graph must not be empty");
+            }
+            for (Node graphNode : graph.values()) {
+                ObjectNode graphObject = object(graphNode, "graph[]");
+                requireFields(graphObject, "graph[]", "role", "label");
+                String role = requiredString(required(graphObject, "role"), "graph[].role");
+                if (!Set.of("ENTRY", "SITE", "SOURCE", "DESERIALIZE", "CALLBACK", "BRIDGE",
+                        "STEP", "IMPACT", "BOUNDARY").contains(role)) {
+                    throw new IllegalArgumentException("unsupported graph role: " + role);
+                }
+                requiredString(required(graphObject, "label"), "graph[].label");
+            }
+            ObjectNode proof = object(required(item, "proof"), "proof");
+            requireFields(proof, "proof", "entry", "site", "input", "callback", "bridge",
+                    "terminal", "feasibility");
+            for (String key : List.of("entry", "site", "input", "callback", "bridge",
+                    "terminal", "feasibility")) {
+                requiredString(required(proof, key), "proof." + key);
+            }
+            List<String> findingLimits = optionalLimits(item, "limits", "findings[].limits");
+            if ("COMPLETE".equals(status) && !findingLimits.isEmpty()) {
+                throw new IllegalArgumentException("complete finding has proof limits");
+            }
+            if (!"COMPLETE".equals(status) && findingLimits.isEmpty()) {
+                throw new IllegalArgumentException("incomplete finding needs a named proof limit");
+            }
             ChainRecord record = new ChainRecord(
-                    string(required(item, "id"), "id"),
-                    chainKeyNode == null ? "" : string(chainKeyNode, "chain_key"),
-                    string(required(item, "rule_id"), "rule_id"),
-                    string(required(item, "category"), "category"),
-                    string(required(item, "severity"), "severity"),
-                    string(required(entry, "class"), "entry.class"),
-                    string(required(entry, "method"), "entry.method"),
-                    string(required(entry, "descriptor"), "entry.descriptor"),
-                    string(required(entry, "kind"), "entry.kind"),
-                    string(required(sink, "class"), "sink.class"),
-                    string(required(sink, "method"), "sink.method"),
-                    string(required(sink, "descriptor"), "sink.descriptor"),
+                    id, id, "JUST-REPORT-V2", "FINDING", status,
+                    requiredString(required(entry, "owner"), "entry.owner"),
+                    requiredString(required(entry, "method"), "entry.method"),
+                    requiredString(required(entry, "descriptor"), "entry.descriptor"),
+                    optionalString(entry, "kind"),
+                    requiredString(required(impact, "owner"), "impact.owner"),
+                    requiredString(required(impact, "method"), "impact.method"),
+                    requiredString(required(impact, "descriptor"), "impact.descriptor"),
                     canonicalWithoutId(item),
-                    bool(required(item, "exported"), "exported"));
+                    true);
             if (byIdentity.put(record.variantIdentity(), record) != null) {
                 throw new IllegalArgumentException("duplicate canonical chain identity: "
                         + record.variantIdentity());
@@ -150,6 +215,72 @@ public final class CanonicalReportReader {
             records.add(record);
         }
         return new Snapshot(schema, records);
+    }
+
+    private static void requireFields(ObjectNode object, String name, String... allowed) {
+        java.util.Set<String> fields = Set.of(allowed);
+        for (String key : object.fields().keySet()) {
+            if (!fields.contains(key)) {
+                throw new IllegalArgumentException("unexpected field in " + name + ": " + key);
+            }
+        }
+        for (String key : allowed) {
+            if (!key.equals("kind") && !key.equals("role") && !key.equals("limits")
+                    && !key.equals("candidates") && !key.equals("exported")
+                    && !object.fields().containsKey(key)) {
+                throw new IllegalArgumentException("missing field: " + name + "." + key);
+            }
+        }
+    }
+
+    private static String optionalString(ObjectNode object, String key) {
+        Node value = object.fields().get(key);
+        return value == null ? "" : requiredString(value, key);
+    }
+
+    private static List<String> optionalLimits(ObjectNode object, String key, String name) {
+        Node value = object.fields().get(key);
+        if (value == null) {
+            return List.of();
+        }
+        ArrayNode array = array(value, name);
+        if (array.values().isEmpty()) {
+            throw new IllegalArgumentException("limits must not be empty: " + name);
+        }
+        Set<String> seen = new java.util.HashSet<>();
+        List<String> limits = new ArrayList<>();
+        for (Node item : array.values()) {
+            String limit = requiredString(item, name + "[]");
+            if (!seen.add(limit)) {
+                throw new IllegalArgumentException("duplicate limit: " + name + "=" + limit);
+            }
+            limits.add(limit);
+        }
+        return List.copyOf(limits);
+    }
+
+    private static Long optionalNonNegativeInteger(ObjectNode object, String key, String name) {
+        Node value = object.fields().get(key);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof ScalarNode scalar)
+                || !scalar.raw().matches("0|[1-9][0-9]*")) {
+            throw new IllegalArgumentException("expected non-negative integer: " + name);
+        }
+        try {
+            return Long.parseLong(scalar.raw());
+        } catch (NumberFormatException failure) {
+            throw new IllegalArgumentException("integer out of range: " + name, failure);
+        }
+    }
+
+    private static String requiredString(Node node, String name) {
+        String value = string(node, name);
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("expected non-blank string: " + name);
+        }
+        return value;
     }
 
     private static Node required(ObjectNode object, String key) {
@@ -179,14 +310,6 @@ public final class CanonicalReportReader {
             throw new IllegalArgumentException("expected string: " + name);
         }
         return value.value();
-    }
-
-    private static boolean bool(Node node, String name) {
-        if (!(node instanceof ScalarNode value)
-                || (!"true".equals(value.raw()) && !"false".equals(value.raw()))) {
-            throw new IllegalArgumentException("expected boolean: " + name);
-        }
-        return "true".equals(value.raw());
     }
 
     private static String canonicalWithoutId(ObjectNode object) {

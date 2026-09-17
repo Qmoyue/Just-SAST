@@ -251,6 +251,10 @@ public final class ScanPipeline {
         int targetFeature = jdkFeature(jdkSource);
             BytecodeFrontend.ScopedLoad scopedApplication = loadApplication(frontend, targets,
                     targetFeature, inputTracker);
+            if (!scopedApplication.unparseableArtifactIndexes().isEmpty()) {
+                throw new IOException("INPUT_UNPARSEABLE: artifact indexes "
+                        + scopedApplication.unparseableArtifactIndexes());
+            }
             LoadResult applicationLoad = scopedApplication.load();
             java.util.Set<String> demandRoots = modePolicy.demandRootClasses(
                     scopedApplication.applicationClassNames());

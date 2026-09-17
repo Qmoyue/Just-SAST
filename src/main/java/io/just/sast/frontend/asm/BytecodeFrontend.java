@@ -120,6 +120,7 @@ public final class BytecodeFrontend {
                              Map<String, Integer> classArtifactIndexes,
                              Map<String, List<Integer>> duplicateArtifactIndexes,
                              Map<String, List<String>> artifactDetails,
+                             List<Integer> unparseableArtifactIndexes,
                              ApplicationResourceFacts applicationResourceFacts) {
         public ScopedLoad {
             load = load == null ? new LoadResult(Map.of(), List.of(), 0, 0) : load;
@@ -153,6 +154,14 @@ public final class BytecodeFrontend {
                 }
             }
             artifactDetails = Map.copyOf(detailCopy);
+            if (unparseableArtifactIndexes == null) {
+                unparseableArtifactIndexes = List.of();
+            } else {
+                if (unparseableArtifactIndexes.stream().anyMatch(index -> index == null || index < 0)) {
+                    throw new IllegalArgumentException("unparseable artifact indexes are invalid");
+                }
+                unparseableArtifactIndexes = List.copyOf(unparseableArtifactIndexes);
+            }
             applicationResourceFacts = applicationResourceFacts == null
                     ? ApplicationResourceFacts.empty() : applicationResourceFacts;
         }
@@ -160,7 +169,7 @@ public final class BytecodeFrontend {
         /** Compatibility constructor for callers interested only in application scope. */
         public ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames) {
             this(load, applicationClassNames, Map.of(), Map.of(), Map.of(),
-                    ApplicationResourceFacts.empty());
+                    List.of(), ApplicationResourceFacts.empty());
         }
 
         /** Compatibility constructor for callers that do not consume embedded provenance. */
@@ -168,7 +177,7 @@ public final class BytecodeFrontend {
                           Map<String, Integer> classArtifactIndexes,
                           Map<String, List<Integer>> duplicateArtifactIndexes) {
             this(load, applicationClassNames, classArtifactIndexes, duplicateArtifactIndexes,
-                    Map.of(), ApplicationResourceFacts.empty());
+                    Map.of(), List.of(), ApplicationResourceFacts.empty());
         }
     }
 
@@ -236,9 +245,14 @@ public final class BytecodeFrontend {
                                     ? accumulator::acceptResource : null,
                             targetFeature, inputBudget, inputTracker);
                     accumulator.addReasons(stream.completenessReasons());
+                    if (stream.classesEmitted() == 0
+                            && stream.completenessReasons().contains("ARCHIVE_CORRUPT")) {
+                        accumulator.markUnparseableArtifact(artifactIndex);
+                    }
                 } catch (IOException e) {
                     String origin = target == null ? "<null>" : target.toString();
                     accumulator.diagnostics.add(new ParseDiagnostic(origin, e.getMessage()));
+                    accumulator.markUnparseableArtifact(artifactIndex);
                     JustLogger.error("读取输入失败 {}: {}", origin, e.getMessage());
                 }
                 // Keep artifact ownership aligned with the synchronous reader callback.  A
@@ -482,6 +496,7 @@ public final class BytecodeFrontend {
         private final Map<String, Integer> classArtifactIndexes = new LinkedHashMap<>();
         private final Map<String, List<Integer>> duplicateArtifactIndexes = new LinkedHashMap<>();
         private final Map<String, List<String>> artifactDetails = new LinkedHashMap<>();
+        private final LinkedHashSet<Integer> unparseableArtifactIndexes = new LinkedHashSet<>();
         private final ApplicationResourceParser.Collector resourceCollector =
                 new ApplicationResourceParser.Collector(inputBudget);
         private final List<ClassBytes> batch = new ArrayList<>(STREAM_BATCH_SIZE);
@@ -510,6 +525,10 @@ public final class BytecodeFrontend {
             if (reasons != null) {
                 completenessReasons.addAll(reasons);
             }
+        }
+
+        private void markUnparseableArtifact(int artifactIndex) {
+            unparseableArtifactIndexes.add(artifactIndex);
         }
 
         private void acceptResource(String path, byte[] bytes, String origin) {
@@ -557,7 +576,8 @@ public final class BytecodeFrontend {
 
         private ScopedLoad scopedResult() {
             return new ScopedLoad(result(), applicationClassNames, classArtifactIndexes,
-                    duplicateArtifactIndexes, artifactDetails, resourceCollector.finish());
+                    duplicateArtifactIndexes, artifactDetails,
+                    List.copyOf(unparseableArtifactIndexes), resourceCollector.finish());
         }
     }
 
