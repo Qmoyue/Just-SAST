@@ -1,12 +1,16 @@
 package io.just.sast.cpg.build;
 
 import io.just.sast.analysis.callgraph.CallGraphBuilder;
+import io.just.sast.analysis.entry.ApplicationEntryIndex;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
+import io.just.sast.config.RuleEngine;
+import io.just.sast.config.RuleSet;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.frontend.asm.FactsExtractor;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.HandleRef;
+import io.just.sast.model.HttpExternalSource;
 import io.just.sast.model.InsnFact;
 import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.model.LoadResult;
@@ -26,6 +30,7 @@ import org.objectweb.asm.tree.MethodNode;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -138,6 +143,42 @@ class CpgBuilderProgramUniverseTest {
     }
 
     @Test
+    void asmHttpHandlerBecomesTypedRequestSourceFacts() {
+        byte[] bytes = httpHandlerClassBytes();
+        ClassNode node = new ClassNode();
+        new ClassReader(bytes).accept(node, 0);
+        ClassInfo info = new FactsExtractor().extract(node);
+        LoadResult load = new LoadResult(Map.of(info.internalName(), info), List.of(), 1, 61);
+
+        Graph graph = new CpgBuilder().build(load).graph();
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(RuleSet.EMPTY, new ClassHierarchy(load.classes(), null)),
+                Set.of(info.internalName()), true);
+        String handlerKey = info.internalName() + "#handle"
+                + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR;
+
+        assertTrue(index.isHttpHandlerMethod(handlerKey));
+        assertTrue(index.isExternalEntryMethod(handlerKey));
+        assertEquals(6, index.httpExternalSourcesFor(handlerKey).size());
+        assertEquals(3, index.httpExternalSources().stream()
+                .filter(HttpExternalSource::externalInput).count());
+        assertTrue(index.httpExternalSources().stream().anyMatch(source ->
+                source.kind() == HttpExternalSource.Kind.HEADER
+                        && source.valueRole() == HttpExternalSource.ValueRole.VALUE
+                        && "getFirst".equals(source.apiName())));
+        assertTrue(index.httpExternalSources().stream().anyMatch(source ->
+                source.kind() == HttpExternalSource.Kind.QUERY
+                        && source.externalInput()
+                        && "getQuery".equals(source.apiName())));
+        assertTrue(index.httpExternalSources().stream().anyMatch(source ->
+                source.kind() == HttpExternalSource.Kind.BODY
+                        && source.externalInput()
+                        && "readAllBytes".equals(source.apiName())));
+        assertTrue(index.httpContextRegistrations().isEmpty(),
+                "the source fixture has no createContext registration; P3.6 owns that join");
+    }
+
+    @Test
     void missingLambdaBootstrapRemainsVisibleAsUnknown() {
         String owner = "fixture/MissingBootstrap";
         String descriptor = "()Ljava/lang/Runnable;";
@@ -189,6 +230,45 @@ class CpgBuilderProgramUniverseTest {
         make.visitInsn(Opcodes.ARETURN);
         make.visitMaxs(1, 0);
         make.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] httpHandlerClassBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "fixture/HttpHandlerHost", null,
+                "java/lang/Object", new String[] {ApplicationEntryIndex.HTTP_HANDLER_OWNER});
+        MethodVisitor handle = writer.visitMethod(Opcodes.ACC_PUBLIC,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR, null, null);
+        handle.visitCode();
+        handle.visitVarInsn(Opcodes.ALOAD, 1);
+        handle.visitMethodInsn(Opcodes.INVOKEINTERFACE,
+                ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestHeaders",
+                "()Lcom/sun/net/httpserver/Headers;", true);
+        handle.visitLdcInsn("X-Lookup-URL");
+        handle.visitMethodInsn(Opcodes.INVOKEVIRTUAL, ApplicationEntryIndex.HTTP_HEADERS_OWNER,
+                "getFirst", "(Ljava/lang/String;)Ljava/lang/String;", false);
+        handle.visitInsn(Opcodes.POP);
+
+        handle.visitVarInsn(Opcodes.ALOAD, 1);
+        handle.visitMethodInsn(Opcodes.INVOKEINTERFACE,
+                ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestURI",
+                "()Ljava/net/URI;", true);
+        handle.visitMethodInsn(Opcodes.INVOKEVIRTUAL, ApplicationEntryIndex.HTTP_URI_OWNER,
+                "getQuery", "()Ljava/lang/String;", false);
+        handle.visitInsn(Opcodes.POP);
+
+        handle.visitVarInsn(Opcodes.ALOAD, 1);
+        handle.visitMethodInsn(Opcodes.INVOKEINTERFACE,
+                ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestBody",
+                "()Ljava/io/InputStream;", true);
+        handle.visitMethodInsn(Opcodes.INVOKEVIRTUAL,
+                ApplicationEntryIndex.JAVA_INPUT_STREAM_OWNER, "readAllBytes", "()[B", false);
+        handle.visitInsn(Opcodes.POP);
+        handle.visitInsn(Opcodes.RETURN);
+        handle.visitMaxs(2, 2);
+        handle.visitEnd();
         writer.visitEnd();
         return writer.toByteArray();
     }

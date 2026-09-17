@@ -13,6 +13,7 @@ import io.just.sast.cpg.graph.Node;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.ApplicationResourceFacts;
+import io.just.sast.model.HttpExternalSource;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -683,6 +684,157 @@ class ApplicationEntryIndexContractTest {
                             || policy == ApplicationEntryIndex.MaterializationPolicy.DEFERRED_SUFFIX,
                     policy.retainsForComposition(), status.name());
         }
+    }
+
+    @Test
+    void indexesTypedHttpHandlerAndRequestSourcesWithoutCreatingSite() {
+        String handlerOwner = "fixture/app/HttpHandlerImpl";
+        String handlerKey = handlerOwner + "#handle"
+                + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR;
+        Graph graph = new Graph();
+        Node handler = graph.methodNode(handlerOwner, ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR, false);
+        handler.propsNote("methodAccess", Modifier.PUBLIC);
+        handler.propsNote("classInterfaces", List.of(ApplicationEntryIndex.HTTP_HANDLER_OWNER));
+
+        graph.addCallNode(ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestHeaders",
+                "()Lcom/sun/net/httpserver/Headers;", "INTERFACE", null, 10,
+                handlerOwner, ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.addCallNode(ApplicationEntryIndex.HTTP_HEADERS_OWNER, "getFirst",
+                "(Ljava/lang/String;)Ljava/lang/String;", "VIRTUAL", null, 11,
+                handlerOwner, ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.addCallNode(ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestURI",
+                "()Ljava/net/URI;", "INTERFACE", null, 20, handlerOwner,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.addCallNode(ApplicationEntryIndex.HTTP_URI_OWNER, "getQuery",
+                "()Ljava/lang/String;", "VIRTUAL", null, 21, handlerOwner,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.addCallNode(ApplicationEntryIndex.HTTP_URI_OWNER, "getRawQuery",
+                "()Ljava/lang/String;", "VIRTUAL", null, 22, handlerOwner,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.addCallNode(ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestBody",
+                "()Ljava/io/InputStream;", "INTERFACE", null, 30, handlerOwner,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.addCallNode(ApplicationEntryIndex.JAVA_INPUT_STREAM_OWNER, "readAllBytes",
+                "()[B", "VIRTUAL", null, 31, handlerOwner,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.addCallNode(ApplicationEntryIndex.HTTP_HEADERS_OWNER, "getFirst",
+                "()Ljava/lang/String;", "VIRTUAL", null, 40, handlerOwner,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(RuleSet.EMPTY, new ClassHierarchy(Map.of(), null)),
+                Set.of(handlerOwner), true);
+
+        assertTrue(index.isHttpHandlerMethod(handlerKey));
+        assertTrue(index.isExternalEntryMethod(handlerKey));
+        assertTrue(index.executionEntries().stream().anyMatch(entry ->
+                handlerKey.equals(entry.methodKey())
+                        && "http-handler".equals(entry.entryKind())
+                        && entry.externalControlProven()));
+
+        List<HttpExternalSource> sources = index.httpExternalSourcesFor(handlerKey);
+        assertEquals(7, sources.size(), "only exact HTTP request APIs become typed facts");
+        HttpExternalSource headerContainer = sources.stream()
+                .filter(source -> "getRequestHeaders".equals(source.apiName()))
+                .findFirst().orElseThrow();
+        assertEquals(HttpExternalSource.Kind.HEADER, headerContainer.kind());
+        assertEquals(HttpExternalSource.ValueRole.CONTAINER, headerContainer.valueRole());
+        assertFalse(headerContainer.externalInput());
+        assertEquals("L" + ApplicationEntryIndex.HTTP_EXCHANGE_OWNER + ";",
+                headerContainer.receiver().descriptor());
+        assertEquals("L" + ApplicationEntryIndex.HTTP_HEADERS_OWNER + ";",
+                headerContainer.valueDescriptor());
+
+        HttpExternalSource headerValue = sources.stream()
+                .filter(source -> "getFirst".equals(source.apiName()))
+                .findFirst().orElseThrow();
+        assertEquals(HttpExternalSource.ValueRole.VALUE, headerValue.valueRole());
+        assertTrue(headerValue.externalInput());
+        assertEquals(List.of(new HttpExternalSource.Slot(0, "Ljava/lang/String;")),
+                headerValue.arguments());
+        assertEquals("Ljava/lang/String;", headerValue.valueDescriptor());
+        assertEquals("call:" + headerValue.callId() + "@" + handlerKey + ":return",
+                headerValue.valueIdentity());
+
+        HttpExternalSource queryValue = sources.stream()
+                .filter(source -> "getQuery".equals(source.apiName()))
+                .findFirst().orElseThrow();
+        assertEquals(HttpExternalSource.Kind.QUERY, queryValue.kind());
+        assertTrue(queryValue.externalInput());
+        assertEquals("L" + ApplicationEntryIndex.HTTP_URI_OWNER + ";",
+                queryValue.receiver().descriptor());
+
+        HttpExternalSource bodyValue = sources.stream()
+                .filter(source -> "readAllBytes".equals(source.apiName()))
+                .findFirst().orElseThrow();
+        assertEquals(HttpExternalSource.Kind.BODY, bodyValue.kind());
+        assertTrue(bodyValue.externalInput());
+        assertEquals("[B", bodyValue.valueDescriptor());
+
+        assertEquals(sources, index.httpExternalSources());
+        assertThrows(UnsupportedOperationException.class, sources::clear);
+        assertTrue(index.httpContextRegistrations().isEmpty(),
+                "source facts alone must not manufacture a createContext site");
+        assertTrue(index.terminalImpacts().isEmpty());
+    }
+
+    @Test
+    void exactHttpHandlerMethodRequiresImplementationTypeEvidence() {
+        String owner = "fixture/app/LooksLikeHandler";
+        Graph graph = new Graph();
+        Node method = graph.methodNode(owner, "handle",
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR, false);
+        method.propsNote("methodAccess", Modifier.PUBLIC);
+        graph.addCallNode(ApplicationEntryIndex.HTTP_HEADERS_OWNER, "getFirst",
+                "(Ljava/lang/String;)Ljava/lang/String;", "VIRTUAL", null, 2,
+                owner, "handle", ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(RuleSet.EMPTY, new ClassHierarchy(Map.of(), null)),
+                Set.of(owner), true);
+
+        assertFalse(index.isHttpHandlerMethod(owner + "#handle"
+                        + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR),
+                "a matching method signature without implements evidence is not a handler");
+        assertFalse(index.isExternalEntryMethod(owner + "#handle"
+                        + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR));
+        assertEquals(1, index.httpExternalSources().size(),
+                "the exact source API remains a raw typed fact independent of site joining");
+    }
+
+    @Test
+    void unknownApplicationScopeDoesNotPromoteHttpHandlerOrRequestSource() {
+        String owner = "fixture/app/UnknownScopeHandler";
+        Graph graph = new Graph();
+        Node method = graph.methodNode(owner, "handle",
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR, false);
+        method.propsNote("methodAccess", Modifier.PUBLIC);
+        method.propsNote("classInterfaces", List.of(ApplicationEntryIndex.HTTP_HANDLER_OWNER));
+        graph.addCallNode(ApplicationEntryIndex.HTTP_HEADERS_OWNER, "getFirst",
+                "(Ljava/lang/String;)Ljava/lang/String;", "VIRTUAL", null, 0,
+                owner, "handle", ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(RuleSet.EMPTY, new ClassHierarchy(Map.of(), null)),
+                Set.of(), false);
+
+        assertTrue(index.httpExternalSources().isEmpty());
+        assertTrue(index.applicationEntries().isEmpty());
+        assertFalse(index.isHttpHandlerMethod(owner + "#handle"
+                + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR));
+        assertTrue(index.completenessReasons().contains("APPLICATION_SCOPE_UNKNOWN"));
     }
 
     @Test

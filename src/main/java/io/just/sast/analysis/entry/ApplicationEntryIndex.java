@@ -17,6 +17,7 @@ import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.Descriptor;
 import io.just.sast.model.ApplicationResourceFacts;
+import io.just.sast.model.HttpExternalSource;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -58,6 +59,14 @@ public final class ApplicationEntryIndex {
                     + "Lcom/sun/net/httpserver/HttpContext;";
     public static final String HTTP_HANDLER_DESCRIPTOR =
             "Lcom/sun/net/httpserver/HttpHandler;";
+    public static final String HTTP_HANDLER_OWNER = "com/sun/net/httpserver/HttpHandler";
+    public static final String HTTP_HANDLER_HANDLE_NAME = "handle";
+    public static final String HTTP_HANDLER_HANDLE_DESCRIPTOR =
+            "(Lcom/sun/net/httpserver/HttpExchange;)V";
+    public static final String HTTP_EXCHANGE_OWNER = "com/sun/net/httpserver/HttpExchange";
+    public static final String HTTP_HEADERS_OWNER = "com/sun/net/httpserver/Headers";
+    public static final String HTTP_URI_OWNER = "java/net/URI";
+    public static final String JAVA_INPUT_STREAM_OWNER = "java/io/InputStream";
     private static final int MAX_SLICE_METHODS = 100_000;
     private static final String FRAMEWORK_ENTRY_RULE = "builtin:framework-entry";
     private static final String FRAMEWORK_BINDING_RULE = "builtin:framework-binding";
@@ -600,6 +609,8 @@ public final class ApplicationEntryIndex {
     private final Map<String, List<ApplicationResourceFacts.RouteBinding>> routeBindingsByMember;
     private final List<HttpContextRegistration> httpContextRegistrations;
     private final Map<String, List<HttpContextRegistration>> httpContextRegistrationsByMethod;
+    private final List<HttpExternalSource> httpExternalSources;
+    private final Map<String, List<HttpExternalSource>> httpExternalSourcesByMethod;
     private final List<DeserializeSite> secondaryDeserializeSites;
     private final Set<String> applicationObjectInputHosts;
     private final List<TerminalImpact> terminalImpacts;
@@ -629,6 +640,7 @@ public final class ApplicationEntryIndex {
                                   List<FilterControl> filterControls,
                                   ApplicationResourceFacts resourceFacts,
                                   List<HttpContextRegistration> httpContextRegistrations,
+                                  List<HttpExternalSource> httpExternalSources,
                                   List<TerminalImpact> terminalImpacts,
                                   List<String> entryForwardSlice,
                                   List<String> sinkReverseSlice,
@@ -668,6 +680,9 @@ public final class ApplicationEntryIndex {
                 httpContextRegistrations);
         this.httpContextRegistrationsByMethod = immutableHttpContextRegistrationIndex(
                 this.httpContextRegistrations);
+        this.httpExternalSources = immutableHttpExternalSources(httpExternalSources);
+        this.httpExternalSourcesByMethod = immutableHttpExternalSourceIndex(
+                this.httpExternalSources);
         this.secondaryDeserializeSites = this.deserializeSites.stream()
                 .filter(ApplicationEntryIndex::isSecondaryDeserializeSite)
                 .toList();
@@ -831,6 +846,137 @@ public final class ApplicationEntryIndex {
                             HTTP_HANDLER_DESCRIPTOR, ValueState.UNKNOWN, null)));
         }
         return immutableHttpContextRegistrations(result);
+    }
+
+    /** Discover exact request-header/query/body API facts from application-owned call sites. */
+    private static List<HttpExternalSource> discoverHttpExternalSources(
+            Graph graph, Set<String> applicationOwners, boolean applicationScopeKnown,
+            RuleEngine rules) {
+        if (graph == null || !applicationScopeKnown || applicationOwners.isEmpty()) {
+            return List.of();
+        }
+        List<HttpExternalSource> result = new ArrayList<>();
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            if (call == null || !applicationOwners.contains(call.methodOwner())) {
+                continue;
+            }
+            HttpSourceSpec spec = httpSourceSpec(call, rules);
+            if (spec == null) {
+                continue;
+            }
+            String hostMethodKey = methodKey(call.methodOwner(), call.methodName(),
+                    call.methodDescriptor());
+            List<HttpExternalSource.Slot> arguments = new ArrayList<>();
+            for (int index = 0; index < spec.argumentDescriptors().size(); index++) {
+                arguments.add(new HttpExternalSource.Slot(index,
+                        spec.argumentDescriptors().get(index)));
+            }
+            result.add(new HttpExternalSource(call.id(), hostMethodKey, call.offset(),
+                    spec.apiOwner(), spec.apiName(), spec.apiDescriptor(), spec.kind(),
+                    spec.valueRole(), new HttpExternalSource.Slot(-1, spec.receiverDescriptor()),
+                    arguments, spec.valueDescriptor()));
+        }
+        return immutableHttpExternalSources(result);
+    }
+
+    private static HttpSourceSpec httpSourceSpec(Node call, RuleEngine rules) {
+        if (call == null || call.owner() == null || call.name() == null
+                || call.descriptor() == null) {
+            return null;
+        }
+        if (isExactOrSubtype(call.owner(), HTTP_EXCHANGE_OWNER, rules)) {
+            if ("getRequestHeaders".equals(call.name())
+                    && "()Lcom/sun/net/httpserver/Headers;".equals(call.descriptor())) {
+                return new HttpSourceSpec(HttpExternalSource.Kind.HEADER,
+                        HttpExternalSource.ValueRole.CONTAINER, HTTP_EXCHANGE_OWNER,
+                        "getRequestHeaders", call.descriptor(), "L" + HTTP_EXCHANGE_OWNER + ";",
+                        List.of(), "L" + HTTP_HEADERS_OWNER + ";");
+            }
+            if ("getRequestURI".equals(call.name())
+                    && "()Ljava/net/URI;".equals(call.descriptor())) {
+                return new HttpSourceSpec(HttpExternalSource.Kind.QUERY,
+                        HttpExternalSource.ValueRole.CONTAINER, HTTP_EXCHANGE_OWNER,
+                        "getRequestURI", call.descriptor(), "L" + HTTP_EXCHANGE_OWNER + ";",
+                        List.of(), "L" + HTTP_URI_OWNER + ";");
+            }
+            if ("getRequestBody".equals(call.name())
+                    && "()Ljava/io/InputStream;".equals(call.descriptor())) {
+                return new HttpSourceSpec(HttpExternalSource.Kind.BODY,
+                        HttpExternalSource.ValueRole.CONTAINER, HTTP_EXCHANGE_OWNER,
+                        "getRequestBody", call.descriptor(), "L" + HTTP_EXCHANGE_OWNER + ";",
+                        List.of(), "L" + JAVA_INPUT_STREAM_OWNER + ";");
+            }
+        }
+        if (isExactOrSubtype(call.owner(), HTTP_HEADERS_OWNER, rules)
+                && "getFirst".equals(call.name())
+                && "(Ljava/lang/String;)Ljava/lang/String;".equals(call.descriptor())) {
+            return new HttpSourceSpec(HttpExternalSource.Kind.HEADER,
+                    HttpExternalSource.ValueRole.VALUE, HTTP_HEADERS_OWNER, "getFirst",
+                    call.descriptor(), "L" + HTTP_HEADERS_OWNER + ";",
+                    List.of("Ljava/lang/String;"), "Ljava/lang/String;");
+        }
+        if (isExactOrSubtype(call.owner(), HTTP_URI_OWNER, rules)
+                && ("getQuery".equals(call.name()) || "getRawQuery".equals(call.name()))
+                && "()Ljava/lang/String;".equals(call.descriptor())) {
+            return new HttpSourceSpec(HttpExternalSource.Kind.QUERY,
+                    HttpExternalSource.ValueRole.VALUE, HTTP_URI_OWNER, call.name(),
+                    call.descriptor(), "L" + HTTP_URI_OWNER + ";", List.of(),
+                    "Ljava/lang/String;");
+        }
+        if (isExactOrSubtype(call.owner(), JAVA_INPUT_STREAM_OWNER, rules)) {
+            if ("read".equals(call.name())
+                    && ("()I".equals(call.descriptor())
+                    || "([B)I".equals(call.descriptor())
+                    || "([BII)I".equals(call.descriptor()))) {
+                return new HttpSourceSpec(HttpExternalSource.Kind.BODY,
+                        HttpExternalSource.ValueRole.VALUE, JAVA_INPUT_STREAM_OWNER, "read",
+                        call.descriptor(), "L" + JAVA_INPUT_STREAM_OWNER + ";",
+                        bodyArgumentDescriptors(call.descriptor()),
+                        "I");
+            }
+            if ("readAllBytes".equals(call.name()) && "()[B".equals(call.descriptor())) {
+                return new HttpSourceSpec(HttpExternalSource.Kind.BODY,
+                        HttpExternalSource.ValueRole.VALUE, JAVA_INPUT_STREAM_OWNER, "readAllBytes",
+                        call.descriptor(), "L" + JAVA_INPUT_STREAM_OWNER + ";",
+                        List.of(), "[B");
+            }
+            if ("readNBytes".equals(call.name())
+                    && ("(I)[B".equals(call.descriptor())
+                    || "([BII)I".equals(call.descriptor()))) {
+                return new HttpSourceSpec(HttpExternalSource.Kind.BODY,
+                        HttpExternalSource.ValueRole.VALUE, JAVA_INPUT_STREAM_OWNER, "readNBytes",
+                        call.descriptor(), "L" + JAVA_INPUT_STREAM_OWNER + ";",
+                        bodyArgumentDescriptors(call.descriptor()),
+                        "(I)[B".equals(call.descriptor()) ? "[B" : "I");
+            }
+        }
+        return null;
+    }
+
+    private static List<String> bodyArgumentDescriptors(String descriptor) {
+        return switch (descriptor) {
+            case "()I" -> List.of();
+            case "([B)I" -> List.of("[B");
+            case "([BII)I" -> List.of("[B", "I", "I");
+            default -> List.of("I");
+        };
+    }
+
+    private static boolean isExactOrSubtype(String owner, String target, RuleEngine rules) {
+        return target.equals(owner) || (rules != null && rules.isSubtypeOf(owner, target));
+    }
+
+    private record HttpSourceSpec(HttpExternalSource.Kind kind,
+                                  HttpExternalSource.ValueRole valueRole,
+                                  String apiOwner,
+                                  String apiName,
+                                  String apiDescriptor,
+                                  String receiverDescriptor,
+                                  List<String> argumentDescriptors,
+                                  String valueDescriptor) {
+        private HttpSourceSpec {
+            argumentDescriptors = List.copyOf(argumentDescriptors);
+        }
     }
 
     /** Discover CXF endpoint registration from the constructor/publish call sequence. */
@@ -1078,6 +1224,37 @@ public final class ApplicationEntryIndex {
                     .add(registration);
         }
         Map<String, List<HttpContextRegistration>> result = new TreeMap<>();
+        grouped.forEach((key, values) -> result.put(key, List.copyOf(values)));
+        return Map.copyOf(result);
+    }
+
+    private static List<HttpExternalSource> immutableHttpExternalSources(
+            List<HttpExternalSource> sources) {
+        Objects.requireNonNull(sources, "HTTP external sources");
+        if (sources.isEmpty()) {
+            return List.of();
+        }
+        return sources.stream().map(source ->
+                        Objects.requireNonNull(source, "HTTP external source"))
+                .sorted(Comparator.comparing(HttpExternalSource::hostMethodKey)
+                        .thenComparingInt(HttpExternalSource::callOffset)
+                        .thenComparingLong(HttpExternalSource::callId)
+                        .thenComparing(HttpExternalSource::apiKey))
+                .distinct().toList();
+    }
+
+    private static Map<String, List<HttpExternalSource>> immutableHttpExternalSourceIndex(
+            List<HttpExternalSource> sources) {
+        Objects.requireNonNull(sources, "HTTP external sources");
+        if (sources.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, List<HttpExternalSource>> grouped = new TreeMap<>();
+        for (HttpExternalSource source : sources) {
+            grouped.computeIfAbsent(source.hostMethodKey(), ignored -> new ArrayList<>())
+                    .add(source);
+        }
+        Map<String, List<HttpExternalSource>> result = new TreeMap<>();
         grouped.forEach((key, values) -> result.put(key, List.copyOf(values)));
         return Map.copyOf(result);
     }
@@ -1347,6 +1524,8 @@ public final class ApplicationEntryIndex {
                 owners, applicationScopeKnown);
         List<HttpContextRegistration> httpContextRegistrations =
                 discoverHttpContextRegistrations(graph, owners, applicationScopeKnown);
+        List<HttpExternalSource> httpExternalSources = discoverHttpExternalSources(
+                graph, owners, applicationScopeKnown, rules);
         List<FilterControl> filterControls = discoverFilterControls(graph, owners,
                 applicationScopeKnown);
         if (applicationScopeKnown) {
@@ -1555,6 +1734,7 @@ public final class ApplicationEntryIndex {
         return new ApplicationEntryIndex(applicationScopeKnown, hasDeserializeRoot, owners, entries, sites,
                 List.copyOf(deserializeHosts.values()), serviceEndpoints, filterControls, resources,
                 httpContextRegistrations,
+                httpExternalSources,
                 impacts,
                 forward, reverse, List.copyOf(intersection), dependency, reasons,
                 bindingCallbacks);
@@ -1634,6 +1814,26 @@ public final class ApplicationEntryIndex {
             return List.of();
         }
         return httpContextRegistrationsByMethod.getOrDefault(hostMethodKey, List.of());
+    }
+
+    /** Immutable typed HTTP request-source facts; this list does not imply a verified site. */
+    public List<HttpExternalSource> httpExternalSources() {
+        return httpExternalSources;
+    }
+
+    /** Typed HTTP request-source facts for one exact application host method. */
+    public List<HttpExternalSource> httpExternalSourcesFor(String hostMethodKey) {
+        if (hostMethodKey == null || hostMethodKey.isBlank()) {
+            return List.of();
+        }
+        return httpExternalSourcesByMethod.getOrDefault(hostMethodKey, List.of());
+    }
+
+    /** Whether an exact method is a concrete application-owned HttpHandler callback. */
+    public boolean isHttpHandlerMethod(String methodKey) {
+        return executionEntries.stream().anyMatch(entry -> entry.applicationOwned()
+                && "http-handler".equals(entry.entryKind())
+                && entry.methodKey().equals(methodKey));
     }
 
     /** Immutable application-owned route filters discovered from Filter#doFilter. */
@@ -2491,6 +2691,12 @@ public final class ApplicationEntryIndex {
                 && Modifier.isPublic(access) && Modifier.isStatic(access)) {
             return new FrameworkEntry("lifecycle-main", false, false);
         }
+        if (isHttpHandlerImplementation(method.owner(), classSupertypes, new TreeSet<>())
+                && HTTP_HANDLER_HANDLE_NAME.equals(method.name())
+                && HTTP_HANDLER_HANDLE_DESCRIPTOR.equals(method.descriptor())
+                && Modifier.isPublic(access)) {
+            return new FrameworkEntry("http-handler", true, true);
+        }
         // HttpServlet overrides are commonly protected (the public boundary is the servlet
         // container, not Java visibility).  Keep private helpers out while accepting public
         // or protected lifecycle callbacks with request/response parameters.
@@ -2523,6 +2729,22 @@ public final class ApplicationEntryIndex {
 
     private static boolean servletType(Node method, Map<String, Set<String>> classSupertypes) {
         return method != null && isServletType(method.owner(), classSupertypes, new TreeSet<>());
+    }
+
+    private static boolean isHttpHandlerImplementation(String owner,
+                                                        Map<String, Set<String>> classSupertypes,
+                                                        Set<String> visited) {
+        if (owner == null || owner.isBlank() || HTTP_HANDLER_OWNER.equals(owner)
+                || !visited.add(owner)) {
+            return false;
+        }
+        for (String type : classSupertypes.getOrDefault(owner, Set.of())) {
+            if (HTTP_HANDLER_OWNER.equals(type)
+                    || isHttpHandlerImplementation(type, classSupertypes, visited)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isServletType(String owner, Map<String, Set<String>> classSupertypes,
@@ -2693,6 +2915,7 @@ public final class ApplicationEntryIndex {
             deserializeSites.forEach(value -> update(digest, "site=" + value));
             serviceEndpoints.forEach(value -> update(digest, "service=" + value));
             httpContextRegistrations.forEach(value -> update(digest, "http-context=" + value));
+            httpExternalSources.forEach(value -> update(digest, "http-source=" + value));
             filterControls.forEach(value -> update(digest, "filter=" + value));
             routeBindings.forEach(value -> update(digest, "route=" + value));
             terminalImpacts.forEach(value -> update(digest, "impact=" + value));
