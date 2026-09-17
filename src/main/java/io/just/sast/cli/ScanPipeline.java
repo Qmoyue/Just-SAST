@@ -48,6 +48,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** 扫描管线编排：frontend → 层次 → CPG/调用图（构建后冻结）→ 黑板（串行三阶段）→ report。 */
 public final class ScanPipeline {
@@ -269,6 +270,7 @@ public final class ScanPipeline {
             load = loadWithJdkSlice(frontend, applicationLoad, jdkSource, ruleSet,
                     inputTracker);
             }
+        load = addMissingTypeReasons(load);
         // The frontend has already parsed every bounded input entry.  Before CPG construction,
         // retain only application-owned classes plus a generic, rule/reference-driven dependency
         // closure.  This is the graph-facing demand boundary: it reduces unrelated dependency
@@ -425,7 +427,8 @@ public final class ScanPipeline {
         Map<String, String> reportCalibrations = blackboard.chainCalibrations();
         Map<String, List<String>> reportNotes = blackboardNotes(blackboard);
         LinkedHashSet<String> completeness = new LinkedHashSet<>(completenessReasons(load, cpg.graph(),
-                reportOutcomes, blackboard.completenessReasons(), fast, jdkHome, targetFeature));
+                reportOutcomes, blackboard.completenessReasons(), fast, jdkHome, targetFeature,
+                dependencyGraph));
         if (jdkSource instanceof TargetJdkSource targetJdk) {
             completeness.addAll(targetJdk.completenessReasons());
         } else if (jdkSource instanceof JrtClassSource runtimeJdk) {
@@ -666,12 +669,34 @@ public final class ScanPipeline {
     }
 
     /** 将“没有发现”与“分析曾触顶/跳过内容”区分开，原因使用稳定类别而不泄漏路径。 */
+    private static LoadResult addMissingTypeReasons(LoadResult load) {
+        if (load == null) {
+            throw new IllegalArgumentException("load result is required");
+        }
+        List<String> missing = BytecodeFrontend.missingNonPlatformTypes(load);
+        if (missing.isEmpty()) {
+            return load;
+        }
+        LinkedHashSet<String> reasons = new LinkedHashSet<>(load.completenessReasons());
+        reasons.add("DEPENDENCY_INPUT_INCOMPLETE");
+        reasons.add("MISSING_TYPE");
+        missing.stream().map(type -> "MISSING_TYPE:" + type).forEach(reasons::add);
+        return new LoadResult(load.classes(), load.diagnostics(), load.filesScanned(),
+                load.targetMajorVersion(), List.copyOf(reasons), load.classProvenance(),
+                load.archiveMembers());
+    }
+
     private static List<String> completenessReasons(LoadResult load, io.just.sast.cpg.graph.Graph graph,
                                                      Map<Long, io.just.sast.blackboard.SinkOutcome> outcomes,
                                                      java.util.Set<String> analysisReasons,
-                                                     boolean fast, Path jdkHome, int targetFeature) {
+                                                     boolean fast, Path jdkHome, int targetFeature,
+                                                     DependencyGraph dependencyGraph) {
         LinkedHashSet<String> reasons = new LinkedHashSet<>(load.completenessReasons());
         reasons.addAll(analysisReasons);
+        if (reasons.stream().anyMatch(reason -> reason.startsWith("DUPLICATE_CLASS:"))) {
+            reasons.add("DUPLICATE_CLASS");
+        }
+        addDependencyGraphReasons(reasons, dependencyGraph);
         if (fast) {
             reasons.add("FAST_MODE");
         }
@@ -702,6 +727,36 @@ public final class ScanPipeline {
             }
         }
         return List.copyOf(reasons);
+    }
+
+    private static void addDependencyGraphReasons(Set<String> reasons,
+                                                  DependencyGraph dependencyGraph) {
+        if (dependencyGraph == null) {
+            return;
+        }
+        boolean incomplete = dependencyGraph.nodes().values().stream().anyMatch(node ->
+                node.resolution() == DependencyGraph.Resolution.UNRESOLVED
+                        || !node.error().isBlank())
+                || dependencyGraph.environmentConditions().stream()
+                .anyMatch(ScanPipeline::dependencyInputFailureCondition);
+        if (incomplete) {
+            reasons.add("DEPENDENCY_INPUT_INCOMPLETE");
+        }
+        boolean versionAmbiguous = dependencyGraph.nodes().values().stream().anyMatch(node ->
+                node.resolution() == DependencyGraph.Resolution.CONFLICT)
+                || dependencyGraph.environmentConditions().stream()
+                .anyMatch(condition -> condition.startsWith("MAVEN_CONFLICT:"));
+        if (versionAmbiguous) {
+            reasons.add("DEPENDENCY_VERSION_AMBIGUOUS");
+        }
+    }
+
+    private static boolean dependencyInputFailureCondition(String condition) {
+        if (condition == null || !condition.startsWith("MAVEN_DEPENDENCY_INPUT_INCOMPLETE")) {
+            return false;
+        }
+        return condition.equals("MAVEN_DEPENDENCY_INPUT_INCOMPLETE")
+                || condition.startsWith("MAVEN_DEPENDENCY_INPUT_INCOMPLETE:");
     }
 
     private static String chainProofCompleteness(List<Chain> chains,

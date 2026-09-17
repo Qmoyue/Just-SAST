@@ -1,10 +1,23 @@
 package io.just.sast.frontend.asm;
 
+import io.just.sast.model.ClassInfo;
+import io.just.sast.model.FieldInfo;
+import io.just.sast.model.FieldRef;
+import io.just.sast.model.HandleRef;
+import io.just.sast.model.InsnFact;
+import io.just.sast.model.InvokeDynamicRef;
+import io.just.sast.model.LoadResult;
+import io.just.sast.model.MethodInfo;
+import io.just.sast.model.MethodRef;
+import io.just.sast.model.Op;
+import io.just.sast.model.TryCatchFact;
+import io.just.sast.model.TypeRef;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.InputStream;
 import java.io.IOException;
+import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -51,6 +64,58 @@ class BytecodeFrontendTest {
         assertEquals(1, result.classCount());
         assertTrue(result.completenessReasons().contains("DUPLICATE_CLASS:" + name),
                 result.completenessReasons().toString());
+    }
+
+    @Test
+    void missingTypeFactsAreExactAndNeverInferCoordinates() {
+        String owner = "fixture/Entry";
+        MethodInfo method = new MethodInfo(owner, "run",
+                "(Lmissing/Parameter;[Lmissing/Array;)Lmissing/Return;",
+                Modifier.PUBLIC,
+                List.of(
+                        new InsnFact(0, Op.INVOKEVIRTUAL, List.of(new MethodRef(
+                                "missing/Owner", "call", "()Lmissing/Result;"))),
+                        new InsnFact(1, Op.GETFIELD, List.of(new FieldRef(
+                                "missing/FieldOwner", "value", "Lmissing/FieldValue;"))),
+                        new InsnFact(2, Op.CHECKCAST, List.of(new TypeRef("Lmissing/Type;"))),
+                        new InsnFact(3, Op.LDC, List.of(new HandleRef(1, "missing/Handle",
+                                "load", "(Lmissing/HandleArg;)Lmissing/HandleRet;"))),
+                        new InsnFact(4, Op.INVOKEDYNAMIC, List.of(new InvokeDynamicRef(
+                                "make", "(Lmissing/DynamicArg;)Lmissing/DynamicRet;",
+                                new HandleRef(6, "missing/Bootstrap", "bootstrap",
+                                        "(Lmissing/BootstrapArg;)Lmissing/BootstrapResult;"),
+                                List.of(new TypeRef("Lmissing/BootstrapType;"),
+                                        new MethodRef("missing/BootstrapTarget", "target",
+                                                "()Lmissing/BootstrapResult;"))))),
+                        new InsnFact(5, Op.RETURN, List.of())),
+                List.of(new TryCatchFact(0, 5, 5, "missing/Error")), false, -1,
+                List.of("Lmissing/MethodAnnotation;"));
+        ClassInfo entry = new ClassInfo(owner, "missing/Base", List.of("missing/Interface"),
+                Modifier.PUBLIC, List.of(method),
+                List.of(new FieldInfo(owner, "values", "[Lmissing/Field;", Modifier.PRIVATE,
+                        null, "Ljava/util/List<Lmissing/Generic;>;")),
+                List.of("Lmissing/Annotation;"));
+        ClassInfo defined = new ClassInfo("missing/Defined", "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(new MethodInfo("missing/Defined", "value", "()V",
+                        Modifier.PUBLIC, List.of(new InsnFact(0, Op.RETURN, List.of())),
+                        List.of(), false)), List.of());
+        MethodInfo definedReference = new MethodInfo(owner, "defined", "()Lmissing/Defined;",
+                Modifier.PUBLIC, List.of(new InsnFact(0, Op.RETURN, List.of())), List.of(), false);
+        entry = new ClassInfo(owner, entry.superName(), entry.interfaces(), entry.access(),
+                List.of(method, definedReference), entry.fields(), entry.annotationDescriptors());
+
+        LoadResult load = new LoadResult(Map.of(entry.internalName(), entry,
+                defined.internalName(), defined), List.of(), 2, 61);
+
+        assertEquals(List.of(
+                "missing/Annotation", "missing/Array", "missing/Base", "missing/Bootstrap",
+                "missing/BootstrapArg",
+                "missing/BootstrapResult", "missing/BootstrapTarget", "missing/BootstrapType",
+                "missing/DynamicArg", "missing/DynamicRet", "missing/Error", "missing/Field",
+                "missing/FieldOwner", "missing/FieldValue", "missing/Generic", "missing/Handle",
+                "missing/HandleArg", "missing/HandleRet", "missing/Interface", "missing/MethodAnnotation",
+                "missing/Owner", "missing/Parameter", "missing/Result", "missing/Return",
+                "missing/Type"), BytecodeFrontend.missingNonPlatformTypes(load));
     }
 
     @Test

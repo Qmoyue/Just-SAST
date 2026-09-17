@@ -197,7 +197,8 @@ public final class ScanCommand implements Callable<Integer> {
                 if (detail.isBlank()) {
                     detail = "no-resolved-dependency-artifacts";
                 }
-                throw new ScanPipeline.UsageException("Maven 依赖补齐未完成: " + detail);
+                System.err.println("[just:warn] Maven 依赖闭包未完整；继续静态扫描并标记限制: "
+                        + detail);
             }
             resolved.addAll(completion.paths());
             System.err.println("[just:info] dependencyCompletion=" + completion.status()

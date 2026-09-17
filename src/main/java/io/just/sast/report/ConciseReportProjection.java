@@ -560,7 +560,14 @@ public record ConciseReportProjection(
             if (value == null || value.isBlank()) {
                 throw new IllegalArgumentException("report limit must not be blank");
             }
-            normalized.add(value.trim().toUpperCase(Locale.ROOT));
+            String trimmed = value.trim();
+            int detailSeparator = trimmed.indexOf(':');
+            if (detailSeparator < 0) {
+                normalized.add(trimmed.toUpperCase(Locale.ROOT));
+            } else {
+                normalized.add(trimmed.substring(0, detailSeparator).toUpperCase(Locale.ROOT)
+                        + trimmed.substring(detailSeparator));
+            }
         }
         return normalized.stream().sorted().toList();
     }

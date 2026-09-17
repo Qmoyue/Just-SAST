@@ -1,5 +1,8 @@
 package io.just.sast.cli;
 
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
 import org.junit.jupiter.api.Test;
 import picocli.CommandLine;
 import org.junit.jupiter.api.io.TempDir;
@@ -262,6 +265,120 @@ class VerificationCliContractTest {
         assertFalse(Files.exists(temp.resolve("rejected-output")));
     }
 
+    @Test
+    void missingTypeKeepsStaticReportBoundedWithoutGuessingCoordinates(@TempDir Path temp)
+            throws Exception {
+        Path target = temp.resolve("missing-type.jar");
+        writeClassJar(target, "fixture/MissingReference.class", missingReferenceBytes());
+        Path output = temp.resolve("missing-type-output");
+
+        int code = new CommandLine(new JustMain()).execute(
+                "scan", "--jar", target.toString(), "--offline", "--fast",
+                "--output", output.toString());
+
+        assertEquals(0, code);
+        String json = Files.readString(output.resolve("report.json"));
+        assertTrue(json.contains("\"coverage\":\"BOUNDED\""), json);
+        assertTrue(json.contains("DEPENDENCY_INPUT_INCOMPLETE"), json);
+        assertTrue(json.contains("MISSING_TYPE"), json);
+        assertTrue(json.contains("MISSING_TYPE:missing/NotProvided"), json);
+        assertTrue(Files.readString(output.resolve("meta/dependencies.sbom.json"))
+                .contains("MAVEN_POM_NOT_PROVIDED"));
+        assertFalse(json.contains("fixture:missing-reference"),
+                "missing bytecode types must not become guessed Maven coordinates");
+    }
+
+    @Test
+    void duplicateClassKeepsBothInputSourcesAndBoundsTheReport(@TempDir Path temp)
+            throws Exception {
+        byte[] duplicate = simpleClassBytes("fixture/Duplicate");
+        Path target = temp.resolve("target.jar");
+        Path dependency = temp.resolve("duplicate-dependency.jar");
+        writeClassJar(target, "fixture/Duplicate.class", duplicate);
+        writeClassJar(dependency, "fixture/Duplicate.class", duplicate);
+        Path output = temp.resolve("duplicate-output");
+
+        int code = new CommandLine(new JustMain()).execute(
+                "scan", "--jar", target.toString(), "--deps", dependency.toString(),
+                "--offline", "--fast", "--output", output.toString());
+
+        assertEquals(0, code);
+        String json = Files.readString(output.resolve("report.json"));
+        assertTrue(json.contains("\"coverage\":\"BOUNDED\""), json);
+        assertTrue(json.contains("DUPLICATE_CLASS"), json);
+        String inventory = Files.readString(output.resolve("evidence/dependencies.csv"));
+        assertTrue(inventory.contains("target"), inventory);
+        assertTrue(inventory.contains("dependency-1"), inventory);
+    }
+
+    @Test
+    void versionConflictKeepsBothMavenVersionsAndBoundsTheReport(@TempDir Path temp)
+            throws Exception {
+        Path repository = temp.resolve("repository");
+        write(repository, "fixture/left/1.0/left-1.0.pom",
+                pom("fixture", "left", "1.0",
+                        "<dependencies>" + dependencyXml("common", "1.0") + "</dependencies>"));
+        write(repository, "fixture/right/1.0/right-1.0.pom",
+                pom("fixture", "right", "1.0",
+                        "<dependencies>" + dependencyXml("common", "2.0") + "</dependencies>"));
+        write(repository, "fixture/common/1.0/common-1.0.pom",
+                pom("fixture", "common", "1.0", ""));
+        write(repository, "fixture/common/2.0/common-2.0.pom",
+                pom("fixture", "common", "2.0", ""));
+        writeJar(repository.resolve("fixture/left/1.0/left-1.0.jar"));
+        writeJar(repository.resolve("fixture/right/1.0/right-1.0.jar"));
+        writeJar(repository.resolve("fixture/common/1.0/common-1.0.jar"));
+        writeJar(repository.resolve("fixture/common/2.0/common-2.0.jar"));
+
+        Path root = temp.resolve("pom.xml");
+        write(temp, "pom.xml", pom("fixture", "root", "1.0",
+                "<dependencies>"
+                        + dependencyXml("left", "1.0")
+                        + dependencyXml("right", "1.0")
+                        + "</dependencies>"));
+        Path output = temp.resolve("version-conflict-output");
+        Path target = temp.resolve("target.jar");
+        writeJar(target);
+
+        int code = new CommandLine(new JustMain()).execute(
+                "scan", "--jar", target.toString(), "--pom", root.toString(),
+                "--repository", repository.toUri().toString(), "--offline", "--fast",
+                "--cache", temp.resolve("maven-cache").toString(),
+                "--output", output.toString());
+
+        assertEquals(0, code);
+        String json = Files.readString(output.resolve("report.json"));
+        assertTrue(json.contains("\"coverage\":\"BOUNDED\""), json);
+        assertTrue(json.contains("DEPENDENCY_VERSION_AMBIGUOUS"), json);
+        String inventory = Files.readString(output.resolve("evidence/dependencies.csv"));
+        assertTrue(inventory.contains("fixture:common:1.0:jar:"), inventory);
+        assertTrue(inventory.contains("fixture:common:2.0:jar:"), inventory);
+    }
+
+    @Test
+    void missingPomArtifactContinuesWithAnExplicitDependencyLimit(@TempDir Path temp)
+            throws Exception {
+        Path repository = temp.resolve("empty-repository");
+        Files.createDirectories(repository);
+        Path root = temp.resolve("pom.xml");
+        write(temp, "pom.xml", pom("fixture", "root", "1.0",
+                "<dependencies>" + dependencyXml("not-present", "1.0") + "</dependencies>"));
+        Path target = temp.resolve("target.jar");
+        writeJar(target);
+        Path output = temp.resolve("missing-artifact-output");
+
+        int code = new CommandLine(new JustMain()).execute(
+                "scan", "--jar", target.toString(), "--pom", root.toString(),
+                "--repository", repository.toUri().toString(), "--offline", "--fast",
+                "--cache", temp.resolve("maven-cache").toString(),
+                "--output", output.toString());
+
+        assertEquals(0, code);
+        String json = Files.readString(output.resolve("report.json"));
+        assertTrue(json.contains("\"coverage\":\"BOUNDED\""), json);
+        assertTrue(json.contains("DEPENDENCY_INPUT_INCOMPLETE"), json);
+    }
+
     private static String pom(String group, String artifact, String version, String dependencies) {
         return """
                 <project xmlns="http://maven.apache.org/POM/4.0.0">
@@ -270,6 +387,11 @@ class VerificationCliContractTest {
                   %s
                 </project>
                 """.formatted(group, artifact, version, dependencies);
+    }
+
+    private static String dependencyXml(String artifact, String version) {
+        return "<dependency><groupId>fixture</groupId><artifactId>"
+                + artifact + "</artifactId><version>" + version + "</version></dependency>";
     }
 
     private static void write(Path directory, String name, String content) throws IOException {
@@ -285,6 +407,44 @@ class VerificationCliContractTest {
             output.write(new byte[]{1, 2, 3});
             output.closeEntry();
         }
+    }
+
+    private static void writeClassJar(Path file, String entryName, byte[] bytes) throws IOException {
+        Files.createDirectories(file.getParent());
+        try (JarOutputStream output = new JarOutputStream(Files.newOutputStream(file))) {
+            put(output, entryName, bytes);
+        }
+    }
+
+    private static byte[] simpleClassBytes(String internalName) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, internalName, null,
+                "java/lang/Object", null);
+        MethodVisitor method = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "run", "()V", null, null);
+        method.visitCode();
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(0, 0);
+        method.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] missingReferenceBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "fixture/MissingReference", null,
+                "java/lang/Object", null);
+        MethodVisitor method = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "run", "()V", null, null);
+        method.visitCode();
+        method.visitInsn(Opcodes.ACONST_NULL);
+        method.visitTypeInsn(Opcodes.CHECKCAST, "missing/NotProvided");
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(1, 0);
+        method.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
     }
 
     private static void writeFatJar(Path file) throws IOException {

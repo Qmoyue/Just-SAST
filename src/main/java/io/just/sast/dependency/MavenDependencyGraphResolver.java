@@ -314,7 +314,13 @@ public final class MavenDependencyGraphResolver implements AutoCloseable {
                         provenance, artifact.source(), bindingSourceDetail(artifact),
                         firstInputIndex + index));
             }
-            return resolution.graph().withCompletedArtifacts(bindings);
+            DependencyGraph graph = resolution.graph().withCompletedArtifacts(bindings);
+            if (resolution.problems().stream().anyMatch(problem ->
+                    problem.severity() == Severity.ERROR)) {
+                graph = graph.withEnvironmentConditions(
+                        List.of("MAVEN_DEPENDENCY_INPUT_INCOMPLETE"));
+            }
+            return graph;
         }
 
         /** Path-free identity of effective model, selected bytes, source mode and failures. */

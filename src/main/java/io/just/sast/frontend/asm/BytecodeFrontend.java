@@ -5,9 +5,18 @@ import io.just.sast.model.ApplicationResourceFacts;
 import io.just.sast.model.ArchiveMetadata;
 import io.just.sast.model.ArchiveMemberProvenance;
 import io.just.sast.model.ArtifactProvenance;
+import io.just.sast.model.FieldInfo;
+import io.just.sast.model.FieldRef;
+import io.just.sast.model.HandleRef;
+import io.just.sast.model.InsnFact;
+import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.model.LoadResult;
+import io.just.sast.model.MethodInfo;
+import io.just.sast.model.MethodRef;
 import io.just.sast.model.ProgramUniverse;
 import io.just.sast.model.ParseDiagnostic;
+import io.just.sast.model.TryCatchFact;
+import io.just.sast.model.TypeRef;
 import io.just.sast.util.JustLogger;
 import io.just.sast.util.AdaptiveParallelism;
 import io.just.sast.run.InputBudget;
@@ -19,6 +28,8 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -482,6 +493,112 @@ public final class BytecodeFrontend {
                 input != null && input.callerContextProvided());
         return load(base, extraClassBytes, input != null && input.callerContextProvided()
                 ? tracker : null);
+    }
+
+    /**
+     * Return exact non-platform type names referenced by parsed class facts but absent from the
+     * same bounded input set.  This is a frontend fact only: it does not infer a Maven
+     * coordinate, select an implementation, or probe arbitrary class loaders.  Platform names
+     * are excluded because the JDK source is a separate lazy closure owned by the pipeline.
+     */
+    public static List<String> missingNonPlatformTypes(LoadResult load) {
+        if (load == null || load.classes().isEmpty()) {
+            return List.of();
+        }
+        Set<String> defined = load.classes().keySet();
+        Set<String> referenced = new TreeSet<>();
+        for (ClassInfo info : load.classes().values()) {
+            referencedTypes(info, referenced);
+        }
+        referenced.removeAll(defined);
+        referenced.removeIf(BytecodeFrontend::platformType);
+        return List.copyOf(referenced);
+    }
+
+    private static void referencedTypes(ClassInfo info, Set<String> result) {
+        if (info == null) {
+            return;
+        }
+        addName(result, info.superName());
+        info.interfaces().forEach(name -> addName(result, name));
+        info.annotationDescriptors().forEach(descriptor -> addDescriptor(result, descriptor));
+        for (FieldInfo field : info.fields()) {
+            addDescriptor(result, field.descriptor());
+            field.genericReferenceTypes().forEach(name -> addName(result, name));
+        }
+        for (MethodInfo method : info.methods()) {
+            addDescriptor(result, method.descriptor());
+            method.annotationDescriptors().forEach(descriptor -> addDescriptor(result, descriptor));
+            for (InsnFact instruction : method.instructions()) {
+                addOperands(result, instruction.operands());
+            }
+            for (TryCatchFact catchFact : method.tryCatch()) {
+                addName(result, catchFact.type());
+            }
+        }
+    }
+
+    private static void addOperands(Set<String> result, List<Object> operands) {
+        if (operands == null) {
+            return;
+        }
+        for (Object operand : operands) {
+            if (operand instanceof MethodRef ref) {
+                addName(result, ref.owner());
+                addDescriptor(result, ref.descriptor());
+            } else if (operand instanceof FieldRef ref) {
+                addName(result, ref.owner());
+                addDescriptor(result, ref.descriptor());
+            } else if (operand instanceof TypeRef ref) {
+                addDescriptor(result, ref.descriptor());
+            } else if (operand instanceof HandleRef ref) {
+                addName(result, ref.owner());
+                addDescriptor(result, ref.descriptor());
+            } else if (operand instanceof InvokeDynamicRef ref) {
+                addDescriptor(result, ref.descriptor());
+                if (ref.bootstrap() == null) {
+                    throw new IllegalArgumentException("invokedynamic bootstrap is required");
+                }
+                addName(result, ref.bootstrap().owner());
+                addDescriptor(result, ref.bootstrap().descriptor());
+                addOperands(result, ref.bootstrapArgs());
+            }
+        }
+    }
+
+    private static void addDescriptor(Set<String> result, String descriptor) {
+        if (descriptor == null || descriptor.isEmpty()) {
+            return;
+        }
+        if (!descriptor.startsWith("(") && descriptor.indexOf('L') < 0
+                && descriptor.indexOf('[') < 0) {
+            addName(result, descriptor);
+            return;
+        }
+        for (int index = 0; index < descriptor.length(); index++) {
+            if (descriptor.charAt(index) != 'L') {
+                continue;
+            }
+            int end = descriptor.indexOf(';', index);
+            if (end < 0) {
+                return;
+            }
+            addName(result, descriptor.substring(index + 1, end));
+            index = end;
+        }
+    }
+
+    private static void addName(Set<String> result, String name) {
+        if (name == null || name.isEmpty() || name.startsWith("[")
+                || name.length() == 1 || !name.contains("/")) {
+            return;
+        }
+        result.add(name);
+    }
+
+    private static boolean platformType(String name) {
+        return name.startsWith("java/") || name.startsWith("jdk/")
+                || name.startsWith("sun/") || name.startsWith("com/sun/");
     }
 
     private List<ParsedClass> parse(List<ClassBytes> inputs) {
