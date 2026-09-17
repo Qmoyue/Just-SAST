@@ -1,41 +1,53 @@
 # Just
 
-Just 是一个面向 Java JAR、WAR、Spring Boot fat JAR 和 class 目录的静态反序列化链分析器。它从真实字节码、依赖和目标 JDK 中提取可追溯事实，帮助审计者快速回答：
+Just 是一个面向 Java 字节码的静态反序列化链分析器。它分析 JAR、WAR、Spring Boot fat JAR 和 class 目录，结合目标 JDK、依赖和应用入口，输出可追溯的 gadget 链与应用暴露链证据。
 
-- 哪个入口接收了输入？
-- 反序列化、callback、字段和控制条件如何连接？
-- 哪些依赖、版本、配置和 JDK 条件成立？
-- 静态证据能到达哪个最终影响？
-- 哪些部分仍然未知或受分析边界限制？
+Just 只进行静态分析，不启动目标应用，不初始化或构造目标类，不执行反射调用、反序列化流或 payload，也不生成可投递攻击字节流。
 
-## 项目边界
+## 能力概览
 
-Just 聚焦组件 gadget 链和应用暴露链，不是通用漏洞扫描平台。
+- 从真实字节码中识别反序列化入口、callback、对象关系、控制条件和最终影响。
+- 分析独立组件 gadget 链，或从真实应用入口追踪到依赖/JDK 中的链。
+- 支持 JAR、WAR、嵌套归档、多版本归档和 class 目录。
+- 使用显式依赖、Maven POM、本地缓存和目标 JDK 建立可复核的输入 provenance。
+- 以 report.json 和 report.md 作为两个主报告入口，并在报告中展示 typed Gadget graph。
 
-扫描是静态的：Just 不启动目标应用，不加载或初始化目标类，不构造目标对象，不调用目标方法，不反序列化攻击流，不访问危险终点，也不生成可投递 payload。结果是可审计的静态证据，不是运行时利用确认。
+## 安装
 
-## 快速开始
+从 [GitHub Releases](https://github.com/Qmoyue/Just-SAST/releases) 下载 shaded JAR。运行时需要 JDK 17。
 
-构建需要 JDK 17 和 Maven 3.6 或更高版本：
+~~~bash
+java -jar just-sast-<version>-shaded.jar --help
+~~~
+
+从源码构建：
 
 ~~~bash
 mvn -B test
 mvn -B package -DskipTests
 ~~~
 
-扫描组件：
+生成的 launcher 位于 target/just-sast-<version>-shaded.jar。
+
+## 快速开始
+
+### 组件模式
+
+组件模式从机制触发点开始分析，不代表宿主应用已经暴露该链：
 
 ~~~bash
-java -jar target/just-sast-0.2.0-shaded.jar scan \
+java -jar just-sast-<version>-shaded.jar scan \
   --jar component.jar \
   --jdk-home /path/to/target-jdk \
   --output just-out
 ~~~
 
-扫描应用并使用准确的 Maven 依赖：
+### 应用模式
+
+应用模式从真实应用入口开始分析，需要提供准确的 Maven POM 或依赖：
 
 ~~~bash
-java -jar target/just-sast-0.2.0-shaded.jar scan \
+java -jar just-sast-<version>-shaded.jar scan \
   --jar app.jar \
   --mode application \
   --pom pom.xml \
@@ -43,10 +55,10 @@ java -jar target/just-sast-0.2.0-shaded.jar scan \
   --output just-out
 ~~~
 
-使用已准备好的依赖进行离线扫描：
+使用显式依赖进行离线分析：
 
 ~~~bash
-java -jar target/just-sast-0.2.0-shaded.jar scan \
+java -jar just-sast-<version>-shaded.jar scan \
   --jar app.jar \
   --mode application \
   --deps lib \
@@ -56,70 +68,100 @@ java -jar target/just-sast-0.2.0-shaded.jar scan \
   --output just-out
 ~~~
 
-## 扫描模式
+## 分析模式
 
-| 模式 | 起点 | 导出条件 |
+| 模式 | 分析起点 | 结论要求 |
 | --- | --- | --- |
-| component（默认） | 机制触发点 → gadget → 最终影响 | 触发、对象、控制、依赖和终点证据可解释 |
-| application | 真实应用入口 → site → bridge/依赖/JDK → 最终影响 | 必须有 entry、site、EntryChainJoinEvidence、必要 BridgeEvidence、对象/控制关系和完整 terminal |
+| component | 机制触发点 → gadget → terminal | 触发、对象关系、控制条件、依赖/JDK 条件和 terminal 有静态证据 |
+| application | 真实入口 → site → bridge/依赖/JDK → terminal | 额外要求 entry、site、入口与链的连接证据、必要 bridge、对象/控制关系和完整 terminal |
 
-组件中存在 gadget 不等于应用暴露。类名共现、classpath 共存和调用图共现不能替代值流、对象身份或控制关系。
+类名共现、classpath 共存或调用图共现不能替代对象关系、值流和控制条件。组件模式中的 gadget 不能直接称为应用漏洞。
 
 ## 输出
 
-一次扫描的公开入口只有两个：
+output 指向的目录包含：
 
 ~~~text
 just-out/
-├─ report.json       # agent 的机器可读主报告，包含全部候选和重要变体
-├─ report.md         # 人的主报告，结论、主链和 Gadget 图
-├─ evidence/         # 可选的静态逐跳、依赖和桥证据
-└─ meta/             # provenance、digest、诊断、run.json 和 transaction.json
+├── report.json       # 完整的机器可读报告
+├── report.md         # 面向人的摘要和 Gadget 图
+├── evidence/         # 逐跳、依赖、bridge 和可选格式证据
+└── meta/             # 输入 provenance、digest、诊断和事务元数据
 ~~~
 
-默认不生成空 findings/、重复的 index.md、verification/ 或 payload 文件。CSV、SARIF 等格式如果有明确消费者，只作为 evidence/ 下的附加导出，不替代两个主报告。
+默认不创建空的 findings/ 目录，不生成重复的索引主报告，也不生成 verification、payload 或动态测试文件。
 
-report.json 与 report.md 来自同一个冻结快照。JSON 不截断候选；Markdown 先展示主链和重要变体，详细位置、descriptor、字段关系、预算和 provenance 可以继续在 JSON/evidence 中追溯。
+report.json 保留全部候选和重要变体，适合 agent 或其他程序消费。report.md 先展示结论、主链、阻断点和能力边界，适合人工快速阅读。两个报告来自同一个冻结结果。
 
-如果只能到达 `Method.invoke` 等中间反射 API，Markdown 会单独列出 capability boundary，并明确没有声明最终影响；这类候选仍完整保存在 report.json。
-
-主链图采用稳定的文本形式。下面是阅读格式示意；具体 entry/site、节点角色和证据以本次 report.json 为准：
+报告中的 Gadget 图使用稳定的文本节点和 typed edge，例如：
 
 ~~~text
-HTTP entry
-    │
-    ▼
-DogController#importDogs
-    │ deserialization
-    ▼
-ObjectInputStream#readObject
-    │ callback
-    ▼
-Dog#hashCode → DogModel#wagTail
-    │ reflection
-    ▼
-Method#invoke
-    │
-    ▼
-TemplatesImpl#newTransformer
+ENTRY  DogController#importDogs
+  │
+  ▼
+STEP   ObjectInputStream#readObject
+  │
+  ▼
+STEP   Dog#hashCode → DogModel#wagTail
+  │
+  ▼
+BOUNDARY  Method#invoke
+  │
+  ▼
+TERMINAL  TemplatesImpl#newTransformer
 ~~~
 
-## 结果状态
+如果反射目标无法由输入字节码静态确定，Just 会保留 Method.invoke 这样的 capability boundary，不会把未证明的后续行为当成 terminal。
 
-公开 JSON 使用相互独立的状态轴：
+## 状态含义
 
-| 字段 | 含义 |
-| --- | --- |
-| outcome | 本次是否有可供审阅的结果，或发生失败/参数/运行库错误 |
-| coverage | 静态覆盖是否完整、受边界限制或未知 |
-| chain completeness | 单条链的证据是否完整 |
-| feasibility | 单条链的结构/约束可行性 |
+报告将不同问题分开表示：
 
-旧内部状态 PARTIAL 表示静态分析受到预算、未知分支、解析诊断、JDK 近似或搜索边界影响，不表示动态测试。未知和预算候选会保留；只有完整的 PROVABLY_UNREACHABLE 矛盾可以剪枝。没有发现链也不等于制品安全。
+- outcome：本次是否产生可审阅结果，或发生参数、输入、依赖或内部错误。
+- coverage：静态覆盖是否完整、受边界限制或未知。
+- chain completeness：单条链的证据是否完整。
+- feasibility：单条链的结构和约束是否可行。
 
-## demo 的阅读口径
+PARTIAL 只表示静态覆盖或单条链证明受到预算、未知分支、解析诊断、JDK 近似或搜索边界影响，不表示动态测试结果。未知和预算候选会被保留。
 
-对 benchmark/demo/demo.jar，制品内可静态重建的最短主链是：
+## 架构概览
+
+~~~text
+输入制品 / POM / 依赖 / 目标 JDK
+              │
+              ▼
+      字节码与 provenance frontend
+              │
+              ▼
+      类型、字段、控制和对象事实模型
+              │
+              ▼
+       component/application 求解器
+              │
+              ▼
+      冻结结果 → report.json / report.md
+              │
+              ▼
+        evidence/ 与 meta/ 追溯文件
+~~~
+
+ASM 只负责前端解析。后续模块消费稳定的 typed facts；入口、callback、bridge、terminal、对象关系和控制条件是数据，求解和组合逻辑不依赖题目名称或路径。
+
+## 静态安全边界
+
+Just 不会：
+
+- 加载、初始化或构造目标类和目标对象；
+- 反射调用目标方法或执行目标 callback；
+- 反序列化攻击流、启动目标进程或访问目标 sink；
+- 执行目标构建插件、外部 helper、native 代码或通用解释器；
+- 生成 payload、投递字节流或输出运行时利用确认。
+
+offline 会禁止网络请求，只使用显式输入和完整缓存。依赖缺失、版本不确定、缓存损坏和解析错误会在结果中明确披露或使扫描失败。
+
+## Demo 链口径
+
+对于包含 DogController#importDogs 的 demo，静态主链可以表示为：
 
 ~~~text
 DogController#importDogs
@@ -130,9 +172,9 @@ DogController#importDogs
   → TemplatesImpl#newTransformer
 ~~~
 
-WP 中外部恶意类的 Runtime.getRuntime().exec 不属于 demo.jar 字节码；另一个手工构造对象图中的 invoke → Runtime.exec 也不能凭应用 JAR 自动证明。只有输入制品实际包含 java/lang/Runtime#exec 调用时，Just 才将它作为静态 sink 报告。外部 payload 后果可以作为边界说明，但不会冒充制品内链或运行时确认。
+WP 中外部恶意类的 Runtime.getRuntime().exec 不属于该 demo 应用字节码。只有输入制品本身包含到 java/lang/Runtime#exec 的静态调用时，Just 才会报告该 terminal；外部 payload 后果不会被冒充为应用内部链。
 
-## 参数
+## 常用参数
 
 | 参数 | 作用 |
 | --- | --- |
@@ -141,24 +183,14 @@ WP 中外部恶意类的 Runtime.getRuntime().exec 不属于 demo.jar 字节码�
 | --deps | 附加依赖 JAR 或目录，逗号分隔 |
 | --pom | 显式 Maven 根 POM |
 | --repository | 显式 Maven 仓库，可重复 |
-| --offline | 禁止网络，只使用显式输入和完整缓存 |
-| --jdk-home | 目标 JDK/JRE，用于读取目标字节码与运行库 |
-| --output | 输出目录 |
+| --offline | 禁止联网，只使用显式输入和缓存 |
+| --jdk-home | 目标 JDK/JRE 字节码来源 |
+| --output | 报告输出目录 |
 | --rules | 自定义规则 YAML |
-| --overwrite | 显式替换既有输出 |
+| --overwrite | 显式替换已有输出 |
 
-stats、fast、baseline、suppressions 和 cache 是高级工作流选项；它们不能改变静态安全边界，也不能用少报结果换取速度。参数错误、缺依赖、缓存损坏和内部错误必须显式失败。
+更多设计约束见 [产品要求](docs/requirements.md) 和 [架构说明](docs/architecture.md)。
 
-## 开发与发布
+## 许可证
 
-~~~bash
-mvn -B test
-mvn -B package -DskipTests
-java -jar target/just-sast-0.2.0-shaded.jar --help
-~~~
-
-tools/ 和 benchmark/ 只用于开发验证、真实制品和基准，不属于用户运行时或发布 launcher 的隐式依赖。发布资产必须包含可用 shaded JAR、SHA-256、LICENSE 和第三方声明，并由同一提交的 CI/Release 流程验证。
-
-详细设计见 [docs/architecture.md](docs/architecture.md)，产品契约见 [docs/requirements.md](docs/requirements.md)。
-
-许可证为 GPLv3，见 [LICENSE](LICENSE)。
+Just 使用 GPLv3-only，详见 [LICENSE](LICENSE) 和 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。

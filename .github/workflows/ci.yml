@@ -43,8 +43,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $shaded = 'target/just-sast-0.2.0-shaded.jar'
-          $thin = 'target/just-sast-0.2.0.jar'
+          $version = (& mvn -q -DforceStdout help:evaluate '-Dexpression=project.version').Trim()
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "invalid project version: $version" }
+          $shaded = "target/just-sast-$version-shaded.jar"
+          $thin = "target/just-sast-$version.jar"
           if (-not (Test-Path -LiteralPath $shaded -PathType Leaf)) { throw "missing shaded launcher: $shaded" }
           if (-not (Test-Path -LiteralPath $thin -PathType Leaf)) { throw "missing thin library artifact: $thin" }
           & java -jar $shaded --help
@@ -53,8 +55,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $shaded = Get-Item -LiteralPath 'target/just-sast-0.2.0-shaded.jar'
-          $thin = Get-Item -LiteralPath 'target/just-sast-0.2.0.jar'
+          $version = (& mvn -q -DforceStdout help:evaluate '-Dexpression=project.version').Trim()
+          $shaded = Get-Item -LiteralPath "target/just-sast-$version-shaded.jar"
+          $thin = Get-Item -LiteralPath "target/just-sast-$version.jar"
           if ($shaded.Length -le $thin.Length) { throw 'shaded artifact must contain dependencies and be larger than thin artifact' }
           $main = & jar tf $shaded.FullName
           if (-not ($main -contains 'META-INF/MANIFEST.MF')) { throw 'shaded manifest missing' }
@@ -63,7 +66,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $shaded = (Resolve-Path 'target/just-sast-0.2.0-shaded.jar').Path
+          $version = (& mvn -q -DforceStdout help:evaluate '-Dexpression=project.version').Trim()
+          $shaded = (Resolve-Path "target/just-sast-$version-shaded.jar").Path
           $fixture = Join-Path $env:RUNNER_TEMP 'just-static-smoke.jar'
           $cache = Join-Path $env:RUNNER_TEMP 'just-static-smoke-cache'
           $componentOutput = Join-Path $env:RUNNER_TEMP 'just-static-smoke-component'

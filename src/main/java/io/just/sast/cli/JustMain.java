@@ -8,7 +8,7 @@ import picocli.CommandLine.Command;
 @Command(name = "just-sast",
         description = "轻量字节码 SAST：挖掘 Java 反序列化 gadget 链",
         subcommands = {ScanCommand.class, DiffCommand.class, PerformanceCommand.class},
-        mixinStandardHelpOptions = true, version = "just-sast 0.2.0")
+        mixinStandardHelpOptions = true, version = "just-sast 0.2.1")
 public final class JustMain implements Runnable {
 
     @CommandLine.Spec

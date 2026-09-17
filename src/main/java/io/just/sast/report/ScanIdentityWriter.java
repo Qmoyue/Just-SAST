@@ -20,7 +20,7 @@ import java.util.Locale;
 /** Writes the path-free identity used to invalidate future incremental caches. */
 public final class ScanIdentityWriter {
 
-    public static final String ENGINE_VERSION = "0.2.0";
+    public static final String ENGINE_VERSION = "0.2.1";
     public static final String FILTER_SEMANTICS_VERSION = "bounded-static-filter-v1";
 
     public String write(ReportLayout layout, String artifactHash, String dependencyHash,

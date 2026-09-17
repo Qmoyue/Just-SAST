@@ -73,7 +73,7 @@ public final class SarifReporter {
                 .append("  \"runs\": [{\n")
                 .append("    \"tool\": {\n      \"driver\": {\n")
                 .append("        \"name\": \"just-sast\",\n")
-                .append("        \"version\": \"0.2.0\",\n")
+                .append("        \"version\": \"0.2.1\",\n")
                 .append("        \"informationUri\": \"https://github.com/just-sast/just\",\n")
                 .append("        \"rules\": [").append(rulesArray()).append("]\n")
                 .append("      }\n    },\n");

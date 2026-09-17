@@ -389,15 +389,29 @@ public final class ApplicationChainJoiner {
         EntryChainJoinEvidence join = EntryChainJoinEvidence.of(chainId, entry.id(), siteAtom.id(),
                 segmentId, flow, identity, callback, runtimeType, compatibility,
                 filterDominance, construction, bridgeIds);
+        boolean joinEvidenceComplete = flow != EntryChainJoinEvidence.ValueFlow.UNKNOWN
+                && identity != EntryChainJoinEvidence.ObjectIdentity.IDENTITY_UNKNOWN
+                && callback != EntryChainJoinEvidence.CallbackSemantics.UNKNOWN
+                && runtimeType != EntryChainJoinEvidence.RuntimeTypeProof.UNKNOWN
+                && construction != EntryChainJoinEvidence.ConstructionConstraint.UNKNOWN
+                // A synthetic framework-binding site without an exact typed target proves only
+                // that the endpoint accepts input; it does not prove that this gadget value is
+                // the value reaching the composed chain. An explicit typed binding, protocol
+                // bridge, or taint-solver argument proof can establish that relation.
+                && (site == null || !"builtin:framework-binding".equals(site.ruleId())
+                || entryMatch.typedBinding() || flow != EntryChainJoinEvidence.ValueFlow.UNKNOWN);
+        boolean impactComplete = chain.unresolvedHops() == 0
+                && (terminalDecision.admitted() || declaredJdbcTerminal)
+                && joinEvidenceComplete;
         FindingState state = new FindingState(
                 index.isExternalEntryMethod(entryKey) ? FindingState.EntryStatus.EXTERNAL_ENTRY
                         : FindingState.EntryStatus.APPLICATION_ENTRY,
-                chain.unresolvedHops() == 0 && (terminalDecision.admitted() || declaredJdbcTerminal)
-                        ? FindingState.ChainProgress.IMPACT_CHAIN_COMPLETE
+                impactComplete ? FindingState.ChainProgress.IMPACT_CHAIN_COMPLETE
                         : FindingState.ChainProgress.DEPENDENCY_JOINED,
                 construction == EntryChainJoinEvidence.ConstructionConstraint.SAT
                         ? FindingState.Feasibility.SAT : FindingState.Feasibility.UNKNOWN,
-                chain.unresolvedHops() == 0 ? FindingState.Completeness.COMPLETE
+                chain.unresolvedHops() == 0 && joinEvidenceComplete
+                        ? FindingState.Completeness.COMPLETE
                         : FindingState.Completeness.PARTIAL,
                 risk(chain.sinkRisk()));
 
@@ -758,9 +772,19 @@ public final class ApplicationChainJoiner {
                     return index.applicationInputSitesForMember(member.substring(0, separator),
                             member.substring(separator + 1)).stream();
                 })
-                .min(Comparator.comparingLong(ApplicationEntryIndex.DeserializeSite::callId)
+                // A synthetic framework-binding site is only a boundary fallback. When the
+                // chain also carries a concrete source (for example Kryo/ObjectInputStream or
+                // a service deserializer), prefer that bytecode call so the report names the
+                // actual site rather than the endpoint's synthetic method node. The fallback
+                // remains available for typed HTTP/SOAP binding where no concrete call exists.
+                .min(Comparator.comparingInt(ApplicationChainJoiner::syntheticBindingRank)
+                        .thenComparingLong(ApplicationEntryIndex.DeserializeSite::callId)
                         .thenComparing(ApplicationEntryIndex.DeserializeSite::hostMethodKey))
                 .orElse(null);
+    }
+
+    private static int syntheticBindingRank(ApplicationEntryIndex.DeserializeSite site) {
+        return site != null && "builtin:framework-binding".equals(site.ruleId()) ? 1 : 0;
     }
 
     /** Resolve the exact Jackson binding site carried by the application-side JDBC host. */
@@ -1001,6 +1025,16 @@ public final class ApplicationChainJoiner {
         if (entryMatch != null && entryMatch.typedBinding()) {
             return EntryChainJoinEvidence.ValueFlow.CALLBACK_ARGUMENT;
         }
+        // An entry-only chain is the forward solver's compact representation for a sink
+        // reached directly from the externally controlled entry method. There is no omitted
+        // call-graph prefix to mistake for value flow in this shape; retain the solver fact as
+        // direct evidence while requiring the exact entry match and ENTRY hop.
+        if (entryMatch != null && entryMatch.path().size() == 1
+                && chain.hops().size() == 1
+                && chain.hops().get(0).kind() == HopKind.ENTRY
+                && entryMatch.applicationEntryKey().equals(entryMatch.chainEntryKey())) {
+            return EntryChainJoinEvidence.ValueFlow.DIRECT_VALUE;
+        }
         if (entryMatch != null && entryMatch.path() != null && entryMatch.path().size() > 1) {
             return EntryChainJoinEvidence.ValueFlow.UNKNOWN;
         }
@@ -1010,11 +1044,12 @@ public final class ApplicationChainJoiner {
                     || kind == BridgeEvidence.Kind.SECOND_DESERIALIZATION) {
                 return EntryChainJoinEvidence.ValueFlow.PROTOCOL_REPLY;
             }
-            if (hop.kind() == HopKind.FIELD_FLOW) {
-                return EntryChainJoinEvidence.ValueFlow.DERIVED_VALUE;
-            }
         }
-        return EntryChainJoinEvidence.ValueFlow.DIRECT_VALUE;
+        // A FIELD_FLOW inside the gadget proves an internal object relation, not that the
+        // application-controlled value reaches this chain. Do not promote that relation into
+        // application value-flow evidence; an explicit typed binding or protocol/driver proof
+        // above is required, otherwise the join remains an auditable UNKNOWN boundary.
+        return EntryChainJoinEvidence.ValueFlow.UNKNOWN;
     }
 
     private static String methodIdentity(String owner, String name) {

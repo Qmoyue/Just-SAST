@@ -636,7 +636,7 @@ public final class DependencyInventoryWriter {
                 .append("  \"bomFormat\":\"CycloneDX\",\n")
                 .append("  \"specVersion\":\"1.5\",\n")
                 .append("  \"serialNumber\":\"").append(json(serial)).append("\",\n")
-                .append("  \"version\":1,\n  \"metadata\":{\"tools\":[{\"vendor\":\"Just\",\"name\":\"just-sast\",\"version\":\"0.2.0\"}],\"properties\":[");
+                .append("  \"version\":1,\n  \"metadata\":{\"tools\":[{\"vendor\":\"Just\",\"name\":\"just-sast\",\"version\":\"0.2.1\"}],\"properties\":[");
         List<String> conditions = environmentConditions == null ? List.of()
                 : environmentConditions.stream().distinct().sorted().toList();
         for (int index = 0; index < conditions.size(); index++) {

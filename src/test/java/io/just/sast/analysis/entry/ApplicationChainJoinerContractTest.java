@@ -6,6 +6,7 @@ import io.just.sast.blackboard.Chain;
 import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.BridgeEvidence;
 import io.just.sast.blackboard.EvidenceAtom;
+import io.just.sast.blackboard.FindingState;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.config.Match;
@@ -60,6 +61,25 @@ class ApplicationChainJoinerContractTest {
                 edge.reasonCode().equals("TERMINAL_IMPACT_REACHED")));
         assertTrue(evidence.semanticDigest().matches("[0-9a-f]{64}"));
         assertTrue(evidence.graph().toCanonicalJson().contains("APPLICATION_ENTRY"));
+    }
+
+    @Test
+    void graphOnlyApplicationPrefixDoesNotClaimCompleteValueFlow() {
+        Graph graph = fixture();
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(APP), true);
+
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(chain()), true, "A".repeat(64), Set.of());
+
+        var join = evidence.joins().values().iterator().next();
+        FindingState state = evidence.states().get(chain().key());
+        assertEquals(io.just.sast.blackboard.EntryChainJoinEvidence.ValueFlow.UNKNOWN,
+                join.valueFlow());
+        assertEquals(FindingState.Completeness.PARTIAL, state.completeness());
+        assertEquals(FindingState.ChainProgress.DEPENDENCY_JOINED, state.chainProgress());
+        assertFalse(state.defaultFindingEligible());
     }
 
     @Test
