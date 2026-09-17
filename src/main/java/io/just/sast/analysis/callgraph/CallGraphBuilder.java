@@ -96,6 +96,7 @@ public final class CallGraphBuilder {
         call.propsNote(JndiObjectFactoryCallSite.GRAPH_NOTE_KEY, callSite);
         Map<String, JndiObjectFactoryDispatch.Implementation> implementations = new java.util.TreeMap<>();
         boolean interfaceOnly = false;
+        boolean abstractOnly = false;
         for (var edge : call.out()) {
             Node target = edge.to();
             if (target == null || target.type() != NodeType.METHOD
@@ -109,22 +110,31 @@ public final class CallGraphBuilder {
                 continue;
             }
             io.just.sast.model.ClassInfo targetClass = hierarchy.classInfo(target.owner());
-            if (targetClass != null && !targetClass.isInterface()
-                    && !Modifier.isAbstract(targetClass.access())
-                    && hierarchy.isSubtypeOf(target.owner(),
+            if (targetClass == null || !hierarchy.isSubtypeOf(target.owner(),
                     JndiObjectFactoryCallSite.OBJECT_FACTORY_OWNER)
-                    && edge.type() == EdgeType.DISPATCHES) {
-                JndiObjectFactoryDispatch.Implementation implementation =
-                        new JndiObjectFactoryDispatch.Implementation(target.owner(), target.name(),
-                                target.descriptor());
-                implementations.put(implementation.methodKey(), implementation);
+                    || edge.type() != EdgeType.DISPATCHES) {
+                continue;
             }
+            if (targetClass.isInterface()) {
+                interfaceOnly = true;
+                continue;
+            }
+            if (Modifier.isAbstract(targetClass.access())) {
+                abstractOnly = true;
+                continue;
+            }
+            JndiObjectFactoryDispatch.Implementation implementation =
+                    new JndiObjectFactoryDispatch.Implementation(target.owner(), target.name(),
+                            target.descriptor());
+            implementations.put(implementation.methodKey(), implementation);
         }
         JndiObjectFactoryDispatch.Status status;
         if (!implementations.isEmpty()) {
             status = JndiObjectFactoryDispatch.Status.RESOLVED;
         } else if (interfaceOnly) {
             status = JndiObjectFactoryDispatch.Status.INTERFACE_ONLY;
+        } else if (abstractOnly) {
+            status = JndiObjectFactoryDispatch.Status.ABSTRACT_ONLY;
         } else {
             status = JndiObjectFactoryDispatch.Status.UNKNOWN_IMPLEMENTATION;
         }

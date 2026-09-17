@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class JndiObjectFactoryBridgeContractTest {
 
@@ -90,6 +91,44 @@ class JndiObjectFactoryBridgeContractTest {
         assertFalse(unrelatedCall.notes().containsKey(JndiObjectFactoryCallSite.GRAPH_NOTE_KEY));
     }
 
+    @Test
+    void interfaceOnlyFactoryRemainsCapabilityWithoutImplementationExpansion() {
+        ClassInfo host = extract(hostBytes(JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR));
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host), List.of(), 1, 61);
+        Graph graph = new CpgBuilder().build(load).graph();
+        var call = graph.callsOfMethod(host.internalName() + "#call"
+                        + host.method("call", hostMethodDescriptor()).descriptor())
+                .stream().findFirst().orElseThrow();
+
+        assertEquals(1, new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph));
+        JndiObjectFactoryDispatch dispatch =
+                (JndiObjectFactoryDispatch) call.note(JndiObjectFactoryCallSite.DISPATCH_NOTE_KEY);
+        assertEquals(JndiObjectFactoryDispatch.Status.INTERFACE_ONLY, dispatch.status());
+        assertTrue(dispatch.implementations().isEmpty());
+        assertFalse(dispatch.resolved());
+        assertTrue(call.out().stream().noneMatch(edge -> edge.type() == EdgeType.DISPATCHES));
+    }
+
+    @Test
+    void abstractFactoryRemainsCapabilityWithoutTreatingDeclarationAsImplementation() {
+        ClassInfo host = extract(hostBytes(JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR));
+        ClassInfo abstractFactory = extract(abstractFactoryBytes());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host,
+                abstractFactory.internalName(), abstractFactory), List.of(), 1, 61);
+        Graph graph = new CpgBuilder().build(load).graph();
+        var call = graph.callsOfMethod(host.internalName() + "#call"
+                        + host.method("call", hostMethodDescriptor()).descriptor())
+                .stream().findFirst().orElseThrow();
+
+        assertEquals(1, new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph));
+        JndiObjectFactoryDispatch dispatch =
+                (JndiObjectFactoryDispatch) call.note(JndiObjectFactoryCallSite.DISPATCH_NOTE_KEY);
+        assertEquals(JndiObjectFactoryDispatch.Status.ABSTRACT_ONLY, dispatch.status());
+        assertTrue(dispatch.implementations().isEmpty());
+        assertFalse(dispatch.resolved());
+        assertTrue(call.out().stream().allMatch(edge -> edge.to().owner().equals("fixture/AbstractFactory")));
+    }
+
     private static String hostMethodDescriptor() {
         return "(Ljavax/naming/spi/ObjectFactory;Ljava/lang/Object;Ljavax/naming/Name;"
                 + "Ljavax/naming/Context;Ljava/util/Hashtable;)Ljava/lang/Object;";
@@ -134,6 +173,18 @@ class JndiObjectFactoryBridgeContractTest {
         method.visitInsn(Opcodes.ARETURN);
         method.visitMaxs(1, 5);
         method.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] abstractFactoryBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_ABSTRACT,
+                "fixture/AbstractFactory", null, "java/lang/Object",
+                new String[] {JndiObjectFactoryCallSite.OBJECT_FACTORY_OWNER});
+        writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_ABSTRACT,
+                JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_NAME,
+                JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR, null, null).visitEnd();
         writer.visitEnd();
         return writer.toByteArray();
     }

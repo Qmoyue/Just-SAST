@@ -13,6 +13,7 @@ public record JndiObjectFactoryDispatch(JndiObjectFactoryCallSite callSite,
     public enum Status {
         RESOLVED,
         INTERFACE_ONLY,
+        ABSTRACT_ONLY,
         UNKNOWN_IMPLEMENTATION
     }
 
