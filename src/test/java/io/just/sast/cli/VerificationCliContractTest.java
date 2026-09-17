@@ -232,6 +232,10 @@ class VerificationCliContractTest {
         String bom = Files.readString(output.resolve("meta/dependencies.sbom.json"));
         assertTrue(inventory.contains("nested:BOOT-INF/lib/closure.jar"), inventory);
         assertTrue(bom.contains("MAVEN_POM_NOT_PROVIDED"), bom);
+        try (var files = Files.walk(temp)) {
+            assertTrue(files.noneMatch(path -> path.getFileName() != null
+                    && path.getFileName().toString().equalsIgnoreCase("pom.xml")));
+        }
     }
 
     @Test

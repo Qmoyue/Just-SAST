@@ -16,6 +16,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -408,6 +409,65 @@ class MavenDependencyGraphResolverTest {
     }
 
     @Test
+    void offlineResolutionUsesOnlyExplicitCacheAndRepositories(@TempDir Path isolated)
+            throws Exception {
+        Path requestedRepository = isolated.resolve("requested-repository");
+        Path userRepository = isolated.resolve("user-repository");
+        String requestedPom = pom("fixture", "library", "1.0", "");
+        write(requestedRepository, "fixture/library/1.0/library-1.0.pom", requestedPom);
+        writeJar(requestedRepository.resolve("fixture/library/1.0/library-1.0.jar"),
+                "fixture/request.marker", "request-bytes");
+        write(userRepository, "fixture/library/1.0/library-1.0.pom", requestedPom);
+        writeJar(userRepository.resolve("fixture/library/1.0/library-1.0.jar"),
+                "fixture/user.marker", "user-bytes");
+        Path userHome = isolated.resolve("user-home");
+        write(userHome, ".m2/settings.xml", """
+                <settings>
+                  <localRepository>%s</localRepository>
+                  <profiles><profile><id>user-repository</id><repositories><repository>
+                    <id>user-repository</id><url>%s</url>
+                  </repository></repositories></profile></profiles>
+                  <activeProfiles><activeProfile>user-repository</activeProfile></activeProfiles>
+                </settings>
+                """.formatted(userRepository.toString().replace('\\', '/'),
+                        userRepository.toUri()));
+        Path root = isolated.resolve("root/pom.xml");
+        write(root.getParent(), root.getFileName().toString(), pom("fixture", "root", "1.0",
+                "<dependencies><dependency><groupId>fixture</groupId>"
+                        + "<artifactId>library</artifactId><version>1.0</version></dependency></dependencies>"));
+        Path requestedCache = isolated.resolve("requested-cache");
+        String previousHome = System.getProperty("user.home");
+        String previousLocal = System.getProperty("maven.repo.local");
+        try {
+            System.setProperty("user.home", userHome.toString());
+            System.setProperty("maven.repo.local", userRepository.toString());
+            MavenDependencyGraphResolver.Completion completion;
+            try (MavenDependencyGraphResolver resolver = new MavenDependencyGraphResolver()) {
+                completion = resolver.complete(new MavenDependencyGraphResolver.Request(
+                        root, requestedCache,
+                        List.of(new MavenDependencyGraphResolver.RepositorySpec(
+                                "requested", requestedRepository.toUri())),
+                        List.of(), true));
+            }
+
+            assertEquals(MavenDependencyGraphResolver.Status.COMPLETE, completion.status(),
+                    completion.resolution().problems().toString());
+            assertEquals(List.of("requested"), completion.resolution().repositoryIds());
+            assertEquals(1, completion.artifacts().size());
+            assertTrue(completion.artifacts().get(0).path()
+                    .startsWith(requestedCache.toAbsolutePath().normalize()));
+            assertTrue(Files.exists(requestedCache.resolve("fixture/library/1.0/library-1.0.jar")));
+            try (JarFile artifact = new JarFile(completion.artifacts().get(0).path().toFile())) {
+                assertTrue(artifact.getEntry("fixture/request.marker") != null);
+                assertTrue(artifact.getEntry("fixture/user.marker") == null);
+            }
+        } finally {
+            restoreProperty("user.home", previousHome);
+            restoreProperty("maven.repo.local", previousLocal);
+        }
+    }
+
+    @Test
     void invalidRemoteJarIsRemovedAndReportedInsteadOfEnteringCache() throws Exception {
         Path repository = temp.resolve("invalid-repository");
         write(repository, "fixture/library/1.0/library-1.0.pom",
@@ -663,6 +723,14 @@ class MavenDependencyGraphResolverTest {
             output.putNextEntry(new JarEntry(entryName));
             output.write(content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             output.closeEntry();
+        }
+    }
+
+    private static void restoreProperty(String name, String value) {
+        if (value == null) {
+            System.clearProperty(name);
+        } else {
+            System.setProperty(name, value);
         }
     }
 }
