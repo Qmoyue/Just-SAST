@@ -114,7 +114,15 @@ class FindingOutputReaderContractTest {
                         "entry_prefix_path", entryMethod));
         EvidenceAtom site = EvidenceAtom.of(EvidenceAtom.Kind.BINDING_SITE, "UNKNOWN",
                 "app/ApiController", "putNote()Ljava/lang/Object;",
-                "INDEX_TYPED_BINDING_SITE", Map.of("chain_key", chainKey));
+                "INDEX_TYPED_BINDING_SITE", Map.of(
+                        "chain_key", chainKey,
+                        "input_flow_status", "PROVED",
+                        "input_flow_stages", "external-parameter->decoder->byte-array-stream",
+                        "input_parameter_slots", "1",
+                        "deserialized_element_types", "app/Note",
+                        "reflection_resolution", "BOUNDED",
+                        "reflection_host", "app/ReflectiveBridge#invoke()Ljava/lang/Object;",
+                        "reflection_inputs", "serialized-method-name,serialized-descriptor"));
         EvidenceAtom dependency = EvidenceAtom.of(EvidenceAtom.Kind.DEPENDENCY_SEGMENT,
                 "UNKNOWN", "dep/Gadget", "run", "CHAIN_DEPENDENCY_SUFFIX",
                 Map.of("chain_key", chainKey));
@@ -155,6 +163,12 @@ class FindingOutputReaderContractTest {
         assertEquals("UNKNOWN", trace.joinEvidence().artifactDigest());
         assertEquals("UNKNOWN", trace.joinEvidence().applicationIndexDigest());
         assertEquals(join.id(), trace.joinEvidence().joinId());
+        assertEquals("PROVED", trace.joinEvidence().staticProof().inputFlowStatus());
+        assertEquals(List.of("external-parameter", "decoder", "byte-array-stream"),
+                java.util.Arrays.asList(trace.joinEvidence().staticProof().inputFlowStages()
+                        .split("->")));
+        assertEquals("BOUNDED", trace.joinEvidence().staticProof().reflectionResolution());
+        assertTrue(snapshot.toCanonicalJson().contains("static_proof"));
         assertTrue(snapshot.toCanonicalJson().contains("application_trace"));
     }
 }

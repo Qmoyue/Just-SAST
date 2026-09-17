@@ -104,6 +104,28 @@ report.json 必须：
 
 内部 RunOutcome.PARTIAL 可以继续支持 exit/cache；它只表达静态覆盖或证明边界，不表达动态测试。
 
+application 链的反序列化输入证明必须使用通用 typed value-flow，而不是案例名称或 WP 文本：
+
+~~~text
+external parameter
+  → declared decoder model (例如 Base64.decode)
+  → byte[] / ByteArrayInputStream
+  → ObjectInputStream constructor
+  → readObject()
+  → bounded container element type
+~~~
+
+当 callback 的序列化字段继续进入 `Class.getMethod`/`getDeclaredMethod` 和
+`Method.invoke` 时，求解器还必须保留 receiver、方法名、参数类型 descriptor 和 invoke
+参数之间的字段约束，并对实际调用边做有界分发。`TemplatesImpl` 是静态 impact boundary：
+证明到该边界即可，不要求也不允许证明后续目标代码执行。上述证明结果同时写入
+`meta/application-chain-evidence.json`，并投影到 `report.json` 的
+`application_trace.join_evidence.static_proof`。
+
+`PARTIAL` 的含义是静态覆盖或单链证明仍有缺口，例如输入没有被 typed flow 连接、反射
+receiver/descriptor 未解析、依赖缺失或预算耗尽；它不是“动态测试未执行”，也不表示工具
+曾经执行过目标代码。报告应显示具体阻断原因，不能用动态测试字段替代它。
+
 ### 6.3 Markdown
 
 report.md 第一屏只保留：
@@ -137,6 +159,10 @@ Method#invoke
 TemplatesImpl#newTransformer
 ~~~
 
+若输入值证明是反序列化集合元素，图旁的 static proof 还应能回答 decoder、字节流、
+`readObject`、集合元素和反射字段约束分别在哪里成立；长 descriptor、offset 和完整
+证据仍保留在 report.json/meta 中。
+
 ## 7. demo 验收口径
 
 demo/demo2 必须以 WP 与实际 JAR 字节码交叉核对。demo.jar 的制品内最短主链是：
@@ -151,6 +177,11 @@ DogController#importDogs
 ~~~
 
 WP 外部恶意类中的 Runtime.getRuntime().exec 不在 demo.jar 内；另一个手工 payload 对象图的 invoke → Runtime.exec 也不能仅凭 demo.jar 自动证明。若扫描输入自身含有 java/lang/Runtime#exec 调用，Runtime sink 必须可发现；否则只能将制品外后续影响作为边界说明，不能伪造为制品内静态 terminal。
+
+demo 的 application join 还必须由通用事实完成：HTTP 参数经 decoder、字节流和
+`readObject` 到 `Dog` 集合元素，`Dog` 的序列化字段约束 `DogModel.wagTail` 中的
+`getMethod`/`invoke`，然后以 `TemplatesImpl` 作为静态边界。重命名 service、增加中间
+service、替换 decoder 后仍应遵循同一规则；缺少其中任一事实时才保留 PARTIAL。
 
 ## 8. 质量门槛
 

@@ -1,6 +1,8 @@
 package io.just.sast.analysis.taint;
 
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
+import io.just.sast.config.ModelSource;
+import io.just.sast.config.Rule;
 import io.just.sast.config.RuleEngine;
 import io.just.sast.cpg.build.Cfg;
 import io.just.sast.cpg.build.CfgLabel;
@@ -44,6 +46,83 @@ import java.util.concurrent.atomic.LongAdder;
  * 调用点索引、方法解析缓存、跨方法实参定位、公共判定谓词、入口下游闭包。
  */
 public final class OriginSupport {
+
+    /**
+     * Bounded proof that one application method carries an external parameter through a
+     * decoder/byte-stream construction into an ObjectInputStream collection element.
+     *
+     * <p>This is deliberately a provenance product, not a taint shortcut: a caller must
+     * provide the concrete read site and the finite element types already recovered by the
+     * container analysis. Unknown aliases, opaque factories and missing models stay UNKNOWN.</p>
+     */
+    public record DeserializationInputFlow(Status status, String hostMethodKey,
+                                           long readCallId, List<String> stages,
+                                           Set<Integer> parameterSlots,
+                                           Set<String> elementTypes,
+                                           List<String> reasons) {
+        public enum Status { PROVED, UNKNOWN }
+
+        public DeserializationInputFlow {
+            status = status == null ? Status.UNKNOWN : status;
+            hostMethodKey = hostMethodKey == null ? "" : hostMethodKey;
+            stages = stages == null ? List.of() : List.copyOf(stages);
+            parameterSlots = parameterSlots == null ? Set.of()
+                    : Collections.unmodifiableSet(new java.util.TreeSet<>(parameterSlots));
+            elementTypes = elementTypes == null ? Set.of()
+                    : Collections.unmodifiableSet(new java.util.TreeSet<>(elementTypes));
+            reasons = reasons == null ? List.of() : List.copyOf(reasons);
+        }
+
+        public boolean proven() {
+            return status == Status.PROVED;
+        }
+
+        public static DeserializationInputFlow unknown(String hostMethodKey, long readCallId,
+                                                       String reason) {
+            return new DeserializationInputFlow(Status.UNKNOWN, hostMethodKey, readCallId,
+                    List.of(), Set.of(), Set.of(), reason == null || reason.isBlank()
+                    ? List.of() : List.of(reason));
+        }
+    }
+
+    /**
+     * Bounded relation between serialized fields, Class.getMethod and Method.invoke.
+     * Resolution is intentionally tri-state: a finite but non-exact method name or receiver
+     * remains BOUNDED and does not require a guessed concrete runtime class.
+     */
+    public record ReflectiveDispatchProof(Status status, String callbackMethodKey,
+                                          String reflectiveMethodKey, long lookupCallId,
+                                          long invokeCallId, String receiverPrecision,
+                                          String methodNameResolution,
+                                          String descriptorResolution,
+                                          List<String> constrainedInputs,
+                                          List<String> reasons) {
+        public enum Status { PROVED, BOUNDED, UNKNOWN }
+
+        public ReflectiveDispatchProof {
+            status = status == null ? Status.UNKNOWN : status;
+            callbackMethodKey = callbackMethodKey == null ? "" : callbackMethodKey;
+            reflectiveMethodKey = reflectiveMethodKey == null ? "" : reflectiveMethodKey;
+            receiverPrecision = receiverPrecision == null ? "UNKNOWN" : receiverPrecision;
+            methodNameResolution = methodNameResolution == null
+                    ? "UNKNOWN" : methodNameResolution;
+            descriptorResolution = descriptorResolution == null
+                    ? "UNKNOWN" : descriptorResolution;
+            constrainedInputs = constrainedInputs == null ? List.of()
+                    : List.copyOf(constrainedInputs);
+            reasons = reasons == null ? List.of() : List.copyOf(reasons);
+        }
+
+        public boolean established() {
+            return status != Status.UNKNOWN;
+        }
+
+        public static ReflectiveDispatchProof unknown(String reason) {
+            return new ReflectiveDispatchProof(Status.UNKNOWN, "", "", -1L, -1L,
+                    "UNKNOWN", "UNKNOWN", "UNKNOWN", List.of(),
+                    reason == null || reason.isBlank() ? List.of() : List.of(reason));
+        }
+    }
 
     /** JVM descriptor of the callback method supplied by the proxy runtime. */
     public static final String SERIALIZED_PROXY_HANDLER_DESCRIPTOR =
@@ -1299,6 +1378,473 @@ public final class OriginSupport {
             }
         }
         return false;
+    }
+
+    /**
+     * Prove the application-side byte/value path into one concrete ObjectInputStream read.
+     *
+     * <p>The proof intentionally stops at declared model contracts.  A model such as
+     * {@code return:[arg0]} is enough to carry a Base64 string through a decoder, while an
+     * opaque factory or an unresolved field alias remains UNKNOWN.  This makes the result
+     * reusable for renamed classes and alternate decoder APIs without adding application
+     * predicates to the joiner.</p>
+     */
+    public DeserializationInputFlow proveDeserializationInput(MethodInfo host, Node read,
+                                                               Set<String> elementTypes) {
+        if (host == null || read == null || !isObjectInputStreamRead(read)) {
+            return DeserializationInputFlow.unknown(host == null ? "" : methodKey(host),
+                    read == null ? -1L : read.id(), "OIS_READ_SITE_MISSING");
+        }
+        Set<String> normalizedTypes = elementTypes == null ? Set.of()
+                : new java.util.TreeSet<>(elementTypes);
+        if (normalizedTypes.isEmpty()) {
+            return DeserializationInputFlow.unknown(methodKey(host), read.id(),
+                    "SERIALIZED_ELEMENT_TYPE_UNKNOWN");
+        }
+        ForwardOrigins.Result result = origins.compute(host);
+        Set<ValueOrigin> readReceivers = argOriginAtOrdinal(read, -1, result);
+        if (readReceivers.isEmpty()) {
+            return DeserializationInputFlow.unknown(methodKey(host), read.id(),
+                    "OIS_RECEIVER_ORIGIN_UNKNOWN");
+        }
+        List<Node> calls = orderedCalls(host);
+        InputFlowAccumulator accumulator = new InputFlowAccumulator();
+        boolean foundOisConstructor = false;
+        for (Node constructor : calls) {
+            if (!isObjectInputStreamConstructor(constructor)
+                    || !originsOverlap(readReceivers,
+                    argOriginAtOrdinal(constructor, -1, result))) {
+                continue;
+            }
+            foundOisConstructor = true;
+            Set<ValueOrigin> streamObjects = argOriginAtOrdinal(constructor, 0, result);
+            for (ValueOrigin streamObject : ValueOriginOrder.sorted(streamObjects)) {
+                if (!(streamObject instanceof ValueOrigin.Insn allocation)) {
+                    continue;
+                }
+                for (Node streamConstructor : calls) {
+                    if (!isByteArrayInputStreamConstructor(streamConstructor)
+                            || !containsOrigin(
+                            argOriginAtOrdinal(streamConstructor, -1, result), allocation)) {
+                        continue;
+                    }
+                    Set<ValueOrigin> bytes = argOriginAtOrdinal(streamConstructor, 0, result);
+                    InputFlowAccumulator candidate = new InputFlowAccumulator();
+                    if (traceExternalInput(bytes, host, result, candidate,
+                            new HashSet<>(), 0)) {
+                        candidate.stages.add("byte-array-stream");
+                        candidate.stages.add("object-input-stream");
+                        candidate.stages.add("collection-element");
+                        candidate.parameterSlots.forEach(accumulator.parameterSlots::add);
+                        accumulator.stages.addAll(candidate.stages);
+                        accumulator.proven = true;
+                    }
+                }
+            }
+        }
+        if (!accumulator.proven) {
+            return DeserializationInputFlow.unknown(methodKey(host), read.id(),
+                    foundOisConstructor ? "OIS_INPUT_STREAM_ORIGIN_UNKNOWN"
+                            : "OIS_CONSTRUCTOR_NOT_LINKED");
+        }
+        accumulator.stages = distinctOrdered(accumulator.stages);
+        accumulator.stages.add("element-types:" + String.join(",", normalizedTypes));
+        return new DeserializationInputFlow(DeserializationInputFlow.Status.PROVED,
+                methodKey(host), read.id(), accumulator.stages, accumulator.parameterSlots,
+                normalizedTypes, List.of());
+    }
+
+    /**
+     * Scan only serialized-element callback methods that are already present in a composed
+     * chain, then prove the generic Class.getMethod/Method.invoke relation in their callee.
+     * The descriptor-qualified method-key set is supplied by the chain owner; it is never
+     * inferred from a class name or benchmark label.
+     */
+    public ReflectiveDispatchProof proveReflectiveDispatch(Set<String> elementTypes,
+                                                            Set<String> chainMethodIdentities) {
+        if (elementTypes == null || elementTypes.isEmpty()
+                || chainMethodIdentities == null || chainMethodIdentities.isEmpty()) {
+            return ReflectiveDispatchProof.unknown("REFLECTIVE_CHAIN_CONTEXT_MISSING");
+        }
+        List<Node> methods = new ArrayList<>();
+        for (Node methodNode : graph.nodesOfType(NodeType.METHOD)) {
+            String key = methodKeyOf(methodNode.owner(), methodNode.name(), methodNode.descriptor());
+            if (!chainMethodIdentities.contains(key)
+                    || !matchesElementType(methodNode.owner(), elementTypes)) {
+                continue;
+            }
+            methods.add(methodNode);
+        }
+        methods.sort(java.util.Comparator.comparing(n -> methodKeyOf(n.owner(), n.name(),
+                n.descriptor())));
+        Set<String> diagnostics = new java.util.TreeSet<>();
+        if (methods.isEmpty()) {
+            return ReflectiveDispatchProof.unknown("SERIALIZED_CALLBACK_METHOD_NOT_IN_CHAIN");
+        }
+        for (Node callbackNode : methods) {
+            MethodInfo callback = methodOf(callbackNode.owner(), callbackNode.name(),
+                    callbackNode.descriptor());
+            if (callback == null) {
+                continue;
+            }
+            ForwardOrigins.Result callbackResult = origins.compute(callback);
+            for (Node callbackCall : orderedCalls(callback)) {
+                List<MethodInfo> targets = dispatchTargets(callbackCall);
+                if (targets.isEmpty()) {
+                    diagnostics.add("REFLECTIVE_TARGET_NOT_IN_CHAIN");
+                }
+                for (MethodInfo target : targets) {
+                    if (!receiverMayDispatchTo(callbackCall, callback, target.owner(),
+                            target.name(), target.descriptor(), callbackResult)) {
+                        continue;
+                    }
+                    ReflectiveDispatchProof proof = proveReflectiveBridge(callback,
+                            callbackCall, target, callbackResult);
+                    if (proof.established()) {
+                        return proof;
+                    }
+                    diagnostics.addAll(proof.reasons());
+                }
+            }
+        }
+        if (diagnostics.isEmpty()) {
+            diagnostics.add("REFLECTIVE_FIELD_CONSTRAINT_NOT_PROVEN");
+        }
+        return ReflectiveDispatchProof.unknown(String.join("+", diagnostics));
+    }
+
+    /** Public typed wrapper for the bounded Class.getMethod parameter descriptor proof. */
+    public String reflectiveParameterDescriptor(Node lookup, MethodInfo host) {
+        if (lookup == null || host == null || lookup.offset() < 0
+                || lookup.offset() >= host.instructions().size()) {
+            return null;
+        }
+        return reflectiveParameterDescriptor(host, host.insnAt(lookup.offset()),
+                new MethodRef(lookup.owner(), lookup.name(), lookup.descriptor()));
+    }
+
+    private ReflectiveDispatchProof proveReflectiveBridge(MethodInfo callback, Node callbackCall,
+                                                          MethodInfo target,
+                                                          ForwardOrigins.Result callbackResult) {
+        ForwardOrigins.Result targetResult = origins.compute(target);
+        boolean sawInvoke = false;
+        boolean sawLookup = false;
+        boolean sawSharedReceiver = false;
+        for (Node invoke : orderedCalls(target)) {
+            if (!isMethodInvoke(invoke)) {
+                continue;
+            }
+            sawInvoke = true;
+            Set<ValueOrigin> methodReceivers = argOriginAtOrdinal(invoke, -1, targetResult);
+            for (Node lookup : orderedCalls(target)) {
+                if (!isClassMethodLookup(lookup)
+                        || !containsOrigin(methodReceivers,
+                        new ValueOrigin.CallResult(lookup.id()))) {
+                    continue;
+                }
+                sawLookup = true;
+                Set<ValueOrigin> lookupReceiver = argOriginAtOrdinal(lookup, -1, targetResult);
+                Set<ValueOrigin> invokeTarget = argOriginAtOrdinal(invoke, 0, targetResult);
+                Set<ValueOrigin> methodName = argOriginAtOrdinal(lookup, 0, targetResult);
+                Set<ValueOrigin> descriptor = argOriginAtOrdinal(lookup, 1, targetResult);
+                Set<ValueOrigin> invokeArguments = argOriginAtOrdinal(invoke, 1, targetResult);
+                if (lookupReceiver.isEmpty() || invokeTarget.isEmpty()
+                        || !reflectiveReceiversShare(lookupReceiver, invokeTarget, targetResult)
+                        || methodName.isEmpty() || descriptor.isEmpty()
+                        || invokeArguments.isEmpty()) {
+                    continue;
+                }
+                sawSharedReceiver = true;
+                if (!mappedSerializedField(callbackCall, target, methodName,
+                        callbackResult)
+                        || !mappedSerializedField(callbackCall, target, descriptor,
+                        callbackResult)
+                        || !mappedSerializedField(callbackCall, target, invokeTarget,
+                        callbackResult)
+                        || !mappedSerializedField(callbackCall, target,
+                        invokeArguments, callbackResult)) {
+                    continue;
+                }
+                String nameResolution = reflectiveNamePrefix(lookup, target, targetResult)
+                        == null ? "BOUNDED" : "EXACT";
+                String descriptorResolution = reflectiveParameterDescriptor(lookup, target) == null
+                        ? "BOUNDED" : "EXACT";
+                String precision = receiverPrecision(callbackCall, callback, target.owner(),
+                        target.name(), target.descriptor(), callbackResult);
+                ReflectiveDispatchProof.Status status = "EXACT".equals(nameResolution)
+                        && "EXACT".equals(descriptorResolution)
+                        && !"UNKNOWN".equals(precision)
+                        ? ReflectiveDispatchProof.Status.PROVED
+                        : ReflectiveDispatchProof.Status.BOUNDED;
+                return new ReflectiveDispatchProof(status, methodKey(callback), methodKey(target),
+                        lookup.id(), invoke.id(), precision, nameResolution,
+                        descriptorResolution, List.of("serialized-receiver",
+                                "serialized-method-name", "serialized-descriptor",
+                                "serialized-invoke-arguments"), List.of());
+            }
+        }
+        String reason = !sawInvoke ? "METHOD_INVOKE_NOT_FOUND"
+                : !sawLookup ? "CLASS_METHOD_LOOKUP_NOT_LINKED"
+                : !sawSharedReceiver ? "REFLECTIVE_RECEIVER_NOT_SHARED"
+                : "REFLECTIVE_SERIALIZED_FIELDS_NOT_MAPPED";
+        return ReflectiveDispatchProof.unknown(reason);
+    }
+
+    /**
+     * {@code input.getClass()} deliberately produces a new Class value in the JVM origin
+     * lattice.  For a reflective lookup, its receiver is nevertheless the object later passed
+     * to Method.invoke.  Recover that one JDK relation without widening arbitrary CallResult
+     * values or treating every Class object as the same receiver.
+     */
+    private boolean reflectiveReceiversShare(Set<ValueOrigin> lookupReceiver,
+                                             Set<ValueOrigin> invokeTarget,
+                                             ForwardOrigins.Result targetResult) {
+        if (originsOverlap(lookupReceiver, invokeTarget)) {
+            return true;
+        }
+        for (ValueOrigin value : ValueOriginOrder.sorted(lookupReceiver)) {
+            if (!(value instanceof ValueOrigin.CallResult callResult)) {
+                continue;
+            }
+            Node producer = callNode(callResult.callNodeId());
+            if (producer == null || !"getClass".equals(producer.name())
+                    || !"java/lang/Object".equals(producer.owner())) {
+                continue;
+            }
+            if (originsOverlap(argOriginAtOrdinal(producer, -1, targetResult), invokeTarget)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean mappedSerializedField(Node callbackCall, MethodInfo target,
+                                         Set<ValueOrigin> targetOrigins,
+                                         ForwardOrigins.Result callbackResult) {
+        if (targetOrigins == null || targetOrigins.isEmpty()) {
+            return false;
+        }
+        boolean mapped = false;
+        for (ValueOrigin origin : ValueOriginOrder.sorted(targetOrigins)) {
+            if (!(origin instanceof ValueOrigin.Param parameter)) {
+                return false;
+            }
+            int ordinal = Descriptor.paramOrdinal(target.descriptor(), target.isStatic(),
+                    parameter.slot());
+            if (ordinal < 0) {
+                return false;
+            }
+            Set<ValueOrigin> callbackOrigins = argOriginAtOrdinal(callbackCall, ordinal,
+                    callbackResult);
+            if (callbackOrigins.isEmpty()
+                    || !callbackOrigins.stream().allMatch(OriginSupport::isSerializedFieldRead)) {
+                return false;
+            }
+            mapped = true;
+        }
+        return mapped;
+    }
+
+    private List<MethodInfo> dispatchTargets(Node call) {
+        Map<String, MethodInfo> targets = new TreeMap<>();
+        for (Edge edge : call.out()) {
+            if (edge.type() != EdgeType.INVOKES && edge.type() != EdgeType.DISPATCHES) {
+                continue;
+            }
+            Node targetNode = edge.to();
+            MethodInfo target = methodOf(targetNode.owner(), targetNode.name(),
+                    targetNode.descriptor());
+            if (target != null) {
+                targets.put(methodKey(target), target);
+            }
+        }
+        if (targets.isEmpty()) {
+            MethodInfo direct = methodOf(call.owner(), call.name(), call.descriptor());
+            if (direct != null) {
+                targets.put(methodKey(direct), direct);
+            }
+        }
+        return List.copyOf(targets.values());
+    }
+
+    private boolean matchesElementType(String owner, Set<String> elementTypes) {
+        for (String elementType : elementTypes) {
+            if (elementType != null && (elementType.equals(owner)
+                    || hierarchy.isSubtypeOf(elementType, owner))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isSerializedFieldRead(ValueOrigin value) {
+        if (!(value instanceof ValueOrigin.FieldRead field)) {
+            return false;
+        }
+        ValueOrigin receiver = field.receiver();
+        while (receiver instanceof ValueOrigin.FieldRead nested) {
+            receiver = nested.receiver();
+        }
+        return receiver instanceof ValueOrigin.Param parameter && parameter.slot() == 0;
+    }
+
+    private List<Node> orderedCalls(MethodInfo method) {
+        List<Node> calls = new ArrayList<>(graph.callsOfMethod(methodKey(method)));
+        calls.sort(java.util.Comparator.comparingInt(Node::offset).thenComparingLong(Node::id));
+        return calls;
+    }
+
+    private boolean traceExternalInput(Set<ValueOrigin> values, MethodInfo host,
+                                       ForwardOrigins.Result result,
+                                       InputFlowAccumulator accumulator,
+                                       Set<ValueOrigin> visiting, int depth) {
+        if (values == null || values.isEmpty() || depth > 10) {
+            return false;
+        }
+        if (values.stream().anyMatch(value -> value instanceof ValueOrigin.Unknown)) {
+            return false;
+        }
+        boolean proven = false;
+        for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
+            if (value == null || !visiting.add(value)) {
+                continue;
+            }
+            try {
+                if (value instanceof ValueOrigin.Param parameter) {
+                    if (isExternalParameter(host, parameter.slot())) {
+                        accumulator.parameterSlots.add(parameter.slot());
+                        accumulator.stages.add("external-parameter");
+                        proven = true;
+                    }
+                } else if (value instanceof ValueOrigin.CallResult callResult
+                        && callResult.callNodeId() >= 0) {
+                    Node call = callNode(callResult.callNodeId());
+                    if (call == null) {
+                        continue;
+                    }
+                    Rule.ModelRule model = ruleEngine.matchingModel(call.owner(), call.name(),
+                            call.descriptor()).orElse(null);
+                    if (model == null) {
+                        continue;
+                    }
+                    for (String source : model.actions().getOrDefault("return", List.of())) {
+                        Set<ValueOrigin> sourceOrigins = modelReturnOrigins(source, call, result);
+                        if (sourceOrigins.isEmpty()) {
+                            continue;
+                        }
+                        String returnType = Descriptor.returnType(call.descriptor());
+                        if (traceExternalInput(sourceOrigins, host, result, accumulator,
+                                visiting, depth + 1)) {
+                            accumulator.stages.add(("[B".equals(returnType) ? "decoder:" : "model:")
+                                    + call.owner() + "#" + call.name());
+                            proven = true;
+                        }
+                    }
+                } else if (value instanceof ValueOrigin.Insn instruction
+                        && instruction.offset() >= 0
+                        && instruction.offset() < host.instructions().size()) {
+                    InsnFact fact = host.insnAt(instruction.offset());
+                    if (fact.op() == Op.CHECKCAST) {
+                        ForwardOrigins.State before = result.stateBefore().get(instruction.offset());
+                        if (before != null && !before.stack().isEmpty()
+                                && traceExternalInput(before.stack().get(before.stack().size() - 1)
+                                .origins(), host, result, accumulator, visiting, depth + 1)) {
+                            proven = true;
+                        }
+                    }
+                }
+            } finally {
+                visiting.remove(value);
+            }
+        }
+        return proven;
+    }
+
+    private Set<ValueOrigin> modelReturnOrigins(String source, Node call,
+                                                ForwardOrigins.Result result) {
+        ModelSource parsed = ModelSource.parse(source);
+        if (parsed == null) {
+            return Set.of();
+        }
+        Set<ValueOrigin> values = parsed.receiver()
+                ? argOriginAtOrdinal(call, -1, result)
+                : parsed.argumentOrdinal() == null ? Set.of()
+                : argOriginAtOrdinal(call, parsed.argumentOrdinal(), result);
+        if (!parsed.element()) {
+            return values;
+        }
+        Set<ValueOrigin> elements = new LinkedHashSet<>();
+        for (ValueOrigin value : ValueOriginOrder.sorted(values)) {
+            elements.addAll(ContainerElementSources.resolve(value, result));
+        }
+        return elements;
+    }
+
+    private boolean isExternalParameter(MethodInfo method, int slot) {
+        List<Integer> slots = Descriptor.argSlots(method.descriptor(), method.isStatic());
+        int current = 0;
+        for (int index = 0; index < slots.size(); index++) {
+            if (current == slot) {
+                return method.isStatic() || index > 0;
+            }
+            current += slots.get(index);
+        }
+        return false;
+    }
+
+    private static boolean originsOverlap(Set<ValueOrigin> left, Set<ValueOrigin> right) {
+        if (left == null || right == null || left.isEmpty() || right.isEmpty()) {
+            return false;
+        }
+        for (ValueOrigin value : left) {
+            if (right.contains(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsOrigin(Set<ValueOrigin> values, ValueOrigin expected) {
+        return values != null && expected != null && values.contains(expected);
+    }
+
+    private boolean isObjectInputStreamConstructor(Node call) {
+        return call != null && "<init>".equals(call.name())
+                && ("java/io/ObjectInputStream".equals(call.owner())
+                || ruleEngine.isSubtypeOf(call.owner(), "java/io/ObjectInputStream"));
+    }
+
+    private boolean isByteArrayInputStreamConstructor(Node call) {
+        return call != null && "<init>".equals(call.name())
+                && Descriptor.paramCount(call.descriptor()) > 0
+                && "[B".equals(Descriptor.paramType(call.descriptor(), 0))
+                && ("java/io/ByteArrayInputStream".equals(call.owner())
+                || ruleEngine.isSubtypeOf(call.owner(), "java/io/InputStream"));
+    }
+
+    private static boolean isClassMethodLookup(Node call) {
+        return call != null && "java/lang/Class".equals(call.owner())
+                && ("getMethod".equals(call.name()) || "getDeclaredMethod".equals(call.name()))
+                && Descriptor.paramCount(call.descriptor()) >= 2;
+    }
+
+    private static boolean isMethodInvoke(Node call) {
+        return call != null && "java/lang/reflect/Method".equals(call.owner())
+                && "invoke".equals(call.name()) && Descriptor.paramCount(call.descriptor()) >= 2;
+    }
+
+    private static String methodIdentity(String owner, String name) {
+        return (owner == null ? "" : owner) + "#" + (name == null ? "" : name);
+    }
+
+    private static List<String> distinctOrdered(List<String> values) {
+        return new ArrayList<>(new java.util.LinkedHashSet<>(values));
+    }
+
+    private static final class InputFlowAccumulator {
+        private boolean proven;
+        private List<String> stages = new ArrayList<>();
+        private final Set<Integer> parameterSlots = new java.util.TreeSet<>();
     }
 
     private boolean concreteSerializableType(String type) {

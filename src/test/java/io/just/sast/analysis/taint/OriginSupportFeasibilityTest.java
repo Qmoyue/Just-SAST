@@ -13,6 +13,7 @@ import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.frontend.asm.FactsExtractor;
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.FieldInfo;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.Op;
@@ -24,6 +25,7 @@ import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 import org.objectweb.asm.Type;
@@ -300,6 +302,101 @@ class OriginSupportFeasibilityTest {
     }
 
     @Test
+    void typedInputFlowFollowsRenamedServiceAndAlternateDecoderModel() {
+        MethodNode method = new MethodNode(Modifier.PUBLIC, "accept", "(Ljava/lang/String;)V",
+                null, null);
+        method.instructions.add(new TypeInsnNode(Op.NEW.code(), "java/io/ByteArrayInputStream"));
+        method.instructions.add(new InsnNode(Op.DUP.code()));
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        method.instructions.add(new MethodInsnNode(Op.INVOKESTATIC.code(),
+                "fixture/codec/AltDecoder", "decode", "(Ljava/lang/String;)[B", false));
+        method.instructions.add(new MethodInsnNode(Op.INVOKESPECIAL.code(),
+                "java/io/ByteArrayInputStream", "<init>", "([B)V", false));
+        method.instructions.add(new VarInsnNode(Op.ASTORE.code(), 2));
+        method.instructions.add(new TypeInsnNode(Op.NEW.code(), "java/io/ObjectInputStream"));
+        method.instructions.add(new InsnNode(Op.DUP.code()));
+        method.instructions.add(new VarInsnNode(Op.ALOAD.code(), 2));
+        method.instructions.add(new MethodInsnNode(Op.INVOKESPECIAL.code(),
+                "java/io/ObjectInputStream", "<init>", "(Ljava/io/InputStream;)V", false));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;", false));
+        method.instructions.add(new TypeInsnNode(Op.CHECKCAST.code(), "java/util/Collection"));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Collection",
+                "iterator", "()Ljava/util/Iterator;", true));
+        method.instructions.add(new MethodInsnNode(Op.INVOKEINTERFACE.code(), "java/util/Iterator",
+                "next", "()Ljava/lang/Object;", true));
+        method.instructions.add(new TypeInsnNode(Op.CHECKCAST.code(), "fixture/RenamedElement"));
+        method.instructions.add(new InsnNode(Op.POP.code()));
+        method.instructions.add(new InsnNode(Op.RETURN.code()));
+
+        MethodInfo hostMethod = extract("fixture/renamed/ImportService", method);
+        ClassInfo service = new ClassInfo(hostMethod.owner(), "java/lang/Object", List.of(),
+                Modifier.PUBLIC, List.of(hostMethod), List.of());
+        ClassInfo element = new ClassInfo("fixture/RenamedElement", "java/lang/Object",
+                List.of("java/io/Serializable"), Modifier.PUBLIC, List.of(), List.of());
+        ClassInfo serializable = new ClassInfo("java/io/Serializable", "java/lang/Object",
+                List.of(), Modifier.PUBLIC | Modifier.INTERFACE, List.of(), List.of());
+        Rule.ModelRule decoder = new Rule.ModelRule("fixture-alt-decoder",
+                new Rule.CallMatcher(Match.of("fixture/codec/AltDecoder"), Match.of("decode"),
+                        Match.of("(Ljava/lang/String;)[B")), Map.of("return", List.of("arg0")));
+        LoadResult load = new LoadResult(Map.of(service.internalName(), service,
+                element.internalName(), element, serializable.internalName(), serializable),
+                List.of(), 3, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(new RuleSet(List.of(), List.of(), List.of(), List.of(decoder),
+                        List.of()), hierarchy), false, cpg.index());
+        Node read = cpg.graph().nodesOfType(NodeType.CALL).stream()
+                .filter(OriginSupport::isOisRead).findFirst().orElseThrow();
+
+        OriginSupport.DeserializationInputFlow flow = support.proveDeserializationInput(hostMethod,
+                read, Set.of("fixture/RenamedElement"));
+        assertTrue(flow.proven(), "renamed service/element must use the generic typed input proof");
+        assertEquals(Set.of(1), flow.parameterSlots());
+        assertEquals(Set.of("fixture/RenamedElement"), flow.elementTypes());
+        assertTrue(flow.stages().stream().anyMatch(stage -> stage.contains("fixture/codec/AltDecoder#decode")));
+
+        OriginSupport opaque = new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
+        OriginSupport.DeserializationInputFlow unknown = opaque.proveDeserializationInput(
+                hostMethod, read, Set.of("fixture/RenamedElement"));
+        assertFalse(unknown.proven(),
+                "an unmodeled decoder must not be promoted to an external typed flow");
+    }
+
+    @Test
+    void reflectiveDispatchBindsSerializedFieldsAcrossInterfaceCallback() {
+        OriginSupport support = reflectiveDispatchSupport(true);
+
+        OriginSupport.ReflectiveDispatchProof proof = support.proveReflectiveDispatch(
+                Set.of("fixture/RenamedElement"),
+                Set.of("fixture/RenamedElement#hashCode()I",
+                        "fixture/ReflectiveBridge#invoke(Ljava/lang/Object;Ljava/lang/String;"
+                                + "[Ljava/lang/Class;[Ljava/lang/Object;)Ljava/lang/Object;"));
+        assertTrue(proof.established(), "serialized fields must reach the bounded reflective bridge");
+        assertEquals(OriginSupport.ReflectiveDispatchProof.Status.BOUNDED, proof.status());
+        assertEquals("BOUNDED", proof.methodNameResolution());
+        assertEquals("BOUNDED", proof.descriptorResolution());
+        assertTrue(proof.constrainedInputs().contains("serialized-method-name"));
+    }
+
+    @Test
+    void reflectiveDispatchRejectsConstantMethodName() {
+        OriginSupport support = reflectiveDispatchSupport(false);
+        OriginSupport.ReflectiveDispatchProof proof = support.proveReflectiveDispatch(
+                Set.of("fixture/RenamedElement"),
+                Set.of("fixture/RenamedElement#hashCode()I",
+                        "fixture/ReflectiveBridge#invoke(Ljava/lang/Object;Ljava/lang/String;"
+                                + "[Ljava/lang/Class;[Ljava/lang/Object;)Ljava/lang/Object;"));
+
+        assertFalse(proof.established(),
+                "a constant lookup name is not a serialized-field constraint");
+        assertTrue(proof.reasons().contains("REFLECTIVE_SERIALIZED_FIELDS_NOT_MAPPED"));
+    }
+
+    @Test
     void zeroArgumentReflectiveLookupRecoversEmptyClassArrayDescriptor() throws Exception {
         MethodNode method = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "run", "()V", null, null);
         method.instructions.add(new LdcInsnNode(Type.getObjectType("fixture/Target")));
@@ -445,6 +542,76 @@ class OriginSupportFeasibilityTest {
 
         assertEquals(1, support.frameworkMethodInvokeSites().size(),
                 "framework reflection index must retain Method.invoke");
+    }
+
+    private static OriginSupport reflectiveDispatchSupport(boolean serializedMethodName) {
+        MethodNode callback = new MethodNode(Modifier.PUBLIC, "hashCode", "()I", null, null);
+        for (String field : List.of("object", "methodName", "paramTypes", "args")) {
+            if ("methodName".equals(field) && !serializedMethodName) {
+                callback.instructions.add(new LdcInsnNode("fixedMethod"));
+                continue;
+            }
+            callback.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+            String descriptor = switch (field) {
+                case "object" -> "Ljava/lang/Object;";
+                case "methodName" -> "Ljava/lang/String;";
+                case "paramTypes" -> "[Ljava/lang/Class;";
+                default -> "[Ljava/lang/Object;";
+            };
+            callback.instructions.add(new FieldInsnNode(Op.GETFIELD.code(),
+                    "fixture/RenamedElement", field, descriptor));
+        }
+        callback.instructions.add(new MethodInsnNode(Op.INVOKESTATIC.code(),
+                "fixture/ReflectiveBridge", "invoke",
+                "(Ljava/lang/Object;Ljava/lang/String;[Ljava/lang/Class;[Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        callback.instructions.add(new InsnNode(Op.POP.code()));
+        callback.instructions.add(new InsnNode(Op.ICONST_0.code()));
+        callback.instructions.add(new InsnNode(Op.IRETURN.code()));
+
+        MethodNode bridge = new MethodNode(Modifier.PUBLIC | Modifier.STATIC, "invoke",
+                "(Ljava/lang/Object;Ljava/lang/String;[Ljava/lang/Class;[Ljava/lang/Object;)Ljava/lang/Object;",
+                null, null);
+        bridge.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        bridge.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(), "java/lang/Object",
+                "getClass", "()Ljava/lang/Class;", false));
+        bridge.instructions.add(new VarInsnNode(Op.ASTORE.code(), 5));
+        bridge.instructions.add(new VarInsnNode(Op.ALOAD.code(), 5));
+        bridge.instructions.add(new VarInsnNode(Op.ALOAD.code(), 1));
+        bridge.instructions.add(new VarInsnNode(Op.ALOAD.code(), 2));
+        bridge.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(), "java/lang/Class",
+                "getMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;", false));
+        bridge.instructions.add(new VarInsnNode(Op.ASTORE.code(), 6));
+        bridge.instructions.add(new VarInsnNode(Op.ALOAD.code(), 6));
+        bridge.instructions.add(new VarInsnNode(Op.ALOAD.code(), 0));
+        bridge.instructions.add(new VarInsnNode(Op.ALOAD.code(), 3));
+        bridge.instructions.add(new MethodInsnNode(Op.INVOKEVIRTUAL.code(),
+                "java/lang/reflect/Method", "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;", false));
+        bridge.instructions.add(new InsnNode(Op.ARETURN.code()));
+
+        MethodInfo callbackInfo = extract("fixture/RenamedElement", callback);
+        MethodInfo bridgeInfo = extract("fixture/ReflectiveBridge", bridge);
+        List<FieldInfo> fields = List.of(
+                new FieldInfo("fixture/RenamedElement", "object", "Ljava/lang/Object;", 0),
+                new FieldInfo("fixture/RenamedElement", "methodName", "Ljava/lang/String;", 0),
+                new FieldInfo("fixture/RenamedElement", "paramTypes", "[Ljava/lang/Class;", 0),
+                new FieldInfo("fixture/RenamedElement", "args", "[Ljava/lang/Object;", 0));
+        ClassInfo element = new ClassInfo("fixture/RenamedElement", "java/lang/Object",
+                List.of("java/io/Serializable"), Modifier.PUBLIC,
+                List.of(callbackInfo), fields);
+        ClassInfo bridgeClass = new ClassInfo("fixture/ReflectiveBridge", "java/lang/Object",
+                List.of(), Modifier.PUBLIC, List.of(bridgeInfo), List.of());
+        ClassInfo serializable = new ClassInfo("java/io/Serializable", "java/lang/Object",
+                List.of(), Modifier.PUBLIC | Modifier.INTERFACE, List.of(), List.of());
+        LoadResult load = new LoadResult(Map.of(element.internalName(), element,
+                bridgeClass.internalName(), bridgeClass, serializable.internalName(), serializable),
+                List.of(), 3, 61);
+        BuiltCpg cpg = new CpgBuilder().build(load);
+        cpg.graph().freeze();
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        return new OriginSupport(cpg.graph(), hierarchy,
+                new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
     }
 
     @Test

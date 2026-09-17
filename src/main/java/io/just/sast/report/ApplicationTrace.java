@@ -66,7 +66,24 @@ public record ApplicationTrace(
             String artifactCompatibility,
             String filterDominance,
             String constructionConstraint,
-            List<String> bridgeEvidenceIds) {
+            List<String> bridgeEvidenceIds,
+            StaticProof staticProof) {
+
+        /** Compatibility constructor for evidence produced before typed provenance fields. */
+        public JoinEvidence(String evidenceGraphDigest, String artifactDigest,
+                            String applicationIndexDigest, String joinId,
+                            String applicationChainId, String entryAtomId,
+                            String siteAtomId, String dependencySegmentId,
+                            String valueFlow, String objectIdentity,
+                            String callbackSemantics, String runtimeTypeProof,
+                            String artifactCompatibility, String filterDominance,
+                            String constructionConstraint, List<String> bridgeEvidenceIds) {
+            this(evidenceGraphDigest, artifactDigest, applicationIndexDigest, joinId,
+                    applicationChainId, entryAtomId, siteAtomId, dependencySegmentId,
+                    valueFlow, objectIdentity, callbackSemantics, runtimeTypeProof,
+                    artifactCompatibility, filterDominance, constructionConstraint,
+                    bridgeEvidenceIds, null);
+        }
 
         public JoinEvidence {
             evidenceGraphDigest = required(evidenceGraphDigest, "evidenceGraphDigest");
@@ -114,15 +131,18 @@ public record ApplicationTrace(
                 }
                 json.append('"').append(esc(bridgeEvidenceIds.get(index))).append('"');
             }
-            return json.append("]}").toString();
+            json.append("],\"static_proof\":");
+            return json.append(staticProof == null ? "null" : staticProof.toCanonicalJson())
+                    .append('}').toString();
         }
 
         public String display() {
-            return "join=" + joinId + "; value=" + valueFlow + "; object=" + objectIdentity
+            String base = "join=" + joinId + "; value=" + valueFlow + "; object=" + objectIdentity
                     + "; callback=" + callbackSemantics + "; type=" + runtimeTypeProof
                     + "; artifact=" + artifactCompatibility + "; filter=" + filterDominance
                     + "; construction=" + constructionConstraint + "; bridges="
                     + String.join(",", bridgeEvidenceIds);
+            return staticProof == null ? base : base + "; proof=" + staticProof.display();
         }
 
         private static String required(String value, String name) {
@@ -130,6 +150,99 @@ public record ApplicationTrace(
                 throw new IllegalArgumentException(name + " must be non-blank");
             }
             return value.trim();
+        }
+    }
+
+    /**
+     * Report-facing projection of the typed input/reflection proof.  It is deliberately a
+     * compact value object: the full evidence graph remains in meta/application-chain-evidence,
+     * while report.json carries the stages an agent needs to understand why a join is complete.
+     */
+    public record StaticProof(
+            String inputFlowStatus,
+            String inputFlowStages,
+            List<String> inputParameterSlots,
+            List<String> deserializedElementTypes,
+            String reflectionResolution,
+            String reflectionHost,
+            String reflectionReceiverPrecision,
+            String reflectionMethodName,
+            String reflectionDescriptor,
+            List<String> reflectionInputs,
+            List<String> reflectionReasons) {
+
+        public StaticProof {
+            inputFlowStatus = optional(inputFlowStatus);
+            inputFlowStages = optional(inputFlowStages);
+            inputParameterSlots = stableList(inputParameterSlots);
+            deserializedElementTypes = stableList(deserializedElementTypes);
+            reflectionResolution = optional(reflectionResolution);
+            reflectionHost = optional(reflectionHost);
+            reflectionReceiverPrecision = optional(reflectionReceiverPrecision);
+            reflectionMethodName = optional(reflectionMethodName);
+            reflectionDescriptor = optional(reflectionDescriptor);
+            reflectionInputs = stableList(reflectionInputs);
+            reflectionReasons = stableList(reflectionReasons);
+        }
+
+        public boolean present() {
+            return !inputFlowStatus.isBlank() || !inputFlowStages.isBlank()
+                    || !deserializedElementTypes.isEmpty() || !reflectionResolution.isBlank()
+                    || !reflectionHost.isBlank() || !reflectionInputs.isEmpty()
+                    || !reflectionReasons.isEmpty();
+        }
+
+        public String display() {
+            String input = inputFlowStages.isBlank() ? inputFlowStatus : inputFlowStages;
+            String reflection = reflectionResolution.isBlank() ? "UNKNOWN" : reflectionResolution;
+            if (!reflectionHost.isBlank()) {
+                reflection += "@" + reflectionHost;
+            }
+            return "input=" + (input.isBlank() ? "UNKNOWN" : input)
+                    + "; reflection=" + reflection;
+        }
+
+        public String toCanonicalJson() {
+            return "{\"input_flow_status\":\"" + esc(inputFlowStatus)
+                    + "\",\"input_flow_stages\":\"" + esc(inputFlowStages)
+                    + "\",\"input_parameter_slots\":" + strings(inputParameterSlots)
+                    + ",\"deserialized_element_types\":" + strings(deserializedElementTypes)
+                    + ",\"reflection_resolution\":\"" + esc(reflectionResolution)
+                    + "\",\"reflection_host\":\"" + esc(reflectionHost)
+                    + "\",\"reflection_receiver_precision\":\""
+                    + esc(reflectionReceiverPrecision)
+                    + "\",\"reflection_method_name\":\"" + esc(reflectionMethodName)
+                    + "\",\"reflection_descriptor\":\"" + esc(reflectionDescriptor)
+                    + "\",\"reflection_inputs\":" + strings(reflectionInputs)
+                    + ",\"reflection_reasons\":" + strings(reflectionReasons) + "}";
+        }
+
+        private static List<String> stableList(List<String> values) {
+            if (values == null || values.isEmpty()) {
+                return List.of();
+            }
+            return List.copyOf(values.stream().filter(Objects::nonNull)
+                    .map(String::trim).filter(value -> !value.isBlank()).toList());
+        }
+
+        private static String optional(String value) {
+            return value == null ? "" : value.trim();
+        }
+
+        private static String strings(List<String> values) {
+            StringBuilder json = new StringBuilder("[");
+            for (int index = 0; index < values.size(); index++) {
+                if (index > 0) {
+                    json.append(',');
+                }
+                json.append('"').append(esc(values.get(index))).append('"');
+            }
+            return json.append(']').toString();
+        }
+
+        private static String esc(String value) {
+            return value.replace("\\", "\\\\").replace("\"", "\\\"")
+                    .replace("\r", "\\r").replace("\n", "\\n");
         }
     }
 
@@ -209,7 +322,7 @@ public record ApplicationTrace(
                                     join.artifactCompatibility().name(),
                                     join.filterDominance().name(),
                                     join.constructionConstraint().name(),
-                                    join.bridgeEvidenceIds()));
+                                    join.bridgeEvidenceIds(), staticProof(site)));
                     traces.putIfAbsent(chainKey, trace);
                 });
         return Map.copyOf(traces);
@@ -311,6 +424,35 @@ public record ApplicationTrace(
         }
         String value = atom.attributes().get(key);
         return value == null ? "" : value.trim();
+    }
+
+    private static StaticProof staticProof(EvidenceAtom site) {
+        if (site == null) {
+            return null;
+        }
+        String inputStatus = attribute(site, "input_flow_status");
+        String inputStages = attribute(site, "input_flow_stages");
+        List<String> inputSlots = splitCsv(attribute(site, "input_parameter_slots"));
+        List<String> elementTypes = splitCsv(attribute(site, "deserialized_element_types"));
+        String reflectionResolution = attribute(site, "reflection_resolution");
+        String reflectionHost = attribute(site, "reflection_host");
+        String receiverPrecision = attribute(site, "reflection_receiver_precision");
+        String methodName = attribute(site, "reflection_method_name");
+        String descriptor = attribute(site, "reflection_descriptor");
+        List<String> inputs = splitCsv(attribute(site, "reflection_inputs"));
+        List<String> reasons = splitCsv(attribute(site, "reflection_reasons"));
+        StaticProof proof = new StaticProof(inputStatus, inputStages, inputSlots, elementTypes,
+                reflectionResolution, reflectionHost, receiverPrecision, methodName, descriptor,
+                inputs, reasons);
+        return proof.present() ? proof : null;
+    }
+
+    private static List<String> splitCsv(String value) {
+        if (value == null || value.isBlank()) {
+            return List.of();
+        }
+        return List.copyOf(java.util.Arrays.stream(value.split(","))
+                .map(String::trim).filter(item -> !item.isBlank()).toList());
     }
 
     private static String normalize(String value) {

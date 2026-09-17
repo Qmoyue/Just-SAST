@@ -191,13 +191,31 @@
                 "entry_atom_id": { "type": "string" }, "site_atom_id": { "type": "string" }, "dependency_segment_id": { "type": "string" },
                 "value_flow": { "type": "string" }, "object_identity": { "type": "string" }, "callback_semantics": { "type": "string" },
                 "runtime_type_proof": { "type": "string" }, "artifact_compatibility": { "type": "string" }, "filter_dominance": { "type": "string" },
-                "construction_constraint": { "type": "string" }, "bridge_evidence_ids": { "type": "array", "items": { "type": "string" } }
+                "construction_constraint": { "type": "string" }, "bridge_evidence_ids": { "type": "array", "items": { "type": "string" } },
+                "static_proof": { "$ref": "#/$defs/static_proof" }
               },
               "additionalProperties": false
             }
           },
           "additionalProperties": false
         }
+      },
+      "additionalProperties": false
+    }
+    ,"static_proof": {
+      "type": ["object", "null"],
+      "properties": {
+        "input_flow_status": { "type": "string" },
+        "input_flow_stages": { "type": "string" },
+        "input_parameter_slots": { "type": "array", "items": { "type": "string" } },
+        "deserialized_element_types": { "type": "array", "items": { "type": "string" } },
+        "reflection_resolution": { "type": "string" },
+        "reflection_host": { "type": "string" },
+        "reflection_receiver_precision": { "type": "string" },
+        "reflection_method_name": { "type": "string" },
+        "reflection_descriptor": { "type": "string" },
+        "reflection_inputs": { "type": "array", "items": { "type": "string" } },
+        "reflection_reasons": { "type": "array", "items": { "type": "string" } }
       },
       "additionalProperties": false
     }

@@ -598,6 +598,27 @@ rules:
   # 来源：CodeQL Jodd Json 模块
 
   # ---- model 规则（tabby actions 模式）：JDK 集合/字符串的声明式污点透传 ----
+  # Byte decoders are value-preserving boundaries.  The model is deliberately expressed as
+  # an API contract so the application joiner can follow any configured decoder implementation
+  # without naming an application class or assuming a particular demo shape.
+  - id: MODEL-JDK-BASE64-DECODER-DECODE
+    kind: model
+    match:
+      call: { owner: "java/util/Base64$Decoder", name: "decode" }
+    actions: { return: [arg0] }
+
+  - id: MODEL-COMMONS-CODEC-BASE64-DECODE
+    kind: model
+    match:
+      call: { owner: "org/apache/commons/codec/binary/Base64", name: "decodeBase64" }
+    actions: { return: [arg0] }
+
+  - id: MODEL-JAXB-DATATYPE-CONVERTER-BASE64
+    kind: model
+    match:
+      call: { owner: "javax/xml/bind/DatatypeConverter", name: "parseBase64Binary" }
+    actions: { return: [arg0] }
+
   - id: MODEL-MAP-PUT
     kind: model
     match:

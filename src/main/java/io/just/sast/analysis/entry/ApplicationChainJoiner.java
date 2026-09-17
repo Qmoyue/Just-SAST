@@ -15,12 +15,14 @@ import io.just.sast.blackboard.GadgetSegmentId;
 import io.just.sast.blackboard.HopKind;
 import io.just.sast.blackboard.ObjectGraphPlan;
 import io.just.sast.blackboard.SinkRisk;
+import io.just.sast.analysis.taint.OriginSupport;
 import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Edge;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.ApplicationResourceFacts;
 import io.just.sast.model.Descriptor;
+import io.just.sast.model.MethodInfo;
 
 import java.util.ArrayList;
 import java.util.ArrayDeque;
@@ -88,12 +90,20 @@ public final class ApplicationChainJoiner {
         String digest = applicationDigest(blackboard);
         return build(blackboard.applicationEntryIndex(), blackboard.graph(),
                 blackboard.chains(), blackboard.scanInputs().applicationScopeKnown(),
-                digest, blackboard.completenessReasons());
+                digest, blackboard.completenessReasons(), blackboard.originSupport());
     }
 
     public static ApplicationChainEvidence build(ApplicationEntryIndex index, Graph graph,
                                                   List<Chain> chains, boolean scopeKnown,
                                                   String artifactDigest, Set<String> scanReasons) {
+        return build(index, graph, chains, scopeKnown, artifactDigest, scanReasons, null);
+    }
+
+    /** Build application evidence with the shared typed provenance owner. */
+    public static ApplicationChainEvidence build(ApplicationEntryIndex index, Graph graph,
+                                                  List<Chain> chains, boolean scopeKnown,
+                                                  String artifactDigest, Set<String> scanReasons,
+                                                  OriginSupport originSupport) {
         if (index == null || graph == null) {
             return ApplicationChainEvidence.empty(scopeKnown, List.of("INDEX_OR_GRAPH_MISSING"));
         }
@@ -123,6 +133,7 @@ public final class ApplicationChainJoiner {
         // the same BFS for every sink variant.
         Map<String, EntryMatch> entryMatchCache = new HashMap<>();
         Map<String, List<String>> callTargetCache = new HashMap<>();
+        Map<Long, OriginSupport.DeserializationInputFlow> inputFlowCache = new HashMap<>();
         for (Chain chain : ordered) {
             ApplicationEntryIndex.CandidateAdmissionDecision admission =
                     candidateAdmission(index, graph, chain);
@@ -131,7 +142,8 @@ public final class ApplicationChainJoiner {
                 decisions.put(chain.key(), admission.reasonCode());
                 continue;
             }
-            Decision decision = decide(index, graph, chain, entryMatchCache, callTargetCache);
+            Decision decision = decide(index, graph, chain, entryMatchCache, callTargetCache,
+                    originSupport, inputFlowCache);
             decisions.put(chain.key(), decision.reason());
             if (decision.join() == null) {
                 continue;
@@ -173,7 +185,9 @@ public final class ApplicationChainJoiner {
 
     private static Decision decide(ApplicationEntryIndex index, Graph graph, Chain chain,
                                    Map<String, EntryMatch> entryMatchCache,
-                                   Map<String, List<String>> callTargetCache) {
+                                   Map<String, List<String>> callTargetCache,
+                                   OriginSupport originSupport,
+                                   Map<Long, OriginSupport.DeserializationInputFlow> inputFlowCache) {
         if (chain == null) {
             return Decision.rejected("CHAIN_MISSING");
         }
@@ -278,6 +292,14 @@ public final class ApplicationChainJoiner {
         if (bridgeProfile.jdbcConfiguration() && !bridgeProfile.jdbcComplete()) {
             return Decision.rejected("JDBC_XML_BRIDGE_NOT_PROVEN");
         }
+        OriginSupport.DeserializationInputFlow inputFlow = deserializationInputFlow(
+                originSupport, graph, site, inputFlowCache);
+        OriginSupport.ReflectiveDispatchProof reflectiveProof = inputFlow.proven()
+                && chainMethods.contains(methodIdentity("java/lang/reflect/Method", "invoke"))
+                ? originSupport.proveReflectiveDispatch(inputFlow.elementTypes(),
+                chainMethodKeys(chain))
+                : OriginSupport.ReflectiveDispatchProof.unknown(inputFlow.proven()
+                ? "REFLECTIVE_INVOKE_NOT_IN_CHAIN" : "DESERIALIZATION_INPUT_NOT_PROVEN");
         if (entryMatch.typedBinding()) {
             entryAttributes.put("binding_target_type", chain.entryClass());
             entryAttributes.put("binding_site_call_id", Long.toString(site.callId()));
@@ -290,7 +312,8 @@ public final class ApplicationChainJoiner {
                         : "INDEX_APPLICATION_ENTRY") : entryMatch.typedBinding()
                         ? "INDEX_TYPED_BINDING_ENTRY" : "INDEX_APPLICATION_CALL_PREFIX",
                 entryAttributes);
-        EvidenceAtom siteAtom = siteAtom(site, entryKey, chain, entryMatch, bridgeProfile);
+        EvidenceAtom siteAtom = siteAtom(site, entryKey, chain, entryMatch, bridgeProfile,
+                inputFlow, reflectiveProof);
         GadgetSegmentId segmentId = dependencySegmentId(index, chain, dependencyOwner);
         Map<String, String> dependencyAttributes = new TreeMap<>();
         dependencyAttributes.put("segment_id", segmentId.value());
@@ -306,8 +329,11 @@ public final class ApplicationChainJoiner {
                 Map.of("descriptor", chain.sinkDescriptor(), "risk", chain.sinkRisk().name()));
 
         ApplicationChainId chainId = ApplicationChainId.fromCanonical("chain", chain.key());
-        EntryChainJoinEvidence.ValueFlow flow = valueFlow(chain, entryMatch, bridgeProfile);
+        EntryChainJoinEvidence.ValueFlow flow = valueFlow(chain, entryMatch, bridgeProfile,
+                inputFlow);
         EntryChainJoinEvidence.ObjectIdentity identity = flow == EntryChainJoinEvidence.ValueFlow.PROTOCOL_REPLY
+                ? EntryChainJoinEvidence.ObjectIdentity.SERIALIZED_ROUND_TRIP
+                : flow == EntryChainJoinEvidence.ValueFlow.DESERIALIZED_ELEMENT
                 ? EntryChainJoinEvidence.ObjectIdentity.SERIALIZED_ROUND_TRIP
                 : flow == EntryChainJoinEvidence.ValueFlow.DIRECT_VALUE
                 ? EntryChainJoinEvidence.ObjectIdentity.SAME_OBJECT
@@ -400,6 +426,10 @@ public final class ApplicationChainJoiner {
                 // bridge, or taint-solver argument proof can establish that relation.
                 && (site == null || !"builtin:framework-binding".equals(site.ruleId())
                 || entryMatch.typedBinding() || flow != EntryChainJoinEvidence.ValueFlow.UNKNOWN);
+        if (flow == EntryChainJoinEvidence.ValueFlow.DESERIALIZED_ELEMENT
+                && !reflectiveProof.established()) {
+            joinEvidenceComplete = false;
+        }
         boolean impactComplete = chain.unresolvedHops() == 0
                 && (terminalDecision.admitted() || declaredJdbcTerminal)
                 && joinEvidenceComplete;
@@ -842,9 +872,35 @@ public final class ApplicationChainJoiner {
         return Set.copyOf(members);
     }
 
+    /**
+     * Keep the reflective callback frontier descriptor-precise.  ChainHop.desc is the target
+     * descriptor, so each non-empty descriptor identifies the method at the hop destination;
+     * the entry descriptor is recovered from the ENTRY hop.  Name-only identities remain useful
+     * for general admission, but are too broad for serialized callback selection.
+     */
+    private static Set<String> chainMethodKeys(Chain chain) {
+        if (chain == null) {
+            return Set.of();
+        }
+        Set<String> members = new TreeSet<>();
+        String entryDescriptor = entryDescriptor(chain);
+        if (!entryDescriptor.isBlank()) {
+            members.add(methodKey(chain.entryClass(), chain.entryMethod(), entryDescriptor));
+        }
+        for (ChainHop hop : chain.hops()) {
+            if (hop == null || hop.desc() == null || hop.desc().isBlank()) {
+                continue;
+            }
+            members.add(methodKey(hop.toOwner(), hop.toName(), hop.desc()));
+        }
+        return Set.copyOf(members);
+    }
+
     private static EvidenceAtom siteAtom(ApplicationEntryIndex.DeserializeSite site,
                                          String entryKey, Chain chain, EntryMatch match,
-                                         BridgeProfile bridgeProfile) {
+                                         BridgeProfile bridgeProfile,
+                                         OriginSupport.DeserializationInputFlow inputFlow,
+                                         OriginSupport.ReflectiveDispatchProof reflectiveProof) {
         EvidenceAtom.Kind kind = site == null ? EvidenceAtom.Kind.DESERIALIZATION_SITE
                 : siteKind(site.bridge(), match != null && match.typedBinding());
         String owner = site == null ? ownerOf(entryKey) : site.owner();
@@ -868,7 +924,70 @@ public final class ApplicationChainJoiner {
             }
         }
         addBridgeProfileAttributes(attributes, bridgeProfile);
+        addProvenanceAttributes(attributes, inputFlow, reflectiveProof);
         return EvidenceAtom.of(kind, "UNKNOWN", owner, member, evidenceCode, attributes);
+    }
+
+    private static void addProvenanceAttributes(Map<String, String> attributes,
+                                                OriginSupport.DeserializationInputFlow inputFlow,
+                                                OriginSupport.ReflectiveDispatchProof reflectiveProof) {
+        if (inputFlow != null && inputFlow.status()
+                != OriginSupport.DeserializationInputFlow.Status.UNKNOWN) {
+            attributes.put("input_flow_status", inputFlow.status().name());
+            attributes.put("input_flow_stages", String.join("->", inputFlow.stages()));
+            attributes.put("input_parameter_slots", inputFlow.parameterSlots().stream()
+                    .map(String::valueOf).collect(java.util.stream.Collectors.joining(",")));
+            attributes.put("deserialized_element_types", String.join(",",
+                    inputFlow.elementTypes()));
+        }
+        if (reflectiveProof != null && (inputFlow != null && inputFlow.proven()
+                || reflectiveProof.established())) {
+            attributes.put("reflection_resolution", reflectiveProof.status().name());
+            if (reflectiveProof.established()) {
+                attributes.put("reflection_host", reflectiveProof.reflectiveMethodKey());
+                attributes.put("reflection_lookup_call_id", Long.toString(
+                        reflectiveProof.lookupCallId()));
+                attributes.put("reflection_invoke_call_id", Long.toString(
+                        reflectiveProof.invokeCallId()));
+                attributes.put("reflection_receiver_precision",
+                        reflectiveProof.receiverPrecision());
+                attributes.put("reflection_method_name", reflectiveProof.methodNameResolution());
+                attributes.put("reflection_descriptor", reflectiveProof.descriptorResolution());
+                attributes.put("reflection_inputs", String.join(",",
+                        reflectiveProof.constrainedInputs()));
+            }
+            if (!reflectiveProof.reasons().isEmpty()) {
+                attributes.put("reflection_reasons", String.join(",",
+                        reflectiveProof.reasons()));
+            }
+        }
+    }
+
+    private static OriginSupport.DeserializationInputFlow deserializationInputFlow(
+            OriginSupport originSupport, Graph graph, ApplicationEntryIndex.DeserializeSite site,
+            Map<Long, OriginSupport.DeserializationInputFlow> cache) {
+        if (originSupport == null || graph == null || site == null || !site.externalInput()) {
+            return OriginSupport.DeserializationInputFlow.unknown(site == null ? ""
+                    : site.hostMethodKey(), site == null ? -1L : site.callId(),
+                    "TYPED_INPUT_FLOW_UNAVAILABLE");
+        }
+        OriginSupport.DeserializationInputFlow cached = cache == null ? null
+                : cache.get(site.callId());
+        if (cached != null) {
+            return cached;
+        }
+        Node hostNode = graph.findMethodNodeKey(site.hostMethodKey());
+        MethodInfo host = hostNode == null ? null : originSupport.methodOf(hostNode.owner(),
+                hostNode.name(), hostNode.descriptor());
+        Node read = originSupport.callNode(site.callId());
+        Set<String> elementTypes = host == null ? Set.of()
+                : originSupport.deserializedContainerElementTypes(host);
+        OriginSupport.DeserializationInputFlow flow = originSupport.proveDeserializationInput(
+                host, read, elementTypes);
+        if (cache != null) {
+            cache.put(site.callId(), flow);
+        }
+        return flow;
     }
 
     /**
@@ -1012,7 +1131,8 @@ public final class ApplicationChainJoiner {
     }
 
     private static EntryChainJoinEvidence.ValueFlow valueFlow(Chain chain, EntryMatch entryMatch,
-                                                              BridgeProfile bridgeProfile) {
+                                                              BridgeProfile bridgeProfile,
+                                                              OriginSupport.DeserializationInputFlow inputFlow) {
         // A graph-only caller prefix proves control reachability, not that the exact external
         // value survives parameter/field conversion.  Keep the axis UNKNOWN until a typed
         // value-flow fact or protocol bridge establishes that relation.
@@ -1024,6 +1144,9 @@ public final class ApplicationChainJoiner {
         }
         if (entryMatch != null && entryMatch.typedBinding()) {
             return EntryChainJoinEvidence.ValueFlow.CALLBACK_ARGUMENT;
+        }
+        if (inputFlow != null && inputFlow.proven()) {
+            return EntryChainJoinEvidence.ValueFlow.DESERIALIZED_ELEMENT;
         }
         // An entry-only chain is the forward solver's compact representation for a sink
         // reached directly from the externally controlled entry method. There is no omitted

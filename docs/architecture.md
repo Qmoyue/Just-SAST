@@ -62,6 +62,20 @@ ASM 事实进入共享程序模型后，由传播、类型层次、字段 alias�
 
 lookup、connect、构造器、解码、二次解析和类定义可能是 bridge，不自动是终点。只到中间 API 的候选应保留断点和状态，不能被报告为完整影响。
 
+application 的 typed join 由共享 `OriginSupport` 持有，不由报告层或 demo 规则拼接：
+
+1. `ForwardOrigins` 将入口参数沿声明的 model rule 传播到 decoder 返回值；
+2. 精确连接 `byte[]`、`ByteArrayInputStream`、`ObjectInputStream` 和 `readObject`，再以有限
+   容器 element type 连接到 callback；
+3. 在 callback 的真实调用边上，对 `getClass` receiver、`Class.getMethod` 参数和
+   `Method.invoke` receiver/arguments 做 bounded resolution；
+4. 只有这些事实与同一 chain 的 `Method.invoke` 相交时，`DESERIALIZED_ELEMENT` 才能
+   提升为完整 application join。
+
+这里的 model 是 API 语义数据，不包含应用类名、路径、digest、benchmark 答案或 payload
+内容。未知、循环和预算边界都保留为 UNKNOWN/PARTIAL；不会通过扩大任意 CallResult、
+执行反射或猜测字段来“补全”链。
+
 ## 5. 静态边界和有限筛选
 
 所有模式都只读取输入并进行受限静态求值。禁止加载/初始化/构造目标类和对象，禁止反射调用目标方法、反序列化攻击流、启动应用、访问危险 sink、执行目标 native 或构建插件。内部错误直接失败。
@@ -100,6 +114,11 @@ report.md
 
 report.json 是 agent 入口，不能因 Markdown 展示上限丢候选；report.md 是人的入口，不能把 ranking、telemetry 和全部内部状态堆在首屏。两者必须共享 chain identity、计数、顺序和 graph projection。详细链展示之外，Markdown 还要汇总 capability boundary，让被截到候选表后的反射断点仍然可见。
 
+每个已建立的 application trace 可以带一个 `static_proof` 投影：输入阶段、参数 slot、
+反序列化 element type、反射解析级别、receiver 精度、方法名/descriptor 状态以及字段
+约束来源。它是 evidence graph 的只读摘要；完整节点、call id、offset 和失败原因仍由
+`meta/application-chain-evidence.json` 保留，两个报告格式不得各自重新推导。
+
 公开状态拆为：
 
 - outcome：有没有可审阅的结果，或发生失败/参数/运行库错误；
@@ -125,6 +144,10 @@ DogController#importDogs
 ~~~
 
 WP 外部恶意类的 Runtime.getRuntime().exec 不在 demo.jar 内，另一个手工对象图方案中的 invoke → Runtime.exec 也不由应用 JAR 自动证明。输入制品真实调用 java/lang/Runtime#exec 时，规则正常产生 sink；没有该字节码时，报告只能写制品外后续影响说明，不能伪造 terminal。
+
+`TemplatesImpl`、`ClassLoader#defineClass` 等边界的静态证明不等于执行证明。它们只说明
+字节码和类型/控制约束已经抵达影响边界；报告不得重新引入 `target_code_executed`、
+payload 或动态 verifier 字段。
 
 ## 8. 事务、缓存和错误
 

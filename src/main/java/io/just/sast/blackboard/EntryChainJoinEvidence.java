@@ -26,6 +26,8 @@ public record EntryChainJoinEvidence(
         DIRECT_VALUE,
         OBJECT_IDENTITY,
         CALLBACK_ARGUMENT,
+        /** A finite collection element recovered from one serialized input object. */
+        DESERIALIZED_ELEMENT,
         PROTOCOL_REPLY,
         DERIVED_VALUE,
         UNKNOWN
