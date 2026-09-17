@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://just.invalid/schema/concise-report-v2.schema.json",
+  "title": "Just concise static report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mode", "result", "findings", "provenance"],
+  "properties": {
+    "schema_version": { "const": "JUST-REPORT-V2" },
+    "mode": { "enum": ["component", "application"] },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "coverage"],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "FINDINGS_AVAILABLE",
+            "NO_FINDINGS",
+            "FAILED",
+            "UNSUPPORTED"
+          ]
+        },
+        "coverage": { "enum": ["COMPLETE", "BOUNDED", "UNKNOWN"] },
+        "candidates": { "type": "integer", "minimum": 0 },
+        "exported": { "type": "integer", "minimum": 0 },
+        "limits": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "minItems": 1
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "detail"],
+      "properties": {
+        "artifact_sha256": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "method", "descriptor"],
+      "properties": {
+        "owner": { "type": "string", "minLength": 1 },
+        "method": { "type": "string", "minLength": 1 },
+        "descriptor": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 }
+      }
+    },
+    "graph_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "label"],
+      "properties": {
+        "role": {
+          "enum": [
+            "ENTRY",
+            "SITE",
+            "SOURCE",
+            "DESERIALIZE",
+            "CALLBACK",
+            "BRIDGE",
+            "STEP",
+            "IMPACT",
+            "BOUNDARY"
+          ]
+        },
+        "label": { "type": "string", "minLength": 1 }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "entry", "impact", "graph", "proof"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["COMPLETE", "PARTIAL", "UNKNOWN"] },
+        "entry": { "$ref": "#/$defs/method" },
+        "impact": { "$ref": "#/$defs/method" },
+        "graph": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/graph_node" }
+        },
+        "proof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entry", "site", "input", "callback", "bridge", "terminal", "feasibility"],
+          "properties": {
+            "entry": { "type": "string", "minLength": 1 },
+            "site": { "type": "string", "minLength": 1 },
+            "input": { "type": "string", "minLength": 1 },
+            "callback": { "type": "string", "minLength": 1 },
+            "bridge": { "type": "string", "minLength": 1 },
+            "terminal": { "type": "string", "minLength": 1 },
+            "feasibility": { "type": "string", "minLength": 1 }
+          }
+        },
+        "limits": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "minItems": 1
+        }
+      }
+    }
+  }
+}
