@@ -25,6 +25,8 @@ public final class ProgramUniverse {
 
     private final Map<String, ClassInfo> classes;
     private final Map<String, ArtifactProvenance> classArtifacts;
+    private final Map<String, List<ArchiveMemberProvenance>> classProvenance;
+    private final List<ArchiveMemberProvenance> archiveMembers;
     private final List<ArtifactProvenance> artifacts;
     private final DependencyGraph dependencyGraph;
     private final List<ParseDiagnostic> diagnostics;
@@ -35,6 +37,8 @@ public final class ProgramUniverse {
 
     private ProgramUniverse(Map<String, ClassInfo> classes,
                             Map<String, ArtifactProvenance> classArtifacts,
+                            Map<String, List<ArchiveMemberProvenance>> classProvenance,
+                            List<ArchiveMemberProvenance> archiveMembers,
                             List<ArtifactProvenance> artifacts,
                             DependencyGraph dependencyGraph,
                             List<ParseDiagnostic> diagnostics,
@@ -68,6 +72,21 @@ public final class ProgramUniverse {
             }
         }
         this.classArtifacts = Collections.unmodifiableMap(artifactCopy);
+        LinkedHashMap<String, List<ArchiveMemberProvenance>> classProvenanceCopy =
+                new LinkedHashMap<>();
+        if (classProvenance != null) {
+            for (Map.Entry<String, List<ArchiveMemberProvenance>> entry : classProvenance.entrySet()) {
+                if (classCopy.containsKey(entry.getKey()) && entry.getValue() != null
+                        && entry.getValue().stream().noneMatch(Objects::isNull)) {
+                    classProvenanceCopy.put(entry.getKey(), List.copyOf(entry.getValue()));
+                }
+            }
+        }
+        this.classProvenance = Collections.unmodifiableMap(classProvenanceCopy);
+        if (archiveMembers == null || archiveMembers.stream().anyMatch(Objects::isNull)) {
+            throw new IllegalArgumentException("archive members are invalid");
+        }
+        this.archiveMembers = List.copyOf(archiveMembers);
         this.artifacts = immutableDistinctArtifacts(artifacts);
         this.dependencyGraph = Objects.requireNonNull(dependencyGraph, "dependency graph");
         this.diagnostics = diagnostics == null ? List.of() : List.copyOf(diagnostics);
@@ -79,7 +98,8 @@ public final class ProgramUniverse {
 
     public static ProgramUniverse from(LoadResult load) {
         Objects.requireNonNull(load, "load");
-        return new ProgramUniverse(load.classes(), Map.of(), List.of(), DependencyGraph.empty(),
+        return new ProgramUniverse(load.classes(), Map.of(), load.classProvenance(),
+                load.archiveMembers(), List.of(), DependencyGraph.empty(),
                 load.diagnostics(), load.completenessReasons(), load.filesScanned(),
                 load.targetMajorVersion());
     }
@@ -87,7 +107,8 @@ public final class ProgramUniverse {
     /** Build a universe with explicit artifact metadata without reparsing classes. */
     public static ProgramUniverse of(LoadResult load, List<ArtifactProvenance> artifacts) {
         Objects.requireNonNull(load, "load");
-        return new ProgramUniverse(load.classes(), Map.of(), artifacts, DependencyGraph.empty(),
+        return new ProgramUniverse(load.classes(), Map.of(), load.classProvenance(),
+                load.archiveMembers(), artifacts, DependencyGraph.empty(),
                 load.diagnostics(), load.completenessReasons(), load.filesScanned(),
                 load.targetMajorVersion());
     }
@@ -97,7 +118,8 @@ public final class ProgramUniverse {
                                      Map<String, ArtifactProvenance> classArtifacts,
                                      List<ArtifactProvenance> artifacts) {
         Objects.requireNonNull(load, "load");
-        return new ProgramUniverse(load.classes(), classArtifacts, artifacts,
+        return new ProgramUniverse(load.classes(), classArtifacts, load.classProvenance(),
+                load.archiveMembers(), artifacts,
                 DependencyGraph.empty(), load.diagnostics(), load.completenessReasons(),
                 load.filesScanned(), load.targetMajorVersion());
     }
@@ -108,7 +130,8 @@ public final class ProgramUniverse {
                                      List<ArtifactProvenance> artifacts,
                                      DependencyGraph dependencyGraph) {
         Objects.requireNonNull(load, "load");
-        return new ProgramUniverse(load.classes(), classArtifacts, artifacts, dependencyGraph,
+        return new ProgramUniverse(load.classes(), classArtifacts, load.classProvenance(),
+                load.archiveMembers(), artifacts, dependencyGraph,
                 load.diagnostics(), load.completenessReasons(), load.filesScanned(),
                 load.targetMajorVersion());
     }
@@ -123,6 +146,16 @@ public final class ProgramUniverse {
 
     public Map<String, ArtifactProvenance> classArtifacts() {
         return classArtifacts;
+    }
+
+    /** Member-level provenance for every successfully loaded class with a known source. */
+    public Map<String, List<ArchiveMemberProvenance>> classProvenance() {
+        return classProvenance;
+    }
+
+    /** Class and nested-archive members captured by the closure/frontend boundary. */
+    public List<ArchiveMemberProvenance> archiveMembers() {
+        return archiveMembers;
     }
 
     public DependencyGraph dependencyGraph() {
@@ -186,7 +219,7 @@ public final class ProgramUniverse {
     /** Preserve LoadResult compatibility at a typed boundary. */
     public LoadResult toLoadResult() {
         return new LoadResult(classes, diagnostics, filesScanned, targetMajorVersion,
-                completenessReasons);
+                completenessReasons, classProvenance, archiveMembers);
     }
 
     private static List<ArtifactProvenance> immutableDistinctArtifacts(List<ArtifactProvenance> values) {
@@ -273,6 +306,15 @@ public final class ProgramUniverse {
                     .sorted(Map.Entry.comparingByKey())
                     .forEach(entry -> update(digest, "class-artifact="
                             + TypeId.of(entry.getKey()).canonical() + '=' + entry.getValue().identity()));
+            classProvenance.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(entry -> entry.getValue().stream()
+                            .map(ArchiveMemberProvenance::identity)
+                            .sorted()
+                            .forEach(value -> update(digest, "class-provenance="
+                                    + TypeId.of(entry.getKey()).canonical() + '=' + value)));
+            archiveMembers.stream().map(ArchiveMemberProvenance::identity).sorted()
+                    .forEach(value -> update(digest, "archive-member=" + value));
             update(digest, "dependency-graph=" + dependencyGraph.semanticDigest());
             return hex(digest.digest());
         } catch (NoSuchAlgorithmException impossible) {

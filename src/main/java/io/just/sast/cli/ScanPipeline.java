@@ -243,14 +243,16 @@ public final class ScanPipeline {
             jdkSource = jrt;
         }
         try {
-        BytecodeFrontend frontend = new BytecodeFrontend(inputBudget);
+            BytecodeFrontend frontend = new BytecodeFrontend(inputBudget);
         // 先解析 target/deps；完整模式随后只把应用引用、规则类型和 magic-entry 方法
         // 所需的 JDK 类体放进 CPG，避免对同一批应用字节重复读取/解析。
         // 把原始 ClassBytes 限制在独立 helper 的生命周期内。完整扫描需要的只是
         // ClassInfo；否则 JDK 切片规划期间 input 仍会把整批 fat-jar byte[] 挂住。
         int targetFeature = jdkFeature(jdkSource);
+            List<ArtifactProvenance> artifactInputs = artifactProvenance(target, scanDeps,
+                    targetArtifactHash, dependencyHashes, jdkSource, targetFeature);
             BytecodeFrontend.ScopedLoad scopedApplication = loadApplication(frontend, targets,
-                    targetFeature, inputTracker);
+                    targetFeature, inputTracker, artifactInputs);
             if (!scopedApplication.unparseableArtifactIndexes().isEmpty()) {
                 throw new IOException("INPUT_UNPARSEABLE: artifact indexes "
                         + scopedApplication.unparseableArtifactIndexes());
@@ -260,13 +262,13 @@ public final class ScanPipeline {
                     scopedApplication.applicationClassNames());
             java.util.Set<String> applicationClassNames = modePolicy.applicationClassNames(
                     scopedApplication.applicationClassNames());
-        LoadResult load;
-        if (fast) {
+            LoadResult load;
+            if (fast) {
             load = applicationLoad;
-        } else {
+            } else {
             load = loadWithJdkSlice(frontend, applicationLoad, jdkSource, ruleSet,
                     inputTracker);
-        }
+            }
         // The frontend has already parsed every bounded input entry.  Before CPG construction,
         // retain only application-owned classes plus a generic, rule/reference-driven dependency
         // closure.  This is the graph-facing demand boundary: it reduces unrelated dependency
@@ -300,8 +302,6 @@ public final class ScanPipeline {
         // same graph is carried by the immutable universe and later serialized by the report
         // boundary; inventory generation must not reopen paths and invent a second identity.
         long dependencyResolutionStart = System.nanoTime();
-        List<ArtifactProvenance> artifactInputs = artifactProvenance(target, scanDeps,
-                targetArtifactHash, dependencyHashes, jdkSource, targetFeature);
         DependencyGraph dependencyGraph = new io.just.sast.report.DependencyInventoryWriter()
                 .build(target, actualDependencies, targetArtifactHash, load.targetMajorVersion(),
                         dependencyHashes.subList(0, actualDependencyCount), artifactInputs,
@@ -557,10 +557,12 @@ public final class ScanPipeline {
     }
 
     private static BytecodeFrontend.ScopedLoad loadApplication(BytecodeFrontend frontend,
-                                                               List<Path> targets,
-                                                               int targetFeature,
-                                                               InputBudget.Tracker inputTracker) {
-        return frontend.loadStreamingWithApplicationScope(targets, targetFeature, inputTracker);
+                                                                List<Path> targets,
+                                                                int targetFeature,
+                                                                InputBudget.Tracker inputTracker,
+                                                                List<ArtifactProvenance> artifactInputs) {
+        return frontend.loadStreamingWithApplicationScope(targets, targetFeature, inputTracker,
+                artifactInputs);
     }
 
     /** Input identities are computed once at the scan boundary and carried by the universe. */

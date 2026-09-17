@@ -289,7 +289,13 @@ public final class DemandDrivenProgramSlice {
             reasons.add("DEPENDENCY_DEMAND_SLICE_CAP:" + MAX_SELECTED_CLASSES);
         }
         LoadResult sliced = new LoadResult(selected, input.diagnostics(), input.filesScanned(),
-                input.targetMajorVersion(), List.copyOf(reasons));
+                input.targetMajorVersion(), List.copyOf(reasons),
+                input.classProvenance().entrySet().stream()
+                        .filter(entry -> selected.containsKey(entry.getKey()))
+                        .collect(java.util.stream.Collectors.toMap(
+                                java.util.Map.Entry::getKey, java.util.Map.Entry::getValue,
+                                (left, right) -> left, java.util.LinkedHashMap::new)),
+                input.archiveMembers());
         int selectedDependencies = dependencyCount(selected, applicationClassNames);
         return new Result(sliced, true, available.size(), selected.size(), inputDependencies,
                 selectedDependencies, capability.size(), anchors.size(), rounds, capped);

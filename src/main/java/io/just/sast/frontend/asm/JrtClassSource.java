@@ -1,6 +1,7 @@
 package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.ArchiveMemberProvenance;
 import io.just.sast.model.JdkClassSource;
 import io.just.sast.model.JdkSourceInfo;
 import io.just.sast.run.InputBudget;
@@ -490,7 +491,11 @@ public final class JrtClassSource implements JdkClassSource {
             byte[] bytes = IoUtil.readAll(input,
                     Math.min(size, budget.maxEntryBytes()), inputTracker);
             verifyClassEntryUnchanged(snapshot);
-            return new ClassBytes(internalName, bytes, "jdk:/" + module);
+            String origin = "jdk:/" + module;
+            return new ClassBytes(internalName, bytes, origin,
+                    ArchiveMemberProvenance.fromBytes(origin, origin, internalName + ".class",
+                            bytes, ArchiveMemberProvenance.Role.JDK,
+                            ArchiveMemberProvenance.Kind.CLASS));
         } catch (IOException failure) {
             throw new BudgetInputException(failure.getMessage() == null
                     ? "JDK_INPUT_BUDGET" : failure.getMessage(), failure);

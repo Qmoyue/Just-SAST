@@ -3,6 +3,7 @@ package io.just.sast.frontend.asm;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.ApplicationResourceFacts;
 import io.just.sast.model.ArchiveMetadata;
+import io.just.sast.model.ArchiveMemberProvenance;
 import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.ProgramUniverse;
@@ -70,7 +71,9 @@ public final class BytecodeFrontend {
     /** 已读取但尚未解析的目标输入；用于 JDK 切片先解析应用，再复用同一批字节。 */
     public record Inputs(List<ClassBytes> classes, List<ParseDiagnostic> diagnostics,
                          List<String> completenessReasons, InputBudget.Tracker tracker,
-                         boolean callerContextProvided) {
+                         boolean callerContextProvided,
+                         Map<String, List<ArchiveMemberProvenance>> classProvenance,
+                         List<ArchiveMemberProvenance> archiveMembers) {
         public Inputs {
             classes = classes == null ? List.of() : List.copyOf(classes);
             diagnostics = diagnostics == null ? List.of() : List.copyOf(diagnostics);
@@ -79,12 +82,22 @@ public final class BytecodeFrontend {
             // null tracker plus a forged flag claim scan-wide accounting; load(Inputs) would
             // otherwise create a fresh local budget while reporting a complete context.
             callerContextProvided = callerContextProvided && tracker != null;
+            classProvenance = immutableClassProvenance(classProvenance);
+            archiveMembers = immutableArchiveMembers(archiveMembers);
         }
 
         /** Compatibility constructor for callers that do not own an aggregate input budget. */
         public Inputs(List<ClassBytes> classes, List<ParseDiagnostic> diagnostics,
                       List<String> completenessReasons) {
-            this(classes, diagnostics, completenessReasons, null, false);
+            this(classes, diagnostics, completenessReasons, null, false, Map.of(), List.of());
+        }
+
+        /** Compatibility constructor for callers that explicitly provide the five legacy fields. */
+        public Inputs(List<ClassBytes> classes, List<ParseDiagnostic> diagnostics,
+                      List<String> completenessReasons, InputBudget.Tracker tracker,
+                      boolean callerContextProvided) {
+            this(classes, diagnostics, completenessReasons, tracker, callerContextProvided,
+                    Map.of(), List.of());
         }
 
         /**
@@ -94,7 +107,8 @@ public final class BytecodeFrontend {
          */
         public Inputs(List<ClassBytes> classes, List<ParseDiagnostic> diagnostics,
                       List<String> completenessReasons, InputBudget.Tracker tracker) {
-            this(classes, diagnostics, completenessReasons, tracker, tracker != null);
+            this(classes, diagnostics, completenessReasons, tracker, tracker != null,
+                    Map.of(), List.of());
         }
 
         /**
@@ -122,6 +136,8 @@ public final class BytecodeFrontend {
                              Map<String, List<Integer>> duplicateArtifactIndexes,
                              Map<String, List<String>> artifactDetails,
                              Map<String, ArchiveMetadata> archiveMetadata,
+                             Map<String, List<ArchiveMemberProvenance>> classProvenance,
+                             List<ArchiveMemberProvenance> archiveMembers,
                              List<Integer> unparseableArtifactIndexes,
                              ApplicationResourceFacts applicationResourceFacts) {
         public ScopedLoad {
@@ -167,6 +183,8 @@ public final class BytecodeFrontend {
                 }
             }
             archiveMetadata = Map.copyOf(metadataCopy);
+            classProvenance = immutableClassProvenance(classProvenance);
+            archiveMembers = immutableArchiveMembers(archiveMembers);
             if (unparseableArtifactIndexes == null) {
                 unparseableArtifactIndexes = List.of();
             } else {
@@ -182,7 +200,7 @@ public final class BytecodeFrontend {
         /** Compatibility constructor for callers interested only in application scope. */
         public ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames) {
             this(load, applicationClassNames, Map.of(), Map.of(), Map.of(),
-                    Map.of(), List.of(), ApplicationResourceFacts.empty());
+                    Map.of(), Map.of(), List.of(), List.of(), ApplicationResourceFacts.empty());
         }
 
         /** Compatibility constructor for callers that do not consume embedded provenance. */
@@ -190,7 +208,8 @@ public final class BytecodeFrontend {
                           Map<String, Integer> classArtifactIndexes,
                           Map<String, List<Integer>> duplicateArtifactIndexes) {
             this(load, applicationClassNames, classArtifactIndexes, duplicateArtifactIndexes,
-                    Map.of(), Map.of(), List.of(), ApplicationResourceFacts.empty());
+                    Map.of(), Map.of(), Map.of(), List.of(), List.of(),
+                    ApplicationResourceFacts.empty());
         }
     }
 
@@ -224,8 +243,8 @@ public final class BytecodeFrontend {
      * cannot reset aggregate limits between target and dependency artifacts.
      */
     public LoadResult loadStreaming(List<Path> targets, int targetFeature,
-                                    InputBudget.Tracker callerTracker) {
-        return loadStreamingInternal(targets, targetFeature, callerTracker, false).load();
+                                     InputBudget.Tracker callerTracker) {
+        return loadStreamingInternal(targets, targetFeature, callerTracker, false, null).load();
     }
 
     /**
@@ -235,30 +254,49 @@ public final class BytecodeFrontend {
      */
     public ScopedLoad loadStreamingWithApplicationScope(List<Path> targets, int targetFeature,
                                                          InputBudget.Tracker callerTracker) {
-        return loadStreamingInternal(targets, targetFeature, callerTracker, true);
+        return loadStreamingInternal(targets, targetFeature, callerTracker, true, null);
+    }
+
+    /**
+     * One-pass load with input identities frozen by the scan boundary.  The list must contain
+     * one direct provenance value per target/dependency input; JDK provenance is not part of this
+     * argument because JDK classes enter through the separate JDK source.
+     */
+    public ScopedLoad loadStreamingWithApplicationScope(List<Path> targets, int targetFeature,
+                                                         InputBudget.Tracker callerTracker,
+                                                         List<ArtifactProvenance> artifactInputs) {
+        return loadStreamingInternal(targets, targetFeature, callerTracker, true,
+                artifactInputs);
     }
 
     private ScopedLoad loadStreamingInternal(List<Path> targets, int targetFeature,
                                               InputBudget.Tracker callerTracker,
-                                              boolean captureApplicationScope) {
+                                              boolean captureApplicationScope,
+                                              List<ArtifactProvenance> artifactInputs) {
         InputBudget.Tracker inputTracker = callerTracker == null
                 ? inputBudget.tracker() : callerTracker;
+        if (artifactInputs != null && targets != null && artifactInputs.size() < targets.size()) {
+            throw new IllegalArgumentException("direct artifact provenance is incomplete");
+        }
         try (ParsingSession session = new ParsingSession(inputTracker)) {
             StreamingAccumulator accumulator = new StreamingAccumulator(session,
-                    captureApplicationScope);
+                    captureApplicationScope, artifactInputs);
             if (targets == null) {
                 return accumulator.scopedResult();
             }
             for (int artifactIndex = 0; artifactIndex < targets.size(); artifactIndex++) {
                 Path target = targets.get(artifactIndex);
                 accumulator.setArtifactIndex(artifactIndex);
+                accumulator.addRootMember(artifactIndex, target);
                 try {
                     JarReader.StreamResult stream = jarReader.streamDetailedWithResources(target,
                     accumulator::accept, captureApplicationScope
                                     ? accumulator::acceptResource : null,
-                            targetFeature, inputBudget, inputTracker);
+                            targetFeature, inputBudget, inputTracker,
+                            artifactRole(artifactIndex));
                     accumulator.addReasons(stream.completenessReasons());
                     accumulator.addMetadata(stream.archiveMetadata());
+                    accumulator.addArchiveMembers(stream.archiveMembers());
                     if (stream.classesEmitted() == 0
                             && stream.completenessReasons().contains("ARCHIVE_CORRUPT")) {
                         accumulator.markUnparseableArtifact(artifactIndex);
@@ -294,7 +332,6 @@ public final class BytecodeFrontend {
     /** Typed universe load using a caller-owned aggregate input tracker. */
     public ProgramUniverse loadUniverse(List<Path> targets, int targetFeature,
                                         InputBudget.Tracker callerTracker) {
-        LoadResult result = loadStreaming(targets, targetFeature, callerTracker);
         List<ArtifactProvenance> provenance = new ArrayList<>();
         if (targets != null) {
             for (Path target : targets) {
@@ -310,6 +347,8 @@ public final class BytecodeFrontend {
                 }
             }
         }
+        LoadResult result = loadStreamingInternal(targets, targetFeature, callerTracker, false,
+                provenance).load();
         return ProgramUniverse.of(result, provenance);
     }
 
@@ -329,6 +368,7 @@ public final class BytecodeFrontend {
         List<ParseDiagnostic> diagnostics = new ArrayList<>();
         List<String> completenessReasons = new ArrayList<>();
         List<ClassBytes> inputs = new ArrayList<>();
+        List<ArchiveMemberProvenance> archiveMembers = new ArrayList<>();
         InputBudget.Tracker inputTracker = callerTracker == null
                 ? inputBudget.tracker() : callerTracker;
         for (Path target : targets) {
@@ -337,6 +377,7 @@ public final class BytecodeFrontend {
                         inputBudget, inputTracker);
                 completenessReasons.addAll(read.completenessReasons());
                 inputs.addAll(read.classes());
+                archiveMembers.addAll(read.archiveMembers());
             } catch (IOException e) {
                 diagnostics.add(new ParseDiagnostic(target.toString(), e.getMessage()));
                 JustLogger.error("读取输入失败 {}: {}", target, e.getMessage());
@@ -344,7 +385,7 @@ public final class BytecodeFrontend {
         }
         return new Inputs(inputs, diagnostics,
                 List.copyOf(new java.util.LinkedHashSet<>(completenessReasons)), inputTracker,
-                callerTracker != null);
+                callerTracker != null, classProvenance(inputs), archiveMembers);
     }
 
     /** 解析已经读取的目标输入。目标类本身先入图，保留输入顺序和诊断顺序。 */
@@ -389,8 +430,10 @@ public final class BytecodeFrontend {
             }
             maxMajor = Math.max(maxMajor, result.majorVersion());
         }
+        Map<String, List<ArchiveMemberProvenance>> classProvenance = mergeClassProvenance(
+                input.classProvenance(), classProvenance(input.classes()), classes);
         return new LoadResult(classes, List.copyOf(diagnostics), input.classes().size(), maxMajor,
-                List.copyOf(completenessReasons));
+                List.copyOf(completenessReasons), classProvenance, input.archiveMembers());
     }
 
     /** 在已有目标结果上追加外部类，避免 JDK 切片规划时再次解析目标类。 */
@@ -407,6 +450,10 @@ public final class BytecodeFrontend {
         Map<String, ClassInfo> classes = new LinkedHashMap<>(base.classes());
         List<ParseDiagnostic> diagnostics = new ArrayList<>(base.diagnostics());
         LinkedHashSet<String> completenessReasons = new LinkedHashSet<>(base.completenessReasons());
+        Map<String, List<ArchiveMemberProvenance>> classProvenance =
+                new LinkedHashMap<>(base.classProvenance());
+        List<ArchiveMemberProvenance> archiveMembers = new ArrayList<>(base.archiveMembers());
+        archiveMembers.addAll(memberSnapshot(extraClassBytes));
         if (callerTracker == null) {
             completenessReasons.add("INPUT_BUDGET_CALLER_CONTEXT_MISSING");
         }
@@ -422,9 +469,10 @@ public final class BytecodeFrontend {
             }
             classes.putIfAbsent(result.className(), result.info());
         }
+        mergeClassProvenanceInto(classProvenance, classProvenance(extraClassBytes), classes);
         return new LoadResult(classes, List.copyOf(diagnostics),
                 base.filesScanned() + extraClassBytes.size(), base.targetMajorVersion(),
-                List.copyOf(completenessReasons));
+                List.copyOf(completenessReasons), classProvenance, archiveMembers);
     }
 
     /** 目标输入 + 外部类的兼容入口。 */
@@ -503,6 +551,7 @@ public final class BytecodeFrontend {
     private final class StreamingAccumulator {
         private final ParsingSession parsingSession;
         private final boolean captureApplicationScope;
+        private final List<ArtifactProvenance> artifactInputs;
         private final Map<String, ClassInfo> classes = new LinkedHashMap<>();
         private final List<ParseDiagnostic> diagnostics = new ArrayList<>();
         private final LinkedHashSet<String> completenessReasons = new LinkedHashSet<>();
@@ -511,6 +560,9 @@ public final class BytecodeFrontend {
         private final Map<String, List<Integer>> duplicateArtifactIndexes = new LinkedHashMap<>();
         private final Map<String, List<String>> artifactDetails = new LinkedHashMap<>();
         private final Map<String, ArchiveMetadata> archiveMetadata = new LinkedHashMap<>();
+        private final Map<String, List<ArchiveMemberProvenance>> classProvenance =
+                new LinkedHashMap<>();
+        private final List<ArchiveMemberProvenance> archiveMembers = new ArrayList<>();
         private final LinkedHashSet<Integer> unparseableArtifactIndexes = new LinkedHashSet<>();
         private final ApplicationResourceParser.Collector resourceCollector =
                 new ApplicationResourceParser.Collector(inputBudget);
@@ -519,9 +571,11 @@ public final class BytecodeFrontend {
         private int maxMajor;
         private int artifactIndex;
 
-        private StreamingAccumulator(ParsingSession parsingSession, boolean captureApplicationScope) {
+        private StreamingAccumulator(ParsingSession parsingSession, boolean captureApplicationScope,
+                                     List<ArtifactProvenance> artifactInputs) {
             this.parsingSession = parsingSession;
             this.captureApplicationScope = captureApplicationScope;
+            this.artifactInputs = artifactInputs == null ? null : List.copyOf(artifactInputs);
         }
 
         private void setArtifactIndex(int artifactIndex) {
@@ -555,6 +609,32 @@ public final class BytecodeFrontend {
             }
         }
 
+        private void addArchiveMembers(List<ArchiveMemberProvenance> members) {
+            if (members != null) {
+                archiveMembers.addAll(members);
+            }
+        }
+
+        private void addRootMember(int artifactIndex, Path target) {
+            if (artifactInputs == null) {
+                return;
+            }
+            if (artifactIndex < 0 || artifactIndex >= artifactInputs.size()) {
+                throw new IllegalArgumentException("direct artifact provenance index is invalid");
+            }
+            ArtifactProvenance artifact = artifactInputs.get(artifactIndex);
+            if (artifact == null) {
+                throw new IllegalArgumentException("direct artifact provenance is null");
+            }
+            String logicalName = artifact.logicalName();
+            if (target == null && logicalName.isBlank()) {
+                throw new IllegalArgumentException("direct artifact logical name is missing");
+            }
+            archiveMembers.add(ArchiveMemberProvenance.fromKnownHash(logicalName, logicalName,
+                    "<root>", artifact.sha256(), artifactRole(artifactIndex), "",
+                    ArchiveMemberProvenance.Kind.ARCHIVE));
+        }
+
         private void markUnparseableArtifact(int artifactIndex) {
             unparseableArtifactIndexes.add(artifactIndex);
         }
@@ -575,6 +655,11 @@ public final class BytecodeFrontend {
                 if (parsed.diagnostic() != null) {
                     diagnostics.add(parsed.diagnostic());
                     continue;
+                }
+                ArchiveMemberProvenance member = batch.get(i).provenance();
+                if (member != null) {
+                    classProvenance.computeIfAbsent(parsed.className(), ignored ->
+                            new ArrayList<>()).add(member);
                 }
                 if (captureApplicationScope && artifactIndex == 0
                         && isApplicationArtifactClass(batch.get(i))) {
@@ -598,14 +683,47 @@ public final class BytecodeFrontend {
         }
 
         private LoadResult result() {
+            List<ArchiveMemberProvenance> finalizedMembers = finalizeMembers();
+            Map<String, List<ArchiveMemberProvenance>> finalizedClassProvenance =
+                    finalizeClassProvenance(finalizedMembers);
             return new LoadResult(classes, List.copyOf(diagnostics), filesScanned, maxMajor,
-                    List.copyOf(completenessReasons));
+                    List.copyOf(completenessReasons), finalizedClassProvenance,
+                    finalizedMembers);
         }
 
         private ScopedLoad scopedResult() {
-            return new ScopedLoad(result(), applicationClassNames, classArtifactIndexes,
+            LoadResult load = result();
+            return new ScopedLoad(load, applicationClassNames, classArtifactIndexes,
                     duplicateArtifactIndexes, artifactDetails, archiveMetadata,
+                    load.classProvenance(), load.archiveMembers(),
                     List.copyOf(unparseableArtifactIndexes), resourceCollector.finish());
+        }
+
+        private List<ArchiveMemberProvenance> finalizeMembers() {
+            Map<String, ArchiveMetadata> parsed = new LinkedHashMap<>(archiveMetadata);
+            List<ArchiveMemberProvenance> result = new ArrayList<>(archiveMembers.size());
+            for (ArchiveMemberProvenance member : archiveMembers) {
+                String coordinate = exactCoordinate(parsed.get(member.logicalArtifact()));
+                result.add(coordinate.isBlank() ? member : member.withCoordinate(coordinate));
+            }
+            return List.copyOf(result);
+        }
+
+        private Map<String, List<ArchiveMemberProvenance>> finalizeClassProvenance(
+                List<ArchiveMemberProvenance> finalizedMembers) {
+            Map<String, ArchiveMemberProvenance> byContent = new LinkedHashMap<>();
+            for (ArchiveMemberProvenance member : finalizedMembers) {
+                byContent.putIfAbsent(member.contentIdentity(), member);
+            }
+            Map<String, List<ArchiveMemberProvenance>> result = new LinkedHashMap<>();
+            for (Map.Entry<String, List<ArchiveMemberProvenance>> entry : classProvenance.entrySet()) {
+                List<ArchiveMemberProvenance> values = new ArrayList<>();
+                for (ArchiveMemberProvenance member : entry.getValue()) {
+                    values.add(byContent.getOrDefault(member.contentIdentity(), member));
+                }
+                result.put(entry.getKey(), List.copyOf(values));
+            }
+            return result;
         }
     }
 
@@ -638,6 +756,108 @@ public final class BytecodeFrontend {
             }
         }
         return null;
+    }
+
+    private static ArchiveMemberProvenance.Role artifactRole(int artifactIndex) {
+        return artifactIndex == 0 ? ArchiveMemberProvenance.Role.ROOT
+                : ArchiveMemberProvenance.Role.EXPLICIT_DEPENDENCY;
+    }
+
+    private static String exactCoordinate(ArchiveMetadata metadata) {
+        if (metadata == null || metadata.pomProperties().size() != 1) {
+            return "";
+        }
+        return metadata.pomProperties().get(0).coordinate();
+    }
+
+    private static Map<String, List<ArchiveMemberProvenance>> immutableClassProvenance(
+            Map<String, List<ArchiveMemberProvenance>> values) {
+        if (values == null || values.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, List<ArchiveMemberProvenance>> copy = new LinkedHashMap<>();
+        for (Map.Entry<String, List<ArchiveMemberProvenance>> entry : values.entrySet()) {
+            if (entry.getKey() == null || entry.getKey().isBlank()
+                    || entry.getValue() == null
+                    || entry.getValue().stream().anyMatch(value -> value == null)) {
+                throw new IllegalArgumentException("class provenance is invalid");
+            }
+            copy.put(entry.getKey(), List.copyOf(entry.getValue()));
+        }
+        return Map.copyOf(copy);
+    }
+
+    private static List<ArchiveMemberProvenance> immutableArchiveMembers(
+            List<ArchiveMemberProvenance> values) {
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        if (values.stream().anyMatch(value -> value == null)) {
+            throw new IllegalArgumentException("archive members must not contain null entries");
+        }
+        return List.copyOf(values);
+    }
+
+    private static Map<String, List<ArchiveMemberProvenance>> classProvenance(
+            List<ClassBytes> values) {
+        Map<String, List<ArchiveMemberProvenance>> result = new LinkedHashMap<>();
+        if (values == null) {
+            return result;
+        }
+        for (ClassBytes value : values) {
+            if (value == null || value.className() == null || value.className().isBlank()
+                    || value.provenance() == null) {
+                continue;
+            }
+            result.computeIfAbsent(value.className(), ignored -> new ArrayList<>())
+                    .add(value.provenance());
+        }
+        return result;
+    }
+
+    private static List<ArchiveMemberProvenance> memberSnapshot(List<ClassBytes> values) {
+        List<ArchiveMemberProvenance> result = new ArrayList<>();
+        if (values != null) {
+            for (ClassBytes value : values) {
+                if (value != null && value.provenance() != null) {
+                    result.add(value.provenance());
+                }
+            }
+        }
+        return result;
+    }
+
+    private static Map<String, List<ArchiveMemberProvenance>> mergeClassProvenance(
+            Map<String, List<ArchiveMemberProvenance>> first,
+            Map<String, List<ArchiveMemberProvenance>> second,
+            Map<String, ClassInfo> classes) {
+        Map<String, List<ArchiveMemberProvenance>> result = new LinkedHashMap<>();
+        mergeClassProvenanceInto(result, first, classes);
+        mergeClassProvenanceInto(result, second, classes);
+        return result;
+    }
+
+    private static void mergeClassProvenanceInto(
+            Map<String, List<ArchiveMemberProvenance>> target,
+            Map<String, List<ArchiveMemberProvenance>> values,
+            Map<String, ClassInfo> classes) {
+        if (values == null) {
+            return;
+        }
+        for (Map.Entry<String, List<ArchiveMemberProvenance>> entry : values.entrySet()) {
+            if (entry.getKey() == null || !classes.containsKey(entry.getKey())
+                    || entry.getValue() == null) {
+                continue;
+            }
+            List<ArchiveMemberProvenance> destination = target.computeIfAbsent(entry.getKey(),
+                    ignored -> new ArrayList<>());
+            for (ArchiveMemberProvenance member : entry.getValue()) {
+                if (member != null && destination.stream().noneMatch(existing ->
+                        existing.contentIdentity().equals(member.contentIdentity()))) {
+                    destination.add(member);
+                }
+            }
+        }
     }
 
     /**

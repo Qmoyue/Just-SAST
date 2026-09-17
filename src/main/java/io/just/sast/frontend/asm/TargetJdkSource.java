@@ -1,6 +1,7 @@
 package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.ArchiveMemberProvenance;
 import io.just.sast.model.JdkClassSource;
 import io.just.sast.model.JdkSourceInfo;
 import io.just.sast.run.InputBudget;
@@ -208,8 +209,12 @@ public final class TargetJdkSource implements JdkClassSource {
                     accountClass(jarPath, entry);
                     try (var input = zip.getInputStream(entry)) {
                         byte[] bytes = readClassEntryBytes(jarPath, entry, input);
-                        result = new ClassBytes(internalName, bytes,
-                                "jdk:" + jarPath.getFileName());
+                        String origin = "jdk:" + jarPath.getFileName();
+                        result = new ClassBytes(internalName, bytes, origin,
+                                ArchiveMemberProvenance.fromBytes(origin, origin,
+                                        internalName + ".class", bytes,
+                                        ArchiveMemberProvenance.Role.JDK,
+                                        ArchiveMemberProvenance.Kind.CLASS));
                     }
                 }
             }
@@ -256,7 +261,11 @@ public final class TargetJdkSource implements JdkClassSource {
                     accountClass(jar, entry);
                     try (var input = zip.getInputStream(entry)) {
                         byte[] bytes = readClassEntryBytes(jar, entry, input);
-                        result.add(new ClassBytes(className, bytes, "jdk:" + jar.getFileName()));
+                        String origin = "jdk:" + jar.getFileName();
+                        result.add(new ClassBytes(className, bytes, origin,
+                                ArchiveMemberProvenance.fromBytes(origin, origin,
+                                        name, bytes, ArchiveMemberProvenance.Role.JDK,
+                                        ArchiveMemberProvenance.Kind.CLASS)));
                     }
                 }
             }

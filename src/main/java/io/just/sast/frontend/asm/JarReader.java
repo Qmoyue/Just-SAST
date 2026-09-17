@@ -1,18 +1,22 @@
 package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ArchiveMetadata;
+import io.just.sast.model.ArchiveMemberProvenance;
 import io.just.sast.util.IoUtil;
 import io.just.sast.util.JustLogger;
 import io.just.sast.util.ArchiveLimits;
 import io.just.sast.run.InputBudget;
 
 import java.io.FilterInputStream;
+import java.security.DigestInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PushbackInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Enumeration;
@@ -51,29 +55,43 @@ public final class JarReader {
 
     /** 类文件读取结果；类列表与“是否因边界跳过内容”分开，避免把上限误当成解析成功。 */
     public record ReadResult(List<ClassBytes> classes, List<String> completenessReasons,
-                             Map<String, ArchiveMetadata> archiveMetadata) {
+                             Map<String, ArchiveMetadata> archiveMetadata,
+                             List<ArchiveMemberProvenance> archiveMembers) {
         public ReadResult {
             classes = classes == null ? List.of() : List.copyOf(classes);
             completenessReasons = completenessReasons == null ? List.of() : List.copyOf(completenessReasons);
             archiveMetadata = immutableMetadata(archiveMetadata);
+            archiveMembers = immutableMembers(archiveMembers);
         }
 
         public ReadResult(List<ClassBytes> classes, List<String> completenessReasons) {
-            this(classes, completenessReasons, Map.of());
+            this(classes, completenessReasons, Map.of(), List.of());
+        }
+
+        public ReadResult(List<ClassBytes> classes, List<String> completenessReasons,
+                          Map<String, ArchiveMetadata> archiveMetadata) {
+            this(classes, completenessReasons, archiveMetadata, List.of());
         }
     }
 
     /** 流式读取结果：只保留计数和完整性原因，不持有任何 class byte[]。 */
     public record StreamResult(int classesEmitted, List<String> completenessReasons,
-                               Map<String, ArchiveMetadata> archiveMetadata) {
+                               Map<String, ArchiveMetadata> archiveMetadata,
+                               List<ArchiveMemberProvenance> archiveMembers) {
         public StreamResult {
             completenessReasons = completenessReasons == null ? List.of()
                     : List.copyOf(completenessReasons);
             archiveMetadata = immutableMetadata(archiveMetadata);
+            archiveMembers = immutableMembers(archiveMembers);
         }
 
         public StreamResult(int classesEmitted, List<String> completenessReasons) {
-            this(classesEmitted, completenessReasons, Map.of());
+            this(classesEmitted, completenessReasons, Map.of(), List.of());
+        }
+
+        public StreamResult(int classesEmitted, List<String> completenessReasons,
+                            Map<String, ArchiveMetadata> archiveMetadata) {
+            this(classesEmitted, completenessReasons, archiveMetadata, List.of());
         }
     }
 
@@ -101,7 +119,8 @@ public final class JarReader {
         List<ClassBytes> out = new ArrayList<>();
         StreamResult result = streamDetailed(target, out::add, targetFeature, policy,
                 policy.tracker());
-        return new ReadResult(out, result.completenessReasons(), result.archiveMetadata());
+        return new ReadResult(enrichClassProvenance(out, result.archiveMembers()),
+                result.completenessReasons(), result.archiveMetadata(), result.archiveMembers());
     }
 
     /** Read while reusing a caller-owned tracker across several archive inputs. */
@@ -110,7 +129,8 @@ public final class JarReader {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         List<ClassBytes> out = new ArrayList<>();
         StreamResult result = streamDetailed(target, out::add, targetFeature, policy, tracker);
-        return new ReadResult(out, result.completenessReasons(), result.archiveMetadata());
+        return new ReadResult(enrichClassProvenance(out, result.archiveMembers()),
+                result.completenessReasons(), result.archiveMetadata(), result.archiveMembers());
     }
 
     /**
@@ -160,6 +180,16 @@ public final class JarReader {
                                              ResourceConsumer resources,
                                              int targetFeature, InputBudget budget,
                                              InputBudget.Tracker tracker) throws IOException {
+        return streamDetailedWithResources(target, consumer, resources, targetFeature, budget,
+                tracker, ArchiveMemberProvenance.Role.ROOT);
+    }
+
+    /** Internal closure entry point with an explicit role for a direct dependency input. */
+    StreamResult streamDetailedWithResources(Path target, ClassConsumer consumer,
+                                             ResourceConsumer resources,
+                                             int targetFeature, InputBudget budget,
+                                             InputBudget.Tracker tracker,
+                                             ArchiveMemberProvenance.Role rootRole) throws IOException {
         if (target == null || consumer == null) {
             throw new IllegalArgumentException("target and consumer are required");
         }
@@ -167,7 +197,8 @@ public final class JarReader {
             throw new IOException("目标不存在: " + target);
         }
         ArchiveLimits.checkPathAncestors(target, budget);
-        ReaderState state = new ReaderState(consumer, resources, targetFeature, budget, tracker);
+        ReaderState state = new ReaderState(consumer, resources, targetFeature, budget, tracker,
+                rootRole);
         // Reject a reparse point before deciding whether the path is a directory.  The
         // default Files.isDirectory call follows a directory symlink, which would let a
         // link escape the explicitly selected scan root and bypass the archive policy.
@@ -219,8 +250,10 @@ public final class JarReader {
                         return state.result();
                     }
                     try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(target, "CLASS_INPUT")) {
-                        state.emit(new ClassBytes(classNameFromPath(name),
-                                state.readBytes(opened.stream()), name));
+                        byte[] bytes = state.readBytes(opened.stream());
+                        state.emit(new ClassBytes(classNameFromPath(name), bytes, name,
+                                state.classMember(name, name, bytes,
+                                        state.rootRole)));
                     }
                     java.nio.file.attribute.BasicFileAttributes after = Files.readAttributes(target,
                             java.nio.file.attribute.BasicFileAttributes.class,
@@ -290,8 +323,9 @@ public final class JarReader {
                     }
                     state.archiveBudget.observeFile(rel, before.size());
                     try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(p, "CLASS_DIRECTORY")) {
-                        state.emit(new ClassBytes(classNameFromPath(rel),
-                                state.readBytes(opened.stream()), origin));
+                        byte[] bytes = state.readBytes(opened.stream());
+                        state.emit(new ClassBytes(classNameFromPath(rel), bytes, origin,
+                                state.classMember(origin, rel, bytes, state.rootRole)));
                     }
                     java.nio.file.attribute.BasicFileAttributes after = Files.readAttributes(p,
                             java.nio.file.attribute.BasicFileAttributes.class,
@@ -430,7 +464,8 @@ public final class JarReader {
                         }
                         String classPath = multiRelease.logicalPath(path);
                         state.emit(new ClassBytes(stripClassPrefix(classPath), classBytes,
-                                origin + "!" + path));
+                                origin + "!" + path,
+                                state.classMember(origin, path, classBytes, state.rootRole)));
                     } else if (state.resourceConsumer != null && depth == 0
                             && path.toLowerCase(java.util.Locale.ROOT)
                             .endsWith(".xml")) {
@@ -445,13 +480,22 @@ public final class JarReader {
                             continue;
                         }
                         CRC32 crc = new CRC32();
-                        try (var input = new CheckedInputStream(zip.getInputStream(entry), crc)) {
+                        MessageDigest digest = newSha256();
+                        boolean walked;
+                        try (var input = new CheckedInputStream(zip.getInputStream(entry), crc);
+                             var digested = new DigestInputStream(input, digest)) {
                             // Parse the nested stream in place. Copying every nested JAR first
                             // doubled the global uncompressed accounting and created a large
                             // transient allocation on ordinary fat artifacts.
-                            readNestedJar(input, origin + "!" + path, depth + 1, state, true);
+                            walked = readNestedJar(digested, origin + "!" + path, depth + 1,
+                                    state, true);
                         }
                         state.verifyCrc(entry, crc.getValue());
+                        state.archiveMember(origin, path,
+                                walked ? hex(digest.digest()) : "UNKNOWN",
+                                origin + "!" + path,
+                                ArchiveMemberProvenance.Role.NESTED_LIBRARY,
+                                ArchiveMemberProvenance.Kind.ARCHIVE);
                     }
                 } catch (IOException failure) {
                     if (state.markEntryFailure(failure)) {
@@ -478,8 +522,8 @@ public final class JarReader {
     }
 
     /** 嵌套 jar 内继续递归；直接消费当前 zip entry，不复制整个嵌套 jar。 */
-    private void readNestedJar(InputStream input, String origin, int depth,
-                               ReaderState state, boolean accountContainer) throws IOException {
+    private boolean readNestedJar(InputStream input, String origin, int depth,
+                                  ReaderState state, boolean accountContainer) throws IOException {
         // Closing a child ZipInputStream must not close its parent's current entry. The
         // wrapper is also what lets the top-level ZipFile close the entry deterministically.
         InputStream source = accountContainer ? state.containerStream(input) : input;
@@ -498,7 +542,7 @@ public final class JarReader {
                 if (++emptyReads > 16) {
                     state.markArchiveCorrupt();
                     JustLogger.warn("嵌套 ZIP/JAR 输入无进展，跳过剩余内容 {}", origin);
-                    return;
+                    return false;
                 }
                 continue;
             }
@@ -508,7 +552,7 @@ public final class JarReader {
         if (read < signature.length || !isZipSignature(signature)) {
             state.markArchiveCorrupt();
             JustLogger.warn("嵌套 ZIP/JAR 缺少有效 local header，跳过剩余内容 {}", origin);
-            return;
+            return false;
         }
         checkedInput.unread(signature);
         boolean innerArchiveFullyWalked = false;
@@ -523,17 +567,17 @@ public final class JarReader {
             while ((entry = zip.getNextEntry()) != null) {
                 if (!seenEntryNames.add(entry.getName())) {
                     state.markArchiveDuplicate();
-                    return;
+                    return false;
                 }
                 if (!state.observeEntry(entry)) {
                     if (state.budgetExceeded()) {
-                        return;
+                        return false;
                     }
                     continue;
                 }
                 if (state.atCapacity()) {
                     state.markCap("解析嵌套 jar " + origin);
-                    return;
+                    return false;
                 }
                 String path = entry.getName();
                 if (!ArchiveLimits.safeEntryName(path, state.budget)) {
@@ -550,10 +594,10 @@ public final class JarReader {
                         payloadBytes = state.readEntryBytes(entry, zip);
                     } catch (IOException failure) {
                         if (state.markEntryFailure(failure)) {
-                            return;
+                            return false;
                         }
                         if (state.markArchiveReadCorruption(failure)) {
-                            return;
+                            return false;
                         }
                         throw failure;
                     }
@@ -584,14 +628,21 @@ public final class JarReader {
                 }
                 if (path.endsWith(".class")) {
                     state.emit(new ClassBytes(stripClassPrefix(selection.logicalPath(path)),
-                            payload.bytes(), origin + "!" + path));
+                            payload.bytes(), origin + "!" + path,
+                            state.classMember(origin, path, payload.bytes(),
+                                    ArchiveMemberProvenance.Role.NESTED_LIBRARY)));
                 } else if (path.endsWith(".jar")) {
                     if (depth >= state.budget.maxArchiveNesting()) {
                         state.reasons.add("NESTING_CAP:" + state.budget.maxArchiveNesting());
                         continue;
                     }
-                    readNestedJar(new java.io.ByteArrayInputStream(payload.bytes()),
-                            origin + "!" + path, depth + 1, state, false);
+                    String nestedOrigin = origin + "!" + path;
+                    state.archiveMember(origin, path,
+                            ArchiveMemberProvenance.sha256Of(payload.bytes()), nestedOrigin,
+                            ArchiveMemberProvenance.Role.NESTED_LIBRARY,
+                            ArchiveMemberProvenance.Kind.ARCHIVE);
+                    readNestedJar(new java.io.ByteArrayInputStream(payload.bytes()), nestedOrigin,
+                            depth + 1, state, false);
                 }
             }
             // Spring Boot's nested-jar layout may append alignment bytes after an otherwise
@@ -616,6 +667,7 @@ public final class JarReader {
         if (accountContainer && innerArchiveFullyWalked) {
             drainNestedRemainder(checkedInput, state);
         }
+        return innerArchiveFullyWalked;
     }
 
     /** Consume legal bytes after an inner ZIP's end record so the outer entry CRC is complete. */
@@ -650,9 +702,11 @@ public final class JarReader {
         private final ResourceConsumer resourceConsumer;
         private final int targetFeature;
         private final InputBudget budget;
+        private final ArchiveMemberProvenance.Role rootRole;
         private final Set<String> reasons = new LinkedHashSet<>();
         private final Set<String> emittedClassNames = new LinkedHashSet<>();
         private final Map<String, Map<String, byte[]>> metadataEntries = new LinkedHashMap<>();
+        private final List<ArchiveMemberProvenance> archiveMembers = new ArrayList<>();
         private final InputBudget.Tracker archiveBudget;
         private int emitted;
         private boolean budgetExceeded;
@@ -660,12 +714,14 @@ public final class JarReader {
 
         private ReaderState(ClassConsumer consumer, ResourceConsumer resourceConsumer,
                             int targetFeature, InputBudget budget,
-                            InputBudget.Tracker tracker) {
+                            InputBudget.Tracker tracker,
+                            ArchiveMemberProvenance.Role rootRole) {
             this.consumer = consumer;
             this.resourceConsumer = resourceConsumer;
             this.targetFeature = targetFeature > 0 ? targetFeature : runtimeFeature();
             this.budget = budget == null ? InputBudget.defaults() : budget;
             this.archiveBudget = tracker == null ? this.budget.tracker() : tracker;
+            this.rootRole = rootRole == null ? ArchiveMemberProvenance.Role.ROOT : rootRole;
         }
 
         private boolean atCapacity() {
@@ -705,6 +761,27 @@ public final class JarReader {
             }
             metadataEntries.computeIfAbsent(origin, ignored -> new LinkedHashMap<>())
                     .putIfAbsent(normalizeMetadataPath(path), bytes.clone());
+        }
+
+        private ArchiveMemberProvenance classMember(String logicalArtifact, String path,
+                                                    byte[] bytes,
+                                                    ArchiveMemberProvenance.Role role) {
+            return ArchiveMemberProvenance.fromBytes(logicalArtifact, logicalArtifact, path,
+                    bytes, role, ArchiveMemberProvenance.Kind.CLASS);
+        }
+
+        private void archiveMember(String source, String path, String sha256,
+                                   String logicalArtifact,
+                                   ArchiveMemberProvenance.Role role,
+                                   ArchiveMemberProvenance.Kind kind) {
+            archiveMembers.add(ArchiveMemberProvenance.fromKnownHash(logicalArtifact, source,
+                    path, sha256, role, "", kind));
+        }
+
+        private void addRootMember(ArchiveMemberProvenance member) {
+            if (member != null) {
+                archiveMembers.add(member);
+            }
         }
 
         /** Convert bounded-entry failures into an auditable partial result. */
@@ -870,7 +947,14 @@ public final class JarReader {
                 parsed.put(entry.getKey(), metadata);
                 reasons.addAll(metadata.completenessReasons());
             }
-            return new StreamResult(emitted, List.copyOf(reasons), parsed);
+            List<ArchiveMemberProvenance> finalizedMembers = new ArrayList<>(archiveMembers.size());
+            for (ArchiveMemberProvenance member : archiveMembers) {
+                String coordinate = exactCoordinate(parsed.get(member.logicalArtifact()));
+                finalizedMembers.add(coordinate.isBlank() ? member
+                        : member.withCoordinate(coordinate));
+            }
+            return new StreamResult(emitted, List.copyOf(reasons), parsed,
+                    List.copyOf(finalizedMembers));
         }
 
         private void emit(ClassBytes bytes) throws IOException {
@@ -878,6 +962,10 @@ public final class JarReader {
                 markCap(bytes.origin());
                 return;
             }
+            if (bytes == null || bytes.provenance() == null) {
+                throw new IllegalArgumentException("archive member provenance is required");
+            }
+            archiveMembers.add(bytes.provenance());
             if (!emittedClassNames.add(bytes.className())) {
                 reasons.add("DUPLICATE_CLASS:" + bytes.className());
                 return;
@@ -907,6 +995,58 @@ public final class JarReader {
 
     private static String normalizeMetadataPath(String path) {
         return path == null ? "" : path.replace('\\', '/').trim();
+    }
+
+    private static String exactCoordinate(ArchiveMetadata metadata) {
+        if (metadata == null || metadata.pomProperties().size() != 1) {
+            return "";
+        }
+        return metadata.pomProperties().get(0).coordinate();
+    }
+
+    private static List<ArchiveMemberProvenance> immutableMembers(
+            List<ArchiveMemberProvenance> values) {
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        List<ArchiveMemberProvenance> copy = new ArrayList<>(values.size());
+        for (ArchiveMemberProvenance value : values) {
+            copy.add(java.util.Objects.requireNonNull(value, "archive member"));
+        }
+        return List.copyOf(copy);
+    }
+
+    private static List<ClassBytes> enrichClassProvenance(
+            List<ClassBytes> classes, List<ArchiveMemberProvenance> members) {
+        if (classes == null || classes.isEmpty() || members == null || members.isEmpty()) {
+            return classes == null ? List.of() : List.copyOf(classes);
+        }
+        Map<String, ArchiveMemberProvenance> byContent = new HashMap<>();
+        for (ArchiveMemberProvenance member : members) {
+            byContent.putIfAbsent(member.contentIdentity(), member);
+        }
+        List<ClassBytes> result = new ArrayList<>(classes.size());
+        for (ClassBytes value : classes) {
+            if (value == null || value.provenance() == null) {
+                result.add(value);
+                continue;
+            }
+            ArchiveMemberProvenance finalized = byContent.get(value.provenance().contentIdentity());
+            result.add(finalized == null ? value : value.withProvenance(finalized));
+        }
+        return List.copyOf(result);
+    }
+
+    private static MessageDigest newSha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("sha256-unavailable", impossible);
+        }
+    }
+
+    private static String hex(byte[] bytes) {
+        return java.util.HexFormat.of().formatHex(bytes).toUpperCase(java.util.Locale.ROOT);
     }
 
     private static Map<String, ArchiveMetadata> immutableMetadata(
