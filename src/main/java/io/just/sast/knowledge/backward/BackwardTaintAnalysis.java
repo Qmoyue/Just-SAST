@@ -276,6 +276,12 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         if (event.type() != EventType.SCAN_START) {
             return;
         }
+        if (bb.scanInputs().applicationScopeKnown()
+                && !bb.applicationEntryIndex().hasVerifiedApplicationRoot()) {
+            bb.markIncomplete("NO_APPLICATION_ENTRY");
+            JustLogger.info("application 无 verified entry/site，跳过全局 sink 反向枚举");
+            return;
+        }
         long startTime = System.currentTimeMillis();
         // 独立枚举 sink 候选（规则自匹配），按入口距离升序——离反序列化入口近的 sink 先分析，
         // 全局预算优先花在可达成链密度最高的地方（JDD bottom-up 导向）
@@ -394,9 +400,11 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
 
     private boolean shouldAnalyzeSink(Node call) {
         if (call == null || bb == null || bb.scanInputs() == null
-                || !bb.scanInputs().applicationScopeKnown()
-                || bb.applicationEntryIndex().applicationEntries().isEmpty()) {
+                || !bb.scanInputs().applicationScopeKnown()) {
             return true;
+        }
+        if (!bb.applicationEntryIndex().hasVerifiedApplicationRoot()) {
+            return false;
         }
         String host = OriginSupport.methodKeyOf(call.methodOwner(), call.methodName(),
                 call.methodDescriptor());

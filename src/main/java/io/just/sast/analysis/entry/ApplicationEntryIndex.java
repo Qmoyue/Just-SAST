@@ -53,7 +53,7 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 8;
+    public static final int MODEL_VERSION = 9;
     public static final String HTTP_SERVER_OWNER = "com/sun/net/httpserver/HttpServer";
     public static final String HTTP_SERVER_CREATE_CONTEXT_NAME = "createContext";
     public static final String HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR =
@@ -2023,7 +2023,11 @@ public final class ApplicationEntryIndex {
                 sinkHosts.add(impact.hostMethodKey());
             }
         }
-        List<String> reverse = reverseSlice(graph, sinkHosts, reasons);
+        // A known application with no verified entry/site has no application demand boundary.
+        // Do not build the global sink-reverse caller index for that negative result; component
+        // and unknown-scope indexes retain the compatibility reverse slice below.
+        List<String> reverse = applicationScopeKnown && roots.isEmpty()
+                ? List.of() : reverseSlice(graph, sinkHosts, reasons);
         Set<String> intersection = new TreeSet<>(forward);
         intersection.retainAll(reverse);
         List<String> dependency = intersection.stream()
@@ -2160,6 +2164,11 @@ public final class ApplicationEntryIndex {
     /** Whether an exact method is the callback root of a verified application site. */
     public boolean isApplicationSiteRoot(String methodKey) {
         return methodKey != null && applicationSiteRoots.contains(methodKey);
+    }
+
+    /** Whether the immutable entry/site projection contains at least one verified root. */
+    public boolean hasVerifiedApplicationRoot() {
+        return applicationScopeKnown && !entryForwardMethods.isEmpty();
     }
 
     /** Whether an exact method is a concrete application-owned HttpHandler callback. */

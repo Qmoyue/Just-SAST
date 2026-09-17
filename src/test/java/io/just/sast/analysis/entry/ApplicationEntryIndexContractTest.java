@@ -156,6 +156,33 @@ class ApplicationEntryIndexContractTest {
     }
 
     @Test
+    void knownApplicationWithoutVerifiedEntryOrSiteSkipsGlobalSinkReverseEnumeration() {
+        String owner = "fixture/app/NoEntry";
+        Graph graph = new Graph();
+        graph.methodNode(owner, "health", "()V", false);
+        Node terminal = graph.methodNode(RUNTIME, "exec", SINK_DESC, true);
+        Node call = graph.addCallNode(RUNTIME, "exec", SINK_DESC, "VIRTUAL", null, 0,
+                owner, "health", "()V");
+        graph.addEdge(call, terminal, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        RuleEngine engine = new RuleEngine(rules(), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex application = ApplicationEntryIndex.build(graph, engine,
+                Set.of(owner), true);
+        assertTrue(application.applicationEntries().isEmpty());
+        assertTrue(application.applicationSiteRoots().isEmpty());
+        assertFalse(application.hasVerifiedApplicationRoot());
+        assertTrue(application.sinkReverseSlice().isEmpty(),
+                "a no-entry application must not enumerate the global sink reverse slice");
+        assertTrue(application.completenessReasons().contains("NO_APPLICATION_ENTRY"));
+
+        ApplicationEntryIndex component = ApplicationEntryIndex.build(graph, engine,
+                Set.of(owner), false);
+        assertTrue(component.sinkReverseSlice().contains(owner + "#health()V"),
+                "the application gate must not alter the component reverse index");
+    }
+
+    @Test
     void indexesOnlyExactApplicationHttpContextRegistrationAndKeepsValueSlotsTyped() {
         String appOwner = "fixture/app/Web";
         String appMain = appOwner + "#main([Ljava/lang/String;)V";

@@ -240,6 +240,7 @@ class CpgBuilderProgramUniverseTest {
 
         assertEquals(Set.of(handler), index.applicationSiteRoots());
         assertTrue(index.isApplicationSiteRoot(handler));
+        assertTrue(index.hasVerifiedApplicationRoot());
         assertTrue(index.entryForwardSlice().contains(handler));
         assertTrue(index.sinkReverseSlice().contains(handler));
         assertTrue(index.entryTerminalIntersection().contains(handler));
