@@ -266,6 +266,30 @@ class VerificationCliContractTest {
     }
 
     @Test
+    void unparseableArchiveFailsThroughCliWithoutPublishingAnEmptyReport(@TempDir Path temp)
+            throws Exception {
+        Path input = temp.resolve("unparseable.jar");
+        Files.writeString(input, "not a zip archive", StandardCharsets.US_ASCII);
+        Path output = temp.resolve("unparseable-output");
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        PrintStream original = System.err;
+        int code;
+        try {
+            System.setErr(new PrintStream(captured, true, StandardCharsets.UTF_8));
+            code = new CommandLine(new JustMain()).execute(
+                    "scan", "--jar", input.toString(), "--offline", "--fast",
+                    "--output", output.toString());
+        } finally {
+            System.setErr(original);
+        }
+
+        String error = captured.toString(StandardCharsets.UTF_8);
+        assertTrue(code != 0, error);
+        assertTrue(error.contains("INPUT_UNPARSEABLE"), error);
+        assertFalse(Files.exists(output));
+    }
+
+    @Test
     void missingTypeKeepsStaticReportBoundedWithoutGuessingCoordinates(@TempDir Path temp)
             throws Exception {
         Path target = temp.resolve("missing-type.jar");
