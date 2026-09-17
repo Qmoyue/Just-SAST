@@ -45,7 +45,7 @@ public final class ScanCommand implements Callable<Integer> {
     List<String> repositories;
 
     @Option(names = "--offline",
-            description = "禁止网络请求；只使用显式输入和已存在的完整 Maven 缓存")
+            description = "禁止网络请求；无 POM 时只使用实际输入/嵌套制品，有 POM 时使用显式缓存")
     boolean offline;
 
     @Option(names = "--output", paramLabel = "<dir>", defaultValue = "just-out",
@@ -148,9 +148,9 @@ public final class ScanCommand implements Callable<Integer> {
         int explicitDependencyCount = resolved.size();
         boolean hasRepositories = repositories != null && !repositories.isEmpty();
         if (pom == null) {
-            if (offline || hasRepositories) {
+            if (hasRepositories) {
                 throw new ScanPipeline.UsageException(
-                        "--offline/--repository 需要同时提供显式 --pom；无 POM 时 Just 不按类名猜包");
+                        "无 POM 时不能使用 --repository；请提供显式 --pom。Just 不按类名猜包");
             }
             return new PreparedDependencies(resolved, explicitDependencyCount, null,
                     "MAVEN_POM_NOT_PROVIDED", ScanPipeline.DependencyPreparation.notProvided());
