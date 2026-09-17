@@ -94,6 +94,66 @@ class ApplicationEntryIndexContractTest {
     }
 
     @Test
+    void dependencyMainIsLookupOnlyAndIsolatedMainCannotAdmitApplicationDemand() {
+        String targetMainOwner = "fixture/app/Main";
+        String helperOwner = "fixture/app/Helper";
+        String dependencyMainOwner = "fixture/lib/DependencyMain";
+        String targetMain = targetMainOwner + "#main([Ljava/lang/String;)V";
+        String helper = helperOwner + "#decode()V";
+        String dependencyMain = dependencyMainOwner + "#main([Ljava/lang/String;)V";
+        String runtimeDescriptor = "(Ljava/lang/String;)Ljava/lang/Process;";
+        Graph graph = new Graph();
+
+        Node main = graph.methodNode(targetMainOwner, "main", "([Ljava/lang/String;)V", false);
+        main.propsNote("methodAccess", Modifier.PUBLIC | Modifier.STATIC);
+        Node publicHelper = graph.methodNode(helperOwner, "decode", "()V", false);
+        publicHelper.propsNote("methodAccess", Modifier.PUBLIC);
+        Node dependencyEntry = graph.methodNode(dependencyMainOwner, "main",
+                "([Ljava/lang/String;)V", false);
+        dependencyEntry.propsNote("methodAccess", Modifier.PUBLIC | Modifier.STATIC);
+        Node runtime = graph.methodNode(RUNTIME, "exec", runtimeDescriptor, true);
+        Node exec = graph.addCallNode(RUNTIME, "exec", runtimeDescriptor, "VIRTUAL", null, 0,
+                dependencyMainOwner, "main", "([Ljava/lang/String;)V");
+        graph.addEdge(exec, runtime, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(rules(), new ClassHierarchy(Map.of(), null)),
+                Set.of(targetMainOwner, helperOwner), true);
+
+        assertEquals(Set.of(targetMain), index.applicationEntryMethods());
+        assertTrue(index.isApplicationEntryMethod(targetMain));
+        assertFalse(index.isApplicationEntryMethod(dependencyMain));
+        assertFalse(index.isApplicationEntryMethod(helper));
+        assertTrue(index.executionEntries().stream().anyMatch(entry ->
+                dependencyMainOwner.equals(entry.owner())
+                        && entry.status() == FindingState.EntryStatus.NO_APPLICATION_ENTRY));
+        assertTrue(index.entryForwardSlice().contains(targetMain));
+        assertFalse(index.entryForwardSlice().contains(helper));
+        assertFalse(index.entryForwardSlice().contains(dependencyMain));
+        assertTrue(index.sinkReverseSlice().contains(dependencyMain));
+        assertTrue(index.entryTerminalIntersection().isEmpty(),
+                "an isolated target main must not meet an unrelated terminal");
+        assertFalse(index.allowsDependencyExpansion());
+
+        ApplicationEntryIndex.DemandDecision isolated = index.demandAdmission(targetMain,
+                dependencyMain, false);
+        assertEquals(ApplicationEntryIndex.DemandStatus.ENTRY_NOT_IN_TERMINAL_DEMAND,
+                isolated.status(), isolated.toString());
+
+        ApplicationEntryIndex.CandidateAdmissionDecision helperAdmission =
+                index.candidateAdmission(helperOwner, "decode", "()V", RUNTIME, "exec",
+                        runtimeDescriptor, false);
+        assertEquals(ApplicationEntryIndex.CandidateAdmissionStatus.ENTRY_NOT_FORWARD_REACHABLE,
+                helperAdmission.status(), helperAdmission.toString());
+        ApplicationEntryIndex.CandidateAdmissionDecision dependencyAdmission =
+                index.candidateAdmission(dependencyMainOwner, "main",
+                        "([Ljava/lang/String;)V", RUNTIME, "exec", runtimeDescriptor, false);
+        assertEquals(ApplicationEntryIndex.CandidateAdmissionStatus.APPLICATION_ENTRY_NOT_IN_CHAIN,
+                dependencyAdmission.status(), dependencyAdmission.toString());
+    }
+
+    @Test
     void applicationScopeJoinsEntryForwardAndTerminalReverseSlices() {
         Graph graph = fixture();
         RuleSet rules = rules();
