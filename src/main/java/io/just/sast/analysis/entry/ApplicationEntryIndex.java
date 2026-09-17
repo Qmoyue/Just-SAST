@@ -53,7 +53,7 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 7;
+    public static final int MODEL_VERSION = 8;
     public static final String HTTP_SERVER_OWNER = "com/sun/net/httpserver/HttpServer";
     public static final String HTTP_SERVER_CREATE_CONTEXT_NAME = "createContext";
     public static final String HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR =
@@ -674,6 +674,7 @@ public final class ApplicationEntryIndex {
     private final Map<String, List<HttpExternalSource>> httpExternalSourcesByMethod;
     private final List<HttpSite> httpSites;
     private final Map<String, List<HttpSite>> httpSitesByMethod;
+    private final Set<String> applicationSiteRoots;
     private final List<DeserializeSite> secondaryDeserializeSites;
     private final Set<String> applicationObjectInputHosts;
     private final List<TerminalImpact> terminalImpacts;
@@ -705,6 +706,7 @@ public final class ApplicationEntryIndex {
                                   List<HttpContextRegistration> httpContextRegistrations,
                                   List<HttpExternalSource> httpExternalSources,
                                   List<HttpSite> httpSites,
+                                  Set<String> applicationSiteRoots,
                                   List<TerminalImpact> terminalImpacts,
                                   List<String> entryForwardSlice,
                                   List<String> sinkReverseSlice,
@@ -749,6 +751,7 @@ public final class ApplicationEntryIndex {
                 this.httpExternalSources);
         this.httpSites = immutableHttpSites(httpSites);
         this.httpSitesByMethod = immutableHttpSiteIndex(this.httpSites);
+        this.applicationSiteRoots = immutableSorted(applicationSiteRoots);
         this.secondaryDeserializeSites = this.deserializeSites.stream()
                 .filter(ApplicationEntryIndex::isSecondaryDeserializeSite)
                 .toList();
@@ -2001,11 +2004,16 @@ public final class ApplicationEntryIndex {
         sites.sort(Comparator.comparingLong(DeserializeSite::callId));
         impacts.sort(Comparator.comparingLong(TerminalImpact::callId));
 
+        Set<String> siteRoots = new TreeSet<>();
+        if (applicationScopeKnown) {
+            httpSites.stream().map(HttpSite::handlerMethodKey).forEach(siteRoots::add);
+        }
         Set<String> roots = new TreeSet<>();
         if (applicationScopeKnown) {
             entries.stream().filter(entry -> entry.status() != FindingState.EntryStatus.NO_APPLICATION_ENTRY)
                     .map(ExecutionEntry::methodKey).forEach(roots::add);
             sourceHosts.keySet().forEach(roots::add);
+            roots.addAll(siteRoots);
         }
         List<String> forward = forwardSlice(graph, methods, roots, reasons);
 
@@ -2036,6 +2044,7 @@ public final class ApplicationEntryIndex {
                 httpContextRegistrations,
                 httpExternalSources,
                 httpSites,
+                siteRoots,
                 impacts,
                 forward, reverse, List.copyOf(intersection), dependency, reasons,
                 bindingCallbacks);
@@ -2141,6 +2150,16 @@ public final class ApplicationEntryIndex {
             return List.of();
         }
         return httpSitesByMethod.getOrDefault(hostMethodKey, List.of());
+    }
+
+    /** Immutable callback methods that begin a verified application site flow. */
+    public Set<String> applicationSiteRoots() {
+        return applicationSiteRoots;
+    }
+
+    /** Whether an exact method is the callback root of a verified application site. */
+    public boolean isApplicationSiteRoot(String methodKey) {
+        return methodKey != null && applicationSiteRoots.contains(methodKey);
     }
 
     /** Whether an exact method is a concrete application-owned HttpHandler callback. */
@@ -2413,7 +2432,8 @@ public final class ApplicationEntryIndex {
 
     /** Only an application-owned root plus a non-empty direct slice may request dependency expansion. */
     public boolean allowsDependencyExpansion() {
-        return applicationScopeKnown && !applicationExecutionEntries.isEmpty()
+        return applicationScopeKnown
+                && (!applicationExecutionEntries.isEmpty() || !applicationSiteRoots.isEmpty())
                 && !entryTerminalIntersection.isEmpty();
     }
 
@@ -3231,6 +3251,7 @@ public final class ApplicationEntryIndex {
             httpContextRegistrations.forEach(value -> update(digest, "http-context=" + value));
             httpExternalSources.forEach(value -> update(digest, "http-source=" + value));
             httpSites.forEach(value -> update(digest, "http-site=" + value));
+            applicationSiteRoots.forEach(value -> update(digest, "site-root=" + value));
             filterControls.forEach(value -> update(digest, "filter=" + value));
             routeBindings.forEach(value -> update(digest, "route=" + value));
             terminalImpacts.forEach(value -> update(digest, "impact=" + value));

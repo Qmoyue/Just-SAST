@@ -147,6 +147,8 @@ public final class OriginSupport {
     private final boolean applicationScopeKnown;
     /** Typed application execution roots supplied by the entry index. */
     private final Set<String> applicationEntryMethods;
+    /** Typed callback roots supplied by verified application sites. */
+    private final Set<String> applicationSiteRoots;
     /** 入口下游闭包（惰性一次构建）：反向剪枝与链剪枝共用。 */
     private Set<String> entryDownstream;
     /** 入口 BFS 距离（与下游闭包同一次遍历产出）：反向探索按离入口近者优先。 */
@@ -465,7 +467,7 @@ public final class OriginSupport {
     }
 
     /**
-     * Build shared support with the typed application-entry roots.  The set is a semantic
+     * Build shared support with the typed application entry roots.  The set is a semantic
      * input to the reachability closure, not a second rule source; callers should obtain it
      * from {@code ApplicationEntryIndex.applicationEntryMethods()} so framework/lifecycle
      * boundaries and configured entries share one owner.
@@ -473,6 +475,15 @@ public final class OriginSupport {
     public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine,
                          boolean fast, CpgIndex cpgIndex, Set<String> applicationOwners,
                          boolean applicationScopeKnown, Set<String> applicationEntryMethods) {
+        this(graph, hierarchy, ruleEngine, fast, cpgIndex, applicationOwners,
+                applicationScopeKnown, applicationEntryMethods, Set.of());
+    }
+
+    /** Build shared support with both typed application entry and verified site roots. */
+    public OriginSupport(Graph graph, ClassHierarchy hierarchy, RuleEngine ruleEngine,
+                         boolean fast, CpgIndex cpgIndex, Set<String> applicationOwners,
+                         boolean applicationScopeKnown, Set<String> applicationEntryMethods,
+                         Set<String> applicationSiteRoots) {
         this.graph = graph;
         this.cpgIndex = cpgIndex == null ? CpgIndex.empty() : cpgIndex;
         this.hierarchy = hierarchy;
@@ -482,6 +493,9 @@ public final class OriginSupport {
         this.applicationScopeKnown = applicationScopeKnown;
         this.applicationEntryMethods = applicationEntryMethods == null ? Set.of()
                 : java.util.Collections.unmodifiableSet(new java.util.TreeSet<>(applicationEntryMethods));
+        this.applicationSiteRoots = java.util.Objects.requireNonNull(applicationSiteRoots,
+                "applicationSiteRoots").isEmpty() ? Set.of()
+                : java.util.Collections.unmodifiableSet(new java.util.TreeSet<>(applicationSiteRoots));
         this.frameworkPackages = deriveFrameworkPackages();
         // CALL ids are already grouped by host method in the frozen CPG. Forward transfer
         // can therefore resolve an invoke by (method key, offset) without allocating the
@@ -2762,7 +2776,8 @@ public final class OriginSupport {
         // roots that cannot be recovered from the legacy magic/source rules.  Admit only the
         // immutable, application-owned method keys supplied by that index; dependency/JDK
         // classes are still blocked by applicationOwnerAllowed below.
-        if (applicationScopeKnown && !applicationEntryMethods.isEmpty()) {
+        if (applicationScopeKnown
+                && (!applicationEntryMethods.isEmpty() || !applicationSiteRoots.isEmpty())) {
             applicationRootAvailable = true;
         }
         List<Node> proxyTargets = new ArrayList<>();
@@ -2789,13 +2804,15 @@ public final class OriginSupport {
         // whole-entry closure without turning a missing direct edge into a negative proof.
         Set<String> terminalDemand = new HashSet<>(sinkDistances.keySet());
         terminalDemand.addAll(applicationEntryMethods);
+        terminalDemand.addAll(applicationSiteRoots);
         // Proxy callbacks are semantic edges.  Keep only callback methods already proven to
         // participate in a bounded terminal reverse slice; application roots remain admitted
         // independently so a later bridge can still explain an unresolved suffix.
         for (Node target : proxyTargets) {
             String key = methodKeyOf(target.strProp("owner"), target.strProp("name"),
                     target.strProp("desc"));
-            if (sinkDistances.containsKey(key) || applicationEntryMethods.contains(key)) {
+            if (sinkDistances.containsKey(key) || applicationEntryMethods.contains(key)
+                    || applicationSiteRoots.contains(key)) {
                 terminalDemand.add(key);
             }
         }
@@ -2860,8 +2877,9 @@ public final class OriginSupport {
         // status.  Keeping them in this closure is necessary for a later entry → binding /
         // lookup → dependency join and does not manufacture a source fact here.
         if (applicationRootAvailable && applicationScopeKnown) {
-            List<String> applicationRoots = new ArrayList<>(applicationEntryMethods);
-            applicationRoots.sort(String::compareTo);
+            java.util.Set<String> applicationRootKeys = new java.util.TreeSet<>(applicationEntryMethods);
+            applicationRootKeys.addAll(applicationSiteRoots);
+            List<String> applicationRoots = new ArrayList<>(applicationRootKeys);
             for (String key : applicationRoots) {
                 Node root = methodNodeOf(graph, key);
                 if (root == null || !applicationOwnerAllowed(root.strProp("owner"))) {
@@ -3629,7 +3647,7 @@ public final class OriginSupport {
         if (!applicationScopeKnown || graph == null) {
             return false;
         }
-        if (!applicationEntryMethods.isEmpty()) {
+        if (!applicationEntryMethods.isEmpty() || !applicationSiteRoots.isEmpty()) {
             return true;
         }
         for (Node method : graph.nodesOfType(NodeType.METHOD)) {

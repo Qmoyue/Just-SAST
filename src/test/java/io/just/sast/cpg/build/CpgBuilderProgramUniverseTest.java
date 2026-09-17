@@ -3,6 +3,9 @@ package io.just.sast.cpg.build;
 import io.just.sast.analysis.callgraph.CallGraphBuilder;
 import io.just.sast.analysis.entry.ApplicationEntryIndex;
 import io.just.sast.analysis.hierarchy.ClassHierarchy;
+import io.just.sast.blackboard.Blackboard;
+import io.just.sast.config.Match;
+import io.just.sast.config.Rule;
 import io.just.sast.config.RuleEngine;
 import io.just.sast.config.RuleSet;
 import io.just.sast.cpg.graph.Graph;
@@ -28,11 +31,13 @@ import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.MethodNode;
 
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -192,6 +197,8 @@ class CpgBuilderProgramUniverseTest {
                 .anyMatch(HttpExternalSource::externalInput));
         assertTrue(beforeCallGraph.httpSites().isEmpty(),
                 "a handler value without its actual lambda edge cannot form a site");
+        assertTrue(beforeCallGraph.applicationSiteRoots().isEmpty(),
+                "a non-site registration cannot create a site root");
 
         graph = new CpgBuilder().build(load).graph();
         assertTrue(new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph) > 0);
@@ -206,9 +213,47 @@ class CpgBuilderProgramUniverseTest {
                 site.handlerMethodKey());
         assertEquals(io.just.sast.cpg.graph.EdgeType.LAMBDA, site.handlerEdge().edgeType());
         assertTrue(site.externalSources().stream().allMatch(HttpExternalSource::externalInput));
+        assertEquals(Set.of(site.handlerMethodKey()), index.applicationSiteRoots());
         assertEquals(site.externalSources(),
                 index.httpExternalSourcesFor(site.handlerMethodKey()).stream()
                         .filter(HttpExternalSource::externalInput).toList());
+    }
+
+    @Test
+    void verifiedHttpSiteCallbackIsAnApplicationRootForForwardReverseIntersection() {
+        LoadResult load = loadResult(httpLambdaWebClassBytes());
+        ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
+        Graph graph = new CpgBuilder().build(load).graph();
+        assertTrue(new CallGraphBuilder(hierarchy).build(graph) > 0);
+
+        Rule.SinkRule terminal = new Rule.SinkRule("http-header-terminal", "HTTP", "HIGH",
+                new Rule.CallMatcher(Match.of(ApplicationEntryIndex.HTTP_HEADERS_OWNER),
+                        Match.of("getFirst"), Match.of("(Ljava/lang/String;)Ljava/lang/String;")),
+                List.of(new Rule.TaintedPos.Arg(0)), Rule.SinkRole.TERMINAL);
+        RuleEngine engine = new RuleEngine(
+                new RuleSet(List.of(terminal), List.of(), List.of(), List.of(), List.of()),
+                hierarchy);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/HttpLambdaWeb"), true);
+        String handler = "fixture/app/HttpLambdaWeb#lambda$main$0"
+                + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR;
+
+        assertEquals(Set.of(handler), index.applicationSiteRoots());
+        assertTrue(index.isApplicationSiteRoot(handler));
+        assertTrue(index.entryForwardSlice().contains(handler));
+        assertTrue(index.sinkReverseSlice().contains(handler));
+        assertTrue(index.entryTerminalIntersection().contains(handler));
+        assertTrue(index.allowsDependencyExpansion());
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.applicationSiteRoots().clear());
+
+        Blackboard blackboard = new Blackboard(graph, hierarchy, new FieldWriterIndex(),
+                new RuleSet(List.of(terminal), List.of(), List.of(), List.of(), List.of()), 20,
+                new Blackboard.ScanInputs(Path.of("fixture.jar"), List.of(), true, null, 0,
+                        null, Set.of("fixture/app/HttpLambdaWeb"), true));
+        assertEquals(index.applicationSiteRoots(),
+                blackboard.applicationEntryIndex().applicationSiteRoots());
+        assertTrue(blackboard.originSupport().entryDownstream(graph).contains(handler));
     }
 
     @Test

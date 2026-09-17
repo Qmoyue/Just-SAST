@@ -744,8 +744,9 @@ public final class ForwardEngine {
      * engine's hop budget.  OriginSupport already computes the reverse ordinary-call distance
      * for the shared closure.  Intersecting that distance with the entry depth is a cheap,
      * monotone demand seed; field writers and ordinary callers are then added until a fixed
-     * point.  The extra roots cover edges that are deliberately not represented as ordinary
-     * call edges (serialized proxy/method-collection/native callbacks and source hosts).
+     * point.  The extra roots cover verified application sites and edges that are deliberately
+     * not represented as ordinary call edges (serialized proxy/method-collection/native
+     * callbacks and source hosts).
      *
      * If the reverse index itself was capped, its absence is no longer a proof of
      * irrelevance.  In that case retain the old reachable scheduler and make the loss of the
@@ -793,6 +794,8 @@ public final class ForwardEngine {
         // deserialize rule names them.  This keeps the scheduler able to process an external
         // endpoint's binding/lookup body without broadening dependency roots by classpath.
         roots.addAll(bb.applicationEntryIndex().applicationEntryMethods().stream()
+                .filter(reachable::contains).toList());
+        roots.addAll(bb.applicationEntryIndex().applicationSiteRoots().stream()
                 .filter(reachable::contains).toList());
         // Application/framework deserialization boundaries are source roots even when the
         // source rule is a call rather than a magic entry.
@@ -1249,7 +1252,7 @@ public final class ForwardEngine {
         }
     }
 
-    /** 前向可达集：从 magic entry、OIS 宿主与反序列化 source 宿主出发，沿调用边 BFS。 */
+    /** 前向可达集：从 entry/site roots、OIS 宿主与反序列化 source 宿主出发，沿调用边 BFS。 */
     private boolean computeReachable() {
         Deque<String> bfs = new ArrayDeque<>();
         // The backward engine and the calibration layer share OriginSupport's semantic
@@ -1294,7 +1297,10 @@ public final class ForwardEngine {
         // application-owned methods to the ordinary call closure, but defer attacker-control
         // taint to seedApplicationEntries() below.  Thus a main/lifecycle method can provide a
         // structural execution root without turning static initialization into a source.
-        for (String key : bb.applicationEntryIndex().applicationEntryMethods().stream().sorted().toList()) {
+        Set<String> applicationRootKeys = new java.util.TreeSet<>(
+                bb.applicationEntryIndex().applicationEntryMethods());
+        applicationRootKeys.addAll(bb.applicationEntryIndex().applicationSiteRoots());
+        for (String key : applicationRootKeys) {
             if (cancellationRequested()) {
                 return false;
             }

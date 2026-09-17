@@ -388,7 +388,8 @@ public final class Blackboard {
         this.originSupport = new OriginSupport(graph, hierarchy, ruleEngine, this.scanInputs.fast(),
                 this.cpgIndex, this.scanInputs.applicationClassNames(),
                 this.scanInputs.applicationScopeKnown(),
-                this.applicationEntryIndex.applicationEntryMethods());
+                this.applicationEntryIndex.applicationEntryMethods(),
+                this.applicationEntryIndex.applicationSiteRoots());
     }
 
     public Graph graph() {
