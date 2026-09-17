@@ -586,10 +586,11 @@ public final class BytecodeFrontend {
             return true;
         }
         String origin = bytes.origin().replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
-        // JarReader retains the physical nested path in origin.  A class below either
-        // BOOT-INF/lib or WEB-INF/lib belongs to an embedded dependency, never to the
-        // application execution scope, even though it was read from the first target file.
-        return !origin.contains("!boot-inf/lib/") && !origin.contains("!web-inf/lib/");
+        // JarReader retains the physical nested path in origin.  A class below any nested
+        // library layout belongs to an embedded dependency, never to the application execution
+        // scope, even though it was read from the first target file.
+        return !origin.contains("!boot-inf/lib/") && !origin.contains("!web-inf/lib/")
+                && !origin.contains("!lib/");
     }
 
     /** Convert an embedded class origin into the same path-free logical detail used by reports. */
@@ -598,7 +599,7 @@ public final class BytecodeFrontend {
             return null;
         }
         String normalized = origin.replace('\\', '/');
-        for (String marker : List.of("!BOOT-INF/lib/", "!WEB-INF/lib/")) {
+        for (String marker : List.of("!BOOT-INF/lib/", "!WEB-INF/lib/", "!lib/")) {
             int start = normalized.indexOf(marker);
             if (start >= 0) {
                 int nameStart = start + 1;

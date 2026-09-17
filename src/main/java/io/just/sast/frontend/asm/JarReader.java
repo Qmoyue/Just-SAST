@@ -31,7 +31,8 @@ import java.util.zip.CheckedInputStream;
 
 /**
  * 读取 JAR / class 目录 / 单个 class 文件。
- * 支持 Spring Boot fat jar：BOOT-INF/classes 下的类 + BOOT-INF/lib 下的嵌套 jar 递归解析。
+ * 支持 fat jar：根 class、BOOT-INF/classes 下的类以及 BOOT-INF/lib、WEB-INF/lib、lib
+ * 下的嵌套 jar 递归解析。
  */
 public final class JarReader {
 
@@ -63,7 +64,7 @@ public final class JarReader {
     }
 
     private static final String[] CLASS_PREFIXES = {"BOOT-INF/classes/", "WEB-INF/classes/"};
-    private static final String[] LIB_PREFIXES = {"BOOT-INF/lib/", "WEB-INF/lib/"};
+    private static final String[] LIB_PREFIXES = {"BOOT-INF/lib/", "WEB-INF/lib/", "lib/"};
     private static final String SKIPPED_MULTIRELEASE = "META-INF/versions/";
 
     public List<ClassBytes> read(Path target) throws IOException {
@@ -864,7 +865,8 @@ public final class JarReader {
         String normalized = path == null ? ""
                 : path.replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
         return normalized.startsWith("boot-inf/lib/")
-                || normalized.startsWith("web-inf/lib/");
+                || normalized.startsWith("web-inf/lib/")
+                || normalized.startsWith("lib/");
     }
 
     private static boolean isZipSignature(byte[] signature) {
