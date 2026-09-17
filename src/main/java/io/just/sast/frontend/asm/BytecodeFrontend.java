@@ -2,6 +2,7 @@ package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.ApplicationResourceFacts;
+import io.just.sast.model.ArchiveMetadata;
 import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.ProgramUniverse;
@@ -120,6 +121,7 @@ public final class BytecodeFrontend {
                              Map<String, Integer> classArtifactIndexes,
                              Map<String, List<Integer>> duplicateArtifactIndexes,
                              Map<String, List<String>> artifactDetails,
+                             Map<String, ArchiveMetadata> archiveMetadata,
                              List<Integer> unparseableArtifactIndexes,
                              ApplicationResourceFacts applicationResourceFacts) {
         public ScopedLoad {
@@ -154,6 +156,17 @@ public final class BytecodeFrontend {
                 }
             }
             artifactDetails = Map.copyOf(detailCopy);
+            Map<String, ArchiveMetadata> metadataCopy = new LinkedHashMap<>();
+            if (archiveMetadata != null) {
+                for (Map.Entry<String, ArchiveMetadata> entry : archiveMetadata.entrySet()) {
+                    if (entry.getKey() == null || entry.getKey().isBlank()
+                            || entry.getValue() == null) {
+                        throw new IllegalArgumentException("archive metadata is invalid");
+                    }
+                    metadataCopy.put(entry.getKey(), entry.getValue());
+                }
+            }
+            archiveMetadata = Map.copyOf(metadataCopy);
             if (unparseableArtifactIndexes == null) {
                 unparseableArtifactIndexes = List.of();
             } else {
@@ -169,7 +182,7 @@ public final class BytecodeFrontend {
         /** Compatibility constructor for callers interested only in application scope. */
         public ScopedLoad(LoadResult load, java.util.Set<String> applicationClassNames) {
             this(load, applicationClassNames, Map.of(), Map.of(), Map.of(),
-                    List.of(), ApplicationResourceFacts.empty());
+                    Map.of(), List.of(), ApplicationResourceFacts.empty());
         }
 
         /** Compatibility constructor for callers that do not consume embedded provenance. */
@@ -177,7 +190,7 @@ public final class BytecodeFrontend {
                           Map<String, Integer> classArtifactIndexes,
                           Map<String, List<Integer>> duplicateArtifactIndexes) {
             this(load, applicationClassNames, classArtifactIndexes, duplicateArtifactIndexes,
-                    Map.of(), List.of(), ApplicationResourceFacts.empty());
+                    Map.of(), Map.of(), List.of(), ApplicationResourceFacts.empty());
         }
     }
 
@@ -241,10 +254,11 @@ public final class BytecodeFrontend {
                 accumulator.setArtifactIndex(artifactIndex);
                 try {
                     JarReader.StreamResult stream = jarReader.streamDetailedWithResources(target,
-                            accumulator::accept, captureApplicationScope
+                    accumulator::accept, captureApplicationScope
                                     ? accumulator::acceptResource : null,
                             targetFeature, inputBudget, inputTracker);
                     accumulator.addReasons(stream.completenessReasons());
+                    accumulator.addMetadata(stream.archiveMetadata());
                     if (stream.classesEmitted() == 0
                             && stream.completenessReasons().contains("ARCHIVE_CORRUPT")) {
                         accumulator.markUnparseableArtifact(artifactIndex);
@@ -496,6 +510,7 @@ public final class BytecodeFrontend {
         private final Map<String, Integer> classArtifactIndexes = new LinkedHashMap<>();
         private final Map<String, List<Integer>> duplicateArtifactIndexes = new LinkedHashMap<>();
         private final Map<String, List<String>> artifactDetails = new LinkedHashMap<>();
+        private final Map<String, ArchiveMetadata> archiveMetadata = new LinkedHashMap<>();
         private final LinkedHashSet<Integer> unparseableArtifactIndexes = new LinkedHashSet<>();
         private final ApplicationResourceParser.Collector resourceCollector =
                 new ApplicationResourceParser.Collector(inputBudget);
@@ -524,6 +539,19 @@ public final class BytecodeFrontend {
         private void addReasons(List<String> reasons) {
             if (reasons != null) {
                 completenessReasons.addAll(reasons);
+            }
+        }
+
+        private void addMetadata(Map<String, ArchiveMetadata> metadata) {
+            if (metadata == null) {
+                return;
+            }
+            for (Map.Entry<String, ArchiveMetadata> entry : metadata.entrySet()) {
+                ArchiveMetadata previous = archiveMetadata.putIfAbsent(entry.getKey(), entry.getValue());
+                if (previous != null && !previous.equals(entry.getValue())) {
+                    throw new IllegalArgumentException("archive metadata origin collision: "
+                            + entry.getKey());
+                }
             }
         }
 
@@ -576,7 +604,7 @@ public final class BytecodeFrontend {
 
         private ScopedLoad scopedResult() {
             return new ScopedLoad(result(), applicationClassNames, classArtifactIndexes,
-                    duplicateArtifactIndexes, artifactDetails,
+                    duplicateArtifactIndexes, artifactDetails, archiveMetadata,
                     List.copyOf(unparseableArtifactIndexes), resourceCollector.finish());
         }
     }

@@ -305,7 +305,7 @@ public final class ScanPipeline {
         DependencyGraph dependencyGraph = new io.just.sast.report.DependencyInventoryWriter()
                 .build(target, actualDependencies, targetArtifactHash, load.targetMajorVersion(),
                         dependencyHashes.subList(0, actualDependencyCount), artifactInputs,
-                        inputBudget, inputTracker);
+                        scopedApplication.archiveMetadata(), inputBudget, inputTracker);
         if (preparedDependencyGraph != null) {
             dependencyGraph = dependencyGraph.merge(preparedDependencyGraph);
         } else {

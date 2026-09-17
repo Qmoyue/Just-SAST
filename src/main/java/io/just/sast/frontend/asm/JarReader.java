@@ -1,5 +1,6 @@
 package io.just.sast.frontend.asm;
 
+import io.just.sast.model.ArchiveMetadata;
 import io.just.sast.util.IoUtil;
 import io.just.sast.util.JustLogger;
 import io.just.sast.util.ArchiveLimits;
@@ -19,6 +20,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.stream.Stream;
 import java.util.jar.Manifest;
@@ -48,18 +50,30 @@ public final class JarReader {
     }
 
     /** 类文件读取结果；类列表与“是否因边界跳过内容”分开，避免把上限误当成解析成功。 */
-    public record ReadResult(List<ClassBytes> classes, List<String> completenessReasons) {
+    public record ReadResult(List<ClassBytes> classes, List<String> completenessReasons,
+                             Map<String, ArchiveMetadata> archiveMetadata) {
         public ReadResult {
             classes = classes == null ? List.of() : List.copyOf(classes);
             completenessReasons = completenessReasons == null ? List.of() : List.copyOf(completenessReasons);
+            archiveMetadata = immutableMetadata(archiveMetadata);
+        }
+
+        public ReadResult(List<ClassBytes> classes, List<String> completenessReasons) {
+            this(classes, completenessReasons, Map.of());
         }
     }
 
     /** 流式读取结果：只保留计数和完整性原因，不持有任何 class byte[]。 */
-    public record StreamResult(int classesEmitted, List<String> completenessReasons) {
+    public record StreamResult(int classesEmitted, List<String> completenessReasons,
+                               Map<String, ArchiveMetadata> archiveMetadata) {
         public StreamResult {
             completenessReasons = completenessReasons == null ? List.of()
                     : List.copyOf(completenessReasons);
+            archiveMetadata = immutableMetadata(archiveMetadata);
+        }
+
+        public StreamResult(int classesEmitted, List<String> completenessReasons) {
+            this(classesEmitted, completenessReasons, Map.of());
         }
     }
 
@@ -87,7 +101,7 @@ public final class JarReader {
         List<ClassBytes> out = new ArrayList<>();
         StreamResult result = streamDetailed(target, out::add, targetFeature, policy,
                 policy.tracker());
-        return new ReadResult(out, result.completenessReasons());
+        return new ReadResult(out, result.completenessReasons(), result.archiveMetadata());
     }
 
     /** Read while reusing a caller-owned tracker across several archive inputs. */
@@ -96,7 +110,7 @@ public final class JarReader {
         InputBudget policy = budget == null ? InputBudget.defaults() : budget;
         List<ClassBytes> out = new ArrayList<>();
         StreamResult result = streamDetailed(target, out::add, targetFeature, policy, tracker);
-        return new ReadResult(out, result.completenessReasons());
+        return new ReadResult(out, result.completenessReasons(), result.archiveMetadata());
     }
 
     /**
@@ -202,7 +216,7 @@ public final class JarReader {
                         state.archiveBudget.observeFile(name, size);
                     } catch (IOException failure) {
                         state.markBudget(ReaderState.limitReason(failure, state.budget));
-                        return new StreamResult(state.emitted, List.copyOf(state.reasons));
+                        return state.result();
                     }
                     try (IoUtil.OpenedInput opened = IoUtil.openRegularFile(target, "CLASS_INPUT")) {
                         state.emit(new ClassBytes(classNameFromPath(name),
@@ -219,7 +233,7 @@ public final class JarReader {
                 throw new IOException("不支持的输入: " + target + "（仅支持 .jar/.zip/.class/目录）");
             }
         }
-        return new StreamResult(state.emitted, List.copyOf(state.reasons));
+        return state.result();
     }
 
     private void readDirectory(Path dir, String origin, ReaderState state) throws IOException {
@@ -377,7 +391,7 @@ public final class JarReader {
                 entries.add(entry);
             }
             entries.sort(Comparator.comparing(ZipEntry::getName));
-            MultiReleaseSelection multiRelease = multiReleaseSelection(zip, entries, state);
+            MultiReleaseSelection multiRelease = multiReleaseSelection(zip, entries, origin, state);
             for (ZipEntry entry : entries) {
                 if (!state.observeEntry(entry)) {
                     if (state.budgetExceeded()) {
@@ -401,6 +415,14 @@ public final class JarReader {
                     continue;
                 }
                 try {
+                    if (ArchiveMetadataParser.isMetadataPath(path)
+                            && !state.hasMetadata(origin, path)) {
+                        byte[] metadataBytes;
+                        try (var input = zip.getInputStream(entry)) {
+                            metadataBytes = state.readEntryBytes(entry, input);
+                        }
+                        state.captureMetadata(origin, path, metadataBytes);
+                    }
                     if (path.endsWith(".class")) {
                         byte[] classBytes;
                         try (var input = zip.getInputStream(entry)) {
@@ -521,7 +543,7 @@ public final class JarReader {
                 if (entry.isDirectory()) {
                     continue;
                 }
-                if ("META-INF/MANIFEST.MF".equalsIgnoreCase(path)
+                if (ArchiveMetadataParser.isMetadataPath(path)
                         || path.endsWith(".class") || path.endsWith(".jar")) {
                     byte[] payloadBytes;
                     try {
@@ -556,6 +578,9 @@ public final class JarReader {
                 String path = payload.path();
                 if (selection.skip(path)) {
                     continue;
+                }
+                if (ArchiveMetadataParser.isMetadataPath(path)) {
+                    state.captureMetadata(origin, path, payload.bytes());
                 }
                 if (path.endsWith(".class")) {
                     state.emit(new ClassBytes(stripClassPrefix(selection.logicalPath(path)),
@@ -627,6 +652,7 @@ public final class JarReader {
         private final InputBudget budget;
         private final Set<String> reasons = new LinkedHashSet<>();
         private final Set<String> emittedClassNames = new LinkedHashSet<>();
+        private final Map<String, Map<String, byte[]>> metadataEntries = new LinkedHashMap<>();
         private final InputBudget.Tracker archiveBudget;
         private int emitted;
         private boolean budgetExceeded;
@@ -663,6 +689,22 @@ public final class JarReader {
         private void markArchiveDuplicate() {
             budgetExceeded = true;
             reasons.add("ARCHIVE_DUPLICATE_ENTRY");
+        }
+
+        private boolean hasMetadata(String origin, String path) {
+            Map<String, byte[]> entries = metadataEntries.get(origin);
+            return entries != null && entries.containsKey(normalizeMetadataPath(path));
+        }
+
+        private void captureMetadata(String origin, String path, byte[] bytes) {
+            if (origin == null || origin.isBlank() || !ArchiveMetadataParser.isMetadataPath(path)) {
+                return;
+            }
+            if (bytes == null) {
+                throw new IllegalArgumentException("metadata bytes are required");
+            }
+            metadataEntries.computeIfAbsent(origin, ignored -> new LinkedHashMap<>())
+                    .putIfAbsent(normalizeMetadataPath(path), bytes.clone());
         }
 
         /** Convert bounded-entry failures into an auditable partial result. */
@@ -820,6 +862,17 @@ public final class JarReader {
                     || message.startsWith("INPUT_STREAM_NO_PROGRESS");
         }
 
+        private StreamResult result() {
+            Map<String, ArchiveMetadata> parsed = new LinkedHashMap<>();
+            for (Map.Entry<String, Map<String, byte[]>> entry : metadataEntries.entrySet()) {
+                ArchiveMetadata metadata = ArchiveMetadataParser.parse(entry.getKey(),
+                        entry.getValue());
+                parsed.put(entry.getKey(), metadata);
+                reasons.addAll(metadata.completenessReasons());
+            }
+            return new StreamResult(emitted, List.copyOf(reasons), parsed);
+        }
+
         private void emit(ClassBytes bytes) throws IOException {
             if (atCapacity()) {
                 markCap(bytes.origin());
@@ -850,6 +903,26 @@ public final class JarReader {
         public void close() {
             // Parent ZipFile/ZipInputStream owns the underlying stream.
         }
+    }
+
+    private static String normalizeMetadataPath(String path) {
+        return path == null ? "" : path.replace('\\', '/').trim();
+    }
+
+    private static Map<String, ArchiveMetadata> immutableMetadata(
+            Map<String, ArchiveMetadata> values) {
+        if (values == null || values.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, ArchiveMetadata> copy = new LinkedHashMap<>();
+        for (Map.Entry<String, ArchiveMetadata> entry : values.entrySet()) {
+            if (entry.getKey() == null || entry.getKey().isBlank()
+                    || entry.getValue() == null) {
+                throw new IllegalArgumentException("archive metadata is invalid");
+            }
+            copy.put(entry.getKey(), entry.getValue());
+        }
+        return Map.copyOf(copy);
     }
 
     private static boolean isNestedLib(String path) {
@@ -907,6 +980,7 @@ public final class JarReader {
      */
     private static MultiReleaseSelection multiReleaseSelection(ZipFile zip,
                                                                 List<ZipEntry> entries,
+                                                                String origin,
                                                                 ReaderState state) {
         boolean enabled = false;
         ZipEntry manifest = null;
@@ -919,6 +993,7 @@ public final class JarReader {
         if (manifest != null) {
             try (InputStream input = zip.getInputStream(manifest)) {
                 byte[] bytes = state.readBytes(input);
+                state.captureMetadata(origin, manifest.getName(), bytes);
                 enabled = "true".equalsIgnoreCase(new Manifest(
                         new java.io.ByteArrayInputStream(bytes)).getMainAttributes()
                         .getValue("Multi-Release"));

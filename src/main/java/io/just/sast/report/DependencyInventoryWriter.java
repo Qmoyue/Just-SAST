@@ -1,7 +1,10 @@
 package io.just.sast.report;
 
+import io.just.sast.frontend.asm.ArchiveMetadataParser;
 import io.just.sast.util.ArchiveLimits;
 import io.just.sast.util.ArtifactFingerprint;
+import io.just.sast.util.IoUtil;
+import io.just.sast.model.ArchiveMetadata;
 import io.just.sast.model.ArtifactProvenance;
 import io.just.sast.model.DependencyGraph;
 import io.just.sast.run.InputBudget;
@@ -21,8 +24,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -36,9 +37,7 @@ import java.util.zip.ZipFile;
  */
 public final class DependencyInventoryWriter {
 
-    private static final Pattern VERSIONED_NAME = Pattern.compile(
-            "^(.+?)-((?:\\d+)(?:\\.[0-9A-Za-z]+)+(?:[-._][0-9A-Za-z]+)*)$");
-    private static final long MAX_PROPERTIES_BYTES = 256L * 1024L;
+    private static final long MAX_METADATA_BYTES = 256L * 1024L;
 
     private record Component(String ref, String kind, String group, String name, String version,
                              String hash, String source, String parentRef, String error,
@@ -51,6 +50,13 @@ public final class DependencyInventoryWriter {
     }
 
     private record NestedFailure(String code, String detail) {
+    }
+
+    private record MetadataRead(ArchiveMetadata metadata, String error) {
+        private MetadataRead {
+            metadata = metadata == null ? ArchiveMetadata.empty("<unknown>") : metadata;
+            error = error == null ? "" : error;
+        }
     }
 
     public String write(ReportLayout layout, Path target, List<Path> dependencies,
@@ -101,7 +107,7 @@ public final class DependencyInventoryWriter {
                                  List<String> knownDependencyHashes, InputBudget budget,
                                  InputBudget.Tracker tracker) throws IOException {
         return build(target, dependencies, targetHash, targetMajorVersion,
-                knownDependencyHashes, null, budget, tracker);
+                knownDependencyHashes, null, null, budget, tracker);
     }
 
     /**
@@ -113,6 +119,21 @@ public final class DependencyInventoryWriter {
                                  String targetHash, int targetMajorVersion,
                                  List<String> knownDependencyHashes,
                                  List<ArtifactProvenance> inputProvenance,
+                                 InputBudget budget, InputBudget.Tracker tracker) throws IOException {
+        return build(target, dependencies, targetHash, targetMajorVersion,
+                knownDependencyHashes, inputProvenance, null, budget, tracker);
+    }
+
+    /**
+     * Build while consuming metadata captured by the frontend's archive boundary.  A non-null
+     * map is a closed snapshot: absent metadata means the archive supplied no recognized
+     * metadata, so this method never reopens the input or invents a coordinate.
+     */
+    public DependencyGraph build(Path target, List<Path> dependencies,
+                                 String targetHash, int targetMajorVersion,
+                                 List<String> knownDependencyHashes,
+                                 List<ArtifactProvenance> inputProvenance,
+                                 Map<String, ArchiveMetadata> archiveMetadata,
                                  InputBudget budget, InputBudget.Tracker tracker) throws IOException {
         if (target == null) {
             throw new IOException("dependency graph target is required");
@@ -130,7 +151,7 @@ public final class DependencyInventoryWriter {
                 ? derivedProvenance(target, ArtifactProvenance.Role.APPLICATION, targetHash)
                 : inputProvenance.get(0);
         addDirect(components, target, "application", "target", targetHash, "", sharedBudget,
-                policy, 0, applicationProvenance);
+                policy, 0, applicationProvenance, archiveMetadata);
         if (Files.isDirectory(target, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
             environmentConditions.add("CLASS_DIRECTORY_INPUT:0");
         }
@@ -142,7 +163,7 @@ public final class DependencyInventoryWriter {
                     ? derivedProvenance(dependency, ArtifactProvenance.Role.DEPENDENCY, knownHash)
                     : inputProvenance.get(i + 1);
             addDirect(components, dependency, "direct", "dependency-" + (i + 1), knownHash, "",
-                    sharedBudget, policy, i + 1, dependencyProvenance);
+                    sharedBudget, policy, i + 1, dependencyProvenance, archiveMetadata);
             if (Files.isDirectory(dependency, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
                 environmentConditions.add("CLASS_DIRECTORY_INPUT:" + (i + 1));
             }
@@ -173,7 +194,8 @@ public final class DependencyInventoryWriter {
     private void addDirect(Map<String, Component> components, Path input, String kind,
                            String source, String knownHash, String parentRef,
                            InputBudget.Tracker budget, InputBudget policy, int inputIndex,
-                           ArtifactProvenance provenance) {
+                           ArtifactProvenance provenance,
+                           Map<String, ArchiveMetadata> archiveMetadata) throws IOException {
         if (input == null) {
             return;
         }
@@ -188,23 +210,37 @@ public final class DependencyInventoryWriter {
         }
         String fallback = digest("component|" + source + "|" + String.valueOf(input.getFileName()));
         String ref = uniqueDirectRef(components, ref(hash, fallback), inputIndex);
-        Coordinates coordinates = coordinates(input, policy, budget);
+        String origin = input.getFileName() == null ? "<unknown>" : input.getFileName().toString();
+        MetadataRead metadataRead = archiveMetadata == null
+                ? readMetadata(input, policy, budget)
+                : new MetadataRead(archiveMetadata.get(origin), "");
+        if (error.isBlank() && !metadataRead.error().isBlank()) {
+            error = metadataRead.error();
+        }
+        Coordinates coordinates = coordinates(input, metadataRead.metadata());
         put(components, new Component(ref, kind, coordinates.group(), coordinates.name(),
                 coordinates.version(), normalizeHash(hash), source, parentRef, error, "",
                 inputIndex, provenance));
-        NestedFailure nestedFailure = addNested(components, input, ref, budget, policy);
+        NestedFailure nestedFailure = addNested(components, input, ref, origin, archiveMetadata,
+                budget, policy);
         if (nestedFailure != null) {
             Component current = components.get(ref);
-            if (current != null && current.error().isBlank()) {
+            if (current != null && (current.error().isBlank() || current.errorDetail().isBlank())) {
+                String failureCode = current.error().isBlank()
+                        ? nestedFailure.code() : current.error();
+                String failureDetail = current.errorDetail().isBlank()
+                        ? nestedFailure.detail() : current.errorDetail();
                 components.put(ref, new Component(current.ref(), current.kind(), current.group(),
                         current.name(), current.version(), current.hash(), current.source(),
-                        current.parentRef(), nestedFailure.code(), nestedFailure.detail(),
+                        current.parentRef(), failureCode, failureDetail,
                         current.inputIndex(), current.provenance()));
             }
         }
     }
 
     private NestedFailure addNested(Map<String, Component> components, Path input, String parentRef,
+                                    String archiveOrigin,
+                                    Map<String, ArchiveMetadata> archiveMetadata,
                                     InputBudget.Tracker tracker, InputBudget policy) {
         if (!Files.isRegularFile(input) || ArchiveLimits.isLinkOrReparsePoint(input)) {
             return null;
@@ -246,7 +282,9 @@ public final class DependencyInventoryWriter {
                     try (InputStream stream = zip.getInputStream(entry)) {
                         nestedHash = boundedDigest(stream, tracker);
                     }
-                    Coordinates coordinates = coordinates(Path.of(entry.getName()), policy, tracker);
+                    ArchiveMetadata metadata = archiveMetadata == null ? null
+                            : archiveMetadata.get(archiveOrigin + "!" + entry.getName());
+                    Coordinates coordinates = coordinates(Path.of(entry.getName()), metadata);
                     String ref = uniqueEmbeddedRef(components, ref(nestedHash,
                             digest("nested|" + parentRef + "|" + entry.getName())),
                             parentRef, entry.getName());
@@ -382,64 +420,78 @@ public final class DependencyInventoryWriter {
         return hex(digest.digest());
     }
 
-    private static Coordinates coordinates(Path input, InputBudget policy,
-                                           InputBudget.Tracker tracker) {
+    private static MetadataRead readMetadata(Path input, InputBudget policy,
+                                             InputBudget.Tracker tracker) {
+        String origin = input == null || input.getFileName() == null
+                ? "<unknown>" : input.getFileName().toString();
+        if (!Files.isRegularFile(input, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                || ArchiveLimits.isLinkOrReparsePoint(input)) {
+            return new MetadataRead(ArchiveMetadata.empty(origin), "");
+        }
+        try {
+            ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
+                    input, policy, "INVENTORY_METADATA");
+            Map<String, byte[]> selected = new LinkedHashMap<>();
+            java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+            long cap = Math.min(MAX_METADATA_BYTES, policy.maxEntryBytes());
+            try (ArchiveLimits.ZipFileHandle handle = ArchiveLimits.openZipFile(snapshot,
+                    "INVENTORY_METADATA")) {
+                ZipFile zip = handle.zip();
+                var iterator = zip.entries();
+                while (iterator.hasMoreElements()) {
+                    ZipEntry entry = iterator.nextElement();
+                    if (entry == null || !seen.add(entry.getName())) {
+                        return new MetadataRead(ArchiveMetadata.empty(origin),
+                                "ARCHIVE_DUPLICATE_ENTRY");
+                    }
+                    if (entry.isDirectory()
+                            || !ArchiveMetadataParser.isMetadataPath(entry.getName())) {
+                        continue;
+                    }
+                    if (!ArchiveLimits.safeEntryName(entry.getName(), policy)) {
+                        return new MetadataRead(ArchiveMetadata.empty(origin),
+                                "UNSAFE_ENTRY_PATH");
+                    }
+                    if (entry.getSize() >= 0L && entry.getSize() > cap) {
+                        return new MetadataRead(ArchiveMetadata.empty(origin),
+                                "ARCHIVE_ENTRY_READ_CAP");
+                    }
+                    tracker.observe(entry);
+                    try (InputStream stream = zip.getInputStream(entry)) {
+                        byte[] bytes = IoUtil.readAll(stream, cap, tracker);
+                        if (entry.getCrc() >= 0L) {
+                            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+                            crc.update(bytes);
+                            if (crc.getValue() != entry.getCrc()) {
+                                return new MetadataRead(ArchiveMetadata.empty(origin),
+                                        "ARCHIVE_CORRUPT");
+                            }
+                        }
+                        selected.put(entry.getName(), bytes);
+                    }
+                }
+            }
+            return new MetadataRead(ArchiveMetadataParser.parse(origin, selected), "");
+        } catch (IOException | RuntimeException failure) {
+            return new MetadataRead(ArchiveMetadata.empty(origin), errorCode(failure));
+        }
+    }
+
+    private static Coordinates coordinates(Path input, ArchiveMetadata metadata) {
         String name = input == null || input.getFileName() == null
                 ? "unknown" : input.getFileName().toString();
         if (name.endsWith(".jar")) {
             name = name.substring(0, name.length() - 4);
         }
-        String group = "";
-        String artifact = name;
-        String version = "unknown";
-        try {
-            if (Files.isRegularFile(input) && !ArchiveLimits.isLinkOrReparsePoint(input)) {
-                ArchiveLimits.FileReadSnapshot snapshot = ArchiveLimits.snapshotRegularFile(
-                        input, policy, "INVENTORY_COORDINATES");
-                try (ArchiveLimits.ZipFileHandle handle = ArchiveLimits.openZipFile(snapshot,
-                        "INVENTORY_COORDINATES")) {
-                    ZipFile zip = handle.zip();
-                    ZipEntry properties = zip.stream()
-                            .filter(entry -> entry.getName().startsWith("META-INF/maven/")
-                                    && entry.getName().endsWith("/pom.properties"))
-                            .sorted(Comparator.comparing(ZipEntry::getName))
-                            .findFirst().orElse(null);
-                    long cap = Math.min(MAX_PROPERTIES_BYTES, policy.maxEntryBytes());
-                    if (properties != null && properties.getSize() >= 0
-                            && properties.getSize() <= cap) {
-                        java.util.Properties values = new java.util.Properties();
-                        try (InputStream stream = zip.getInputStream(properties)) {
-                            values.load(new java.io.StringReader(new String(
-                                    io.just.sast.util.IoUtil.readAll(stream, cap, tracker),
-                                    StandardCharsets.UTF_8)));
-                        }
-                        group = value(values.getProperty("groupId"));
-                        artifact = value(values.getProperty("artifactId"));
-                        version = value(values.getProperty("version"));
-                    }
-                }
-            }
-        } catch (IOException | RuntimeException ignored) {
-            // Filename coordinates remain useful and are explicitly marked unknown when not
-            // present in the artifact metadata.
+        if (metadata != null && metadata.pomProperties().size() == 1) {
+            ArchiveMetadata.PomProperties pom = metadata.pomProperties().get(0);
+            return new Coordinates(pom.groupId(), pom.artifactId(), pom.version());
         }
-        if (group.isBlank() || artifact.equals("unknown")) {
-            Matcher matcher = VERSIONED_NAME.matcher(artifact);
-            if (matcher.matches()) {
-                artifact = matcher.group(1);
-                if (version.equals("unknown")) {
-                    version = matcher.group(2);
-                }
-            }
-        }
-        return new Coordinates(group, artifact, version);
+        // The file name is a display name only.  It never supplies a Maven group or version.
+        return new Coordinates("", name, "unknown");
     }
 
     private record Coordinates(String group, String name, String version) {
-    }
-
-    private static String value(String value) {
-        return value == null ? "" : value.trim();
     }
 
     private static String normalizeHash(String hash) {
@@ -518,7 +570,8 @@ public final class DependencyInventoryWriter {
     }
 
     private static boolean isNestedLibrary(String name) {
-        return (name.startsWith("BOOT-INF/lib/") || name.startsWith("WEB-INF/lib/"))
+        return (name.startsWith("BOOT-INF/lib/") || name.startsWith("WEB-INF/lib/")
+                || name.startsWith("lib/"))
                 && name.endsWith(".jar") && !name.endsWith("/");
     }
 
