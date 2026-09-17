@@ -11,6 +11,7 @@ import io.just.sast.model.FieldRef;
 import io.just.sast.model.HttpHandlerValue;
 import io.just.sast.model.InsnFact;
 import io.just.sast.model.InvokeDynamicRef;
+import io.just.sast.model.JndiReferenceFact;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
@@ -97,6 +98,7 @@ public final class CpgBuilder {
                     }
                 }
                 annotateHttpHandlerValues(graph, method);
+                annotateJndiReferenceFacts(graph, method);
                 for (var tryCatch : method.tryCatch()) {
                     slice.accept(tryCatch);
                 }
@@ -199,6 +201,375 @@ public final class CpgBuilder {
 
     public static String methodKey(String owner, String name, String desc) {
         return owner + "#" + name + desc;
+    }
+
+    /**
+     * Retain exact Reference object identity and its constructor/RefAddr fields at the CPG
+     * seam.  This is a deliberately small straight-line transfer: aliases inside locals and
+     * the operand stack retain the same allocation token, while unsupported control-flow or
+     * stack shapes abandon the proof.  No target method is loaded or invoked.
+     */
+    private static void annotateJndiReferenceFacts(Graph graph, MethodInfo method) {
+        if (graph == null || method == null || method.instructions().isEmpty()
+                || !method.tryCatch().isEmpty()
+                || method.instructions().stream().anyMatch(insn -> insn.op().isCondJump()
+                || insn.op().isUncondJump() || insn.op().isSwitch())) {
+            return;
+        }
+        String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
+        List<ReferenceFlowSlot> stack = new ArrayList<>();
+        Map<Integer, ReferenceFlowSlot> locals = new HashMap<>();
+        List<ReferenceBuilder> references = new ArrayList<>();
+        for (InsnFact insn : method.instructions()) {
+            if (!transferJndiReferenceInstruction(graph, hostMethodKey, insn, stack, locals,
+                    references)) {
+                return;
+            }
+        }
+        for (ReferenceBuilder reference : references) {
+            if (!reference.constructed()) {
+                continue;
+            }
+            Node construction = graph.findCallNode(hostMethodKey, reference.constructionOffset());
+            if (construction == null) {
+                throw new IllegalStateException("Reference constructor call is missing from CPG");
+            }
+            construction.propsNote(JndiReferenceFact.GRAPH_NOTE_KEY, reference.toFact());
+        }
+    }
+
+    private static boolean transferJndiReferenceInstruction(
+            Graph graph, String hostMethodKey, InsnFact insn, List<ReferenceFlowSlot> stack,
+            Map<Integer, ReferenceFlowSlot> locals, List<ReferenceBuilder> references) {
+        if (insn == null || insn.op() == null) {
+            return false;
+        }
+        switch (insn.op()) {
+            case NOP, IINC -> {
+                return true;
+            }
+            case ACONST_NULL -> stack.add(ReferenceFlowSlot.string(
+                    JndiReferenceFact.FieldValue.nullValue()));
+            case ICONST_M1, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5,
+                    FCONST_0, FCONST_1, FCONST_2, BIPUSH, SIPUSH ->
+                    stack.add(ReferenceFlowSlot.unknown(false));
+            case LCONST_0, LCONST_1, DCONST_0, DCONST_1 ->
+                    stack.add(ReferenceFlowSlot.unknown(true));
+            case LDC -> {
+                Object constant = insn.constant();
+                if (constant instanceof String value) {
+                    stack.add(ReferenceFlowSlot.string(JndiReferenceFact.FieldValue.known(value)));
+                } else {
+                    stack.add(ReferenceFlowSlot.unknown(
+                            constant instanceof Long || constant instanceof Double));
+                }
+            }
+            case ALOAD, ILOAD, FLOAD, LLOAD, DLOAD ->
+                    stack.add(locals.getOrDefault(insn.varIndex(),
+                            ReferenceFlowSlot.unknown(insn.op() == Op.LLOAD
+                                    || insn.op() == Op.DLOAD)));
+            case ASTORE, ISTORE, FSTORE, LSTORE, DSTORE -> {
+                ReferenceFlowSlot value = pop(stack);
+                if (value == null) {
+                    return false;
+                }
+                locals.put(insn.varIndex(), value);
+            }
+            case NEW -> {
+                String owner = internalName(insn.typeRef());
+                if (owner == null) {
+                    return false;
+                }
+                if (JndiReferenceFact.REFERENCE_OWNER.equals(owner)) {
+                    ReferenceBuilder reference = new ReferenceBuilder(hostMethodKey,
+                            insn.offset());
+                    references.add(reference);
+                    stack.add(ReferenceFlowSlot.reference(reference));
+                } else if (JndiReferenceFact.STRING_REF_ADDR_OWNER.equals(owner)) {
+                    stack.add(ReferenceFlowSlot.address(new RefAddrBuilder(hostMethodKey,
+                            insn.offset(), owner)));
+                } else {
+                    stack.add(ReferenceFlowSlot.unknown(false));
+                }
+            }
+            case CHECKCAST -> {
+                ReferenceFlowSlot value = pop(stack);
+                if (value == null) {
+                    return false;
+                }
+                stack.add(value);
+            }
+            case GETSTATIC -> {
+                FieldRef field = insn.fieldRef();
+                if (field == null || !validTypeDescriptor(field.descriptor())) {
+                    return false;
+                }
+                stack.add(ReferenceFlowSlot.unknown(isCategory2(field.descriptor())));
+            }
+            case PUTSTATIC -> {
+                if (pop(stack) == null) {
+                    return false;
+                }
+            }
+            case GETFIELD -> {
+                if (pop(stack) == null) {
+                    return false;
+                }
+                FieldRef field = insn.fieldRef();
+                if (field == null || !validTypeDescriptor(field.descriptor())) {
+                    return false;
+                }
+                stack.add(ReferenceFlowSlot.unknown(isCategory2(field.descriptor())));
+            }
+            case PUTFIELD -> {
+                if (pop(stack) == null || pop(stack) == null) {
+                    return false;
+                }
+            }
+            case DUP -> {
+                ReferenceFlowSlot value = peek(stack);
+                if (value == null || value.category2()) {
+                    return false;
+                }
+                stack.add(value);
+            }
+            case SWAP -> {
+                if (stack.size() < 2 || stack.get(stack.size() - 1).category2()
+                        || stack.get(stack.size() - 2).category2()) {
+                    return false;
+                }
+                int top = stack.size() - 1;
+                ReferenceFlowSlot first = stack.get(top);
+                stack.set(top, stack.get(top - 1));
+                stack.set(top - 1, first);
+            }
+            case POP -> {
+                if (pop(stack) == null) {
+                    return false;
+                }
+            }
+            case POP2 -> {
+                ReferenceFlowSlot value = pop(stack);
+                if (value == null || (!value.category2() && pop(stack) == null)) {
+                    return false;
+                }
+            }
+            case INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE,
+                    INVOKEDYNAMIC -> {
+                return transferJndiReferenceInvoke(graph, hostMethodKey, insn, stack, locals);
+            }
+            case IRETURN, FRETURN, ARETURN, LRETURN, DRETURN, RETURN, ATHROW -> {
+                if (insn.op() != Op.RETURN && pop(stack) == null) {
+                    return false;
+                }
+            }
+            case MONITORENTER, MONITOREXIT -> {
+                if (pop(stack) == null) {
+                    return false;
+                }
+            }
+            default -> {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean transferJndiReferenceInvoke(
+            Graph graph, String hostMethodKey, InsnFact insn, List<ReferenceFlowSlot> stack,
+            Map<Integer, ReferenceFlowSlot> locals) {
+        String owner = null;
+        String name;
+        String descriptor;
+        boolean dynamic = insn.op() == Op.INVOKEDYNAMIC;
+        if (dynamic) {
+            if (insn.operands().isEmpty()
+                    || !(insn.operands().get(0) instanceof InvokeDynamicRef invokedynamic)) {
+                return false;
+            }
+            name = invokedynamic.name();
+            descriptor = invokedynamic.descriptor();
+        } else {
+            MethodRef method = insn.methodRef();
+            if (method == null) {
+                return false;
+            }
+            owner = method.owner();
+            name = method.name();
+            descriptor = method.descriptor();
+        }
+        if (!validMethodDescriptor(descriptor)) {
+            return false;
+        }
+        int argumentCount;
+        try {
+            argumentCount = Descriptor.paramCount(descriptor);
+        } catch (RuntimeException invalidDescriptor) {
+            return false;
+        }
+        boolean receiverRequired = !dynamic && insn.op() != Op.INVOKESTATIC;
+        int required = argumentCount + (receiverRequired ? 1 : 0);
+        if (stack.size() < required) {
+            return false;
+        }
+        List<ReferenceFlowSlot> arguments = new ArrayList<>(argumentCount);
+        for (int index = argumentCount - 1; index >= 0; index--) {
+            ReferenceFlowSlot argument = pop(stack);
+            if (argument == null) {
+                return false;
+            }
+            arguments.add(0, argument);
+        }
+        ReferenceFlowSlot receiver = receiverRequired ? pop(stack) : null;
+        if (receiverRequired && receiver == null) {
+            return false;
+        }
+        Node call = graph.findCallNode(hostMethodKey, insn.offset());
+        if (call == null) {
+            return false;
+        }
+
+        if (!dynamic && "<init>".equals(name)
+                && JndiReferenceFact.REFERENCE_OWNER.equals(owner)
+                && insn.op() == Op.INVOKESPECIAL
+                && !initializeReference(receiver, descriptor, arguments, call)) {
+            return false;
+        }
+        if (!dynamic && "<init>".equals(name)
+                && JndiReferenceFact.STRING_REF_ADDR_OWNER.equals(owner)
+                && insn.op() == Op.INVOKESPECIAL
+                && !initializeRefAddr(receiver, descriptor, arguments, call)) {
+            return false;
+        }
+        if (!dynamic && JndiReferenceFact.REFERENCE_OWNER.equals(owner)
+                && "add".equals(name)
+                && insn.op() == Op.INVOKEVIRTUAL
+                && !addReferenceAddress(receiver, descriptor, arguments)) {
+            return false;
+        }
+        if (!dynamic && JndiReferenceFact.REFERENCE_OWNER.equals(owner)
+                && insn.op() == Op.INVOKEVIRTUAL
+                && (("remove".equals(name)
+                && JndiReferenceFact.REFERENCE_REMOVE_DESCRIPTOR.equals(descriptor))
+                || ("clear".equals(name)
+                && JndiReferenceFact.REFERENCE_CLEAR_DESCRIPTOR.equals(descriptor)))) {
+            return false;
+        }
+
+        String returnType;
+        try {
+            returnType = Descriptor.returnType(descriptor);
+        } catch (RuntimeException invalidDescriptor) {
+            return false;
+        }
+        if (!"V".equals(returnType)) {
+            stack.add("Ljava/lang/String;".equals(returnType)
+                    ? ReferenceFlowSlot.string(JndiReferenceFact.FieldValue.unknown())
+                    : ReferenceFlowSlot.unknown(isCategory2(returnType)));
+        }
+        return true;
+    }
+
+    private static boolean initializeReference(ReferenceFlowSlot receiver, String descriptor,
+                                               List<ReferenceFlowSlot> arguments, Node call) {
+        if (receiver == null || receiver.reference() == null) {
+            return false;
+        }
+        ReferenceBuilder reference = receiver.reference();
+        if (JndiReferenceFact.REFERENCE_CONSTRUCTOR_ONE_DESCRIPTOR.equals(descriptor)) {
+            if (arguments.size() != 1) {
+                return false;
+            }
+            reference.construct(call.id(), call.offset(), valueOf(arguments.get(0)),
+                    JndiReferenceFact.FieldValue.absent(),
+                    JndiReferenceFact.FieldValue.absent());
+            return true;
+        }
+        if (JndiReferenceFact.REFERENCE_CONSTRUCTOR_ADDRESS_DESCRIPTOR.equals(descriptor)) {
+            if (arguments.size() != 2) {
+                return false;
+            }
+            reference.construct(call.id(), call.offset(), valueOf(arguments.get(0)),
+                    JndiReferenceFact.FieldValue.absent(),
+                    JndiReferenceFact.FieldValue.absent());
+            return addAddress(reference, arguments.get(1));
+        }
+        if (JndiReferenceFact.REFERENCE_CONSTRUCTOR_FACTORY_DESCRIPTOR.equals(descriptor)) {
+            if (arguments.size() != 3) {
+                return false;
+            }
+            reference.construct(call.id(), call.offset(), valueOf(arguments.get(0)),
+                    valueOf(arguments.get(1)), valueOf(arguments.get(2)));
+            return true;
+        }
+        if (JndiReferenceFact.REFERENCE_CONSTRUCTOR_FULL_DESCRIPTOR.equals(descriptor)) {
+            if (arguments.size() != 4) {
+                return false;
+            }
+            reference.construct(call.id(), call.offset(), valueOf(arguments.get(0)),
+                    valueOf(arguments.get(2)), valueOf(arguments.get(3)));
+            return addAddress(reference, arguments.get(1));
+        }
+        return true;
+    }
+
+    private static boolean initializeRefAddr(ReferenceFlowSlot receiver, String descriptor,
+                                             List<ReferenceFlowSlot> arguments, Node call) {
+        if (receiver == null || receiver.address() == null
+                || !JndiReferenceFact.STRING_REF_ADDR_CONSTRUCTOR_DESCRIPTOR.equals(descriptor)
+                || arguments.size() != 2) {
+            return false;
+        }
+        receiver.address().construct(call.id(), call.offset(), valueOf(arguments.get(0)),
+                valueOf(arguments.get(1)));
+        return true;
+    }
+
+    private static boolean addReferenceAddress(ReferenceFlowSlot receiver, String descriptor,
+                                               List<ReferenceFlowSlot> arguments) {
+        if (receiver == null || receiver.reference() == null
+                || !receiver.reference().constructed()) {
+            return false;
+        }
+        if (JndiReferenceFact.REFERENCE_ADD_ADDRESS_DESCRIPTOR.equals(descriptor)) {
+            if (arguments.size() != 1) {
+                return false;
+            }
+            return addAddress(receiver.reference(), arguments.get(0));
+        }
+        if (JndiReferenceFact.REFERENCE_ADD_INDEXED_ADDRESS_DESCRIPTOR.equals(descriptor)) {
+            if (arguments.size() != 2) {
+                return false;
+            }
+            return addAddress(receiver.reference(), arguments.get(1));
+        }
+        return false;
+    }
+
+    private static boolean addAddress(ReferenceBuilder reference, ReferenceFlowSlot value) {
+        if (value == null || value.address() == null || !value.address().constructed()) {
+            return false;
+        }
+        reference.add(value.address());
+        return true;
+    }
+
+    private static JndiReferenceFact.FieldValue valueOf(ReferenceFlowSlot value) {
+        return value == null || value.stringValue() == null
+                ? JndiReferenceFact.FieldValue.unknown() : value.stringValue();
+    }
+
+    private static String internalName(TypeRef type) {
+        if (type == null || type.descriptor() == null) {
+            return null;
+        }
+        String descriptor = type.descriptor();
+        if (descriptor.startsWith("L") && descriptor.endsWith(";")) {
+            String value = descriptor.substring(1, descriptor.length() - 1);
+            return value.isBlank() || value.indexOf('.') >= 0 ? null : value;
+        }
+        return descriptor.isBlank() || descriptor.startsWith("[")
+                || descriptor.indexOf('.') >= 0 ? null : descriptor;
     }
 
     /**
@@ -476,11 +847,11 @@ public final class CpgBuilder {
                 && value.handler().typeOwner().equals(origin.typeOwner());
     }
 
-    private static FlowSlot pop(List<FlowSlot> stack) {
+    private static <T> T pop(List<T> stack) {
         return stack.isEmpty() ? null : stack.remove(stack.size() - 1);
     }
 
-    private static FlowSlot peek(List<FlowSlot> stack) {
+    private static <T> T peek(List<T> stack) {
         return stack.isEmpty() ? null : stack.get(stack.size() - 1);
     }
 
@@ -511,6 +882,114 @@ public final class CpgBuilder {
             return "unknown";
         }
         return descriptor.substring(1, descriptor.length() - 1);
+    }
+
+    private static final class ReferenceBuilder {
+        private final String hostMethodKey;
+        private final int allocationOffset;
+        private final List<RefAddrBuilder> properties = new ArrayList<>();
+        private JndiReferenceFact.FieldValue type = JndiReferenceFact.FieldValue.unknown();
+        private JndiReferenceFact.FieldValue factoryClass = JndiReferenceFact.FieldValue.unknown();
+        private JndiReferenceFact.FieldValue factoryLocation = JndiReferenceFact.FieldValue.unknown();
+        private long constructionCallId = -1;
+        private int constructionOffset = -1;
+
+        private ReferenceBuilder(String hostMethodKey, int allocationOffset) {
+            this.hostMethodKey = hostMethodKey;
+            this.allocationOffset = allocationOffset;
+        }
+
+        private boolean constructed() {
+            return constructionCallId >= 0;
+        }
+
+        private int constructionOffset() {
+            return constructionOffset;
+        }
+
+        private void construct(long callId, int callOffset, JndiReferenceFact.FieldValue type,
+                               JndiReferenceFact.FieldValue factoryClass,
+                               JndiReferenceFact.FieldValue factoryLocation) {
+            if (constructed()) {
+                throw new IllegalStateException("Reference allocation initialized twice");
+            }
+            this.constructionCallId = callId;
+            this.constructionOffset = callOffset;
+            this.type = type;
+            this.factoryClass = factoryClass;
+            this.factoryLocation = factoryLocation;
+        }
+
+        private void add(RefAddrBuilder address) {
+            properties.add(address);
+        }
+
+        private JndiReferenceFact toFact() {
+            JndiReferenceFact.ObjectIdentity identity = new JndiReferenceFact.ObjectIdentity(
+                    JndiReferenceFact.REFERENCE_OWNER, hostMethodKey, allocationOffset,
+                    constructionOffset, constructionCallId);
+            List<JndiReferenceFact.RefAddrFact> values = properties.stream()
+                    .map(RefAddrBuilder::toFact)
+                    .toList();
+            return new JndiReferenceFact(identity, type, factoryClass, factoryLocation, values);
+        }
+    }
+
+    private static final class RefAddrBuilder {
+        private final String hostMethodKey;
+        private final int allocationOffset;
+        private final String owner;
+        private JndiReferenceFact.FieldValue type = JndiReferenceFact.FieldValue.unknown();
+        private JndiReferenceFact.FieldValue content = JndiReferenceFact.FieldValue.unknown();
+        private long constructionCallId = -1;
+        private int constructionOffset = -1;
+
+        private RefAddrBuilder(String hostMethodKey, int allocationOffset, String owner) {
+            this.hostMethodKey = hostMethodKey;
+            this.allocationOffset = allocationOffset;
+            this.owner = owner;
+        }
+
+        private boolean constructed() {
+            return constructionCallId >= 0;
+        }
+
+        private void construct(long callId, int callOffset, JndiReferenceFact.FieldValue type,
+                               JndiReferenceFact.FieldValue content) {
+            if (constructed()) {
+                throw new IllegalStateException("RefAddr allocation initialized twice");
+            }
+            this.constructionCallId = callId;
+            this.constructionOffset = callOffset;
+            this.type = type;
+            this.content = content;
+        }
+
+        private JndiReferenceFact.RefAddrFact toFact() {
+            return new JndiReferenceFact.RefAddrFact(new JndiReferenceFact.ObjectIdentity(owner,
+                    hostMethodKey, allocationOffset, constructionOffset, constructionCallId),
+                    type, content);
+        }
+    }
+
+    private record ReferenceFlowSlot(ReferenceBuilder reference, RefAddrBuilder address,
+                                     JndiReferenceFact.FieldValue stringValue,
+                                     boolean category2) {
+        private static ReferenceFlowSlot unknown(boolean category2) {
+            return new ReferenceFlowSlot(null, null, null, category2);
+        }
+
+        private static ReferenceFlowSlot string(JndiReferenceFact.FieldValue value) {
+            return new ReferenceFlowSlot(null, null, value, false);
+        }
+
+        private static ReferenceFlowSlot reference(ReferenceBuilder value) {
+            return new ReferenceFlowSlot(value, null, null, false);
+        }
+
+        private static ReferenceFlowSlot address(RefAddrBuilder value) {
+            return new ReferenceFlowSlot(null, value, null, false);
+        }
     }
 
     private record HandlerOrigin(HttpHandlerValue.Kind kind, int producerOffset,
