@@ -50,7 +50,14 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 5;
+    public static final int MODEL_VERSION = 6;
+    public static final String HTTP_SERVER_OWNER = "com/sun/net/httpserver/HttpServer";
+    public static final String HTTP_SERVER_CREATE_CONTEXT_NAME = "createContext";
+    public static final String HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR =
+            "(Ljava/lang/String;Lcom/sun/net/httpserver/HttpHandler;)"
+                    + "Lcom/sun/net/httpserver/HttpContext;";
+    public static final String HTTP_HANDLER_DESCRIPTOR =
+            "Lcom/sun/net/httpserver/HttpHandler;";
     private static final int MAX_SLICE_METHODS = 100_000;
     private static final String FRAMEWORK_ENTRY_RULE = "builtin:framework-entry";
     private static final String FRAMEWORK_BINDING_RULE = "builtin:framework-binding";
@@ -120,6 +127,85 @@ public final class ApplicationEntryIndex {
             serviceMethodKey = requireText(serviceMethodKey, "serviceMethodKey");
             protocol = requireText(protocol, "protocol");
             publishPath = requireText(publishPath, "publishPath");
+        }
+    }
+
+    /** Knowledge state for a value carried by a typed call-site fact. */
+    public enum ValueState {
+        CONSTANT,
+        UNKNOWN
+    }
+
+    /**
+     * One JVM value position at a concrete call site.  The ordinal is -1 for the receiver and
+     * otherwise is the zero-based callee argument ordinal.  Identity is deliberately derived
+     * from the physical call site and position; it is not a class/name guess and does not claim
+     * that two positions alias until a later typed origin/bridge owner proves it.
+     */
+    public record HttpContextValue(long callId, String hostMethodKey, int callOffset,
+                                   int argumentOrdinal, String declaredDescriptor,
+                                   ValueState state, String constantValue) {
+        public HttpContextValue {
+            if (callId < 0) {
+                throw new IllegalArgumentException("callId must be non-negative");
+            }
+            hostMethodKey = requireText(hostMethodKey, "hostMethodKey");
+            if (callOffset < 0) {
+                throw new IllegalArgumentException("callOffset must be non-negative");
+            }
+            if (argumentOrdinal < -1) {
+                throw new IllegalArgumentException("argumentOrdinal must be -1 or greater");
+            }
+            declaredDescriptor = requireText(declaredDescriptor, "declaredDescriptor");
+            state = Objects.requireNonNull(state, "state");
+            if (state == ValueState.CONSTANT && constantValue == null) {
+                throw new IllegalArgumentException("constant value is required when known");
+            }
+            if (state == ValueState.UNKNOWN && constantValue != null) {
+                throw new IllegalArgumentException("unknown value cannot carry a constant");
+            }
+        }
+
+        /** Stable identity for this exact call-site value position. */
+        public String identity() {
+            return "call:" + callId + "@" + hostMethodKey + ":" + argumentOrdinal;
+        }
+    }
+
+    /**
+     * Exact application-owned {@code HttpServer.createContext(String,HttpHandler)} registration.
+     * The API hit is a site-registration fact only; it is not an external source or terminal.
+     */
+    public record HttpContextRegistration(long callId, String hostMethodKey, int callOffset,
+                                          HttpContextValue receiver, HttpContextValue path,
+                                          HttpContextValue handler) {
+        public HttpContextRegistration {
+            if (callId < 0) {
+                throw new IllegalArgumentException("callId must be non-negative");
+            }
+            hostMethodKey = requireText(hostMethodKey, "hostMethodKey");
+            if (callOffset < 0) {
+                throw new IllegalArgumentException("callOffset must be non-negative");
+            }
+            receiver = Objects.requireNonNull(receiver, "receiver");
+            path = Objects.requireNonNull(path, "path");
+            handler = Objects.requireNonNull(handler, "handler");
+            validateValue(receiver, callId, hostMethodKey, callOffset, -1,
+                    "L" + HTTP_SERVER_OWNER + ";");
+            validateValue(path, callId, hostMethodKey, callOffset, 0, "Ljava/lang/String;");
+            validateValue(handler, callId, hostMethodKey, callOffset, 1,
+                    HTTP_HANDLER_DESCRIPTOR);
+        }
+
+        private static void validateValue(HttpContextValue value, long callId,
+                                          String hostMethodKey, int callOffset,
+                                          int ordinal, String descriptor) {
+            if (value.callId() != callId || !hostMethodKey.equals(value.hostMethodKey())
+                    || value.callOffset() != callOffset
+                    || value.argumentOrdinal() != ordinal
+                    || !descriptor.equals(value.declaredDescriptor())) {
+                throw new IllegalArgumentException("HTTP context value does not match call site");
+            }
         }
     }
 
@@ -512,6 +598,8 @@ public final class ApplicationEntryIndex {
     private final Map<String, EntryChainJoinEvidence.FilterDominance> filterDominanceByService;
     private final List<ApplicationResourceFacts.RouteBinding> routeBindings;
     private final Map<String, List<ApplicationResourceFacts.RouteBinding>> routeBindingsByMember;
+    private final List<HttpContextRegistration> httpContextRegistrations;
+    private final Map<String, List<HttpContextRegistration>> httpContextRegistrationsByMethod;
     private final List<DeserializeSite> secondaryDeserializeSites;
     private final Set<String> applicationObjectInputHosts;
     private final List<TerminalImpact> terminalImpacts;
@@ -540,6 +628,7 @@ public final class ApplicationEntryIndex {
                                   List<ServiceEndpoint> serviceEndpoints,
                                   List<FilterControl> filterControls,
                                   ApplicationResourceFacts resourceFacts,
+                                  List<HttpContextRegistration> httpContextRegistrations,
                                   List<TerminalImpact> terminalImpacts,
                                   List<String> entryForwardSlice,
                                   List<String> sinkReverseSlice,
@@ -575,6 +664,10 @@ public final class ApplicationEntryIndex {
                 ? ApplicationResourceFacts.empty() : resourceFacts;
         this.routeBindings = immutableRouteBindings(resources);
         this.routeBindingsByMember = immutableRouteBindingIndex(this.routeBindings);
+        this.httpContextRegistrations = immutableHttpContextRegistrations(
+                httpContextRegistrations);
+        this.httpContextRegistrationsByMethod = immutableHttpContextRegistrationIndex(
+                this.httpContextRegistrations);
         this.secondaryDeserializeSites = this.deserializeSites.stream()
                 .filter(ApplicationEntryIndex::isSecondaryDeserializeSite)
                 .toList();
@@ -710,6 +803,34 @@ public final class ApplicationEntryIndex {
         Map<String, List<DeserializeSite>> result = new java.util.TreeMap<>();
         grouped.forEach((member, values) -> result.put(member, List.copyOf(values)));
         return Map.copyOf(result);
+    }
+
+    /** Discover only exact application-owned HttpServer context registrations. */
+    private static List<HttpContextRegistration> discoverHttpContextRegistrations(
+            Graph graph, Set<String> applicationOwners, boolean applicationScopeKnown) {
+        if (graph == null || !applicationScopeKnown || applicationOwners.isEmpty()) {
+            return List.of();
+        }
+        List<HttpContextRegistration> result = new ArrayList<>();
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            if (!applicationOwners.contains(call.methodOwner())
+                    || !HTTP_SERVER_OWNER.equals(call.owner())
+                    || !HTTP_SERVER_CREATE_CONTEXT_NAME.equals(call.name())
+                    || !HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR.equals(call.descriptor())
+                    || "DYNAMIC".equals(call.invokeKind())) {
+                continue;
+            }
+            String hostMethodKey = methodKey(call.methodOwner(), call.methodName(),
+                    call.methodDescriptor());
+            result.add(new HttpContextRegistration(call.id(), hostMethodKey, call.offset(),
+                    new HttpContextValue(call.id(), hostMethodKey, call.offset(), -1,
+                            "L" + HTTP_SERVER_OWNER + ";", ValueState.UNKNOWN, null),
+                    new HttpContextValue(call.id(), hostMethodKey, call.offset(), 0,
+                            "Ljava/lang/String;", ValueState.UNKNOWN, null),
+                    new HttpContextValue(call.id(), hostMethodKey, call.offset(), 1,
+                            HTTP_HANDLER_DESCRIPTOR, ValueState.UNKNOWN, null)));
+        }
+        return immutableHttpContextRegistrations(result);
     }
 
     /** Discover CXF endpoint registration from the constructor/publish call sequence. */
@@ -929,6 +1050,36 @@ public final class ApplicationEntryIndex {
                         .thenComparing(ServiceEndpoint::publishPath)
                         .thenComparing(ServiceEndpoint::protocol))
                 .distinct().toList();
+    }
+
+    private static List<HttpContextRegistration> immutableHttpContextRegistrations(
+            List<HttpContextRegistration> registrations) {
+        Objects.requireNonNull(registrations, "registrations");
+        if (registrations.isEmpty()) {
+            return List.of();
+        }
+        return registrations.stream().map(registration ->
+                        Objects.requireNonNull(registration, "registration"))
+                .sorted(Comparator.comparing(HttpContextRegistration::hostMethodKey)
+                        .thenComparingInt(HttpContextRegistration::callOffset)
+                        .thenComparingLong(HttpContextRegistration::callId))
+                .distinct().toList();
+    }
+
+    private static Map<String, List<HttpContextRegistration>>
+    immutableHttpContextRegistrationIndex(List<HttpContextRegistration> registrations) {
+        Objects.requireNonNull(registrations, "registrations");
+        if (registrations.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, List<HttpContextRegistration>> grouped = new TreeMap<>();
+        for (HttpContextRegistration registration : registrations) {
+            grouped.computeIfAbsent(registration.hostMethodKey(), ignored -> new ArrayList<>())
+                    .add(registration);
+        }
+        Map<String, List<HttpContextRegistration>> result = new TreeMap<>();
+        grouped.forEach((key, values) -> result.put(key, List.copyOf(values)));
+        return Map.copyOf(result);
     }
 
     private static Map<String, List<ServiceEndpoint>> immutableServiceEndpointIndex(
@@ -1194,6 +1345,8 @@ public final class ApplicationEntryIndex {
         // stable projection instead of rescanning CXF/Servlet calls for every candidate.
         List<ServiceEndpoint> serviceEndpoints = discoverServiceEndpoints(graph, entries,
                 owners, applicationScopeKnown);
+        List<HttpContextRegistration> httpContextRegistrations =
+                discoverHttpContextRegistrations(graph, owners, applicationScopeKnown);
         List<FilterControl> filterControls = discoverFilterControls(graph, owners,
                 applicationScopeKnown);
         if (applicationScopeKnown) {
@@ -1401,6 +1554,7 @@ public final class ApplicationEntryIndex {
         }
         return new ApplicationEntryIndex(applicationScopeKnown, hasDeserializeRoot, owners, entries, sites,
                 List.copyOf(deserializeHosts.values()), serviceEndpoints, filterControls, resources,
+                httpContextRegistrations,
                 impacts,
                 forward, reverse, List.copyOf(intersection), dependency, reasons,
                 bindingCallbacks);
@@ -1467,6 +1621,19 @@ public final class ApplicationEntryIndex {
     /** Whether a typed service operation is backed by a concrete EndpointImpl.publish call. */
     public boolean isRegisteredServiceMethod(String methodKey) {
         return !serviceEndpointsFor(methodKey).isEmpty();
+    }
+
+    /** Immutable exact application-owned HttpServer context registrations. */
+    public List<HttpContextRegistration> httpContextRegistrations() {
+        return httpContextRegistrations;
+    }
+
+    /** Context registrations for one exact application host method. */
+    public List<HttpContextRegistration> httpContextRegistrationsFor(String hostMethodKey) {
+        if (hostMethodKey == null || hostMethodKey.isBlank()) {
+            return List.of();
+        }
+        return httpContextRegistrationsByMethod.getOrDefault(hostMethodKey, List.of());
     }
 
     /** Immutable application-owned route filters discovered from Filter#doFilter. */
@@ -2525,6 +2692,7 @@ public final class ApplicationEntryIndex {
             executionEntries.forEach(value -> update(digest, "entry=" + value));
             deserializeSites.forEach(value -> update(digest, "site=" + value));
             serviceEndpoints.forEach(value -> update(digest, "service=" + value));
+            httpContextRegistrations.forEach(value -> update(digest, "http-context=" + value));
             filterControls.forEach(value -> update(digest, "filter=" + value));
             routeBindings.forEach(value -> update(digest, "route=" + value));
             terminalImpacts.forEach(value -> update(digest, "impact=" + value));

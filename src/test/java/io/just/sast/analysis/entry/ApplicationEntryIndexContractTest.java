@@ -22,6 +22,7 @@ import java.lang.reflect.Modifier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -151,6 +152,68 @@ class ApplicationEntryIndexContractTest {
                         "([Ljava/lang/String;)V", RUNTIME, "exec", runtimeDescriptor, false);
         assertEquals(ApplicationEntryIndex.CandidateAdmissionStatus.APPLICATION_ENTRY_NOT_IN_CHAIN,
                 dependencyAdmission.status(), dependencyAdmission.toString());
+    }
+
+    @Test
+    void indexesOnlyExactApplicationHttpContextRegistrationAndKeepsValueSlotsTyped() {
+        String appOwner = "fixture/app/Web";
+        String appMain = appOwner + "#main([Ljava/lang/String;)V";
+        String wrongOwner = "java/net/ServerSocket";
+        String wrongDescriptor = "(Ljava/lang/String;)Lcom/sun/net/httpserver/HttpContext;";
+        Graph graph = new Graph();
+        Node main = graph.methodNode(appOwner, "main", "([Ljava/lang/String;)V", false);
+        main.propsNote("methodAccess", Modifier.PUBLIC | Modifier.STATIC);
+
+        Node exact = graph.addCallNode(ApplicationEntryIndex.HTTP_SERVER_OWNER,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_NAME,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR, "VIRTUAL", null, 10,
+                appOwner, "main", "([Ljava/lang/String;)V");
+        graph.addCallNode(ApplicationEntryIndex.HTTP_SERVER_OWNER,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_NAME, wrongDescriptor,
+                "VIRTUAL", null, 20, appOwner, "main", "([Ljava/lang/String;)V");
+        graph.addCallNode(ApplicationEntryIndex.HTTP_SERVER_OWNER, "create",
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR, "VIRTUAL", null, 30,
+                appOwner, "main", "([Ljava/lang/String;)V");
+        graph.addCallNode(wrongOwner, ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_NAME,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR, "VIRTUAL", null, 40,
+                appOwner, "main", "([Ljava/lang/String;)V");
+        graph.addCallNode(ApplicationEntryIndex.HTTP_SERVER_OWNER,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_NAME,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR, "DYNAMIC", null, 50,
+                appOwner, "main", "([Ljava/lang/String;)V");
+        graph.freeze();
+
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(RuleSet.EMPTY, new ClassHierarchy(Map.of(), null)),
+                Set.of(appOwner), true);
+
+        assertEquals(1, index.httpContextRegistrations().size());
+        ApplicationEntryIndex.HttpContextRegistration registration =
+                index.httpContextRegistrations().get(0);
+        assertEquals(exact.id(), registration.callId());
+        assertEquals(appMain, registration.hostMethodKey());
+        assertEquals(10, registration.callOffset());
+        assertEquals(-1, registration.receiver().argumentOrdinal());
+        assertEquals("L" + ApplicationEntryIndex.HTTP_SERVER_OWNER + ";",
+                registration.receiver().declaredDescriptor());
+        assertEquals(0, registration.path().argumentOrdinal());
+        assertEquals("Ljava/lang/String;", registration.path().declaredDescriptor());
+        assertEquals(ApplicationEntryIndex.ValueState.UNKNOWN, registration.path().state());
+        assertEquals(1, registration.handler().argumentOrdinal());
+        assertEquals(ApplicationEntryIndex.HTTP_HANDLER_DESCRIPTOR,
+                registration.handler().declaredDescriptor());
+        assertNotEquals(registration.receiver().identity(), registration.handler().identity());
+        assertEquals(List.of(registration), index.httpContextRegistrationsFor(appMain));
+        assertThrows(UnsupportedOperationException.class,
+                () -> index.httpContextRegistrations().clear());
+        assertTrue(index.terminalImpacts().isEmpty(),
+                "createContext registration is a site fact, not a terminal impact");
+
+        ApplicationEntryIndex unknownScope = ApplicationEntryIndex.build(graph,
+                new RuleEngine(RuleSet.EMPTY, new ClassHierarchy(Map.of(), null)),
+                Set.of(), false);
+        assertTrue(unknownScope.httpContextRegistrations().isEmpty(),
+                "unknown application ownership cannot create an HTTP site fact");
     }
 
     @Test
