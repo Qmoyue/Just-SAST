@@ -145,7 +145,7 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
             ApplicationEntryIndex.ProducerCandidate candidate = new ApplicationEntryIndex.ProducerCandidate(
                     rule.id(), rule.category(), rule.severity(), entryClass, entryMethod,
                     materializedEntryDescriptor, frag.entryKind(), sinkOwner, frag.sinkName(),
-                    materializedSinkDescriptor, rule.role().name(), rule.sinkRisk(),
+                    materializedSinkDescriptor, RuleSchemaV2.sinkRoleFor(rule).name(), rule.sinkRisk(),
                     continuation || declaredFragmentContinuation, false,
                     declaredFragmentContinuation);
             Supplier<Chain> materializer = () -> {
@@ -160,7 +160,8 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
                             materializedEntryDescriptor, null));
                     return new Chain(rule.id(), rule.category(), rule.severity(),
                             entryClass, entryMethod, frag.entryKind(), sinkOwner, frag.sinkName(),
-                            directHops, 0, materializedSinkDescriptor, rule.role().name(),
+                            directHops, 0, materializedSinkDescriptor,
+                            RuleSchemaV2.sinkRoleFor(rule).name(),
                             frag.constructionPlan(), rule.sinkRisk());
                 }
                 Rule.HopSpec last = fragmentHops.get(fragmentHops.size() - 1);
@@ -188,7 +189,8 @@ public final class FragmentKnowledgeSource implements KnowledgeSource {
                 }
                 return new Chain(rule.id(), rule.category(), rule.severity(),
                         entryClass, entryMethod, frag.entryKind(), sinkOwner, frag.sinkName(),
-                        hops, 0, materializedSinkDescriptor, rule.role().name(),
+                        hops, 0, materializedSinkDescriptor,
+                        RuleSchemaV2.sinkRoleFor(rule).name(),
                         frag.constructionPlan(), rule.sinkRisk());
             };
             FragmentProducer producer = new FragmentProducer(candidate, materializer);

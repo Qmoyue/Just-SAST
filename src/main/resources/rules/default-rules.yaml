@@ -49,6 +49,7 @@ rules:
     match:
       call: { owner: "javax/naming/Context", name: ~"lookup|list|bind" }
     tainted: [{arg: 0}]
+    role: capability
 
   - id: JUST-SINK-REFLECTIVE-INVOKE
     kind: sink

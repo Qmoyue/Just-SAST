@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -73,6 +74,29 @@ class ForwardEvidenceEmitterContractTest {
         Chain materialized = emission.materializer().get();
         assertTrue(candidate.matches(materialized));
         assertEquals(List.of(sink, entry), materialized.hops());
+    }
+
+    @Test
+    void initialContextLookupMaterializesAsCapabilityBridge() {
+        String descriptor = "(Ljava/lang/String;)Ljava/lang/Object;";
+        Rule.SinkRule rule = new Rule.SinkRule("initial-context-lookup", "JNDI", "HIGH",
+                new Rule.CallMatcher(Match.of("javax/naming/InitialContext"),
+                        Match.of("lookup"), Match.of(descriptor)),
+                List.of(new Rule.TaintedPos.Arg(0)));
+        Node call = new Node(3, "javax/naming/InitialContext", "lookup", descriptor,
+                "VIRTUAL", null, 12, "app/Handler", "handle", "()V");
+        ChainHop entry = new ChainHop("app/Handler", "handle", "app/Handler", "handle",
+                HopKind.ENTRY, null, "http", "()V", null);
+        ChainHop lookup = new ChainHop("app/Handler", "handle",
+                "javax/naming/InitialContext", "lookup", HopKind.DIRECT_CALL, null,
+                "call", descriptor, 0);
+
+        ForwardEvidenceEmitter.LazyEmission emission = ForwardEvidenceEmitter.emitLazy(
+                rule, call, List.of(entry, lookup)).orElseThrow();
+        assertEquals("CAPABILITY", emission.candidate().terminalRole());
+        Chain chain = emission.materializer().get();
+        assertEquals("CAPABILITY", chain.sinkRole());
+        assertFalse(chain.terminalSink(), "lookup is a bridge, not a terminal effect");
     }
 
     @Test

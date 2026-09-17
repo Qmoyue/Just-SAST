@@ -78,6 +78,11 @@ class RuleSchemaV2ContractTest {
         assertTrue(lookup.semantics().boundary().contains(RuleSchemaV2.Boundary.LOOKUP));
         assertTrue(lookup.semantics().terminal().isEmpty(),
                 "lookup is a bridge/capability and static solving must continue to the suffix");
+        Rule.SinkRule lookupRule = legacy.sinks().stream()
+                .filter(rule -> "JUST-SINK-JNDI-LOOKUP".equals(rule.id()))
+                .findFirst().orElseThrow();
+        assertEquals(Rule.SinkRole.CAPABILITY, lookupRule.role());
+        assertEquals(Rule.SinkRole.CAPABILITY, RuleSchemaV2.sinkRoleFor(lookupRule));
 
         RuleSchemaV2.Definition ctor = catalog.rules().stream()
                 .filter(rule -> "JUST-SINK-PROCESSBUILDER-CTOR".equals(rule.id()))
@@ -124,6 +129,24 @@ class RuleSchemaV2ContractTest {
         assertTrue(http.semantics().terminal().contains(RuleSchemaV2.Terminal.NETWORK_SEND));
         assertTrue(http.semantics().bridge().isEmpty(),
                 "ordinary HTTP connect is not a JDBC or JNDI response bridge");
+    }
+
+    @Test
+    void exactInitialContextLookupCannotLeakLegacyTerminalRole() {
+        String descriptor = "(Ljava/lang/String;)Ljava/lang/Object;";
+        Rule.SinkRule lookup = new Rule.SinkRule("initial-context-lookup", "JNDI", "HIGH",
+                new Rule.CallMatcher(Match.of("javax/naming/InitialContext"),
+                        Match.of("lookup"), Match.of(descriptor)),
+                List.of(new Rule.TaintedPos.Arg(0)));
+
+        assertEquals(Rule.SinkRole.TERMINAL, lookup.role(),
+                "the compatibility constructor still exposes the legacy raw bit");
+        assertEquals(Rule.SinkRole.CAPABILITY, RuleSchemaV2.sinkRoleFor(lookup));
+        RuleSchemaV2.Definition definition = RuleSchemaV2.adapt(lookup);
+        assertTrue(definition.semantics().capability().contains(RuleSchemaV2.Capability.JNDI));
+        assertTrue(definition.semantics().bridge().contains(RuleSchemaV2.Bridge.JNDI_RMI));
+        assertTrue(definition.semantics().boundary().contains(RuleSchemaV2.Boundary.LOOKUP));
+        assertTrue(definition.semantics().terminal().isEmpty());
     }
 
     @Test

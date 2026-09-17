@@ -144,7 +144,8 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
                         new ApplicationEntryIndex.ProducerCandidate(rule.id(), rule.category(),
                                 rule.severity(), info.owner(), info.name(), info.descriptor(), bridge,
                                 sinkCall.strProp("owner"), sinkCall.strProp("name"),
-                                sinkCall.strProp("desc"), rule.role().name(), rule.sinkRisk(),
+                                sinkCall.strProp("desc"), RuleSchemaV2.sinkRoleFor(rule).name(),
+                                rule.sinkRisk(),
                                 continuation);
                 FrameworkProducer producer = new FrameworkProducer(candidate, () -> {
                     List<Node> materializedPath = path.materializer().get();
@@ -298,7 +299,7 @@ public final class FrameworkBridgeKnowledgeSource implements KnowledgeSource {
         return new Chain(rule.id(), rule.category(), rule.severity(),
                 entryMethod.owner(), entryMethod.name(), bridge,
                 sinkCall.strProp("owner"), sinkCall.strProp("name"), hops, 0, sinkCall.strProp("desc"),
-                rule.role().name(), null, rule.sinkRisk());
+                RuleSchemaV2.sinkRoleFor(rule).name(), null, rule.sinkRisk());
     }
 
     private static String packagePrefix(String internalName, int segments) {

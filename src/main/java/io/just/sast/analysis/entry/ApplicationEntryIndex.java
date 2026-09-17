@@ -1995,7 +1995,8 @@ public final class ApplicationEntryIndex {
             }
             impacts.add(new TerminalImpact(call.id(),
                     methodKey(call.methodOwner(), call.methodName(), call.methodDescriptor()),
-                    call.owner(), call.name(), call.descriptor(), sink.id(), sink.role(),
+                    call.owner(), call.name(), call.descriptor(), sink.id(),
+                    RuleSchemaV2.sinkRoleFor(sink),
                     applicationScopeKnown && owners.contains(call.methodOwner()),
                     RuleSchemaV2.isTerminalSink(sink)));
         }

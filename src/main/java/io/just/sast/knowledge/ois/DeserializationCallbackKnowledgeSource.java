@@ -353,7 +353,8 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                     new ApplicationEntryIndex.ProducerCandidate(rule.id(), rule.category(),
                             rule.severity(), entry.owner(), entry.name(), entry.desc(), entry.kind(),
                             sinkCall.strProp("owner"), sinkCall.strProp("name"),
-                            sinkCall.strProp("desc"), rule.role().name(), rule.sinkRisk(), continuation);
+                            sinkCall.strProp("desc"), RuleSchemaV2.sinkRoleFor(rule).name(),
+                            rule.sinkRisk(), continuation);
             Supplier<Chain> materializer = () -> {
                 List<ChainHop> materializedMachinery = machinery.materializer().get();
                 if (materializedMachinery == null || materializedMachinery.size() != machineryHopCount) {
@@ -374,7 +375,8 @@ public final class DeserializationCallbackKnowledgeSource implements KnowledgeSo
                 }
                 return new Chain(rule.id(), rule.category(), rule.severity(), entry.owner(),
                         entry.name(), entry.kind(), sinkCall.strProp("owner"), sinkCall.strProp("name"),
-                        forward, 0, sinkCall.strProp("desc"), rule.role().name(), null, rule.sinkRisk());
+                        forward, 0, sinkCall.strProp("desc"),
+                        RuleSchemaV2.sinkRoleFor(rule).name(), null, rule.sinkRisk());
             };
             CallbackProducer producer = new CallbackProducer(candidate, materializer);
             produced += bb.addSolverCandidate(producer.candidate(), producer.materializer()) ? 1 : 0;

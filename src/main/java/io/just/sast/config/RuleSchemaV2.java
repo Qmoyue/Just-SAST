@@ -10,6 +10,7 @@ import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -262,6 +263,16 @@ public final class RuleSchemaV2 {
     /** A sink is terminal only when its v1 terminal bit is not a known bridge/capability edge. */
     public static boolean isTerminalSink(Rule.SinkRule sink) {
         return sink != null && sink.terminal() && !isIntermediateSink(sink);
+    }
+
+    /**
+     * Return the single semantic role used by every chain-producing owner.  Legacy rules may
+     * still carry the default TERMINAL bit, so consumers must not serialize that raw bit for a
+     * typed bridge/capability boundary.
+     */
+    public static Rule.SinkRole sinkRoleFor(Rule.SinkRule sink) {
+        Objects.requireNonNull(sink, "sink");
+        return isTerminalSink(sink) ? Rule.SinkRole.TERMINAL : Rule.SinkRole.CAPABILITY;
     }
 
     /** Stable typed bridge classification for protocol-aware composition. */

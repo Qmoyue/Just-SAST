@@ -77,7 +77,7 @@ public final class ForwardEvidenceEmitter {
                 new ApplicationEntryIndex.ProducerCandidate(rule.id(), rule.category(),
                         rule.severity(), entry.fromOwner(), entry.fromName(),
                         entry.desc(), entryKind, sinkOwner, sinkName, sinkDescriptor,
-                        rule.role().name(), rule.sinkRisk(), continuation);
+                        RuleSchemaV2.sinkRoleFor(rule).name(), rule.sinkRisk(), continuation);
         Supplier<Chain> materializer = () -> {
             if (forwardPath.size() != forwardPathSize) {
                 return null;
@@ -89,7 +89,7 @@ public final class ForwardEvidenceEmitter {
                     materializedEntry.fromOwner(), materializedEntry.fromName(),
                     materializedEntry.reason() == null ? "?" : materializedEntry.reason(),
                     sinkOwner, sinkName, hops, Math.max(0, unresolvedHops), sinkDescriptor,
-                    rule.role().name(), null, rule.sinkRisk());
+                    RuleSchemaV2.sinkRoleFor(rule).name(), null, rule.sinkRisk());
         };
         return Optional.of(new LazyEmission(candidate, materializer));
     }

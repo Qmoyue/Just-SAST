@@ -2578,7 +2578,8 @@ public final class BackwardTaintAnalysis implements KnowledgeSource {
         ApplicationEntryIndex.ProducerCandidate candidate = rule == null ? null
                 : new ApplicationEntryIndex.ProducerCandidate(rule.id(), rule.category(),
                         rule.severity(), entryClass, entryName, entryMethod.descriptor(), entryKind,
-                        trace.sinkOwner, trace.sinkMethod, trace.sinkDescriptor, rule.role().name(),
+                        trace.sinkOwner, trace.sinkMethod, trace.sinkDescriptor,
+                        RuleSchemaV2.sinkRoleFor(rule).name(),
                         rule.sinkRisk(), continuation);
         if (candidate == null) {
             return 0;
