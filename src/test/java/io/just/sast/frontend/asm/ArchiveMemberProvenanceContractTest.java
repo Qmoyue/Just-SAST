@@ -134,6 +134,22 @@ class ArchiveMemberProvenanceContractTest {
                         "app.jar", ArchiveMemberProvenance.Kind.CLASS));
     }
 
+    @Test
+    void jdkClassBytesCarryJdkMemberProvenance() {
+        InputBudget budget = InputBudget.defaults();
+        ClassBytes bytes = JrtClassSource.runtime(budget, budget.tracker())
+                .loadBytes("java/lang/String");
+
+        assertNotNull(bytes);
+        assertNotNull(bytes.provenance());
+        assertEquals(ArchiveMemberProvenance.Role.JDK, bytes.provenance().role());
+        assertEquals(ArchiveMemberProvenance.Kind.CLASS, bytes.provenance().kind());
+        assertEquals("java/lang/String.class", bytes.provenance().archivePath());
+        assertEquals(ArchiveMemberProvenance.sha256Of(bytes.bytes()),
+                bytes.provenance().sha256());
+        assertTrue(bytes.provenance().source().startsWith("jdk:"));
+    }
+
     private static byte[] fixtureBytes(String resource) throws Exception {
         try (InputStream input = ArchiveMemberProvenanceContractTest.class
                 .getResourceAsStream(resource)) {
