@@ -1,196 +1,133 @@
 # Just
 
-Just 是一个面向 Java 字节码的静态反序列化链分析器。它分析 JAR、WAR、Spring Boot fat JAR 和 class 目录，结合目标 JDK、依赖和应用入口，输出可追溯的 gadget 链与应用暴露链证据。
+Just 是一个面向 Java JAR、WAR、Spring Boot fat JAR 和 class 目录的静态反序列化链分析器。它从字节码、依赖和目标 JDK 中提取可验证的入口、对象关系、控制条件与最终影响，帮助人和 agent 判断一条 gadget chain 是否真实存在、是否由应用暴露。
 
-Just 只进行静态分析，不启动目标应用，不初始化或构造目标类，不执行反射调用、反序列化流或 payload，也不生成可投递攻击字节流。
+Just 不运行目标应用，不初始化或构造目标类，不执行反序列化流、反射调用或 payload，也不生成可投递的攻击字节流。
 
-## 能力概览
+## 快速使用
 
-- 从真实字节码中识别反序列化入口、callback、对象关系、控制条件和最终影响。
-- 分析独立组件 gadget 链，或从真实应用入口追踪到依赖/JDK 中的链。
-- 支持 JAR、WAR、嵌套归档、多版本归档和 class 目录。
-- 使用显式依赖、Maven POM、本地缓存和目标 JDK 建立可复核的输入 provenance。
-- 以 report.json 和 report.md 作为两个主报告入口，并在报告中展示 typed Gadget graph。
+运行环境是 JDK 17。目标制品可以使用 `--jdk-home` 指定对应的 JDK/JRE 字节码来源。
 
-## 安装
+从 [GitHub Releases](https://github.com/Qmoyue/Just-SAST/releases) 下载 JAR：
 
-从 [GitHub Releases](https://github.com/Qmoyue/Just-SAST/releases) 下载 shaded JAR。运行时需要 JDK 17。
+```bash
+curl -L -o just-sast-0.2.1-shaded.jar \
+  https://github.com/Qmoyue/Just-SAST/releases/download/v0.2.1/just-sast-0.2.1-shaded.jar
+java -jar just-sast-0.2.1-shaded.jar --help
+```
 
-~~~bash
-java -jar just-sast-<version>-shaded.jar --help
-~~~
+分析独立组件：
 
-从源码构建：
-
-~~~bash
-mvn -B test
-mvn -B package -DskipTests
-~~~
-
-生成的 launcher 位于 target/just-sast-<version>-shaded.jar。
-
-## 快速开始
-
-### 组件模式
-
-组件模式从机制触发点开始分析，不代表宿主应用已经暴露该链：
-
-~~~bash
-java -jar just-sast-<version>-shaded.jar scan \
+```bash
+java -jar just-sast-0.2.1-shaded.jar scan \
   --jar component.jar \
+  --mode component \
   --jdk-home /path/to/target-jdk \
   --output just-out
-~~~
+```
 
-### 应用模式
+从真实应用入口分析，并使用 Maven POM 补齐应用依赖：
 
-应用模式从真实应用入口开始分析，需要提供准确的 Maven POM 或依赖：
-
-~~~bash
-java -jar just-sast-<version>-shaded.jar scan \
+```bash
+java -jar just-sast-0.2.1-shaded.jar scan \
   --jar app.jar \
   --mode application \
   --pom pom.xml \
   --jdk-home /path/to/target-jdk \
   --output just-out
-~~~
+```
 
-使用显式依赖进行离线分析：
+需要离线分析时，显式提供依赖目录并追加 `--offline`：
 
-~~~bash
-java -jar just-sast-<version>-shaded.jar scan \
-  --jar app.jar \
-  --mode application \
-  --deps lib \
-  --pom pom.xml \
-  --offline \
-  --jdk-home /path/to/target-jdk \
-  --output just-out
-~~~
+```bash
+java -jar just-sast-0.2.1-shaded.jar scan \
+  --jar app.jar --mode application --pom pom.xml --deps lib \
+  --offline --jdk-home /path/to/target-jdk --output just-out
+```
 
-## 分析模式
+一次扫描生成：
 
-| 模式 | 分析起点 | 结论要求 |
-| --- | --- | --- |
-| component | 机制触发点 → gadget → terminal | 触发、对象关系、控制条件、依赖/JDK 条件和 terminal 有静态证据 |
-| application | 真实入口 → site → bridge/依赖/JDK → terminal | 额外要求 entry、site、入口与链的连接证据、必要 bridge、对象/控制关系和完整 terminal |
-
-类名共现、classpath 共存或调用图共现不能替代对象关系、值流和控制条件。组件模式中的 gadget 不能直接称为应用漏洞。
-
-## 输出
-
-output 指向的目录包含：
-
-~~~text
+```text
 just-out/
-├── report.json       # 完整的机器可读报告
-├── report.md         # 面向人的摘要和 Gadget 图
-├── evidence/         # 逐跳、依赖、bridge 和可选格式证据
-└── meta/             # 输入 provenance、digest、诊断和事务元数据
-~~~
+├── report.json       # 完整机器可读结果，适合 agent 和工具消费
+├── report.md         # 人类可读摘要、结论和 Gadget 图
+├── evidence/         # 逐跳、依赖和应用连接证据
+└── meta/             # 输入摘要、来源和分析元数据
+```
 
-默认不创建空的 findings/ 目录，不生成重复的索引主报告，也不生成 verification、payload 或动态测试文件。
+不会生成空的 `findings/` 目录，也不会生成重复的索引报告、动态测试或 payload 文件。
 
-report.json 保留全部候选和重要变体，适合 agent 或其他程序消费。report.md 先展示结论、主链、阻断点和能力边界，适合人工快速阅读。两个报告来自同一个冻结结果。
+## Just 的优点
 
-报告中的 Gadget 图使用稳定的文本节点和 typed edge，例如：
+- **静态且安全**：分析过程不执行目标代码，适合在 CI、代码审计和离线环境中使用。
+- **区分组件能力与应用暴露**：`component` 模式分析独立 gadget 机制；`application` 模式必须从真实应用入口连接到依赖/JDK 中的完整链，避免把“类在 classpath 中”误报成应用漏洞。
+- **结论可追溯**：每个结论关联入口、callback、bridge、terminal、对象/控制关系以及输入依赖和 JDK 来源。
+- **同时服务人和 agent**：`report.json` 保留完整候选和结构化证据；`report.md` 用稳定的文本图快速展示主链、阻断点和边界。
+- **保守表达不确定性**：未知条件、预算边界和不完整静态证明会明确标记为 `UNKNOWN` 或 `PARTIAL`，不会被伪装成运行时验证结果。
 
-~~~text
-ENTRY  DogController#importDogs
-  │
-  ▼
-STEP   ObjectInputStream#readObject
-  │
-  ▼
-STEP   Dog#hashCode → DogModel#wagTail
-  │
-  ▼
+## 架构
+
+```text
+JAR/WAR/class  依赖/POM  目标 JDK
+        │          │          │
+        └──────────┴──────────┘
+                   ▼
+       输入解析与 provenance 记录
+                   ▼
+          ASM 字节码前端
+                   ▼
+        稳定的 typed facts 模型
+   (入口、callback、对象、控制、bridge、terminal)
+                   ▼
+          共享静态链求解器
+       ┌───────────┴───────────┐
+       ▼                       ▼
+ component：机制触发点      application：真实入口
+       │                       │
+       └───────────┬───────────┘
+                   ▼
+        冻结结果与同源报告生成
+             ├── report.json
+             ├── report.md
+             ├── evidence/
+             └── meta/
+```
+
+ASM 只负责把字节码转换为事实；后续求解器不依赖题名、路径或 benchmark 名称。组件模式的发现不能直接称为应用漏洞，应用模式还必须证明入口、站点、必要连接证据、对象/控制条件和完整 terminal。
+
+报告中的 Gadget 图使用稳定节点和有类型的边，示意如下：
+
+```text
+ENTRY     DogController#importDogs
+   │
+   ▼
+CALL      ObjectInputStream#readObject
+   │
+   ▼
+CALL      Dog#hashCode → DogModel#wagTail
+   │
+   ▼
 BOUNDARY  Method#invoke
-  │
-  ▼
+   │
+   ▼
 TERMINAL  TemplatesImpl#newTransformer
-~~~
+```
 
-如果反射目标无法由输入字节码静态确定，Just 会保留 Method.invoke 这样的 capability boundary，不会把未证明的后续行为当成 terminal。
-
-## 状态含义
-
-报告将不同问题分开表示：
-
-- outcome：本次是否产生可审阅结果，或发生参数、输入、依赖或内部错误。
-- coverage：静态覆盖是否完整、受边界限制或未知。
-- chain completeness：单条链的证据是否完整。
-- feasibility：单条链的结构和约束是否可行。
-
-PARTIAL 只表示静态覆盖或单条链证明受到预算、未知分支、解析诊断、JDK 近似或搜索边界影响，不表示动态测试结果。未知和预算候选会被保留。
-
-## 架构概览
-
-~~~text
-输入制品 / POM / 依赖 / 目标 JDK
-              │
-              ▼
-      字节码与 provenance frontend
-              │
-              ▼
-      类型、字段、控制和对象事实模型
-              │
-              ▼
-       component/application 求解器
-              │
-              ▼
-      冻结结果 → report.json / report.md
-              │
-              ▼
-        evidence/ 与 meta/ 追溯文件
-~~~
-
-ASM 只负责前端解析。后续模块消费稳定的 typed facts；入口、callback、bridge、terminal、对象关系和控制条件是数据，求解和组合逻辑不依赖题目名称或路径。
-
-## 静态安全边界
-
-Just 不会：
-
-- 加载、初始化或构造目标类和目标对象；
-- 反射调用目标方法或执行目标 callback；
-- 反序列化攻击流、启动目标进程或访问目标 sink；
-- 执行目标构建插件、外部 helper、native 代码或通用解释器；
-- 生成 payload、投递字节流或输出运行时利用确认。
-
-offline 会禁止网络请求，只使用显式输入和完整缓存。依赖缺失、版本不确定、缓存损坏和解析错误会在结果中明确披露或使扫描失败。
-
-## Demo 链口径
-
-对于包含 DogController#importDogs 的 demo，静态主链可以表示为：
-
-~~~text
-DogController#importDogs
-  → ObjectInputStream#readObject
-  → Dog#hashCode
-  → DogModel#wagTail
-  → Method#invoke
-  → TemplatesImpl#newTransformer
-~~~
-
-WP 中外部恶意类的 Runtime.getRuntime().exec 不属于该 demo 应用字节码。只有输入制品本身包含到 java/lang/Runtime#exec 的静态调用时，Just 才会报告该 terminal；外部 payload 后果不会被冒充为应用内部链。
-
-## 常用参数
-
-| 参数 | 作用 |
-| --- | --- |
-| --jar | 输入 JAR、WAR 或 class 目录 |
-| --mode | component（默认）或 application |
-| --deps | 附加依赖 JAR 或目录，逗号分隔 |
-| --pom | 显式 Maven 根 POM |
-| --repository | 显式 Maven 仓库，可重复 |
-| --offline | 禁止联网，只使用显式输入和缓存 |
-| --jdk-home | 目标 JDK/JRE 字节码来源 |
-| --output | 报告输出目录 |
-| --rules | 自定义规则 YAML |
-| --overwrite | 显式替换已有输出 |
-
-更多设计约束见 [产品要求](docs/requirements.md) 和 [架构说明](docs/architecture.md)。
+当反射目标无法从输入字节码中静态确定时，报告会保留 `Method#invoke` 这样的能力边界，不把未证明的后续行为写成 terminal。
 
 ## 许可证
 
 Just 使用 GPLv3-only，详见 [LICENSE](LICENSE) 和 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+## Gleipner 跑分
+
+本轮使用重新拉取的官方 Gleipner 源码（revision `6cad4b07cf3a0f54fa2b149f5df9febccd02dcff`）和 Just 的静态诊断口径，覆盖 31 个分类/聚合制品：
+
+| 指标 | 结果 |
+| --- | ---: |
+| TP | `656/122` |
+| FP | `177/47` |
+| 原始计数 | `833` |
+| 去重计数 | `833` |
+
+这是 Just 的静态诊断结果，不是 Gleipner 官方 evaluator 的动态执行分数；官方 evaluator 需要加载并调用基准目标类，与 Just 的静态分析边界不兼容。当前 `ysoserial-cc1` 的静态诊断项为 `0/1`，该限制已保留并公开披露，未使用 benchmark 名称特判来伪造通过。
