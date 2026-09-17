@@ -6,12 +6,14 @@ import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.LoadResult;
 import io.just.sast.model.ProgramUniverse;
 import io.just.sast.model.ClassInfo;
+import io.just.sast.model.ClassForNameCallSite;
 import io.just.sast.model.Descriptor;
 import io.just.sast.model.FieldRef;
 import io.just.sast.model.HttpHandlerValue;
 import io.just.sast.model.InsnFact;
 import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.model.JndiReferenceFact;
+import io.just.sast.model.MethodId;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
@@ -133,6 +135,11 @@ public final class CpgBuilder {
         }
         var call = graph.addCallNode(owner, name, desc, invokeKind, indy, insn.offset(),
                 enclosing.owner(), enclosing.name(), enclosing.descriptor());
+        ClassForNameCallSite.fromCall(call.id(),
+                MethodId.of(enclosing.owner(), enclosing.name(),
+                        enclosing.descriptor()),
+                insn.offset(), owner, name, desc, invokeKind)
+                .ifPresent(site -> call.propsNote(ClassForNameCallSite.GRAPH_NOTE_KEY, site));
         List<String> classLiteralHints = classLiteralHints(enclosing, insn.offset());
         if (!classLiteralHints.isEmpty()) {
             call.propsNote("classLiteralHints", classLiteralHints);
