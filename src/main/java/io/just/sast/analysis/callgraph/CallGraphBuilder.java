@@ -7,12 +7,15 @@ import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.HandleRef;
 import io.just.sast.model.LambdaMetafactoryCallSite;
+import io.just.sast.model.JndiObjectFactoryCallSite;
+import io.just.sast.model.JndiObjectFactoryDispatch;
 import java.util.HashMap;
 import java.util.Map;
 import io.just.sast.model.InvokeDynamicRef;
 import io.just.sast.util.JustLogger;
 import java.lang.reflect.Modifier;
 
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -71,8 +74,63 @@ public final class CallGraphBuilder {
                 case "DYNAMIC" -> edgeCount += addLambda(graph, call, (InvokeDynamicRef) call.prop("indy"));
                 default -> JustLogger.debug("未知调用类型 {}: {}#{}", kind, owner, name);
             }
+            annotateObjectFactoryDispatch(call);
         }
         return edgeCount;
+    }
+
+    /**
+     * Publish the exact JNDI callback contract after ordinary bounded interface dispatch has
+     * produced its graph edges.  This is evidence only: no factory class is loaded, initialized,
+     * reflectively invoked, or interpreted here.
+     */
+    private void annotateObjectFactoryDispatch(Node call) {
+        String hostMethodKey = call.methodOwner() + "#" + call.methodName()
+                + call.methodDescriptor();
+        var site = JndiObjectFactoryCallSite.fromCall(call.id(), hostMethodKey, call.offset(),
+                call.owner(), call.name(), call.descriptor(), call.invokeKind());
+        if (site.isEmpty()) {
+            return;
+        }
+        JndiObjectFactoryCallSite callSite = site.get();
+        call.propsNote(JndiObjectFactoryCallSite.GRAPH_NOTE_KEY, callSite);
+        Map<String, JndiObjectFactoryDispatch.Implementation> implementations = new java.util.TreeMap<>();
+        boolean interfaceOnly = false;
+        for (var edge : call.out()) {
+            Node target = edge.to();
+            if (target == null || target.type() != NodeType.METHOD
+                    || !JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_NAME.equals(target.name())
+                    || !JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR.equals(
+                    target.descriptor())) {
+                continue;
+            }
+            if (JndiObjectFactoryCallSite.OBJECT_FACTORY_OWNER.equals(target.owner())) {
+                interfaceOnly = true;
+                continue;
+            }
+            io.just.sast.model.ClassInfo targetClass = hierarchy.classInfo(target.owner());
+            if (targetClass != null && !targetClass.isInterface()
+                    && !Modifier.isAbstract(targetClass.access())
+                    && hierarchy.isSubtypeOf(target.owner(),
+                    JndiObjectFactoryCallSite.OBJECT_FACTORY_OWNER)
+                    && edge.type() == EdgeType.DISPATCHES) {
+                JndiObjectFactoryDispatch.Implementation implementation =
+                        new JndiObjectFactoryDispatch.Implementation(target.owner(), target.name(),
+                                target.descriptor());
+                implementations.put(implementation.methodKey(), implementation);
+            }
+        }
+        JndiObjectFactoryDispatch.Status status;
+        if (!implementations.isEmpty()) {
+            status = JndiObjectFactoryDispatch.Status.RESOLVED;
+        } else if (interfaceOnly) {
+            status = JndiObjectFactoryDispatch.Status.INTERFACE_ONLY;
+        } else {
+            status = JndiObjectFactoryDispatch.Status.UNKNOWN_IMPLEMENTATION;
+        }
+        call.propsNote(JndiObjectFactoryCallSite.DISPATCH_NOTE_KEY,
+                new JndiObjectFactoryDispatch(callSite, new ArrayList<>(implementations.values()),
+                        status));
     }
 
     private int addVirtual(Graph graph, Node call, String owner, String name, String desc) {
