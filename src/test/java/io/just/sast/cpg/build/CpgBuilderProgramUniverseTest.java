@@ -179,6 +179,70 @@ class CpgBuilderProgramUniverseTest {
     }
 
     @Test
+    void httpLambdaSiteRequiresTheActualLambdaEdgeAndCallbackValueSource() {
+        LoadResult load = loadResult(httpLambdaWebClassBytes());
+        Graph graph = new CpgBuilder().build(load).graph();
+        RuleEngine engine = new RuleEngine(RuleSet.EMPTY,
+                new ClassHierarchy(load.classes(), null));
+
+        ApplicationEntryIndex beforeCallGraph = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/HttpLambdaWeb"), true);
+        assertEquals(1, beforeCallGraph.httpContextRegistrations().size());
+        assertTrue(beforeCallGraph.httpExternalSources().stream()
+                .anyMatch(HttpExternalSource::externalInput));
+        assertTrue(beforeCallGraph.httpSites().isEmpty(),
+                "a handler value without its actual lambda edge cannot form a site");
+
+        graph = new CpgBuilder().build(load).graph();
+        assertTrue(new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph) > 0);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/HttpLambdaWeb"), true);
+        assertEquals(1, index.httpSites().size());
+        ApplicationEntryIndex.HttpSite site = index.httpSites().get(0);
+        assertEquals("fixture/app/HttpLambdaWeb#main([Ljava/lang/String;)V",
+                site.entryMethodKey());
+        assertEquals("fixture/app/HttpLambdaWeb#lambda$main$0"
+                        + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR,
+                site.handlerMethodKey());
+        assertEquals(io.just.sast.cpg.graph.EdgeType.LAMBDA, site.handlerEdge().edgeType());
+        assertTrue(site.externalSources().stream().allMatch(HttpExternalSource::externalInput));
+        assertEquals(site.externalSources(),
+                index.httpExternalSourcesFor(site.handlerMethodKey()).stream()
+                        .filter(HttpExternalSource::externalInput).toList());
+    }
+
+    @Test
+    void httpAllocatedSiteRequiresConstructorEdgeTypedHandlerAndCallbackValueSource() {
+        LoadResult load = loadResult(httpAllocatedWebClassBytes(), httpAllocatedHandlerClassBytes());
+        Graph graph = new CpgBuilder().build(load).graph();
+        RuleEngine engine = new RuleEngine(RuleSet.EMPTY,
+                new ClassHierarchy(load.classes(), null));
+
+        ApplicationEntryIndex beforeCallGraph = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/HttpAllocatedWeb", "fixture/app/HttpAllocatedHandler"),
+                true);
+        assertTrue(beforeCallGraph.httpSites().isEmpty());
+
+        graph = new CpgBuilder().build(load).graph();
+        assertTrue(new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph) > 0);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of("fixture/app/HttpAllocatedWeb", "fixture/app/HttpAllocatedHandler"),
+                true);
+        assertEquals(1, index.httpSites().size());
+        ApplicationEntryIndex.HttpSite site = index.httpSites().get(0);
+        assertEquals("fixture/app/HttpAllocatedHandler#handle"
+                        + ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR,
+                site.handlerMethodKey());
+        assertEquals(io.just.sast.cpg.graph.EdgeType.INVOKES, site.handlerEdge().edgeType());
+        assertEquals("fixture/app/HttpAllocatedHandler#<init>()V",
+                site.handlerEdge().targetMethodKey());
+        assertTrue(index.isHttpHandlerMethod(site.handlerMethodKey()));
+        assertTrue(site.externalSources().stream().anyMatch(source ->
+                source.kind() == HttpExternalSource.Kind.HEADER
+                        && source.valueRole() == HttpExternalSource.ValueRole.VALUE));
+    }
+
+    @Test
     void missingLambdaBootstrapRemainsVisibleAsUnknown() {
         String owner = "fixture/MissingBootstrap";
         String descriptor = "()Ljava/lang/Runnable;";
@@ -271,5 +335,130 @@ class CpgBuilderProgramUniverseTest {
         handle.visitEnd();
         writer.visitEnd();
         return writer.toByteArray();
+    }
+
+    private static LoadResult loadResult(byte[]... classBytes) {
+        Map<String, ClassInfo> classes = new java.util.HashMap<>();
+        for (byte[] bytes : classBytes) {
+            ClassNode node = new ClassNode();
+            new ClassReader(bytes).accept(node, 0);
+            ClassInfo info = new FactsExtractor().extract(node);
+            classes.put(info.internalName(), info);
+        }
+        return new LoadResult(Map.copyOf(classes), List.of(), 1, 61);
+    }
+
+    private static byte[] httpLambdaWebClassBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "fixture/app/HttpLambdaWeb", null,
+                "java/lang/Object", null);
+
+        MethodVisitor lambda = writer.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                "lambda$main$0", ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR,
+                null, new String[] {"java/io/IOException"});
+        lambda.visitCode();
+        lambda.visitVarInsn(Opcodes.ALOAD, 0);
+        lambda.visitMethodInsn(Opcodes.INVOKEINTERFACE,
+                ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestHeaders",
+                "()Lcom/sun/net/httpserver/Headers;", true);
+        lambda.visitLdcInsn("X-Lookup-URL");
+        lambda.visitMethodInsn(Opcodes.INVOKEVIRTUAL, ApplicationEntryIndex.HTTP_HEADERS_OWNER,
+                "getFirst", "(Ljava/lang/String;)Ljava/lang/String;", false);
+        lambda.visitInsn(Opcodes.POP);
+        lambda.visitInsn(Opcodes.RETURN);
+        lambda.visitMaxs(2, 1);
+        lambda.visitEnd();
+
+        MethodVisitor main = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "main",
+                "([Ljava/lang/String;)V", null, new String[] {"java/io/IOException"});
+        main.visitCode();
+        main.visitMethodInsn(Opcodes.INVOKESTATIC, ApplicationEntryIndex.HTTP_SERVER_OWNER,
+                "create", "()Lcom/sun/net/httpserver/HttpServer;", false);
+        main.visitLdcInsn("/lookup");
+        main.visitInvokeDynamicInsn("handle", "()Lcom/sun/net/httpserver/HttpHandler;",
+                lambdaMetafactory(),
+                Type.getMethodType(ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR),
+                new Handle(Opcodes.H_INVOKESTATIC, "fixture/app/HttpLambdaWeb",
+                        "lambda$main$0", ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR, false),
+                Type.getMethodType(ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR));
+        main.visitMethodInsn(Opcodes.INVOKEVIRTUAL, ApplicationEntryIndex.HTTP_SERVER_OWNER,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_NAME,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR, false);
+        main.visitInsn(Opcodes.POP);
+        main.visitInsn(Opcodes.RETURN);
+        main.visitMaxs(3, 1);
+        main.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] httpAllocatedWebClassBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "fixture/app/HttpAllocatedWeb", null,
+                "java/lang/Object", null);
+        MethodVisitor main = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "main",
+                "([Ljava/lang/String;)V", null, new String[] {"java/io/IOException"});
+        main.visitCode();
+        main.visitMethodInsn(Opcodes.INVOKESTATIC, ApplicationEntryIndex.HTTP_SERVER_OWNER,
+                "create", "()Lcom/sun/net/httpserver/HttpServer;", false);
+        main.visitLdcInsn("/lookup");
+        main.visitTypeInsn(Opcodes.NEW, "fixture/app/HttpAllocatedHandler");
+        main.visitInsn(Opcodes.DUP);
+        main.visitMethodInsn(Opcodes.INVOKESPECIAL, "fixture/app/HttpAllocatedHandler", "<init>",
+                "()V", false);
+        main.visitMethodInsn(Opcodes.INVOKEVIRTUAL, ApplicationEntryIndex.HTTP_SERVER_OWNER,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_NAME,
+                ApplicationEntryIndex.HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR, false);
+        main.visitInsn(Opcodes.POP);
+        main.visitInsn(Opcodes.RETURN);
+        main.visitMaxs(4, 1);
+        main.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] httpAllocatedHandlerClassBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "fixture/app/HttpAllocatedHandler", null,
+                "java/lang/Object", new String[] {ApplicationEntryIndex.HTTP_HANDLER_OWNER});
+
+        MethodVisitor constructor = writer.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V",
+                null, null);
+        constructor.visitCode();
+        constructor.visitVarInsn(Opcodes.ALOAD, 0);
+        constructor.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>",
+                "()V", false);
+        constructor.visitInsn(Opcodes.RETURN);
+        constructor.visitMaxs(1, 1);
+        constructor.visitEnd();
+
+        MethodVisitor handle = writer.visitMethod(Opcodes.ACC_PUBLIC,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_NAME,
+                ApplicationEntryIndex.HTTP_HANDLER_HANDLE_DESCRIPTOR, null,
+                new String[] {"java/io/IOException"});
+        handle.visitCode();
+        handle.visitVarInsn(Opcodes.ALOAD, 1);
+        handle.visitMethodInsn(Opcodes.INVOKEINTERFACE,
+                ApplicationEntryIndex.HTTP_EXCHANGE_OWNER, "getRequestHeaders",
+                "()Lcom/sun/net/httpserver/Headers;", true);
+        handle.visitLdcInsn("X-Lookup-URL");
+        handle.visitMethodInsn(Opcodes.INVOKEVIRTUAL, ApplicationEntryIndex.HTTP_HEADERS_OWNER,
+                "getFirst", "(Ljava/lang/String;)Ljava/lang/String;", false);
+        handle.visitInsn(Opcodes.POP);
+        handle.visitInsn(Opcodes.RETURN);
+        handle.visitMaxs(2, 2);
+        handle.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static Handle lambdaMetafactory() {
+        return new Handle(Opcodes.H_INVOKESTATIC, "java/lang/invoke/LambdaMetafactory",
+                "metafactory",
+                "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;"
+                        + "Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;"
+                        + "Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)"
+                        + "Ljava/lang/invoke/CallSite;",
+                false);
     }
 }

@@ -18,6 +18,8 @@ import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.Descriptor;
 import io.just.sast.model.ApplicationResourceFacts;
 import io.just.sast.model.HttpExternalSource;
+import io.just.sast.model.HttpHandlerValue;
+import io.just.sast.model.LambdaMetafactoryCallSite;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -51,7 +53,7 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 6;
+    public static final int MODEL_VERSION = 7;
     public static final String HTTP_SERVER_OWNER = "com/sun/net/httpserver/HttpServer";
     public static final String HTTP_SERVER_CREATE_CONTEXT_NAME = "createContext";
     public static final String HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR =
@@ -215,6 +217,65 @@ public final class ApplicationEntryIndex {
                     || !descriptor.equals(value.declaredDescriptor())) {
                 throw new IllegalArgumentException("HTTP context value does not match call site");
             }
+        }
+    }
+
+    /** One actual graph edge proving how the registered handler value reaches its callback. */
+    public record HttpHandlerEdge(long fromCallId, String fromMethodKey, String targetMethodKey,
+                                  String callbackMethodKey, EdgeType edgeType, String label) {
+        public HttpHandlerEdge {
+            if (fromCallId < 0) {
+                throw new IllegalArgumentException("fromCallId must be non-negative");
+            }
+            fromMethodKey = requireText(fromMethodKey, "fromMethodKey");
+            targetMethodKey = requireText(targetMethodKey, "targetMethodKey");
+            callbackMethodKey = requireText(callbackMethodKey, "callbackMethodKey");
+            edgeType = Objects.requireNonNull(edgeType, "edgeType");
+            label = requireText(label, "label");
+        }
+    }
+
+    /**
+     * Verified HTTP application site: one exact registration, one handler value origin, one
+     * actual callback edge and at least one typed external request value source.
+     */
+    public record HttpSite(HttpContextRegistration registration, HttpHandlerValue handlerValue,
+                           String handlerMethodKey, HttpHandlerEdge handlerEdge,
+                           List<HttpExternalSource> externalSources) {
+        public HttpSite {
+            registration = Objects.requireNonNull(registration, "registration");
+            handlerValue = Objects.requireNonNull(handlerValue, "handlerValue");
+            if (!registration.hostMethodKey().equals(handlerValue.hostMethodKey())) {
+                throw new IllegalArgumentException("handler value host does not match registration");
+            }
+            handlerMethodKey = requireText(handlerMethodKey, "handlerMethodKey");
+            handlerEdge = Objects.requireNonNull(handlerEdge, "handlerEdge");
+            if (!registration.hostMethodKey().equals(handlerEdge.fromMethodKey())
+                    || handlerEdge.fromCallId() != expectedEdgeCallId(handlerValue)
+                    || !handlerMethodKey.equals(handlerEdge.callbackMethodKey())) {
+                throw new IllegalArgumentException("handler edge does not match HTTP site");
+            }
+            if (externalSources == null || externalSources.isEmpty()
+                    || externalSources.stream().anyMatch(source -> source == null
+                    || !source.externalInput())) {
+                throw new IllegalArgumentException("HTTP site needs external value sources");
+            }
+            externalSources = externalSources.stream()
+                    .sorted(Comparator.comparingLong(HttpExternalSource::callId)
+                            .thenComparing(HttpExternalSource::apiKey))
+                    .toList();
+        }
+
+        public String entryMethodKey() {
+            return registration.hostMethodKey();
+        }
+
+        public String identity() {
+            return "http-site:call:" + registration.callId() + "->" + handlerMethodKey;
+        }
+
+        private static long expectedEdgeCallId(HttpHandlerValue value) {
+            return value.lambda() ? value.producerCallId() : value.constructionCallId();
         }
     }
 
@@ -611,6 +672,8 @@ public final class ApplicationEntryIndex {
     private final Map<String, List<HttpContextRegistration>> httpContextRegistrationsByMethod;
     private final List<HttpExternalSource> httpExternalSources;
     private final Map<String, List<HttpExternalSource>> httpExternalSourcesByMethod;
+    private final List<HttpSite> httpSites;
+    private final Map<String, List<HttpSite>> httpSitesByMethod;
     private final List<DeserializeSite> secondaryDeserializeSites;
     private final Set<String> applicationObjectInputHosts;
     private final List<TerminalImpact> terminalImpacts;
@@ -641,6 +704,7 @@ public final class ApplicationEntryIndex {
                                   ApplicationResourceFacts resourceFacts,
                                   List<HttpContextRegistration> httpContextRegistrations,
                                   List<HttpExternalSource> httpExternalSources,
+                                  List<HttpSite> httpSites,
                                   List<TerminalImpact> terminalImpacts,
                                   List<String> entryForwardSlice,
                                   List<String> sinkReverseSlice,
@@ -683,6 +747,8 @@ public final class ApplicationEntryIndex {
         this.httpExternalSources = immutableHttpExternalSources(httpExternalSources);
         this.httpExternalSourcesByMethod = immutableHttpExternalSourceIndex(
                 this.httpExternalSources);
+        this.httpSites = immutableHttpSites(httpSites);
+        this.httpSitesByMethod = immutableHttpSiteIndex(this.httpSites);
         this.secondaryDeserializeSites = this.deserializeSites.stream()
                 .filter(ApplicationEntryIndex::isSecondaryDeserializeSite)
                 .toList();
@@ -877,6 +943,210 @@ public final class ApplicationEntryIndex {
                     arguments, spec.valueDescriptor()));
         }
         return immutableHttpExternalSources(result);
+    }
+
+    /**
+     * Join one exact HTTP registration to its handler value, callback edge and request value.
+     * Source facts are intentionally grouped by the exact callback method key; a source in the
+     * registration host or a nearby method cannot satisfy this join.
+     */
+    private static List<HttpSite> discoverHttpSites(
+            Graph graph, Set<String> applicationOwners, boolean applicationScopeKnown,
+            List<ExecutionEntry> entries, List<HttpContextRegistration> registrations,
+            List<HttpExternalSource> sources) {
+        if (graph == null || !applicationScopeKnown || applicationOwners.isEmpty()
+                || registrations == null || registrations.isEmpty()
+                || sources == null || sources.isEmpty()) {
+            return List.of();
+        }
+        Map<String, List<HttpExternalSource>> externalSourcesByMethod = new TreeMap<>();
+        for (HttpExternalSource source : sources) {
+            if (source == null || !source.externalInput()
+                    || !applicationOwners.contains(ownerOf(source.hostMethodKey()))) {
+                continue;
+            }
+            externalSourcesByMethod.computeIfAbsent(source.hostMethodKey(),
+                    ignored -> new ArrayList<>()).add(source);
+        }
+        if (externalSourcesByMethod.isEmpty()) {
+            return List.of();
+        }
+
+        List<HttpSite> result = new ArrayList<>();
+        for (HttpContextRegistration registration : registrations) {
+            if (registration == null
+                    || !applicationOwners.contains(ownerOf(registration.hostMethodKey()))) {
+                continue;
+            }
+            Node registrationCall = graph.node(registration.callId());
+            if (!isHttpContextCall(registrationCall, registration)) {
+                continue;
+            }
+            List<HttpHandlerValue> values = httpHandlerValues(registrationCall);
+            if (values.size() != 1) {
+                continue;
+            }
+            HttpHandlerValue value = values.get(0);
+            HttpSite site = joinHttpHandler(graph, applicationOwners, entries, registration,
+                    value, externalSourcesByMethod);
+            if (site != null) {
+                result.add(site);
+            }
+        }
+        return immutableHttpSites(result);
+    }
+
+    private static HttpSite joinHttpHandler(
+            Graph graph, Set<String> applicationOwners, List<ExecutionEntry> entries,
+            HttpContextRegistration registration, HttpHandlerValue value,
+            Map<String, List<HttpExternalSource>> externalSourcesByMethod) {
+        if (value == null || !registration.hostMethodKey().equals(value.hostMethodKey())
+                || value.producerOffset() < 0) {
+            return null;
+        }
+        return switch (value.kind()) {
+            case LAMBDA -> joinLambdaHandler(graph, applicationOwners, registration, value,
+                    externalSourcesByMethod);
+            case ALLOCATION -> joinAllocatedHandler(graph, applicationOwners, entries,
+                    registration, value, externalSourcesByMethod);
+        };
+    }
+
+    private static HttpSite joinLambdaHandler(
+            Graph graph, Set<String> applicationOwners, HttpContextRegistration registration,
+            HttpHandlerValue value, Map<String, List<HttpExternalSource>> externalSourcesByMethod) {
+        if (!HTTP_HANDLER_DESCRIPTOR.equals(value.typeDescriptor())
+                || value.producerCallId() < 0 || value.constructionCallId() != -1) {
+            return null;
+        }
+        Node producer = graph.node(value.producerCallId());
+        if (producer == null || producer.type() != NodeType.CALL
+                || !registration.hostMethodKey().equals(methodKey(producer.methodOwner(),
+                producer.methodName(), producer.methodDescriptor()))
+                || producer.offset() != value.producerOffset()
+                || !"DYNAMIC".equals(producer.invokeKind())) {
+            return null;
+        }
+        Object note = producer.note("lambdaCallSite");
+        if (!(note instanceof LambdaMetafactoryCallSite site)
+                || !isHttpHandlerSam(site.functionalInterfaceMethod())) {
+            return null;
+        }
+        List<Edge> lambdaEdges = producer.out().stream()
+                .filter(edge -> edge.type() == EdgeType.LAMBDA)
+                .toList();
+        if (lambdaEdges.size() != 1) {
+            return null;
+        }
+        Edge edge = lambdaEdges.get(0);
+        Node target = edge.to();
+        if (target == null || target.type() != NodeType.METHOD
+                || !applicationOwners.contains(target.owner())
+                || !site.implementation().name().equals(target.name())
+                || !site.implementation().descriptor().equals(target.descriptor())) {
+            return null;
+        }
+        String handlerMethodKey = methodKey(target.owner(), target.name(), target.descriptor());
+        List<HttpExternalSource> externalSources = externalSourcesByMethod.getOrDefault(
+                handlerMethodKey, List.of());
+        if (externalSources.isEmpty()) {
+            return null;
+        }
+        HttpHandlerEdge handlerEdge = new HttpHandlerEdge(producer.id(), registration.hostMethodKey(),
+                handlerMethodKey, handlerMethodKey, edge.type(), edge.label());
+        return new HttpSite(registration, value, handlerMethodKey, handlerEdge, externalSources);
+    }
+
+    private static HttpSite joinAllocatedHandler(
+            Graph graph, Set<String> applicationOwners, List<ExecutionEntry> entries,
+            HttpContextRegistration registration, HttpHandlerValue value,
+            Map<String, List<HttpExternalSource>> externalSourcesByMethod) {
+        if (value.producerCallId() != -1 || value.constructionCallId() < 0
+                || !applicationOwners.contains(value.typeOwner())
+                || !value.typeDescriptor().equals("L" + value.typeOwner() + ";")) {
+            return null;
+        }
+        Node construction = graph.node(value.constructionCallId());
+        if (construction == null || construction.type() != NodeType.CALL
+                || !registration.hostMethodKey().equals(methodKey(construction.methodOwner(),
+                construction.methodName(), construction.methodDescriptor()))
+                || !value.typeOwner().equals(construction.owner())
+                || !"<init>".equals(construction.name())
+                || !"SPECIAL".equals(construction.invokeKind())) {
+            return null;
+        }
+        List<Edge> constructorEdges = construction.out().stream()
+                .filter(edge -> edge.type() == EdgeType.INVOKES
+                        && edge.to() != null && edge.to().type() == NodeType.METHOD
+                        && value.typeOwner().equals(edge.to().owner())
+                        && "<init>".equals(edge.to().name())
+                        && construction.descriptor().equals(edge.to().descriptor()))
+                .toList();
+        if (constructorEdges.size() != 1) {
+            return null;
+        }
+        Edge constructorEdge = constructorEdges.get(0);
+        String handlerMethodKey = methodKey(value.typeOwner(), HTTP_HANDLER_HANDLE_NAME,
+                HTTP_HANDLER_HANDLE_DESCRIPTOR);
+        if (!isHttpHandlerEntry(entries, handlerMethodKey)) {
+            return null;
+        }
+        List<HttpExternalSource> externalSources = externalSourcesByMethod.getOrDefault(
+                handlerMethodKey, List.of());
+        if (externalSources.isEmpty()) {
+            return null;
+        }
+        HttpHandlerEdge handlerEdge = new HttpHandlerEdge(construction.id(),
+                registration.hostMethodKey(), methodKey(constructorEdge.to().owner(),
+                constructorEdge.to().name(), constructorEdge.to().descriptor()), handlerMethodKey,
+                constructorEdge.type(), constructorEdge.label());
+        return new HttpSite(registration, value, handlerMethodKey, handlerEdge, externalSources);
+    }
+
+    private static boolean isHttpContextCall(Node call, HttpContextRegistration registration) {
+        return call != null && call.type() == NodeType.CALL
+                && call.id() == registration.callId()
+                && registration.callOffset() == call.offset()
+                && registration.hostMethodKey().equals(methodKey(call.methodOwner(),
+                call.methodName(), call.methodDescriptor()))
+                && HTTP_SERVER_OWNER.equals(call.owner())
+                && HTTP_SERVER_CREATE_CONTEXT_NAME.equals(call.name())
+                && HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR.equals(call.descriptor())
+                && !"DYNAMIC".equals(call.invokeKind());
+    }
+
+    private static List<HttpHandlerValue> httpHandlerValues(Node call) {
+        if (call == null) {
+            return List.of();
+        }
+        Object note = call.note(HttpHandlerValue.GRAPH_NOTE_KEY);
+        if (!(note instanceof Iterable<?> values)) {
+            return List.of();
+        }
+        List<HttpHandlerValue> result = new ArrayList<>();
+        for (Object value : values) {
+            if (!(value instanceof HttpHandlerValue handlerValue)) {
+                return List.of();
+            }
+            result.add(handlerValue);
+        }
+        return List.copyOf(result);
+    }
+
+    private static boolean isHttpHandlerSam(io.just.sast.model.MethodRef method) {
+        return method != null && HTTP_HANDLER_OWNER.equals(method.owner())
+                && HTTP_HANDLER_HANDLE_NAME.equals(method.name())
+                && HTTP_HANDLER_HANDLE_DESCRIPTOR.equals(method.descriptor());
+    }
+
+    private static boolean isHttpHandlerEntry(List<ExecutionEntry> entries,
+                                              String methodKey) {
+        if (entries == null || methodKey == null || methodKey.isBlank()) {
+            return false;
+        }
+        return entries.stream().anyMatch(entry -> entry.applicationOwned()
+                && "http-handler".equals(entry.entryKind())
+                && methodKey.equals(entry.methodKey()));
     }
 
     private static HttpSourceSpec httpSourceSpec(Node call, RuleEngine rules) {
@@ -1259,6 +1529,34 @@ public final class ApplicationEntryIndex {
         return Map.copyOf(result);
     }
 
+    private static List<HttpSite> immutableHttpSites(List<HttpSite> sites) {
+        Objects.requireNonNull(sites, "HTTP sites");
+        if (sites.isEmpty()) {
+            return List.of();
+        }
+        return sites.stream().map(site -> Objects.requireNonNull(site, "HTTP site"))
+                .sorted(Comparator.comparing(HttpSite::entryMethodKey)
+                        .thenComparingInt(site -> site.registration().callOffset())
+                        .thenComparing(HttpSite::handlerMethodKey)
+                        .thenComparing(site -> site.handlerValue().identity()))
+                .distinct().toList();
+    }
+
+    private static Map<String, List<HttpSite>> immutableHttpSiteIndex(List<HttpSite> sites) {
+        Objects.requireNonNull(sites, "HTTP sites");
+        if (sites.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, List<HttpSite>> grouped = new TreeMap<>();
+        for (HttpSite site : sites) {
+            grouped.computeIfAbsent(site.entryMethodKey(), ignored -> new ArrayList<>())
+                    .add(site);
+        }
+        Map<String, List<HttpSite>> result = new TreeMap<>();
+        grouped.forEach((key, values) -> result.put(key, List.copyOf(values)));
+        return Map.copyOf(result);
+    }
+
     private static Map<String, List<ServiceEndpoint>> immutableServiceEndpointIndex(
             List<ServiceEndpoint> endpoints) {
         if (endpoints == null || endpoints.isEmpty()) {
@@ -1526,6 +1824,8 @@ public final class ApplicationEntryIndex {
                 discoverHttpContextRegistrations(graph, owners, applicationScopeKnown);
         List<HttpExternalSource> httpExternalSources = discoverHttpExternalSources(
                 graph, owners, applicationScopeKnown, rules);
+        List<HttpSite> httpSites = discoverHttpSites(graph, owners, applicationScopeKnown,
+                entries, httpContextRegistrations, httpExternalSources);
         List<FilterControl> filterControls = discoverFilterControls(graph, owners,
                 applicationScopeKnown);
         if (applicationScopeKnown) {
@@ -1735,6 +2035,7 @@ public final class ApplicationEntryIndex {
                 List.copyOf(deserializeHosts.values()), serviceEndpoints, filterControls, resources,
                 httpContextRegistrations,
                 httpExternalSources,
+                httpSites,
                 impacts,
                 forward, reverse, List.copyOf(intersection), dependency, reasons,
                 bindingCallbacks);
@@ -1827,6 +2128,19 @@ public final class ApplicationEntryIndex {
             return List.of();
         }
         return httpExternalSourcesByMethod.getOrDefault(hostMethodKey, List.of());
+    }
+
+    /** Immutable verified HTTP application sites; registration alone never appears here. */
+    public List<HttpSite> httpSites() {
+        return httpSites;
+    }
+
+    /** Verified HTTP sites for one exact registration host method. */
+    public List<HttpSite> httpSitesFor(String hostMethodKey) {
+        if (hostMethodKey == null || hostMethodKey.isBlank()) {
+            return List.of();
+        }
+        return httpSitesByMethod.getOrDefault(hostMethodKey, List.of());
     }
 
     /** Whether an exact method is a concrete application-owned HttpHandler callback. */
@@ -2916,6 +3230,7 @@ public final class ApplicationEntryIndex {
             serviceEndpoints.forEach(value -> update(digest, "service=" + value));
             httpContextRegistrations.forEach(value -> update(digest, "http-context=" + value));
             httpExternalSources.forEach(value -> update(digest, "http-source=" + value));
+            httpSites.forEach(value -> update(digest, "http-site=" + value));
             filterControls.forEach(value -> update(digest, "filter=" + value));
             routeBindings.forEach(value -> update(digest, "route=" + value));
             terminalImpacts.forEach(value -> update(digest, "impact=" + value));
