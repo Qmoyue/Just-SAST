@@ -2321,7 +2321,7 @@ public final class ApplicationEntryIndex {
         boolean servlet = servletType(method, classSupertypes);
 
         if ("main".equals(method.name()) && "([Ljava/lang/String;)V".equals(method.descriptor())
-                && Modifier.isStatic(access)) {
+                && Modifier.isPublic(access) && Modifier.isStatic(access)) {
             return new FrameworkEntry("lifecycle-main", false, false);
         }
         // HttpServlet overrides are commonly protected (the public boundary is the servlet

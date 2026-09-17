@@ -5,6 +5,7 @@ import io.just.sast.config.Rule;
 import io.just.sast.config.RuleEngine;
 import io.just.sast.config.RuleSet;
 import io.just.sast.analysis.taint.OriginSupport;
+import io.just.sast.blackboard.FindingState;
 import io.just.sast.cpg.build.CpgIndex;
 import io.just.sast.cpg.graph.EdgeType;
 import io.just.sast.cpg.graph.Graph;
@@ -52,6 +53,44 @@ class ApplicationEntryIndexContractTest {
         assertTrue(index.isExternalEntryMethod(APP + "#invoke()V"));
         assertEquals(1, index.routeBindingsFor(APP + "#invoke()V").size());
         assertEquals("SOAPService", index.routeBindingsFor(APP + "#invoke()V").get(0).route());
+    }
+
+    @Test
+    void indexesOnlyPublicStaticMainFromTheTargetArtifact() {
+        String target = "fixture/app/Main";
+        String packagePrivate = "fixture/app/PackagePrivateMain";
+        String instance = "fixture/app/InstanceMain";
+        String wrongDescriptor = "fixture/app/WrongDescriptorMain";
+        String dependency = "fixture/lib/DependencyMain";
+        Graph graph = new Graph();
+
+        Node publicStaticMain = graph.methodNode(target, "main", "([Ljava/lang/String;)V", false);
+        publicStaticMain.propsNote("methodAccess", Modifier.PUBLIC | Modifier.STATIC);
+        Node packageStaticMain = graph.methodNode(packagePrivate, "main",
+                "([Ljava/lang/String;)V", false);
+        packageStaticMain.propsNote("methodAccess", Modifier.STATIC);
+        Node publicInstanceMain = graph.methodNode(instance, "main", "([Ljava/lang/String;)V",
+                false);
+        publicInstanceMain.propsNote("methodAccess", Modifier.PUBLIC);
+        Node publicStaticWrongDescriptor = graph.methodNode(wrongDescriptor, "main", "()V", false);
+        publicStaticWrongDescriptor.propsNote("methodAccess", Modifier.PUBLIC | Modifier.STATIC);
+        Node dependencyMain = graph.methodNode(dependency, "main", "([Ljava/lang/String;)V",
+                false);
+        dependencyMain.propsNote("methodAccess", Modifier.PUBLIC | Modifier.STATIC);
+        graph.freeze();
+
+        RuleEngine engine = new RuleEngine(new RuleSet(List.of(), List.of(), List.of(),
+                List.of(), List.of()), new ClassHierarchy(Map.of(), null));
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(target, packagePrivate, instance, wrongDescriptor), true);
+
+        assertEquals(Set.of(target + "#main([Ljava/lang/String;)V"),
+                index.applicationEntryMethods());
+        assertEquals(1, index.applicationEntries().size());
+        assertEquals("lifecycle-main", index.applicationEntries().get(0).entryKind());
+        assertTrue(index.executionEntries().stream()
+                .anyMatch(entry -> entry.owner().equals(dependency)
+                        && entry.status() == FindingState.EntryStatus.NO_APPLICATION_ENTRY));
     }
 
     @Test
