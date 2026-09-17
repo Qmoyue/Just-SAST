@@ -129,6 +129,27 @@ class JndiObjectFactoryBridgeContractTest {
         assertTrue(call.out().stream().allMatch(edge -> edge.to().owner().equals("fixture/AbstractFactory")));
     }
 
+    @Test
+    void factoryBytecodeIsNeverInitializedOrInvokedDuringStaticBridgeModeling() {
+        ClassInfo host = extract(hostBytes(JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR));
+        ClassInfo factory = extract(throwingFactoryBytes());
+        LoadResult load = new LoadResult(Map.of(host.internalName(), host,
+                factory.internalName(), factory), List.of(), 1, 61);
+        Graph graph = new CpgBuilder().build(load).graph();
+        var call = graph.callsOfMethod(host.internalName() + "#call"
+                        + host.method("call", hostMethodDescriptor()).descriptor())
+                .stream().findFirst().orElseThrow();
+
+        new CallGraphBuilder(new ClassHierarchy(load.classes(), null)).build(graph);
+        JndiObjectFactoryDispatch dispatch =
+                (JndiObjectFactoryDispatch) call.note(JndiObjectFactoryCallSite.DISPATCH_NOTE_KEY);
+        assertEquals(JndiObjectFactoryDispatch.Status.RESOLVED, dispatch.status());
+        assertEquals(List.of("fixture/ThrowingFactory#getObjectInstance"
+                        + JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR),
+                dispatch.implementations().stream()
+                        .map(JndiObjectFactoryDispatch.Implementation::methodKey).toList());
+    }
+
     private static String hostMethodDescriptor() {
         return "(Ljavax/naming/spi/ObjectFactory;Ljava/lang/Object;Ljavax/naming/Name;"
                 + "Ljavax/naming/Context;Ljava/util/Hashtable;)Ljava/lang/Object;";
@@ -187,6 +208,35 @@ class JndiObjectFactoryBridgeContractTest {
                 JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR, null, null).visitEnd();
         writer.visitEnd();
         return writer.toByteArray();
+    }
+
+    private static byte[] throwingFactoryBytes() {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "fixture/ThrowingFactory", null,
+                "java/lang/Object", new String[] {JndiObjectFactoryCallSite.OBJECT_FACTORY_OWNER});
+        MethodVisitor initializer = writer.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
+        initializer.visitCode();
+        emitAssertionError(initializer);
+        initializer.visitMaxs(3, 0);
+        initializer.visitEnd();
+        MethodVisitor method = writer.visitMethod(Opcodes.ACC_PUBLIC,
+                JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_NAME,
+                JndiObjectFactoryCallSite.GET_OBJECT_INSTANCE_DESCRIPTOR, null, null);
+        method.visitCode();
+        emitAssertionError(method);
+        method.visitMaxs(3, 5);
+        method.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static void emitAssertionError(MethodVisitor method) {
+        method.visitTypeInsn(Opcodes.NEW, "java/lang/AssertionError");
+        method.visitInsn(Opcodes.DUP);
+        method.visitLdcInsn("ObjectFactory target code must not execute");
+        method.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/AssertionError", "<init>",
+                "(Ljava/lang/Object;)V", false);
+        method.visitInsn(Opcodes.ATHROW);
     }
 
     private static byte[] unrelatedOwnerBytes() {
