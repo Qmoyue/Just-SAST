@@ -118,16 +118,3 @@ TERMINAL  TemplatesImpl#newTransformer
 ## 许可证
 
 Just 使用 GPLv3-only，详见 [LICENSE](LICENSE) 和 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
-
-## Gleipner 跑分
-
-本轮使用重新拉取的官方 Gleipner 源码（revision `6cad4b07cf3a0f54fa2b149f5df9febccd02dcff`）和 Just 的静态诊断口径，覆盖 31 个分类/聚合制品：
-
-| 指标 | 结果 |
-| --- | ---: |
-| TP | `656/122` |
-| FP | `177/47` |
-| 原始计数 | `833` |
-| 去重计数 | `833` |
-
-这是 Just 的静态诊断结果，不是 Gleipner 官方 evaluator 的动态执行分数；官方 evaluator 需要加载并调用基准目标类，与 Just 的静态分析边界不兼容。当前 `ysoserial-cc1` 的静态诊断项为 `0/1`，该限制已保留并公开披露，未使用 benchmark 名称特判来伪造通过。
