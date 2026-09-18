@@ -144,6 +144,41 @@ class CallGraphBuilderTest {
         assertEquals(0, call.out().size());
     }
 
+    @Test
+    void interfaceImplementerCapKeepsDeclaredEdgeWithoutGlobalExpansion() {
+        String descriptor = "()V";
+        MethodInfo declaration = new MethodInfo("fixture/Service", "run", descriptor,
+                Modifier.PUBLIC | Modifier.ABSTRACT, List.of(), List.of(), false);
+        Map<String, ClassInfo> classes = new java.util.LinkedHashMap<>();
+        classes.put("fixture/Service", new ClassInfo("fixture/Service", "java/lang/Object",
+                List.of(), Modifier.PUBLIC | Modifier.INTERFACE | Modifier.ABSTRACT,
+                List.of(declaration), List.of()));
+        for (int index = 0; index < 201; index++) {
+            String owner = "fixture/Impl" + index;
+            MethodInfo implementation = new MethodInfo(owner, "run", descriptor, Modifier.PUBLIC,
+                    List.of(), List.of(), false);
+            classes.put(owner, new ClassInfo(owner, "java/lang/Object",
+                    List.of("fixture/Service"), Modifier.PUBLIC, List.of(implementation),
+                    List.of()));
+        }
+        ClassHierarchy hierarchy = new ClassHierarchy(classes, null);
+        Graph graph = new Graph();
+        graph.methodNode("fixture/Host", "call", "()V", false);
+        graph.addCallNode("fixture/Service", "run", descriptor, "INTERFACE", null, 0,
+                "fixture/Host", "call", "()V");
+        Node call = graph.nodesOfType(NodeType.CALL).get(0);
+
+        int edges = new CallGraphBuilder(hierarchy).build(graph);
+
+        assertEquals(1, edges);
+        assertEquals(1, call.out().size());
+        assertEquals(EdgeType.DISPATCHES, call.out().get(0).type());
+        assertEquals("fixture/Service", call.out().get(0).to().owner());
+        assertEquals("implementers-over-cap", call.note("dispatchSkipped"));
+        assertTrue(graph.nodesOfType(NodeType.METHOD).stream()
+                .noneMatch(node -> node.owner().startsWith("fixture/Impl")));
+    }
+
     private static ClassHierarchy hierarchyOf(MethodInfo... methods) {
         Map<String, ClassInfo> classes = new java.util.LinkedHashMap<>();
         for (MethodInfo method : methods) {
