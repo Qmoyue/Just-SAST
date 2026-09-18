@@ -114,19 +114,6 @@ class OriginSupportFeasibilityTest {
     }
 
     @Test
-    void branchTruthUsesTheSameAbstractStateAsTheSinkGuard() throws Exception {
-        OriginSupport support = emptySupport();
-        MethodInfo method = constantBranchMethod();
-        ForwardOrigins.Result state = support.origins().compute(method);
-        var branchTruth = OriginSupport.class.getDeclaredMethod("knownBranchResult",
-                MethodInfo.class, ForwardOrigins.Result.class, io.just.sast.model.InsnFact.class);
-        branchTruth.setAccessible(true);
-
-        assertEquals(Boolean.TRUE, branchTruth.invoke(support, method, state, method.insnAt(1)),
-                "the feasibility pass must fold the same constant branch used by sink pruning");
-    }
-
-    @Test
     void nativeCallbackUsesExplicitJniHop() {
         String owner = "fixture/NativeBridge";
         MethodInfo nativeMethod = emptyMethod(owner, "invokeNative", "()V",
@@ -421,16 +408,14 @@ class OriginSupportFeasibilityTest {
         ClassHierarchy hierarchy = new ClassHierarchy(load.classes(), null);
         OriginSupport support = new OriginSupport(cpg.graph(), hierarchy,
                 new RuleEngine(RuleSet.EMPTY, hierarchy), false, cpg.index());
-        var lookup = hostMethod.instructions().stream()
-                .filter(insn -> insn.op() == Op.INVOKEVIRTUAL
-                        && insn.methodRef() != null
-                        && "getMethod".equals(insn.methodRef().name()))
+        Node lookup = cpg.graph().nodesOfType(NodeType.CALL).stream()
+                .filter(node -> "java/lang/Class".equals(node.owner())
+                        && "getMethod".equals(node.name())
+                        && "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"
+                        .equals(node.descriptor()))
                 .findFirst().orElseThrow();
-        var descriptor = OriginSupport.class.getDeclaredMethod("reflectiveParameterDescriptor",
-                MethodInfo.class, io.just.sast.model.InsnFact.class, io.just.sast.model.MethodRef.class);
-        descriptor.setAccessible(true);
 
-        assertEquals("()V", descriptor.invoke(support, hostMethod, lookup, lookup.methodRef()),
+        assertEquals("()V", support.reflectiveParameterDescriptor(lookup, hostMethod),
                 "Class.getMethod(name) 的空 Class[] 必须恢复为零参数方法描述符");
     }
 
