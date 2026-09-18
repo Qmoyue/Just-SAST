@@ -351,11 +351,28 @@ public final class ScanPipeline {
         Map<String, ArtifactProvenance> hopArtifacts = hopArtifactOwners(
                 scopedApplication, artifactInputs);
 
+        // Application scope is frozen by the frontend before this boundary.  In that mode the
+        // composer reuses the immutable application-owner set and cannot reopen the primary
+        // artifact; component mode deliberately keeps the clock active because its compatibility
+        // priority discovery may still read the primary input during composition.
+        boolean inputFreeAnalysis = modePolicy.applicationScopeKnown();
         long cpgStart = System.nanoTime();
-        ClassHierarchy hierarchy = new ClassHierarchy(universe.classes(), jdkSource);
-        BuiltCpg cpg = new CpgBuilder().build(universe);
-        int callEdges = new CallGraphBuilder(hierarchy).build(cpg.graph());
-        cpg.graph().freeze();
+        ClassHierarchy hierarchy;
+        BuiltCpg cpg;
+        int callEdges;
+        if (inputFreeAnalysis) {
+            inputTracker.pauseTime();
+        }
+        try {
+            hierarchy = new ClassHierarchy(universe.classes(), jdkSource);
+            cpg = new CpgBuilder().build(universe);
+            callEdges = new CallGraphBuilder(hierarchy).build(cpg.graph());
+            cpg.graph().freeze();
+        } finally {
+            if (inputFreeAnalysis) {
+                inputTracker.resumeTime();
+            }
+        }
         JustLogger.info("CPG 构建完成：节点 {}，边 {}，调用边 {}，字段写入 {} 组",
                 cpg.graph().nodeCount(), cpg.graph().edgeCount(), callEdges,
                 cpg.fieldWriters().fieldCount());
@@ -374,7 +391,16 @@ public final class ScanPipeline {
                         scopedApplication.applicationResourceFacts()));
         scopedApplication.applicationResourceFacts().completenessReasons()
                 .forEach(blackboard::markIncomplete);
-        new Controller(blackboard, KnowledgeSources.discover()).run();
+        if (inputFreeAnalysis) {
+            inputTracker.pauseTime();
+        }
+        try {
+            new Controller(blackboard, KnowledgeSources.discover()).run();
+        } finally {
+            if (inputFreeAnalysis) {
+                inputTracker.resumeTime();
+            }
+        }
         for (Map.Entry<String, Long> timing : blackboard.phaseMs().entrySet()) {
             phaseMs.put(timing.getKey(), timing.getValue());
         }

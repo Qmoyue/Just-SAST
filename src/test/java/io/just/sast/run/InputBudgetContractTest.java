@@ -122,6 +122,26 @@ class InputBudgetContractTest {
     }
 
     @Test
+    void pausedParseClockExcludesFrozenModelWorkWithoutResettingAccounting() throws Exception {
+        InputBudget.Tracker tracker = budgetWithParseMillis(1).tracker();
+        tracker.recordRead(1);
+        tracker.pauseTime();
+        long pausedAt = tracker.elapsedMillis();
+        Thread.sleep(10L);
+
+        assertEquals(pausedAt, tracker.elapsedMillis(),
+                "frozen-model time must not consume the input parse clock");
+        assertEquals(1L, tracker.readUncompressedBytes(),
+                "pausing time must not reset aggregate byte accounting");
+        tracker.checkTime();
+
+        tracker.resumeTime();
+        Thread.sleep(10L);
+        assertThrows(IOException.class, tracker::checkTime,
+                "the clock must enforce the same limit after the next input phase resumes");
+    }
+
+    @Test
     void invalidSchemaAndNonPositiveLimitsFailClosed() {
         InputBudget d = InputBudget.defaults();
         assertThrows(IllegalArgumentException.class, () -> new InputBudget(
@@ -176,5 +196,16 @@ class InputBudgetContractTest {
                 d.maxRuleCodePoints(), d.maxRuleAliases(), d.maxRuleNestingDepth(),
                 d.maxRuleDocuments(), d.maxRuleCount(), d.maxRuleCollectionItems(),
                 d.maxRuleNodes(), d.maxRuleScalarChars(), d.maxPathChars(), d.maxParseMillis());
+    }
+
+    private static InputBudget budgetWithParseMillis(long parseMillis) {
+        InputBudget d = InputBudget.defaults();
+        return new InputBudget(d.schemaVersion(), d.maxPhysicalBytes(), d.maxCompressedBytes(),
+                d.maxUncompressedBytes(), d.maxEntryBytes(), d.maxCompressionRatio(),
+                d.maxArchiveEntries(), d.maxArchiveNesting(), d.maxClassEntries(),
+                d.maxRuleInputBytes(), d.maxRuleCodePoints(), d.maxRuleAliases(),
+                d.maxRuleNestingDepth(), d.maxRuleDocuments(), d.maxRuleCount(),
+                d.maxRuleCollectionItems(), d.maxRuleNodes(), d.maxRuleScalarChars(),
+                d.maxPathChars(), parseMillis);
     }
 }

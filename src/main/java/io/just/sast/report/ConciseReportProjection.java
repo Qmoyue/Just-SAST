@@ -492,8 +492,7 @@ public record ConciseReportProjection(
         LinkedHashSet<String> limits = new LinkedHashSet<>();
         limits.addAll(statistics.runOutcome().reasonCodes());
         limits.addAll(statistics.completenessReasons());
-        if ("application".equals(mode)
-                && (snapshot.applicationTraces().isEmpty() || findings.isEmpty())) {
+        if ("application".equals(mode) && snapshot.applicationTraces().isEmpty()) {
             limits.add("NO_APPLICATION_ENTRY");
         }
         if (findings.isEmpty()) {

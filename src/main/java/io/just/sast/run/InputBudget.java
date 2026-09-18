@@ -178,7 +178,12 @@ public record InputBudget(
         private long ruleNodes;
         private long ruleCollectionItems;
         private long ruleScalarChars;
-        private final long startedNanos = System.nanoTime();
+        // The parse clock is intentionally pausable at a proven input-free phase boundary.
+        // Byte/entry accounting remains in this tracker; only wall time spent solving an
+        // already-frozen model is excluded from the input parser budget.
+        private long activeStartedNanos = System.nanoTime();
+        private long accumulatedActiveNanos;
+        private boolean timePaused;
 
         public Tracker(InputBudget budget) {
             this.budget = budget == null ? InputBudget.defaults() : budget;
@@ -508,6 +513,28 @@ public record InputBudget(
             return InputBudgetResult.within(budget.maxUncompressedBytes(), consumed);
         }
 
+        /**
+         * Stop charging wall time while downstream code consumes an immutable, already-parsed
+         * model.  This does not reset bytes, entries, or any other aggregate accounting.  The
+         * caller may only use this at a phase boundary where the downstream operation cannot
+         * reopen untrusted input; input readers continue to call {@link #checkTime()} normally
+         * before and after the boundary.
+         */
+        public synchronized void pauseTime() {
+            if (!timePaused) {
+                accumulateActiveTime(System.nanoTime());
+                timePaused = true;
+            }
+        }
+
+        /** Resume the shared parse clock for a subsequent bounded input phase. */
+        public synchronized void resumeTime() {
+            if (timePaused) {
+                activeStartedNanos = System.nanoTime();
+                timePaused = false;
+            }
+        }
+
         /** Fail closed when a parser makes no progress or spends too long in allocation/IO. */
         public void checkTime() throws IOException {
             long elapsed = elapsedMillis();
@@ -516,9 +543,28 @@ public record InputBudget(
             }
         }
 
-        public long elapsedMillis() {
-            long elapsedNanos = System.nanoTime() - startedNanos;
+        public synchronized long elapsedMillis() {
+            long elapsedNanos = accumulatedActiveNanos;
+            if (!timePaused) {
+                elapsedNanos = saturatedAdd(elapsedNanos,
+                        Math.max(0L, System.nanoTime() - activeStartedNanos));
+            }
             return Math.max(0L, elapsedNanos / 1_000_000L);
+        }
+
+        private void accumulateActiveTime(long nowNanos) {
+            saturatedAddInPlace(Math.max(0L, nowNanos - activeStartedNanos));
+        }
+
+        private void saturatedAddInPlace(long deltaNanos) {
+            accumulatedActiveNanos = saturatedAdd(accumulatedActiveNanos, deltaNanos);
+        }
+
+        private static long saturatedAdd(long left, long right) {
+            if (right <= 0L || Long.MAX_VALUE - left < right) {
+                return right <= 0L ? left : Long.MAX_VALUE;
+            }
+            return left + right;
         }
 
         private int boundedReadSizeLocked(long localRemaining, int requested)
