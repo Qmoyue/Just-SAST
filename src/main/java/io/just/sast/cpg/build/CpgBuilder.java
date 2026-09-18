@@ -16,6 +16,8 @@ import io.just.sast.model.JaasLoginModuleCallSite;
 import io.just.sast.model.JaasLoginModuleFlow;
 import io.just.sast.model.JdbcConnectionCallSite;
 import io.just.sast.model.JndiReferenceFact;
+import io.just.sast.model.JndiLookupCallSite;
+import io.just.sast.model.JndiLookupIdentityFlow;
 import io.just.sast.model.MethodId;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
@@ -107,6 +109,7 @@ public final class CpgBuilder {
                 annotateJndiReferenceFacts(graph, method);
                 annotateJdbcConnectionFacts(graph, method);
                 annotateJaasLoginModuleFacts(graph, method);
+                annotateJndiLookupIdentityFacts(graph, method);
                 for (var tryCatch : method.tryCatch()) {
                     slice.accept(tryCatch);
                 }
@@ -760,6 +763,105 @@ public final class CpgBuilder {
                     .ifPresent(fact -> call.propsNote(JaasLoginModuleCallSite.GRAPH_NOTE_KEY,
                             fact));
         }
+    }
+
+    /**
+     * Consume the protocol-neutral value-flow result at the exact JNDI lookup/search boundary.
+     * The only continuation this owner proves is the same lookup result identity becoming a
+     * DirContext.search receiver in the same straight-line method.
+     */
+    private static void annotateJndiLookupIdentityFacts(Graph graph, MethodInfo method) {
+        String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
+        if (method.instructions().isEmpty()) {
+            return;
+        }
+        StaticValueFlow.Result flow = StaticValueFlow.analyze(graph, method);
+        if (!flow.complete()) {
+            annotateUnknownJndiLookupFacts(graph, method, hostMethodKey);
+            return;
+        }
+        List<JndiLookupCallSite> lookups = new ArrayList<>();
+        List<JndiLookupCallSite> searches = new ArrayList<>();
+        for (StaticValueFlow.Invocation invocation : flow.invocations()) {
+            JndiLookupCallSite.matchKind(invocation.owner(), invocation.name(),
+                    invocation.descriptor(), invocation.invokeKind()).ifPresent(kind -> {
+                StaticValueFlow.Value receiver = invocation.receiver();
+                if (receiver == null || invocation.result() == null) {
+                    throw new IllegalStateException("exact JNDI call has a missing value slot");
+                }
+                List<JndiLookupCallSite.SlotValue> values = new ArrayList<>();
+                values.add(new JndiLookupCallSite.SlotValue(
+                        TypedBridgeFact.Slot.receiver(jndiReceiverDescriptor(kind)),
+                        jndiValue(receiver)));
+                for (int ordinal = 0; ordinal < invocation.arguments().size(); ordinal++) {
+                    StaticValueFlow.Value argument = invocation.arguments().get(ordinal);
+                    String descriptor = Descriptor.paramType(invocation.descriptor(), ordinal);
+                    if (argument == null || descriptor == null) {
+                        throw new IllegalStateException("exact JNDI argument slot is missing");
+                    }
+                    values.add(new JndiLookupCallSite.SlotValue(
+                            TypedBridgeFact.Slot.argument(ordinal, descriptor),
+                            jndiValue(argument)));
+                }
+                values.add(new JndiLookupCallSite.SlotValue(
+                        TypedBridgeFact.Slot.returnValue(
+                                Descriptor.returnType(invocation.descriptor())),
+                        jndiValue(invocation.result())));
+                JndiLookupCallSite fact = JndiLookupCallSite.withValues(
+                        jndiCallSite(invocation.call(), method), kind, values);
+                invocation.call().propsNote(JndiLookupCallSite.GRAPH_NOTE_KEY, fact);
+                if (kind == JndiLookupCallSite.Kind.INITIAL_CONTEXT_LOOKUP) {
+                    lookups.add(fact);
+                } else {
+                    searches.add(fact);
+                }
+            });
+        }
+        for (JndiLookupCallSite search : searches) {
+            List<JndiLookupIdentityFlow> flows = lookups.stream()
+                    .map(lookup -> JndiLookupIdentityFlow.connect(lookup, search))
+                    .toList();
+            if (!flows.isEmpty()) {
+                graph.node(search.callSite().callId()).propsNote(
+                        JndiLookupIdentityFlow.GRAPH_NOTE_KEY, flows);
+            }
+        }
+    }
+
+    private static void annotateUnknownJndiLookupFacts(Graph graph, MethodInfo method,
+                                                       String hostMethodKey) {
+        MethodId hostMethod = MethodId.of(method.owner(), method.name(), method.descriptor());
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            JndiLookupCallSite.fromCall(call.id(), hostMethod, call.offset(), call.owner(),
+                    call.name(), call.descriptor(), call.invokeKind())
+                    .ifPresent(fact -> call.propsNote(JndiLookupCallSite.GRAPH_NOTE_KEY, fact));
+        }
+    }
+
+    private static String jndiReceiverDescriptor(JndiLookupCallSite.Kind kind) {
+        return kind == JndiLookupCallSite.Kind.INITIAL_CONTEXT_LOOKUP
+                ? JndiLookupCallSite.LOOKUP_RECEIVER_DESCRIPTOR
+                : JndiLookupCallSite.SEARCH_RECEIVER_DESCRIPTOR;
+    }
+
+    private static JndiLookupCallSite.ValueIdentity jndiValue(StaticValueFlow.Value value) {
+        if (value == null) {
+            throw new IllegalArgumentException("JNDI value-flow slot is missing");
+        }
+        return switch (value.state()) {
+            case KNOWN -> JndiLookupCallSite.ValueIdentity.known(value.identity(),
+                    value.descriptor(), value.producerOffset(), value.displayValue());
+            case NULL -> JndiLookupCallSite.ValueIdentity.nullValue(value.identity(),
+                    value.descriptor(), value.producerOffset());
+            case UNKNOWN -> JndiLookupCallSite.ValueIdentity.unknown(value.identity(),
+                    value.descriptor(), value.producerOffset());
+        };
+    }
+
+    private static TypedBridgeFact.CallSite jndiCallSite(Node call, MethodInfo method) {
+        return new TypedBridgeFact.CallSite(call.id(),
+                MethodId.of(method.owner(), method.name(), method.descriptor()), call.offset(),
+                call.owner(), call.name(), call.descriptor(), bridgeInvokeKind(call.invokeKind()));
     }
 
     private static String receiverDescriptor(JaasLoginModuleCallSite.Kind kind) {
