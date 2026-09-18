@@ -2,6 +2,7 @@ package io.just.sast.analysis.hierarchy;
 
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.JdkClassSource;
+import io.just.sast.model.JdkSourceInfo;
 import io.just.sast.model.MethodInfo;
 
 import java.lang.reflect.Modifier;
@@ -23,6 +24,8 @@ public final class ClassHierarchy {
 
     private final Map<String, ClassInfo> classes;
     private final JdkClassSource jdk;
+    /** Immutable seed set: distinguishes program/classpath input from later JDK lazy loads. */
+    private final Set<String> initialClassNames;
     /** 直接子类型：懒加载时写、ANALYSIS 并行时读——并发结构（写稀少，读密集）。 */
     private final Map<String, List<String>> directSubtypes = new java.util.concurrent.ConcurrentHashMap<>();
     /** 缓存均支持并发读（反向引擎 per-sink 并行）；懒加载失效用 clear()，最坏浪费重算无害。 */
@@ -60,6 +63,7 @@ public final class ClassHierarchy {
                 }
             });
         }
+        this.initialClassNames = Set.copyOf(this.classes.keySet());
         // The input map is often a LinkedHashMap, but tests and extension points are free to
         // provide a HashMap.  Subtype indexing is semantically a set operation; making its
         // seed order explicit prevents HashMap iteration order from leaking into dispatch
@@ -159,6 +163,17 @@ public final class ClassHierarchy {
 
     public int classCount() {
         return classes.size();
+    }
+
+    /** True only for a class supplied in the initial program/classpath bytecode set. */
+    public boolean isInitialClass(String internalName) {
+        return internalName != null && initialClassNames.contains(internalName);
+    }
+
+    /** Source provenance for classes loaded lazily from the configured JDK image. */
+    public JdkSourceInfo jdkSourceInfo() {
+        return jdk == null ? new JdkSourceInfo(JdkSourceInfo.ImageKind.UNKNOWN, 0)
+                : jdk.sourceInfo();
     }
 
     /** 已加载类中 name 的直接子类型。 */

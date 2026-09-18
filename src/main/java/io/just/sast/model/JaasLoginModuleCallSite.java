@@ -20,6 +20,7 @@ public record JaasLoginModuleCallSite(
         List<SlotValue> values) {
 
     public static final String GRAPH_NOTE_KEY = "jaasLoginModuleCallSite";
+    public static final String DISPATCH_NOTE_KEY = "jaasLoginModuleDispatch";
 
     public static final String APP_CONFIGURATION_ENTRY_OWNER =
             "javax/security/auth/login/AppConfigurationEntry";

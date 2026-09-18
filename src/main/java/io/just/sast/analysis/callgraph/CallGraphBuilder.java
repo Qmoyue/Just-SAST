@@ -9,6 +9,9 @@ import io.just.sast.model.HandleRef;
 import io.just.sast.model.LambdaMetafactoryCallSite;
 import io.just.sast.model.JndiObjectFactoryCallSite;
 import io.just.sast.model.JndiObjectFactoryDispatch;
+import io.just.sast.model.JaasLoginModuleCallSite;
+import io.just.sast.model.JaasLoginModuleDispatch;
+import io.just.sast.model.JdkSourceInfo;
 import java.util.HashMap;
 import java.util.Map;
 import io.just.sast.model.InvokeDynamicRef;
@@ -75,6 +78,7 @@ public final class CallGraphBuilder {
                 default -> JustLogger.debug("未知调用类型 {}: {}#{}", kind, owner, name);
             }
             annotateObjectFactoryDispatch(call);
+            edgeCount += annotateJaasLoginModuleDispatch(graph, call);
         }
         return edgeCount;
     }
@@ -141,6 +145,94 @@ public final class CallGraphBuilder {
         call.propsNote(JndiObjectFactoryCallSite.DISPATCH_NOTE_KEY,
                 new JndiObjectFactoryDispatch(callSite, new ArrayList<>(implementations.values()),
                         status));
+    }
+
+    /**
+     * Resolve the exact JDK/classpath JndiLoginModule lifecycle target after ordinary CHA.
+     * This reads ClassInfo only; it never loads, initializes, constructs, reflects, or invokes
+     * the target class.  The direct edge is added only when provenance and method resolution
+     * both prove the concrete target.
+     */
+    private int annotateJaasLoginModuleDispatch(Graph graph, Node call) {
+        Object note = call.note(JaasLoginModuleCallSite.GRAPH_NOTE_KEY);
+        if (!(note instanceof JaasLoginModuleCallSite callSite)
+                || (callSite.kind() != JaasLoginModuleCallSite.Kind.LOGIN_MODULE_INITIALIZE
+                && callSite.kind() != JaasLoginModuleCallSite.Kind.LOGIN_MODULE_LOGIN)) {
+            return 0;
+        }
+        JaasLoginModuleDispatch dispatch = resolveJaasLoginModule(callSite);
+        call.propsNote(JaasLoginModuleCallSite.DISPATCH_NOTE_KEY, dispatch);
+        if (!dispatch.resolved()) {
+            return 0;
+        }
+        JaasLoginModuleDispatch.Implementation implementation = dispatch.implementation();
+        Node target = graph.methodNode(implementation.owner(), implementation.name(),
+                implementation.descriptor(), !hierarchy.isInitialClass(implementation.owner()));
+        if (call.out().stream().noneMatch(edge -> edge.type() == EdgeType.DISPATCHES
+                && edge.to() == target)) {
+            graph.addEdge(call, target, EdgeType.DISPATCHES, "JAAS_JNDI_LOGIN_MODULE");
+            return 1;
+        }
+        return 0;
+    }
+
+    private JaasLoginModuleDispatch resolveJaasLoginModule(
+            JaasLoginModuleCallSite callSite) {
+        String targetClass = JaasLoginModuleDispatch.TARGET_CLASS;
+        io.just.sast.model.ClassInfo target = hierarchy.classInfo(targetClass);
+        if (target == null) {
+            return new JaasLoginModuleDispatch(callSite, targetClass, null,
+                    JaasLoginModuleDispatch.Source.UNKNOWN,
+                    JaasLoginModuleDispatch.Status.CLASS_NOT_RESOLVED,
+                    unknownJdkSource());
+        }
+        JdkSourceInfo sourceInfo = hierarchy.isInitialClass(targetClass)
+                ? unknownJdkSource() : hierarchy.jdkSourceInfo();
+        JaasLoginModuleDispatch.Source source = hierarchy.isInitialClass(targetClass)
+                ? JaasLoginModuleDispatch.Source.PROGRAM_INPUT
+                : sourceInfo.imageKind() == JdkSourceInfo.ImageKind.UNKNOWN
+                ? JaasLoginModuleDispatch.Source.UNKNOWN
+                : JaasLoginModuleDispatch.Source.JDK_IMAGE;
+        if (source == JaasLoginModuleDispatch.Source.UNKNOWN) {
+            return new JaasLoginModuleDispatch(callSite, targetClass, null, source,
+                    JaasLoginModuleDispatch.Status.SOURCE_NOT_PROVABLE, sourceInfo);
+        }
+        if (!hierarchy.isSubtypeOf(targetClass, JaasLoginModuleCallSite.LOGIN_MODULE_OWNER)) {
+            return new JaasLoginModuleDispatch(callSite, targetClass, null, source,
+                    JaasLoginModuleDispatch.Status.NOT_LOGIN_MODULE, sourceInfo);
+        }
+        if (target.isInterface() || Modifier.isAbstract(target.access())) {
+            return new JaasLoginModuleDispatch(callSite, targetClass, null, source,
+                    JaasLoginModuleDispatch.Status.INTERFACE_OR_ABSTRACT, sourceInfo);
+        }
+        String name = callSite.kind() == JaasLoginModuleCallSite.Kind.LOGIN_MODULE_INITIALIZE
+                ? JaasLoginModuleCallSite.INITIALIZE_NAME : JaasLoginModuleCallSite.LOGIN_NAME;
+        String descriptor = callSite.kind() == JaasLoginModuleCallSite.Kind.LOGIN_MODULE_INITIALIZE
+                ? JaasLoginModuleCallSite.INITIALIZE_DESCRIPTOR : JaasLoginModuleCallSite.LOGIN_DESCRIPTOR;
+        String owner = hierarchy.resolveMethod(targetClass, name, descriptor);
+        if (owner == null) {
+            return new JaasLoginModuleDispatch(callSite, targetClass, null, source,
+                    JaasLoginModuleDispatch.Status.METHOD_NOT_RESOLVED, sourceInfo);
+        }
+        int access = hierarchy.methodAccess(owner, name, descriptor);
+        if (access < 0) {
+            return new JaasLoginModuleDispatch(callSite, targetClass, null, source,
+                    JaasLoginModuleDispatch.Status.METHOD_NOT_RESOLVED, sourceInfo);
+        }
+        if (Modifier.isAbstract(access)) {
+            return new JaasLoginModuleDispatch(callSite, targetClass, null, source,
+                    JaasLoginModuleDispatch.Status.METHOD_ABSTRACT, sourceInfo);
+        }
+        return new JaasLoginModuleDispatch(callSite,
+                targetClass,
+                new JaasLoginModuleDispatch.Implementation(owner, name, descriptor),
+                source,
+                JaasLoginModuleDispatch.Status.RESOLVED,
+                sourceInfo);
+    }
+
+    private static JdkSourceInfo unknownJdkSource() {
+        return new JdkSourceInfo(JdkSourceInfo.ImageKind.UNKNOWN, 0);
     }
 
     private int addVirtual(Graph graph, Node call, String owner, String name, String desc) {
