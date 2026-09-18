@@ -21,6 +21,7 @@ import io.just.sast.model.JndiLookupCapability;
 import io.just.sast.model.JndiLookupIdentityFlow;
 import io.just.sast.model.JndiNamingEnumerationCallSite;
 import io.just.sast.model.JndiSearchReturnFlow;
+import io.just.sast.model.HessianProxyFactoryCallSite;
 import io.just.sast.model.MethodInvokeCallSite;
 import io.just.sast.model.MethodId;
 import io.just.sast.model.MethodInfo;
@@ -944,6 +945,7 @@ public final class CpgBuilder {
         if (method.instructions().isEmpty()) {
             return;
         }
+        annotateHessianFactoryCallSites(graph, method, hostMethodKey);
         StaticValueFlow.Result flow = StaticValueFlow.analyze(graph, method);
         if (!flow.complete()) {
             annotateUnknownProxyCreationFacts(graph, method, hostMethodKey);
@@ -969,6 +971,18 @@ public final class CpgBuilder {
         }
         annotateProxyInterfaceFacts(graph, method, flow);
         annotateMethodInvokeFacts(graph, method, flow);
+    }
+
+    /** Publish the exact Hessian factory create call-site without reading or invoking Hessian. */
+    private static void annotateHessianFactoryCallSites(Graph graph, MethodInfo method,
+                                                        String hostMethodKey) {
+        MethodId host = MethodId.of(method.owner(), method.name(), method.descriptor());
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            HessianProxyFactoryCallSite.fromCall(call.id(), host, call.offset(), call.owner(),
+                    call.name(), call.descriptor(), call.invokeKind())
+                    .ifPresent(fact -> call.propsNote(HessianProxyFactoryCallSite.GRAPH_NOTE_KEY,
+                            fact));
+        }
     }
 
     /**
