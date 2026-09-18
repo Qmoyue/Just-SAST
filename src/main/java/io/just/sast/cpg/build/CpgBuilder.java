@@ -12,6 +12,8 @@ import io.just.sast.model.FieldRef;
 import io.just.sast.model.HttpHandlerValue;
 import io.just.sast.model.InsnFact;
 import io.just.sast.model.InvokeDynamicRef;
+import io.just.sast.model.JaasLoginModuleCallSite;
+import io.just.sast.model.JaasLoginModuleFlow;
 import io.just.sast.model.JdbcConnectionCallSite;
 import io.just.sast.model.JndiReferenceFact;
 import io.just.sast.model.MethodId;
@@ -104,6 +106,7 @@ public final class CpgBuilder {
                 annotateHttpHandlerValues(graph, method);
                 annotateJndiReferenceFacts(graph, method);
                 annotateJdbcConnectionFacts(graph, method);
+                annotateJaasLoginModuleFacts(graph, method);
                 for (var tryCatch : method.tryCatch()) {
                     slice.accept(tryCatch);
                 }
@@ -643,6 +646,150 @@ public final class CpgBuilder {
                     call.name(), call.descriptor(), call.invokeKind())
                     .ifPresent(site -> call.propsNote(JdbcConnectionCallSite.GRAPH_NOTE_KEY, site));
         }
+    }
+
+    /**
+     * Consume the protocol-neutral value-flow facts at the exact JAAS boundaries.  The owner
+     * records options-map mutations and the LoginModule lifecycle slots, but never resolves a
+     * module class or executes JAAS configuration.  A control-flow/stack failure keeps every
+     * exact consumer visible as an explicit UNKNOWN fact.
+     */
+    private static void annotateJaasLoginModuleFacts(Graph graph, MethodInfo method) {
+        String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
+        if (method.instructions().isEmpty()) {
+            return;
+        }
+        StaticValueFlow.Result flow = StaticValueFlow.analyze(graph, method);
+        if (!flow.complete()) {
+            annotateUnknownJaasLoginModuleFacts(graph, method, hostMethodKey);
+            return;
+        }
+        List<JaasLoginModuleCallSite> optionsEntries = new ArrayList<>();
+        List<JaasLoginModuleCallSite> optionMutations = new ArrayList<>();
+        List<JaasLoginModuleCallSite> initializes = new ArrayList<>();
+        List<JaasLoginModuleCallSite> logins = new ArrayList<>();
+        for (StaticValueFlow.Invocation invocation : flow.invocations()) {
+            JaasLoginModuleCallSite.matchKind(invocation.owner(), invocation.name(),
+                    invocation.descriptor(), invocation.invokeKind()).ifPresent(kind -> {
+                List<JaasLoginModuleCallSite.SlotValue> values = new ArrayList<>();
+                StaticValueFlow.Value receiver = invocation.receiver();
+                if (receiver == null) {
+                    throw new IllegalStateException("exact JAAS call has no receiver");
+                }
+                values.add(new JaasLoginModuleCallSite.SlotValue(
+                        TypedBridgeFact.Slot.receiver(receiverDescriptor(kind)),
+                        jaasValue(receiver)));
+                for (int ordinal = 0; ordinal < invocation.arguments().size(); ordinal++) {
+                    StaticValueFlow.Value argument = invocation.arguments().get(ordinal);
+                    String descriptor = Descriptor.paramType(invocation.descriptor(), ordinal);
+                    if (argument == null || descriptor == null) {
+                        throw new IllegalStateException("exact JAAS argument slot is missing");
+                    }
+                    values.add(new JaasLoginModuleCallSite.SlotValue(
+                            TypedBridgeFact.Slot.argument(ordinal, descriptor),
+                            jaasValue(argument)));
+                }
+                if (invocation.result() != null) {
+                    values.add(new JaasLoginModuleCallSite.SlotValue(
+                            TypedBridgeFact.Slot.returnValue(
+                                    Descriptor.returnType(invocation.descriptor())),
+                            jaasValue(invocation.result())));
+                }
+                TypedBridgeFact.CallSite callSite = jaasCallSite(invocation.call(), method);
+                JaasLoginModuleCallSite fact = JaasLoginModuleCallSite.withValues(callSite,
+                        kind, values);
+                invocation.call().propsNote(JaasLoginModuleCallSite.GRAPH_NOTE_KEY, fact);
+                switch (kind) {
+                    case APP_CONFIGURATION_ENTRY -> optionsEntries.add(fact);
+                    case OPTIONS_MAP_PUT -> optionMutations.add(fact);
+                    case LOGIN_MODULE_INITIALIZE -> initializes.add(fact);
+                    case LOGIN_MODULE_LOGIN -> logins.add(fact);
+                }
+            });
+        }
+        List<JdbcConnectionCallSite> jdbcConnections = graph.callsOfMethod(hostMethodKey).stream()
+                .map(call -> call.note(JdbcConnectionCallSite.GRAPH_NOTE_KEY))
+                .filter(JdbcConnectionCallSite.class::isInstance)
+                .map(JdbcConnectionCallSite.class::cast)
+                .toList();
+        for (JaasLoginModuleCallSite optionsEntry : optionsEntries) {
+            String optionsIdentity = optionsEntry.argument(2).value().token();
+            List<JaasLoginModuleCallSite> matchingMutations = optionMutations.stream()
+                    .filter(mutation -> optionsIdentity.equals(mutation.receiver().value().token()))
+                    .toList();
+            for (JaasLoginModuleCallSite initialize : initializes) {
+                for (JaasLoginModuleCallSite login : logins) {
+                    for (JdbcConnectionCallSite jdbcConnection : jdbcConnections) {
+                        JaasLoginModuleFlow flowFact = JaasLoginModuleFlow.connect(jdbcConnection,
+                                optionsEntry, matchingMutations, initialize, login);
+                        Node loginCall = graph.node(login.callSite().callId());
+                        List<JaasLoginModuleFlow> flows = jaasFlows(
+                                loginCall.note(JaasLoginModuleFlow.GRAPH_NOTE_KEY));
+                        flows.add(flowFact);
+                        loginCall.propsNote(JaasLoginModuleFlow.GRAPH_NOTE_KEY,
+                                List.copyOf(flows));
+                    }
+                }
+            }
+        }
+    }
+
+    private static List<JaasLoginModuleFlow> jaasFlows(Object value) {
+        if (value == null) {
+            return new ArrayList<>();
+        }
+        if (!(value instanceof List<?> values)) {
+            throw new IllegalStateException("JAAS flow note is not a flow list");
+        }
+        List<JaasLoginModuleFlow> result = new ArrayList<>(values.size());
+        for (Object item : values) {
+            if (!(item instanceof JaasLoginModuleFlow flow)) {
+                throw new IllegalStateException("JAAS flow note contains an invalid fact");
+            }
+            result.add(flow);
+        }
+        return result;
+    }
+
+    private static void annotateUnknownJaasLoginModuleFacts(Graph graph, MethodInfo method,
+                                                             String hostMethodKey) {
+        MethodId hostMethod = MethodId.of(method.owner(), method.name(), method.descriptor());
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            JaasLoginModuleCallSite.fromCall(call.id(), hostMethod, call.offset(), call.owner(),
+                    call.name(), call.descriptor(), call.invokeKind())
+                    .ifPresent(fact -> call.propsNote(JaasLoginModuleCallSite.GRAPH_NOTE_KEY,
+                            fact));
+        }
+    }
+
+    private static String receiverDescriptor(JaasLoginModuleCallSite.Kind kind) {
+        return switch (kind) {
+            case APP_CONFIGURATION_ENTRY -> JaasLoginModuleCallSite.APP_CONFIGURATION_ENTRY_DESCRIPTOR;
+            case OPTIONS_MAP_PUT -> JaasLoginModuleCallSite.MAP_DESCRIPTOR;
+            case LOGIN_MODULE_INITIALIZE, LOGIN_MODULE_LOGIN ->
+                    JaasLoginModuleCallSite.LOGIN_MODULE_DESCRIPTOR;
+        };
+    }
+
+    private static JaasLoginModuleCallSite.ValueIdentity jaasValue(
+            StaticValueFlow.Value value) {
+        if (value == null) {
+            throw new IllegalArgumentException("JAAS value-flow slot is missing");
+        }
+        return switch (value.state()) {
+            case KNOWN -> JaasLoginModuleCallSite.ValueIdentity.known(value.identity(),
+                    value.descriptor(), value.producerOffset(), value.displayValue());
+            case NULL -> JaasLoginModuleCallSite.ValueIdentity.nullValue(value.identity(),
+                    value.descriptor(), value.producerOffset());
+            case UNKNOWN -> JaasLoginModuleCallSite.ValueIdentity.unknown(value.identity(),
+                    value.descriptor(), value.producerOffset());
+        };
+    }
+
+    private static TypedBridgeFact.CallSite jaasCallSite(Node call, MethodInfo method) {
+        return new TypedBridgeFact.CallSite(call.id(),
+                MethodId.of(method.owner(), method.name(), method.descriptor()), call.offset(),
+                call.owner(), call.name(), call.descriptor(), bridgeInvokeKind(call.invokeKind()));
     }
 
     private static JdbcConnectionCallSite.ValueIdentity jdbcValue(StaticValueFlow.Value value) {
