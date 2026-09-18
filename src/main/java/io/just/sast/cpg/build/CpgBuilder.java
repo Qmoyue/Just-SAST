@@ -19,6 +19,8 @@ import io.just.sast.model.JndiReferenceFact;
 import io.just.sast.model.JndiLookupCallSite;
 import io.just.sast.model.JndiLookupCapability;
 import io.just.sast.model.JndiLookupIdentityFlow;
+import io.just.sast.model.JndiNamingEnumerationCallSite;
+import io.just.sast.model.JndiSearchReturnFlow;
 import io.just.sast.model.MethodInvokeCallSite;
 import io.just.sast.model.MethodId;
 import io.just.sast.model.MethodInfo;
@@ -772,9 +774,9 @@ public final class CpgBuilder {
     }
 
     /**
-     * Consume the protocol-neutral value-flow result at the exact JNDI lookup/search boundary.
-     * The only continuation this owner proves is the same lookup result identity becoming a
-     * DirContext.search receiver in the same straight-line method.
+     * Publish exact JNDI lookup/search and enumeration-consumer facts from the protocol-neutral
+     * value-flow seam. Lookup identity and search-return propagation remain separate typed
+     * relations; this owner never invokes a provider or interprets a returned object.
      */
     private static void annotateJndiLookupIdentityFacts(Graph graph, MethodInfo method) {
         String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
@@ -788,6 +790,7 @@ public final class CpgBuilder {
         }
         List<JndiLookupCallSite> lookups = new ArrayList<>();
         List<JndiLookupCallSite> searches = new ArrayList<>();
+        List<JndiNamingEnumerationCallSite> consumers = new ArrayList<>();
         for (StaticValueFlow.Invocation invocation : flow.invocations()) {
             JndiLookupCallSite.matchKind(invocation.owner(), invocation.name(),
                     invocation.descriptor(), invocation.invokeKind()).ifPresent(kind -> {
@@ -822,8 +825,30 @@ public final class CpgBuilder {
                     searches.add(fact);
                 }
             });
+            JndiNamingEnumerationCallSite.matchKind(invocation.owner(), invocation.name(),
+                    invocation.descriptor(), invocation.invokeKind()).ifPresent(kind -> {
+                StaticValueFlow.Value receiver = invocation.receiver();
+                if (receiver == null || invocation.result() == null) {
+                    throw new IllegalStateException(
+                            "exact JNDI enumeration call has a missing value slot");
+                }
+                List<JndiNamingEnumerationCallSite.SlotValue> values = List.of(
+                        new JndiNamingEnumerationCallSite.SlotValue(
+                                TypedBridgeFact.Slot.receiver(
+                                        jndiEnumerationReceiverDescriptor(invocation.owner())),
+                                jndiValue(receiver)),
+                        new JndiNamingEnumerationCallSite.SlotValue(
+                                TypedBridgeFact.Slot.returnValue(
+                                        Descriptor.returnType(invocation.descriptor())),
+                                jndiValue(invocation.result())));
+                JndiNamingEnumerationCallSite fact = JndiNamingEnumerationCallSite.withValues(
+                        jndiCallSite(invocation.call(), method), kind, values);
+                invocation.call().propsNote(JndiNamingEnumerationCallSite.GRAPH_NOTE_KEY, fact);
+                consumers.add(fact);
+            });
         }
         attachJndiLookupIdentityFlows(graph, lookups, searches);
+        attachJndiSearchReturnFlows(graph, searches, consumers);
     }
 
     private static void attachJndiLookupIdentityFlows(Graph graph,
@@ -840,11 +865,26 @@ public final class CpgBuilder {
         }
     }
 
+    private static void attachJndiSearchReturnFlows(
+            Graph graph, List<JndiLookupCallSite> searches,
+            List<JndiNamingEnumerationCallSite> consumers) {
+        for (JndiNamingEnumerationCallSite consumer : consumers) {
+            List<JndiSearchReturnFlow> flows = searches.stream()
+                    .map(search -> JndiSearchReturnFlow.connect(search, consumer))
+                    .toList();
+            if (!flows.isEmpty()) {
+                graph.node(consumer.callSite().callId()).propsNote(
+                        JndiSearchReturnFlow.GRAPH_NOTE_KEY, flows);
+            }
+        }
+    }
+
     private static void annotateUnknownJndiLookupFacts(Graph graph, MethodInfo method,
                                                        String hostMethodKey) {
         MethodId hostMethod = MethodId.of(method.owner(), method.name(), method.descriptor());
         List<JndiLookupCallSite> lookups = new ArrayList<>();
         List<JndiLookupCallSite> searches = new ArrayList<>();
+        List<JndiNamingEnumerationCallSite> consumers = new ArrayList<>();
         for (Node call : graph.callsOfMethod(hostMethodKey)) {
             JndiLookupCallSite.fromCall(call.id(), hostMethod, call.offset(), call.owner(),
                     call.name(), call.descriptor(), call.invokeKind())
@@ -856,8 +896,15 @@ public final class CpgBuilder {
                             searches.add(fact);
                         }
                     });
+            JndiNamingEnumerationCallSite.fromCall(call.id(), hostMethod, call.offset(),
+                    call.owner(), call.name(), call.descriptor(), call.invokeKind())
+                    .ifPresent(fact -> {
+                        call.propsNote(JndiNamingEnumerationCallSite.GRAPH_NOTE_KEY, fact);
+                        consumers.add(fact);
+                    });
         }
         attachJndiLookupIdentityFlows(graph, lookups, searches);
+        attachJndiSearchReturnFlows(graph, searches, consumers);
     }
 
     /** Publish capability-only/partial/unknown status at the exact JNDI boundary. */
@@ -1131,6 +1178,12 @@ public final class CpgBuilder {
         return kind == JndiLookupCallSite.Kind.INITIAL_CONTEXT_LOOKUP
                 ? JndiLookupCallSite.LOOKUP_RECEIVER_DESCRIPTOR
                 : JndiLookupCallSite.SEARCH_RECEIVER_DESCRIPTOR;
+    }
+
+    private static String jndiEnumerationReceiverDescriptor(String owner) {
+        return JndiNamingEnumerationCallSite.JAVA_ENUMERATION_OWNER.equals(owner)
+                ? JndiNamingEnumerationCallSite.JAVA_ENUMERATION_DESCRIPTOR
+                : JndiNamingEnumerationCallSite.NAMING_ENUMERATION_DESCRIPTOR;
     }
 
     private static JndiLookupCallSite.ValueIdentity jndiValue(StaticValueFlow.Value value) {
