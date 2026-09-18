@@ -143,6 +143,64 @@ class TypedBridgeFactContractTest {
     }
 
     @Test
+    void explicitCrossArtifactEdgeRetainsEndpointOwnersOrdinalsDescriptorsAndProvenance() {
+        ArtifactProvenance application = applicationArtifact();
+        ArtifactProvenance dependency = new ArtifactProvenance("dependency.jar",
+                ArtifactProvenance.Role.DEPENDENCY, "D".repeat(64), 256L);
+        TypedBridgeFact.Endpoint producer = endpoint("producer", 11L, 4,
+                "fixture/Producer", "produce", "()Ljava/lang/String;",
+                "url-value", "java/lang/String", application,
+                TypedBridgeFact.Slot.returnValue("Ljava/lang/String;"));
+        TypedBridgeFact.Endpoint consumer = endpoint("consumer", 19L, 8,
+                "fixture/Consumer", "accept", "(Ljava/lang/String;)V",
+                "url-value", "java/lang/String", dependency,
+                TypedBridgeFact.Slot.argument(0, "Ljava/lang/String;"));
+
+        TypedBridgeFact edge = TypedBridgeFact.connectCrossArtifact(
+                TypedBridgeFact.Relation.VALUE_FLOW, producer, consumer,
+                TypedBridgeFact.IdentityRelation.SAME);
+
+        assertTrue(edge.proved());
+        assertEquals(TypedBridgeFact.ArtifactRelation.EXPLICIT_CROSS_ARTIFACT,
+                edge.artifactRelation());
+        assertEquals("fixture/Producer", edge.producerOwner());
+        assertEquals("fixture/Consumer", edge.consumerOwner());
+        assertEquals(-1, edge.producerOrdinal());
+        assertEquals(0, edge.consumerOrdinal());
+        assertEquals("Ljava/lang/String;", edge.producerDescriptor());
+        assertEquals("Ljava/lang/String;", edge.consumerDescriptor());
+        assertEquals(application.identity(), edge.producerArtifact().identity());
+        assertEquals(dependency.identity(), edge.consumerArtifact().identity());
+    }
+
+    @Test
+    void crossArtifactHelperKeepsUnknownAndSameArtifactBoundariesExplicit() {
+        ArtifactProvenance application = applicationArtifact();
+        TypedBridgeFact.Endpoint producer = endpoint("producer", 21L, 4,
+                "fixture/Producer", "produce", "()Ljava/lang/String;",
+                "url-value", "java/lang/String", application,
+                TypedBridgeFact.Slot.returnValue("Ljava/lang/String;"));
+        TypedBridgeFact.Endpoint consumer = endpoint("consumer", 29L, 8,
+                "fixture/Consumer", "accept", "(Ljava/lang/String;)V",
+                "url-value", "java/lang/String", application,
+                TypedBridgeFact.Slot.argument(0, "Ljava/lang/String;"));
+
+        TypedBridgeFact sameArtifact = TypedBridgeFact.connectCrossArtifact(
+                TypedBridgeFact.Relation.VALUE_FLOW, producer, consumer,
+                TypedBridgeFact.IdentityRelation.SAME);
+        TypedBridgeFact unknownRelation = TypedBridgeFact.connect(
+                TypedBridgeFact.Relation.VALUE_FLOW, producer, consumer,
+                TypedBridgeFact.IdentityRelation.SAME,
+                TypedBridgeFact.ArtifactRelation.UNKNOWN);
+
+        assertEquals(TypedBridgeFact.Status.UNKNOWN, sameArtifact.status());
+        assertEquals(TypedBridgeFact.Reason.ARTIFACT_RELATION_MISMATCH, sameArtifact.reason());
+        assertEquals(TypedBridgeFact.Status.PARTIAL, unknownRelation.status());
+        assertEquals(TypedBridgeFact.Reason.ARTIFACT_PROVENANCE_UNKNOWN,
+                unknownRelation.reason());
+    }
+
+    @Test
     void slotAndForgedStatusContractsFailClosed() {
         assertThrows(IllegalArgumentException.class,
                 () -> TypedBridgeFact.Slot.argument(-1, "Ljava/lang/String;"));

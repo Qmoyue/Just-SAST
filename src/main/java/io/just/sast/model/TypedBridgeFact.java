@@ -236,8 +236,59 @@ public record TypedBridgeFact(
                 artifactRelation, decision.status(), decision.reason());
     }
 
+    /**
+     * Connect endpoints whose artifacts are explicitly known to be different.
+     *
+     * <p>The relation is deliberately fixed here instead of asking each protocol owner to
+     * repeat the cross-artifact enum choice.  Missing digests and identity/type/descriptor
+     * conflicts still remain the normal explicit PARTIAL/UNKNOWN result of {@link #connect};
+     * this helper never turns an unproved relation into a proved edge.</p>
+     */
+    public static TypedBridgeFact connectCrossArtifact(Relation relation, Endpoint producer,
+                                                       Endpoint consumer,
+                                                       IdentityRelation identityRelation) {
+        return connect(relation, producer, consumer, identityRelation,
+                ArtifactRelation.EXPLICIT_CROSS_ARTIFACT);
+    }
+
     public boolean proved() {
         return status == Status.PROVED;
+    }
+
+    /** The exact callee owner at the producer endpoint; no display-name inference is involved. */
+    public String producerOwner() {
+        return producer.callSite().calleeOwner();
+    }
+
+    /** The exact callee owner at the consumer endpoint; no display-name inference is involved. */
+    public String consumerOwner() {
+        return consumer.callSite().calleeOwner();
+    }
+
+    /** The producer endpoint's declared slot ordinal, or -1 for receiver/return slots. */
+    public int producerOrdinal() {
+        return producer.slot().ordinal();
+    }
+
+    /** The consumer endpoint's declared slot ordinal, or -1 for receiver/return slots. */
+    public int consumerOrdinal() {
+        return consumer.slot().ordinal();
+    }
+
+    public String producerDescriptor() {
+        return producer.slot().descriptor();
+    }
+
+    public String consumerDescriptor() {
+        return consumer.slot().descriptor();
+    }
+
+    public ArtifactProvenance producerArtifact() {
+        return producer.artifact();
+    }
+
+    public ArtifactProvenance consumerArtifact() {
+        return consumer.artifact();
     }
 
     /** Stable semantic identity includes both endpoint positions and every constraint axis. */
