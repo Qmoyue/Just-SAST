@@ -504,6 +504,22 @@ final class StaticValueFlow {
             return length;
         }
 
+        /** Return all physically observed elements in ordinal order, or null when incomplete. */
+        List<Value> elements() {
+            if (!valid || length < 0) {
+                return null;
+            }
+            List<Value> result = new ArrayList<>(length);
+            for (int index = 0; index < length; index++) {
+                Value value = elements.get(index);
+                if (value == null) {
+                    return null;
+                }
+                result.add(value);
+            }
+            return List.copyOf(result);
+        }
+
         /** Return exact Class literals in array order, or null when any member is unresolved. */
         List<String> interfaceTypes() {
             if (!valid || !"[Ljava/lang/Class;".equals(descriptor)

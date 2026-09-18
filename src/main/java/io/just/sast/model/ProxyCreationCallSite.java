@@ -247,8 +247,11 @@ public record ProxyCreationCallSite(
         Objects.requireNonNull(interfaceSet, "proxy interface-set");
         Objects.requireNonNull(handler, "proxy handler identity");
         Objects.requireNonNull(proxy, "proxy identity");
-        if (classLoader.producerOffset() < 0 || interfaceSet.producerOffset() < 0
-                || handler.producerOffset() < 0 || proxy.producerOffset() < 0) {
+        boolean allSlotsUnknown = classLoader.producerOffset() < 0
+                && interfaceSet.producerOffset() < 0
+                && handler.producerOffset() < 0
+                && proxy.producerOffset() < 0;
+        if (allSlotsUnknown) {
             return new Decision(Status.PARTIAL, Reason.VALUE_FLOW_INCOMPLETE);
         }
         if (interfaceSet.state() == ValueState.NULL) {
@@ -256,6 +259,10 @@ public record ProxyCreationCallSite(
         }
         if (interfaceSet.state() == ValueState.UNKNOWN) {
             return new Decision(Status.PARTIAL, Reason.INTERFACE_SET_UNKNOWN);
+        }
+        if (classLoader.producerOffset() < 0 || interfaceSet.producerOffset() < 0
+                || handler.producerOffset() < 0 || proxy.producerOffset() < 0) {
+            return new Decision(Status.PARTIAL, Reason.VALUE_FLOW_INCOMPLETE);
         }
         if (handler.state() == ValueState.NULL) {
             return new Decision(Status.PARTIAL, Reason.NULL_HANDLER);

@@ -19,6 +19,7 @@ import io.just.sast.model.JndiReferenceFact;
 import io.just.sast.model.JndiLookupCallSite;
 import io.just.sast.model.JndiLookupCapability;
 import io.just.sast.model.JndiLookupIdentityFlow;
+import io.just.sast.model.MethodInvokeCallSite;
 import io.just.sast.model.MethodId;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
@@ -899,6 +900,7 @@ public final class CpgBuilder {
         StaticValueFlow.Result flow = StaticValueFlow.analyze(graph, method);
         if (!flow.complete()) {
             annotateUnknownProxyCreationFacts(graph, method, hostMethodKey);
+            annotateUnknownMethodInvokeFacts(graph, method, hostMethodKey);
             return;
         }
         for (StaticValueFlow.Invocation invocation : flow.invocations()) {
@@ -919,6 +921,7 @@ public final class CpgBuilder {
             invocation.call().propsNote(ProxyCreationCallSite.GRAPH_NOTE_KEY, fact);
         }
         annotateProxyInterfaceFacts(graph, method, flow);
+        annotateMethodInvokeFacts(graph, method, flow);
     }
 
     /**
@@ -952,6 +955,96 @@ public final class CpgBuilder {
                     .ifPresent(site -> invocation.call().propsNote(
                             ProxyInterfaceCallSite.GRAPH_NOTE_KEY, site));
         }
+    }
+
+    /**
+     * Publish the exact reflective Method.invoke boundary from the protocol-neutral value flow.
+     * The call-site name/descriptor are exact API facts; Method, target, packed arguments and
+     * return retain independent physical identities.  This owner never resolves or invokes the
+     * reflected target.
+     */
+    private static void annotateMethodInvokeFacts(Graph graph, MethodInfo method,
+                                                   StaticValueFlow.Result flow) {
+        for (StaticValueFlow.Invocation invocation : flow.invocations()) {
+            if (!MethodInvokeCallSite.matches(invocation.owner(), invocation.name(),
+                    invocation.descriptor(), invocation.invokeKind())) {
+                continue;
+            }
+            if (invocation.receiver() == null || invocation.arguments().size() != 2
+                    || invocation.result() == null) {
+                throw new IllegalStateException("exact Method.invoke has an invalid value-flow shape");
+            }
+            MethodInvokeCallSite fact = MethodInvokeCallSite.withValues(
+                    methodInvokeCallSite(invocation.call(), method),
+                    methodInvokeValue(invocation.receiver()),
+                    methodInvokeValue(invocation.arguments().get(0)),
+                    methodInvokeArguments(invocation.arguments().get(1)),
+                    methodInvokeValue(invocation.result()));
+            invocation.call().propsNote(MethodInvokeCallSite.GRAPH_NOTE_KEY, fact);
+        }
+    }
+
+    private static void annotateUnknownMethodInvokeFacts(Graph graph, MethodInfo method,
+                                                          String hostMethodKey) {
+        MethodId hostMethod = MethodId.of(method.owner(), method.name(), method.descriptor());
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            MethodInvokeCallSite.fromCall(call.id(), hostMethod, call.offset(), call.owner(),
+                    call.name(), call.descriptor(), call.invokeKind())
+                    .ifPresent(fact -> call.propsNote(MethodInvokeCallSite.GRAPH_NOTE_KEY, fact));
+        }
+    }
+
+    private static MethodInvokeCallSite.ArgumentArray methodInvokeArguments(
+            StaticValueFlow.Value value) {
+        if (value == null) {
+            throw new IllegalArgumentException("Method.invoke argument array is missing");
+        }
+        if (value.state() == StaticValueFlow.ValueState.NULL) {
+            return MethodInvokeCallSite.ArgumentArray.nullValue(value.identity(),
+                    value.producerOffset());
+        }
+        if (value.state() != StaticValueFlow.ValueState.KNOWN) {
+            return MethodInvokeCallSite.ArgumentArray.unknown(value.identity(), value.descriptor(),
+                    value.producerOffset());
+        }
+        if (!MethodInvokeCallSite.ARGUMENTS_DESCRIPTOR.equals(value.descriptor())
+                || value.arrayShape() == null) {
+            return MethodInvokeCallSite.ArgumentArray.partial(value.identity(), value.descriptor(),
+                    value.producerOffset());
+        }
+        List<StaticValueFlow.Value> elements = value.arrayShape().elements();
+        if (elements == null) {
+            return MethodInvokeCallSite.ArgumentArray.partial(value.identity(), value.descriptor(),
+                    value.producerOffset());
+        }
+        List<MethodInvokeCallSite.ArgumentArray.Element> constraints = new ArrayList<>();
+        for (int ordinal = 0; ordinal < elements.size(); ordinal++) {
+            constraints.add(new MethodInvokeCallSite.ArgumentArray.Element(ordinal,
+                    methodInvokeValue(elements.get(ordinal))));
+        }
+        return MethodInvokeCallSite.ArgumentArray.known(value.identity(), value.producerOffset(),
+                constraints);
+    }
+
+    private static MethodInvokeCallSite.ValueIdentity methodInvokeValue(
+            StaticValueFlow.Value value) {
+        if (value == null) {
+            throw new IllegalArgumentException("Method.invoke value-flow slot is missing");
+        }
+        return switch (value.state()) {
+            case KNOWN -> MethodInvokeCallSite.ValueIdentity.known(value.identity(),
+                    value.descriptor(), value.producerOffset());
+            case NULL -> MethodInvokeCallSite.ValueIdentity.nullValue(value.identity(),
+                    value.descriptor(), value.producerOffset());
+            case UNKNOWN -> MethodInvokeCallSite.ValueIdentity.unknown(value.identity(),
+                    value.descriptor(), value.producerOffset());
+        };
+    }
+
+    private static TypedBridgeFact.CallSite methodInvokeCallSite(Node call, MethodInfo method) {
+        return new TypedBridgeFact.CallSite(call.id(),
+                MethodId.of(method.owner(), method.name(), method.descriptor()), call.offset(),
+                call.owner(), call.name(), call.descriptor(), bridgeInvokeKind(call.invokeKind()));
     }
 
     private static void annotateUnknownProxyCreationFacts(Graph graph, MethodInfo method,
