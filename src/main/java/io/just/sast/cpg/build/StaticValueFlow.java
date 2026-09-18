@@ -160,7 +160,15 @@ final class StaticValueFlow {
                 if (value == null) {
                     return false;
                 }
-                stack.add(value);
+                TypeRef castType = insn.typeRef();
+                if (castType == null || !validTypeDescriptor(castType.descriptor())) {
+                    return false;
+                }
+                String castDescriptor = castDescriptor(castType);
+                if (castDescriptor == null) {
+                    return false;
+                }
+                stack.add(value.cast(castDescriptor));
             }
             case GETSTATIC -> {
                 FieldRef field = insn.fieldRef();
@@ -440,6 +448,24 @@ final class StaticValueFlow {
                 || descriptor.indexOf('.') >= 0 ? null : descriptor;
     }
 
+    private static String castDescriptor(TypeRef type) {
+        String descriptor = type.descriptor();
+        if (descriptor == null || descriptor.isBlank()) {
+            return null;
+        }
+        if (descriptor.startsWith("L") && descriptor.endsWith(";")) {
+            return descriptor;
+        }
+        if (descriptor.startsWith("[")) {
+            return descriptor;
+        }
+        if (descriptor.indexOf('.') >= 0 || descriptor.indexOf(';') >= 0
+                || descriptor.indexOf('(') >= 0 || descriptor.indexOf(')') >= 0) {
+            return null;
+        }
+        return "L" + descriptor + ";";
+    }
+
     private static String token(String hostMethodKey, int offset, String kind) {
         return "value-flow-v1:" + hostMethodKey + ":" + offset + ":" + kind;
     }
@@ -590,6 +616,11 @@ final class StaticValueFlow {
                     new TypedBridgeFact.FlowIdentity(token(hostMethodKey, offset, "array")),
                     null, descriptor, offset, false, null, null,
                     new ArrayShape(descriptor, component, length));
+        }
+
+        Value cast(String castDescriptor) {
+            return new Value(state, identity, displayValue, castDescriptor, producerOffset,
+                    isCategory2(castDescriptor), integerValue, classLiteral, arrayShape);
         }
     }
 

@@ -12,6 +12,9 @@ import io.just.sast.model.JndiObjectFactoryDispatch;
 import io.just.sast.model.JaasLoginModuleCallSite;
 import io.just.sast.model.JaasLoginModuleDispatch;
 import io.just.sast.model.JdkSourceInfo;
+import io.just.sast.model.ProxyInterfaceCallSite;
+import io.just.sast.model.ProxyInterfaceDispatch;
+import io.just.sast.model.ClassInfo;
 import java.util.HashMap;
 import java.util.Map;
 import io.just.sast.model.InvokeDynamicRef;
@@ -73,7 +76,7 @@ public final class CallGraphBuilder {
                     edgeCount++;
                 }
                 case "VIRTUAL" -> edgeCount += addVirtual(graph, call, owner, name, desc);
-                case "INTERFACE" -> edgeCount += addInterface(graph, call, owner, name, desc);
+                case "INTERFACE" -> edgeCount += addInterfaceOrProxy(graph, call, owner, name, desc);
                 case "DYNAMIC" -> edgeCount += addLambda(graph, call, (InvokeDynamicRef) call.prop("indy"));
                 default -> JustLogger.debug("未知调用类型 {}: {}#{}", kind, owner, name);
             }
@@ -268,6 +271,145 @@ public final class CallGraphBuilder {
             count++;
         }
         return count;
+    }
+
+    /**
+     * A receiver proven to be a local Proxy.newProxyInstance result must not fall through to
+     * ordinary CHA implementer enumeration.  Resolve only the exact configured interfaces and
+     * their exact (name, descriptor) declarations.
+     */
+    private int addInterfaceOrProxy(Graph graph, Node call, String owner, String name,
+                                    String desc) {
+        Object note = call.note(ProxyInterfaceCallSite.GRAPH_NOTE_KEY);
+        if (!(note instanceof ProxyInterfaceCallSite site)) {
+            return addInterface(graph, call, owner, name, desc);
+        }
+        ProxyInterfaceDispatch dispatch = resolveProxyInterfaceDispatch(site);
+        call.propsNote(ProxyInterfaceCallSite.DISPATCH_NOTE_KEY, dispatch);
+        if (!dispatch.resolved()) {
+            return 0;
+        }
+        ProxyInterfaceDispatch.Declaration target = dispatch.target();
+        Node targetNode = graph.methodNode(target.owner(), target.name(), target.descriptor(),
+                !hierarchy.isInitialClass(target.owner()));
+        graph.addEdge(call, targetNode, EdgeType.DISPATCHES, "PROXY_DEFAULT");
+        return 1;
+    }
+
+    private ProxyInterfaceDispatch resolveProxyInterfaceDispatch(ProxyInterfaceCallSite site) {
+        if (site.status() != ProxyInterfaceCallSite.Status.PROVED) {
+            ProxyInterfaceDispatch.Status status = site.status()
+                    == ProxyInterfaceCallSite.Status.PARTIAL
+                    ? ProxyInterfaceDispatch.Status.PARTIAL
+                    : ProxyInterfaceDispatch.Status.UNKNOWN;
+            return ProxyInterfaceDispatch.unresolved(site, status, mapProxyReason(site.reason()));
+        }
+        if (!site.creation().interfaceSet().known()) {
+            return ProxyInterfaceDispatch.unresolved(site, ProxyInterfaceDispatch.Status.PARTIAL,
+                    ProxyInterfaceDispatch.Reason.INTERFACE_SET_UNKNOWN);
+        }
+        ClassInfo callOwner = hierarchy.classInfo(site.callSite().calleeOwner());
+        if (callOwner == null) {
+            return ProxyInterfaceDispatch.unresolved(site, ProxyInterfaceDispatch.Status.PARTIAL,
+                    ProxyInterfaceDispatch.Reason.INTERFACE_TYPE_UNRESOLVED);
+        }
+        if (!callOwner.isInterface()) {
+            return ProxyInterfaceDispatch.unresolved(site, ProxyInterfaceDispatch.Status.UNKNOWN,
+                    ProxyInterfaceDispatch.Reason.INTERFACE_MEMBER_NOT_INTERFACE);
+        }
+
+        List<ProxyInterfaceDispatch.Declaration> declarations = new ArrayList<>();
+        boolean unresolvedInterface = false;
+        boolean ownerDeclared = false;
+        for (String interfaceType : site.creation().interfaceSet().interfaceTypes()) {
+            ClassInfo configured = hierarchy.classInfo(interfaceType);
+            if (configured == null) {
+                unresolvedInterface = true;
+                continue;
+            }
+            if (!configured.isInterface()) {
+                return ProxyInterfaceDispatch.unresolved(site,
+                        ProxyInterfaceDispatch.Status.UNKNOWN,
+                        ProxyInterfaceDispatch.Reason.INTERFACE_MEMBER_NOT_INTERFACE);
+            }
+            if (interfaceType.equals(site.callSite().calleeOwner())
+                    || hierarchy.isSubtypeOf(interfaceType, site.callSite().calleeOwner())) {
+                ownerDeclared = true;
+            }
+            String declarationOwner = hierarchy.resolveMethod(interfaceType,
+                    site.callSite().calleeName(), site.callSite().calleeDescriptor());
+            if (declarationOwner == null) {
+                continue;
+            }
+            ClassInfo declarationClass = hierarchy.classInfo(declarationOwner);
+            if (declarationClass == null) {
+                unresolvedInterface = true;
+                continue;
+            }
+            if (!declarationClass.isInterface()) {
+                continue;
+            }
+            io.just.sast.model.MethodInfo method = declarationClass.method(
+                    site.callSite().calleeName(), site.callSite().calleeDescriptor());
+            if (method == null || Modifier.isStatic(method.access())
+                    || Modifier.isPrivate(method.access())) {
+                continue;
+            }
+            ProxyInterfaceDispatch.Kind kind = Modifier.isAbstract(method.access())
+                    ? ProxyInterfaceDispatch.Kind.ABSTRACT_METHOD
+                    : ProxyInterfaceDispatch.Kind.DEFAULT_METHOD;
+            ProxyInterfaceDispatch.Declaration declaration =
+                    new ProxyInterfaceDispatch.Declaration(declarationOwner,
+                            site.callSite().calleeName(), site.callSite().calleeDescriptor(), kind);
+            if (!declarations.contains(declaration)) {
+                declarations.add(declaration);
+            }
+        }
+        if (unresolvedInterface) {
+            return ProxyInterfaceDispatch.unresolved(site, ProxyInterfaceDispatch.Status.PARTIAL,
+                    ProxyInterfaceDispatch.Reason.INTERFACE_TYPE_UNRESOLVED);
+        }
+        if (declarations.isEmpty()) {
+            return ProxyInterfaceDispatch.unresolved(site, ProxyInterfaceDispatch.Status.UNKNOWN,
+                    ownerDeclared ? ProxyInterfaceDispatch.Reason.DESCRIPTOR_NOT_DECLARED
+                            : ProxyInterfaceDispatch.Reason.INTERFACE_OWNER_NOT_DECLARED);
+        }
+        if (!ownerDeclared) {
+            return ProxyInterfaceDispatch.unresolved(site, ProxyInterfaceDispatch.Status.UNKNOWN,
+                    ProxyInterfaceDispatch.Reason.INTERFACE_OWNER_NOT_DECLARED);
+        }
+
+        List<ProxyInterfaceDispatch.Declaration> defaults = declarations.stream()
+                .filter(declaration -> declaration.kind()
+                        == ProxyInterfaceDispatch.Kind.DEFAULT_METHOD)
+                .toList();
+        if (defaults.isEmpty()) {
+            return ProxyInterfaceDispatch.handlerRequired(site, declarations);
+        }
+        List<ProxyInterfaceDispatch.Declaration> mostSpecific = defaults.stream()
+                .filter(candidate -> defaults.stream().allMatch(other ->
+                        candidate.owner().equals(other.owner())
+                                || hierarchy.isSubtypeOf(candidate.owner(), other.owner())))
+                .toList();
+        if (mostSpecific.size() != 1) {
+            return new ProxyInterfaceDispatch(site, defaults, null,
+                    ProxyInterfaceDispatch.Status.UNKNOWN,
+                    ProxyInterfaceDispatch.Reason.DEFAULT_AMBIGUOUS);
+        }
+        return ProxyInterfaceDispatch.defaultResolved(site, mostSpecific.get(0), declarations);
+    }
+
+    private static ProxyInterfaceDispatch.Reason mapProxyReason(
+            ProxyInterfaceCallSite.Reason reason) {
+        return switch (reason) {
+            case NONE -> ProxyInterfaceDispatch.Reason.NONE;
+            case VALUE_FLOW_INCOMPLETE -> ProxyInterfaceDispatch.Reason.VALUE_FLOW_INCOMPLETE;
+            case PROXY_CREATION_INCOMPLETE -> ProxyInterfaceDispatch.Reason.PROXY_CREATION_INCOMPLETE;
+            case INTERFACE_SET_UNKNOWN -> ProxyInterfaceDispatch.Reason.INTERFACE_SET_UNKNOWN;
+            case NULL_RECEIVER -> ProxyInterfaceDispatch.Reason.NULL_RECEIVER;
+            case RECEIVER_DESCRIPTOR_MISMATCH ->
+                    ProxyInterfaceDispatch.Reason.RECEIVER_DESCRIPTOR_MISMATCH;
+        };
     }
 
     private DispatchPlan dispatchPlan(String kind, String owner, String name, String desc) {

@@ -24,6 +24,7 @@ import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
 import io.just.sast.model.ProxyCreationCallSite;
+import io.just.sast.model.ProxyInterfaceCallSite;
 import io.just.sast.model.TypeRef;
 import io.just.sast.model.TypedBridgeFact;
 
@@ -113,7 +114,7 @@ public final class CpgBuilder {
                 annotateJaasLoginModuleFacts(graph, method);
                 annotateJndiLookupIdentityFacts(graph, method);
                 annotateJndiLookupCapabilityFacts(graph, method);
-                annotateProxyCreationFacts(graph, method);
+                annotateProxyFacts(graph, method);
                 for (var tryCatch : method.tryCatch()) {
                     slice.accept(tryCatch);
                 }
@@ -889,8 +890,8 @@ public final class CpgBuilder {
         }
     }
 
-    /** Publish exact Proxy.newProxyInstance slot/identity facts without resolving the runtime. */
-    private static void annotateProxyCreationFacts(Graph graph, MethodInfo method) {
+    /** Publish proxy creation and interface-call facts without resolving or executing the runtime. */
+    private static void annotateProxyFacts(Graph graph, MethodInfo method) {
         String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
         if (method.instructions().isEmpty()) {
             return;
@@ -916,6 +917,40 @@ public final class CpgBuilder {
                     proxyValue(invocation.arguments().get(2)),
                     proxyValue(invocation.result()));
             invocation.call().propsNote(ProxyCreationCallSite.GRAPH_NOTE_KEY, fact);
+        }
+        annotateProxyInterfaceFacts(graph, method, flow);
+    }
+
+    /**
+     * Publish the exact interface call only when its receiver token is the physical result of
+     * the proxy factory in the same straight-line flow.  Class-hierarchy/default resolution is
+     * intentionally left to CallGraphBuilder; this owner never enumerates implementers.
+     */
+    private static void annotateProxyInterfaceFacts(Graph graph, MethodInfo method,
+                                                    StaticValueFlow.Result flow) {
+        Map<TypedBridgeFact.FlowIdentity, ProxyCreationCallSite> creations = new HashMap<>();
+        for (Node call : graph.callsOfMethod(methodKey(method.owner(), method.name(),
+                method.descriptor()))) {
+            Object note = call.note(ProxyCreationCallSite.GRAPH_NOTE_KEY);
+            if (note instanceof ProxyCreationCallSite creation) {
+                creations.put(creation.proxy().identity(), creation);
+            }
+        }
+        if (creations.isEmpty()) {
+            return;
+        }
+        for (StaticValueFlow.Invocation invocation : flow.invocations()) {
+            if (!"INTERFACE".equals(invocation.invokeKind()) || invocation.receiver() == null) {
+                continue;
+            }
+            ProxyCreationCallSite creation = creations.get(invocation.receiver().identity());
+            if (creation == null) {
+                continue;
+            }
+            ProxyInterfaceCallSite.fromValues(proxyCallSite(invocation.call(), method),
+                            proxyValue(invocation.receiver()), creation)
+                    .ifPresent(site -> invocation.call().propsNote(
+                            ProxyInterfaceCallSite.GRAPH_NOTE_KEY, site));
         }
     }
 
