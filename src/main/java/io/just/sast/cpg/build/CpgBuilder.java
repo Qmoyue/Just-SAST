@@ -570,33 +570,59 @@ public final class CpgBuilder {
     }
 
     /**
-     * Preserve the exact JDBC URL/Properties consumer and the finite straight-line value
-     * identities that reach it.  This seam deliberately models only local aliases, allocation
-     * identity, literal values and exact Properties mutations; it never evaluates a driver or
-     * treats equal display text as a flow.
+     * Consume protocol-neutral value-flow invocations at the exact JDBC boundary.  The
+     * value/alias/stack owner deliberately has no JDBC or driver vocabulary.
      */
     private static void annotateJdbcConnectionFacts(Graph graph, MethodInfo method) {
         String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
         if (method.instructions().isEmpty()) {
             return;
         }
-        if (!method.tryCatch().isEmpty()
-                || method.instructions().stream().anyMatch(insn -> insn.op().isCondJump()
-                || insn.op().isUncondJump() || insn.op().isSwitch())) {
+        StaticValueFlow.Result flow = StaticValueFlow.analyze(graph, method);
+        if (!flow.complete()) {
             annotateUnknownJdbcConnectionFacts(graph, method, hostMethodKey);
             return;
         }
-        List<JdbcFlowSlot> stack = new ArrayList<>();
-        Map<Integer, JdbcFlowSlot> locals = new HashMap<>();
+
         List<JdbcPropertyWrite> writes = new ArrayList<>();
         List<JdbcConnectionCapture> connections = new ArrayList<>();
-        for (InsnFact insn : method.instructions()) {
-            if (!transferJdbcInstruction(graph, method, hostMethodKey, insn, stack, locals,
-                    writes, connections)) {
-                annotateUnknownJdbcConnectionFacts(graph, method, hostMethodKey);
-                return;
+        for (StaticValueFlow.Invocation invocation : flow.invocations()) {
+            Node call = invocation.call();
+            if (JdbcConnectionCallSite.matches(invocation.owner(), invocation.name(),
+                    invocation.descriptor(), invocation.invokeKind())) {
+                if (invocation.arguments().size() != 2) {
+                    throw new IllegalStateException("exact JDBC consumer has unexpected arguments");
+                }
+                JdbcConnectionCallSite.Kind kind = JdbcConnectionCallSite.DRIVER_MANAGER_OWNER
+                        .equals(invocation.owner())
+                        ? JdbcConnectionCallSite.Kind.DRIVER_MANAGER_GET_CONNECTION
+                        : JdbcConnectionCallSite.Kind.DRIVER_CONNECT;
+                connections.add(new JdbcConnectionCapture(call, kind,
+                        jdbcValue(invocation.arguments().get(0)),
+                        jdbcValue(invocation.arguments().get(1))));
+            }
+
+            StaticValueFlow.Value receiver = invocation.receiver();
+            if (receiver != null
+                    && JdbcConnectionCallSite.PROPERTIES_DESCRIPTOR.equals(receiver.descriptor())
+                    && JdbcConnectionCallSite.PropertyEntry.PROPERTIES_OWNER
+                    .equals(invocation.owner())
+                    && "VIRTUAL".equals(invocation.invokeKind())
+                    && (JdbcConnectionCallSite.PropertyEntry.SET_PROPERTY_NAME
+                    .equals(invocation.name())
+                    || JdbcConnectionCallSite.PropertyEntry.PUT_NAME
+                    .equals(invocation.name()))
+                    && invocation.arguments().size() == 2
+                    && (JdbcConnectionCallSite.PropertyEntry.SET_PROPERTY_DESCRIPTOR
+                    .equals(invocation.descriptor())
+                    || JdbcConnectionCallSite.PropertyEntry.PUT_DESCRIPTOR
+                    .equals(invocation.descriptor()))) {
+                writes.add(new JdbcPropertyWrite(call, jdbcValue(receiver),
+                        jdbcValue(invocation.arguments().get(0)),
+                        jdbcValue(invocation.arguments().get(1))));
             }
         }
+
         for (JdbcConnectionCapture capture : connections) {
             List<JdbcConnectionCallSite.PropertyEntry> entries = writes.stream()
                     .filter(write -> write.receiver().token().equals(capture.properties().token()))
@@ -619,252 +645,19 @@ public final class CpgBuilder {
         }
     }
 
-    private static boolean transferJdbcInstruction(
-            Graph graph, MethodInfo method, String hostMethodKey, InsnFact insn,
-            List<JdbcFlowSlot> stack, Map<Integer, JdbcFlowSlot> locals,
-            List<JdbcPropertyWrite> writes, List<JdbcConnectionCapture> connections) {
-        if (insn == null || insn.op() == null) {
-            return false;
+    private static JdbcConnectionCallSite.ValueIdentity jdbcValue(StaticValueFlow.Value value) {
+        if (value == null) {
+            throw new IllegalArgumentException("JDBC value-flow slot is missing");
         }
-        switch (insn.op()) {
-            case NOP, IINC -> {
-                return true;
-            }
-            case ACONST_NULL -> stack.add(JdbcFlowSlot.nullValue(hostMethodKey, insn.offset()));
-            case ICONST_M1, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5,
-                    FCONST_0, FCONST_1, FCONST_2, BIPUSH, SIPUSH ->
-                    stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(), "I", false));
-            case LCONST_0, LCONST_1 ->
-                    stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(), "J", true));
-            case DCONST_0, DCONST_1 ->
-                    stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(), "D", true));
-            case LDC -> {
-                Object constant = insn.constant();
-                if (constant instanceof String value) {
-                    stack.add(JdbcFlowSlot.knownString(hostMethodKey, insn.offset(), value));
-                } else {
-                    stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(),
-                            constant instanceof Long ? "J"
-                                    : constant instanceof Double ? "D" : "Ljava/lang/Object;",
-                            constant instanceof Long || constant instanceof Double));
-                }
-            }
-            case ALOAD, ILOAD, FLOAD, LLOAD, DLOAD ->
-                    stack.add(locals.getOrDefault(insn.varIndex(), JdbcFlowSlot.unknown(
-                            hostMethodKey, insn.offset(), "Ljava/lang/Object;",
-                            insn.op() == Op.LLOAD || insn.op() == Op.DLOAD)));
-            case ASTORE, ISTORE, FSTORE, LSTORE, DSTORE -> {
-                JdbcFlowSlot value = jdbcPop(stack);
-                if (value == null) {
-                    return false;
-                }
-                locals.put(insn.varIndex(), value);
-            }
-            case NEW -> {
-                String owner = internalName(insn.typeRef());
-                if (owner == null) {
-                    return false;
-                }
-                stack.add(JdbcFlowSlot.allocation(hostMethodKey, insn.offset(), owner));
-            }
-            case CHECKCAST -> {
-                JdbcFlowSlot value = jdbcPop(stack);
-                if (value == null) {
-                    return false;
-                }
-                stack.add(value);
-            }
-            case GETSTATIC -> {
-                FieldRef field = insn.fieldRef();
-                if (field == null || !validTypeDescriptor(field.descriptor())) {
-                    return false;
-                }
-                stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(), field.descriptor(),
-                        isCategory2(field.descriptor())));
-            }
-            case PUTSTATIC -> {
-                if (jdbcPop(stack) == null) {
-                    return false;
-                }
-            }
-            case GETFIELD -> {
-                if (jdbcPop(stack) == null) {
-                    return false;
-                }
-                FieldRef field = insn.fieldRef();
-                if (field == null || !validTypeDescriptor(field.descriptor())) {
-                    return false;
-                }
-                stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(), field.descriptor(),
-                        isCategory2(field.descriptor())));
-            }
-            case PUTFIELD -> {
-                if (jdbcPop(stack) == null || jdbcPop(stack) == null) {
-                    return false;
-                }
-            }
-            case DUP -> {
-                JdbcFlowSlot value = jdbcPeek(stack);
-                if (value == null || value.category2()) {
-                    return false;
-                }
-                stack.add(value);
-            }
-            case SWAP -> {
-                if (stack.size() < 2 || stack.get(stack.size() - 1).category2()
-                        || stack.get(stack.size() - 2).category2()) {
-                    return false;
-                }
-                int top = stack.size() - 1;
-                JdbcFlowSlot first = stack.get(top);
-                stack.set(top, stack.get(top - 1));
-                stack.set(top - 1, first);
-            }
-            case POP -> {
-                if (jdbcPop(stack) == null) {
-                    return false;
-                }
-            }
-            case POP2 -> {
-                JdbcFlowSlot value = jdbcPop(stack);
-                if (value == null || (!value.category2() && jdbcPop(stack) == null)) {
-                    return false;
-                }
-            }
-            case IALOAD, FALOAD, AALOAD, BALOAD, CALOAD, SALOAD -> {
-                if (!jdbcPopTwo(stack)) {
-                    return false;
-                }
-                stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(),
-                        "Ljava/lang/Object;", false));
-            }
-            case LALOAD, DALOAD -> {
-                if (!jdbcPopTwo(stack)) {
-                    return false;
-                }
-                stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(),
-                        insn.op() == Op.LALOAD ? "J" : "D", true));
-            }
-            case IASTORE, FASTORE, AASTORE, BASTORE, CASTORE, SASTORE,
-                    LASTORE, DASTORE -> {
-                if (!jdbcPopThree(stack)) {
-                    return false;
-                }
-            }
-            case INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE,
-                    INVOKEDYNAMIC -> {
-                return transferJdbcInvoke(graph, method, hostMethodKey, insn, stack, writes,
-                        connections);
-            }
-            case IRETURN, FRETURN, ARETURN, LRETURN, DRETURN, RETURN, ATHROW -> {
-                if (insn.op() != Op.RETURN && jdbcPop(stack) == null) {
-                    return false;
-                }
-            }
-            case MONITORENTER, MONITOREXIT -> {
-                if (jdbcPop(stack) == null) {
-                    return false;
-                }
-            }
-            default -> {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean transferJdbcInvoke(
-            Graph graph, MethodInfo method, String hostMethodKey, InsnFact insn,
-            List<JdbcFlowSlot> stack, List<JdbcPropertyWrite> writes,
-            List<JdbcConnectionCapture> connections) {
-        String owner = null;
-        String name;
-        String descriptor;
-        boolean dynamic = insn.op() == Op.INVOKEDYNAMIC;
-        if (dynamic) {
-            if (insn.operands().isEmpty()
-                    || !(insn.operands().get(0) instanceof InvokeDynamicRef indy)) {
-                return false;
-            }
-            name = indy.name();
-            descriptor = indy.descriptor();
-        } else {
-            MethodRef ref = insn.methodRef();
-            if (ref == null) {
-                return false;
-            }
-            owner = ref.owner();
-            name = ref.name();
-            descriptor = ref.descriptor();
-        }
-        if (!validMethodDescriptor(descriptor)) {
-            return false;
-        }
-        int argumentCount;
-        try {
-            argumentCount = Descriptor.paramCount(descriptor);
-        } catch (RuntimeException invalidDescriptor) {
-            return false;
-        }
-        boolean receiverRequired = !dynamic && insn.op() != Op.INVOKESTATIC;
-        int required = argumentCount + (receiverRequired ? 1 : 0);
-        if (stack.size() < required) {
-            return false;
-        }
-        List<JdbcFlowSlot> arguments = new ArrayList<>(argumentCount);
-        for (int index = argumentCount - 1; index >= 0; index--) {
-            JdbcFlowSlot argument = jdbcPop(stack);
-            if (argument == null) {
-                return false;
-            }
-            arguments.add(0, argument);
-        }
-        JdbcFlowSlot receiver = receiverRequired ? jdbcPop(stack) : null;
-        if (receiverRequired && receiver == null) {
-            return false;
-        }
-        Node call = graph.findCallNode(hostMethodKey, insn.offset());
-        if (call == null) {
-            return false;
-        }
-
-        if (!dynamic && JdbcConnectionCallSite.matches(owner, name, descriptor,
-                call.invokeKind())) {
-            if (arguments.size() != 2) {
-                return false;
-            }
-            JdbcConnectionCallSite.Kind kind = JdbcConnectionCallSite.DRIVER_MANAGER_OWNER
-                    .equals(owner)
-                    ? JdbcConnectionCallSite.Kind.DRIVER_MANAGER_GET_CONNECTION
-                    : JdbcConnectionCallSite.Kind.DRIVER_CONNECT;
-            connections.add(new JdbcConnectionCapture(call, kind,
-                    arguments.get(0).value(), arguments.get(1).value()));
-        }
-
-        if (!dynamic && receiver != null && receiver.value().descriptor()
-                .equals(JdbcConnectionCallSite.PROPERTIES_DESCRIPTOR)
-                && JdbcConnectionCallSite.PropertyEntry.PROPERTIES_OWNER.equals(owner)
-                && call.invokeKind().equals("VIRTUAL")
-                && (JdbcConnectionCallSite.PropertyEntry.SET_PROPERTY_NAME.equals(name)
-                || JdbcConnectionCallSite.PropertyEntry.PUT_NAME.equals(name))
-                && arguments.size() == 2
-                && (JdbcConnectionCallSite.PropertyEntry.SET_PROPERTY_DESCRIPTOR.equals(descriptor)
-                || JdbcConnectionCallSite.PropertyEntry.PUT_DESCRIPTOR.equals(descriptor))) {
-            writes.add(new JdbcPropertyWrite(call, receiver.value(), arguments.get(0).value(),
-                    arguments.get(1).value()));
-        }
-
-        String returnType;
-        try {
-            returnType = Descriptor.returnType(descriptor);
-        } catch (RuntimeException invalidDescriptor) {
-            return false;
-        }
-        if (!"V".equals(returnType)) {
-            stack.add(JdbcFlowSlot.unknown(hostMethodKey, insn.offset(), returnType,
-                    isCategory2(returnType)));
-        }
-        return true;
+        return switch (value.state()) {
+            case KNOWN -> JdbcConnectionCallSite.ValueIdentity.known(
+                    value.identity().value(), value.descriptor(), value.producerOffset(),
+                    value.displayValue());
+            case NULL -> JdbcConnectionCallSite.ValueIdentity.nullValue(
+                    value.identity().value(), value.descriptor(), value.producerOffset());
+            case UNKNOWN -> JdbcConnectionCallSite.ValueIdentity.unknown(
+                    value.identity().value(), value.descriptor(), value.producerOffset());
+        };
     }
 
     private static TypedBridgeFact.CallSite jdbcCallSite(Node call, MethodInfo method) {
@@ -886,51 +679,6 @@ public final class CpgBuilder {
             case "DYNAMIC" -> TypedBridgeFact.InvokeKind.DYNAMIC;
             default -> throw new IllegalArgumentException("unknown JVM invoke kind: " + value);
         };
-    }
-
-    private static String jdbcToken(String hostMethodKey, int offset, String kind) {
-        return "jdbc-" + kind + "-v1:" + hostMethodKey + ":" + offset;
-    }
-
-    private static <T> T jdbcPop(List<T> stack) {
-        return stack.isEmpty() ? null : stack.remove(stack.size() - 1);
-    }
-
-    private static <T> T jdbcPeek(List<T> stack) {
-        return stack.isEmpty() ? null : stack.get(stack.size() - 1);
-    }
-
-    private static boolean jdbcPopTwo(List<JdbcFlowSlot> stack) {
-        return jdbcPop(stack) != null && jdbcPop(stack) != null;
-    }
-
-    private static boolean jdbcPopThree(List<JdbcFlowSlot> stack) {
-        return jdbcPopTwo(stack) && jdbcPop(stack) != null;
-    }
-
-    private record JdbcFlowSlot(JdbcConnectionCallSite.ValueIdentity value, boolean category2) {
-        private static JdbcFlowSlot knownString(String hostMethodKey, int offset, String value) {
-            return new JdbcFlowSlot(JdbcConnectionCallSite.ValueIdentity.known(
-                    jdbcToken(hostMethodKey, offset, "string"),
-                    JdbcConnectionCallSite.URL_DESCRIPTOR, offset, value), false);
-        }
-
-        private static JdbcFlowSlot allocation(String hostMethodKey, int offset, String owner) {
-            return new JdbcFlowSlot(JdbcConnectionCallSite.ValueIdentity.known(
-                    jdbcToken(hostMethodKey, offset, "object"), "L" + owner + ";", offset, null),
-                    false);
-        }
-
-        private static JdbcFlowSlot nullValue(String hostMethodKey, int offset) {
-            return new JdbcFlowSlot(JdbcConnectionCallSite.ValueIdentity.nullValue(
-                    jdbcToken(hostMethodKey, offset, "null"), "Ljava/lang/Object;", offset), false);
-        }
-
-        private static JdbcFlowSlot unknown(String hostMethodKey, int offset,
-                                             String descriptor, boolean category2) {
-            return new JdbcFlowSlot(JdbcConnectionCallSite.ValueIdentity.unknown(
-                    jdbcToken(hostMethodKey, offset, "unknown"), descriptor, offset), category2);
-        }
     }
 
     private record JdbcPropertyWrite(Node call, JdbcConnectionCallSite.ValueIdentity receiver,
