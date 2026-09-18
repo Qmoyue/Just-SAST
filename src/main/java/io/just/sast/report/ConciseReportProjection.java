@@ -161,7 +161,12 @@ public record ConciseReportProjection(
                 // coverage evidence, never public findings.
                 continue;
             }
-            projected.add(project(candidate, trace, "application".equals(normalizedMode)));
+            boolean applicationMode = "application".equals(normalizedMode);
+            ReportHopAudit.Result audit = ReportHopAudit.inspect(candidate, trace,
+                    applicationMode);
+            Status candidateStatus = status(candidate, applicationMode);
+            Status auditedStatus = auditedStatus(candidateStatus, audit);
+            projected.add(project(candidate, trace, applicationMode, audit, auditedStatus));
         }
 
         List<String> resultLimits = resultLimits(normalizedMode, snapshot, statistics, projected);
@@ -264,9 +269,10 @@ public record ConciseReportProjection(
     }
 
     private static Finding project(FindingOutputReader.Finding candidate,
-                                   ApplicationTrace trace, boolean applicationMode) {
+                                   ApplicationTrace trace, boolean applicationMode,
+                                   ReportHopAudit.Result audit, Status auditedStatus) {
         Chain chain = candidate.chain();
-        Status status = status(candidate, applicationMode);
+        Status status = auditedStatus;
         Method entry = applicationMode && trace != null
                 ? applicationEntry(trace)
                 : new Method(safe(chain.entryClass()), safe(chain.entryMethod()),
@@ -278,7 +284,18 @@ public record ConciseReportProjection(
         List<GraphNode> graph = graph(chain, trace, applicationMode);
         Proof proof = proof(candidate, trace, applicationMode);
         return new Finding(candidate.id(), status, entry, impact, graph, proof,
-                findingLimits(candidate, trace, applicationMode, status));
+                findingLimits(candidate, trace, applicationMode, status, audit));
+    }
+
+    /**
+     * A materialized proof gap is a named partial result, never an empty result or an implicit
+     * success. UNKNOWN is retained when the base candidate had no usable chain shape.
+     */
+    private static Status auditedStatus(Status candidateStatus, ReportHopAudit.Result audit) {
+        if (audit == null || audit.passed() || candidateStatus != Status.COMPLETE) {
+            return candidateStatus;
+        }
+        return audit.hops().isEmpty() ? Status.UNKNOWN : Status.PARTIAL;
     }
 
     private static Status status(FindingOutputReader.Finding candidate, boolean applicationMode) {
@@ -317,7 +334,8 @@ public record ConciseReportProjection(
 
     private static List<String> findingLimits(FindingOutputReader.Finding candidate,
                                                ApplicationTrace trace,
-                                               boolean applicationMode, Status status) {
+                                               boolean applicationMode, Status status,
+                                               ReportHopAudit.Result audit) {
         if (status == Status.COMPLETE) {
             return List.of();
         }
@@ -336,6 +354,9 @@ public record ConciseReportProjection(
             candidate.state().defaultFindingViolations().forEach(limits::add);
         } else if (status == Status.PARTIAL) {
             limits.add("STATIC_PROOF_GAP");
+        }
+        if (audit != null) {
+            audit.limits().forEach(limits::add);
         }
         if (limits.isEmpty()) {
             limits.add(status == Status.UNKNOWN ? "STATIC_PROOF_UNKNOWN" : "STATIC_PROOF_GAP");
