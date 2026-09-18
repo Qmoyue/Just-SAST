@@ -496,7 +496,7 @@ class ApplicationChainJoinerContractTest {
     }
 
     @Test
-    void acceptedAutoTypePrefixJoinsUnrelatedApplicationBindingTarget() {
+    void acceptedAutoTypePrefixJoinsAssignableApplicationBindingTarget() {
         String controller = "fixture/app/Controller";
         String target = "fixture/app/Metric";
         String setterDesc = "(Ljava/lang/String;)V";
@@ -533,7 +533,7 @@ class ApplicationChainJoinerContractTest {
         ClassHierarchy hierarchy = new ClassHierarchy(Map.of(
                 "fixture/app/Note", new ClassInfo("fixture/app/Note", "java/lang/Object",
                         List.of(), Modifier.PUBLIC, List.of(), List.of()),
-                target, new ClassInfo(target, "java/lang/Object", List.of(),
+                target, new ClassInfo(target, "fixture/app/Note", List.of(),
                         Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of())), null);
         RuleEngine engine = new RuleEngine(new RuleSet(List.of(sinkRule), List.of(),
                 List.of(), List.of(), List.of()), hierarchy);
@@ -554,6 +554,68 @@ class ApplicationChainJoinerContractTest {
         assertEquals(1, evidence.joinCount());
         assertEquals("JOINED", evidence.decisions().get(chain.key()));
         assertTrue(evidence.graph().toCanonicalJson().contains("TYPED_BINDING_TARGET"));
+    }
+
+    @Test
+    void acceptedAutoTypePrefixDoesNotJoinUnrelatedFinalBindingTarget() {
+        String controller = "fixture/app/Controller";
+        String target = "fixture/app/Metric";
+        String setterDesc = "(Ljava/lang/String;)V";
+        String sinkDesc = "()Ljava/lang/Process;";
+        Graph graph = new Graph();
+        Node endpoint = graph.methodNode(controller, "put", "(Lfixture/app/Note;)V", false);
+        endpoint.propsNote("methodAccess", Modifier.PUBLIC);
+        endpoint.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        endpoint.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PutMapping;"));
+        Node config = graph.methodNode(controller, "configure", "()V", false);
+        config.propsNote("methodAccess", Modifier.PUBLIC);
+        Node accept = graph.addCallNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", "VIRTUAL", null, 0,
+                controller, "configure", "()V");
+        accept.propsNote("stringLiteralHints", List.of("fixture.app."));
+        Node acceptMethod = graph.methodNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", true);
+        graph.addEdge(accept, acceptMethod, EdgeType.INVOKES, "VIRTUAL");
+
+        graph.methodNode(target, "setValue", setterDesc, false);
+        Node runtime = graph.methodNode(RUNTIME, "start", sinkDesc, true);
+        Node sink = graph.addCallNode(RUNTIME, "start", sinkDesc, "VIRTUAL", null, 0,
+                target, "setValue", setterDesc);
+        graph.addEdge(sink, runtime, EdgeType.INVOKES, "VIRTUAL");
+        graph.freeze();
+
+        Rule.SinkRule sinkRule = new Rule.SinkRule("runtime-start", "COMMAND", "HIGH",
+                new Rule.CallMatcher(Match.of(RUNTIME), Match.of("start"), Match.of(sinkDesc)),
+                List.of(), Rule.SinkRole.TERMINAL);
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(
+                "fixture/app/Note", new ClassInfo("fixture/app/Note", "java/lang/Object",
+                        List.of(), Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of()),
+                target, new ClassInfo(target, "java/lang/Object", List.of(),
+                        Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of())), null);
+        RuleEngine engine = new RuleEngine(new RuleSet(List.of(sinkRule), List.of(),
+                List.of(), List.of(), List.of()), hierarchy);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph, engine,
+                Set.of(controller, target), true);
+
+        assertTrue(index.typedBindingSites().stream().anyMatch(site ->
+                site.hostMethodKey().startsWith(controller + "#put")
+                        && site.targetTypes().contains("fixture/app/Note")));
+        assertTrue(index.typedBindingSitesForTarget(target).isEmpty(),
+                "an unrelated final class under an accepted prefix is not a typed target");
+
+        Chain chain = new Chain("unrelated-prefix-final", "COMMAND", "HIGH", target, "setValue",
+                "deserialize", RUNTIME, "start", List.of(
+                new ChainHop(target, "setValue", RUNTIME, "start", HopKind.DIRECT_CALL,
+                        null, "direct", sinkDesc, 0),
+                new ChainHop(target, "setValue", target, "setValue", HopKind.ENTRY,
+                        null, "deserialize", setterDesc, 0)), 0, sinkDesc, "TERMINAL");
+        ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
+                List.of(chain), true, "A".repeat(64), Set.of());
+
+        assertEquals(0, evidence.joinCount());
+        assertFalse(evidence.joinedChainKeys().contains(chain.key()));
     }
 
     @Test

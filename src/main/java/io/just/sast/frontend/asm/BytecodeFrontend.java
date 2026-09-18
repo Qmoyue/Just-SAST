@@ -966,8 +966,14 @@ public final class BytecodeFrontend {
                     || entry.getValue() == null) {
                 continue;
             }
-            List<ArchiveMemberProvenance> destination = target.computeIfAbsent(entry.getKey(),
-                    ignored -> new ArrayList<>());
+            // LoadResult freezes every provenance list at its boundary.  A later JDK/extra
+            // append may revisit an already-known class (for example a duplicate class in a
+            // fat jar plus a platform slice), so copy the existing list before merging instead
+            // of mutating the immutable value carried by the base result.
+            List<ArchiveMemberProvenance> destination = target.get(entry.getKey());
+            destination = destination == null
+                    ? new ArrayList<>() : new ArrayList<>(destination);
+            target.put(entry.getKey(), destination);
             for (ArchiveMemberProvenance member : entry.getValue()) {
                 if (member != null && destination.stream().noneMatch(existing ->
                         existing.contentIdentity().equals(member.contentIdentity()))) {

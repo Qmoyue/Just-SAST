@@ -2,6 +2,7 @@ package io.just.sast.frontend.asm;
 
 import io.just.sast.model.ArchiveMemberProvenance;
 import io.just.sast.model.ArtifactProvenance;
+import io.just.sast.model.LoadResult;
 import io.just.sast.model.ProgramUniverse;
 import io.just.sast.run.InputBudget;
 import org.junit.jupiter.api.Test;
@@ -148,6 +149,34 @@ class ArchiveMemberProvenanceContractTest {
         assertEquals(ArchiveMemberProvenance.sha256Of(bytes.bytes()),
                 bytes.provenance().sha256());
         assertTrue(bytes.provenance().source().startsWith("jdk:"));
+    }
+
+    @Test
+    void appendingDuplicateClassProvenanceCopiesFrozenBaseList() throws Exception {
+        byte[] bytes = fixtureBytes(
+                "/io/just/sast/frontend/asm/BytecodeFrontendTest.class");
+        String className = "io/just/sast/frontend/asm/BytecodeFrontendTest";
+        ArchiveMemberProvenance baseProvenance = ArchiveMemberProvenance.fromBytes(
+                "base.jar", "base.jar", className + ".class", bytes,
+                ArchiveMemberProvenance.Role.ROOT, ArchiveMemberProvenance.Kind.CLASS);
+        ArchiveMemberProvenance extraProvenance = ArchiveMemberProvenance.fromBytes(
+                "extra.jar", "extra.jar", className + ".class", bytes,
+                ArchiveMemberProvenance.Role.EXPLICIT_DEPENDENCY,
+                ArchiveMemberProvenance.Kind.CLASS);
+        InputBudget budget = InputBudget.defaults();
+        BytecodeFrontend frontend = new BytecodeFrontend(budget);
+        InputBudget.Tracker tracker = budget.tracker();
+        LoadResult base = frontend.load(new BytecodeFrontend.Inputs(
+                List.of(new ClassBytes(className, bytes, "base", baseProvenance)),
+                List.of(), List.of(), tracker, true));
+
+        LoadResult merged = frontend.load(base,
+                List.of(new ClassBytes(className, bytes, "extra", extraProvenance)), tracker);
+
+        assertEquals(2, merged.classProvenance().get(className).size());
+        assertEquals(baseProvenance, merged.classProvenance().get(className).get(0));
+        assertEquals(extraProvenance, merged.classProvenance().get(className).get(1));
+        assertTrue(merged.completenessReasons().contains("DUPLICATE_CLASS:" + className));
     }
 
     private static byte[] fixtureBytes(String resource) throws Exception {

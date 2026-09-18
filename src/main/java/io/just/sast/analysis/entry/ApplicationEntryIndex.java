@@ -1957,12 +1957,14 @@ public final class ApplicationEntryIndex {
             }
             List<String> declaredBindingTypes = referenceParameterTypes(method.descriptor());
             List<String> bindingTargets = new ArrayList<>(declaredBindingTypes);
-            // Fastjson 1.2.83's addAccept path is a class-name allowlist, not a Java
-            // assignability proof.  Its checkAutoType prefix branch returns an accepted
-            // application class even when it is unrelated to the declared request type.  Keep
-            // the declared type and the complete application-owned accepted-prefix scope as
-            // separate typed alternatives; never widen it to dependency/JDK classes.
-            bindingTargets.addAll(acceptedApplicationTypes);
+            // Fastjson's addAccept path is a class-name allowlist, not a Java assignability
+            // proof.  A prefix therefore becomes a typed callback alternative only when the
+            // accepted application class is assignable to a declared reference slot of this
+            // binding host.  An unrelated class (or an unresolved hierarchy relation) is not
+            // a typed entry bridge; retaining it here would turn a class-name policy into a
+            // false application chain.
+            bindingTargets.addAll(compatibleAcceptedApplicationTypes(rules,
+                    acceptedApplicationTypes, declaredBindingTypes));
             sites.add(new DeserializeSite(method.id(), host, method.owner(), method.name(),
                     method.descriptor(), FRAMEWORK_BINDING_RULE, "framework-binding", true, true,
                     bindingTargets));
@@ -3187,6 +3189,21 @@ public final class ApplicationEntryIndex {
             return List.of();
         }
         return result.stream().filter(value -> !value.isBlank()).distinct().sorted().toList();
+    }
+
+    private static List<String> compatibleAcceptedApplicationTypes(RuleEngine rules,
+                                                                     List<String> acceptedTypes,
+                                                                     List<String> declaredTypes) {
+        if (rules == null || acceptedTypes == null || acceptedTypes.isEmpty()
+                || declaredTypes == null || declaredTypes.isEmpty()) {
+            return List.of();
+        }
+        return acceptedTypes.stream()
+                .filter(target -> declaredTypes.stream()
+                        .anyMatch(declared -> rules.isSubtypeOf(target, declared)))
+                .distinct()
+                .sorted()
+                .toList();
     }
 
     /**
