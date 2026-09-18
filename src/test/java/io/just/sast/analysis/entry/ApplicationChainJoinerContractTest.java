@@ -519,6 +519,27 @@ class ApplicationChainJoinerContractTest {
         graph.addEdge(accept, graph.findMethodNode(
                 "com/alibaba/fastjson/parser/ParserConfig", "addAccept",
                 "(Ljava/lang/String;)V"), EdgeType.INVOKES, "VIRTUAL");
+        Node converter = graph.addCallNode(
+                "com/alibaba/fastjson/support/spring/FastJsonHttpMessageConverter",
+                "setFastJsonConfig",
+                "(Lcom/alibaba/fastjson/support/config/FastJsonConfig;)V", "VIRTUAL", null, 0,
+                controller, "configure", "()V");
+        Node converterMethod = graph.methodNode(
+                "com/alibaba/fastjson/support/spring/FastJsonHttpMessageConverter",
+                "setFastJsonConfig",
+                "(Lcom/alibaba/fastjson/support/config/FastJsonConfig;)V", true);
+        graph.addEdge(converter, converterMethod, EdgeType.INVOKES, "VIRTUAL");
+        Node registration = graph.addCallNode(
+                "org/springframework/http/converter/HttpMessageConverters$ServerBuilder",
+                "addCustomConverter",
+                "(Lorg/springframework/http/converter/HttpMessageConverter;)Lorg/springframework/http/converter/HttpMessageConverters$Builder;",
+                "INTERFACE", null, 0, controller, "configure", "()V");
+        Node registrationMethod = graph.methodNode(
+                "org/springframework/http/converter/HttpMessageConverters$ServerBuilder",
+                "addCustomConverter",
+                "(Lorg/springframework/http/converter/HttpMessageConverter;)Lorg/springframework/http/converter/HttpMessageConverters$Builder;",
+                true);
+        graph.addEdge(registration, registrationMethod, EdgeType.INVOKES, "INTERFACE");
 
         Node setter = graph.methodNode(target, "setValue", setterDesc, false);
         Node runtime = graph.methodNode(RUNTIME, "start", sinkDesc, true);
@@ -557,7 +578,7 @@ class ApplicationChainJoinerContractTest {
     }
 
     @Test
-    void acceptedAutoTypePrefixDoesNotJoinUnrelatedFinalBindingTarget() {
+    void acceptedAutoTypePrefixJoinsUnrelatedFinalDeserializationSideEffect() {
         String controller = "fixture/app/Controller";
         String target = "fixture/app/Metric";
         String setterDesc = "(Ljava/lang/String;)V";
@@ -579,7 +600,30 @@ class ApplicationChainJoinerContractTest {
                 "addAccept", "(Ljava/lang/String;)V", true);
         graph.addEdge(accept, acceptMethod, EdgeType.INVOKES, "VIRTUAL");
 
-        graph.methodNode(target, "setValue", setterDesc, false);
+        Node converter = graph.addCallNode(
+                "com/alibaba/fastjson/support/spring/FastJsonHttpMessageConverter",
+                "setFastJsonConfig",
+                "(Lcom/alibaba/fastjson/support/config/FastJsonConfig;)V", "VIRTUAL", null, 0,
+                controller, "configure", "()V");
+        Node converterMethod = graph.methodNode(
+                "com/alibaba/fastjson/support/spring/FastJsonHttpMessageConverter",
+                "setFastJsonConfig",
+                "(Lcom/alibaba/fastjson/support/config/FastJsonConfig;)V", true);
+        graph.addEdge(converter, converterMethod, EdgeType.INVOKES, "VIRTUAL");
+        Node registration = graph.addCallNode(
+                "org/springframework/http/converter/HttpMessageConverters$ServerBuilder",
+                "addCustomConverter",
+                "(Lorg/springframework/http/converter/HttpMessageConverter;)Lorg/springframework/http/converter/HttpMessageConverters$Builder;",
+                "INTERFACE", null, 0, controller, "configure", "()V");
+        Node registrationMethod = graph.methodNode(
+                "org/springframework/http/converter/HttpMessageConverters$ServerBuilder",
+                "addCustomConverter",
+                "(Lorg/springframework/http/converter/HttpMessageConverter;)Lorg/springframework/http/converter/HttpMessageConverters$Builder;",
+                true);
+        graph.addEdge(registration, registrationMethod, EdgeType.INVOKES, "INTERFACE");
+
+        Node setter = graph.methodNode(target, "setValue", setterDesc, false);
+        setter.propsNote("methodAccess", Modifier.PUBLIC);
         Node runtime = graph.methodNode(RUNTIME, "start", sinkDesc, true);
         Node sink = graph.addCallNode(RUNTIME, "start", sinkDesc, "VIRTUAL", null, 0,
                 target, "setValue", setterDesc);
@@ -606,6 +650,10 @@ class ApplicationChainJoinerContractTest {
                 "an unrelated final class under an accepted prefix is not a typed target");
         assertFalse(index.isApplicationBindingCallback(target, "setValue", setterDesc),
                 "an unrelated final class must not enter the application callback projection");
+        assertEquals(1, index.deserializationSideEffectSitesForTarget(target).size(),
+                "the actual Fastjson type remains a deserialization side-effect target");
+        assertTrue(index.isApplicationDeserializationSideEffectCallback(target, "setValue",
+                setterDesc));
 
         Chain chain = new Chain("unrelated-prefix-final", "COMMAND", "HIGH", target, "setValue",
                 "deserialize", RUNTIME, "start", List.of(
@@ -616,8 +664,11 @@ class ApplicationChainJoinerContractTest {
         ApplicationChainEvidence evidence = ApplicationChainJoiner.build(index, graph,
                 List.of(chain), true, "A".repeat(64), Set.of());
 
-        assertEquals(0, evidence.joinCount());
-        assertFalse(evidence.joinedChainKeys().contains(chain.key()));
+        assertEquals(1, evidence.joinCount());
+        assertTrue(evidence.joinedChainKeys().contains(chain.key()));
+        String json = evidence.graph().toCanonicalJson();
+        assertTrue(json.contains("DESERIALIZATION_SIDE_EFFECT"));
+        assertFalse(json.contains("TYPED_BINDING_TARGET"));
     }
 
     @Test

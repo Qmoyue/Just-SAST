@@ -53,7 +53,7 @@ import java.util.TreeSet;
  */
 public final class ApplicationEntryIndex {
 
-    public static final int MODEL_VERSION = 9;
+    public static final int MODEL_VERSION = 10;
     public static final String HTTP_SERVER_OWNER = "com/sun/net/httpserver/HttpServer";
     public static final String HTTP_SERVER_CREATE_CONTEXT_NAME = "createContext";
     public static final String HTTP_SERVER_CREATE_CONTEXT_DESCRIPTOR =
@@ -72,6 +72,12 @@ public final class ApplicationEntryIndex {
     private static final int MAX_SLICE_METHODS = 100_000;
     private static final String FRAMEWORK_ENTRY_RULE = "builtin:framework-entry";
     private static final String FRAMEWORK_BINDING_RULE = "builtin:framework-binding";
+    private static final String FASTJSON_PARSER_CONFIG_OWNER =
+            "com/alibaba/fastjson/parser/ParserConfig";
+    private static final String FASTJSON_CONVERTER_OWNER =
+            "com/alibaba/fastjson/support/spring/FastJsonHttpMessageConverter";
+    private static final String SPRING_SERVER_CONVERTER_BUILDER_OWNER =
+            "org/springframework/http/converter/HttpMessageConverters$ServerBuilder";
     private static final Set<String> HTTP_CLASS_ANNOTATIONS = Set.of(
             "Lorg/springframework/web/bind/annotation/RestController;",
             "Lorg/springframework/stereotype/Controller;",
@@ -295,13 +301,23 @@ public final class ApplicationEntryIndex {
     public record DeserializeSite(long callId, String hostMethodKey, String owner, String name,
                                   String descriptor, String ruleId, String bridge,
                                   boolean applicationOwned, boolean externalInput,
-                                  List<String> targetTypes) {
+                                  List<String> targetTypes,
+                                  List<String> deserializationSideEffectTypes) {
         /** Compatibility constructor for callers that predate typed binding targets. */
         public DeserializeSite(long callId, String hostMethodKey, String owner, String name,
                                String descriptor, String ruleId, String bridge,
                                boolean applicationOwned, boolean externalInput) {
             this(callId, hostMethodKey, owner, name, descriptor, ruleId, bridge,
-                    applicationOwned, externalInput, List.of());
+                    applicationOwned, externalInput, List.of(), List.of());
+        }
+
+        /** Compatibility constructor for callers that only provide typed binding targets. */
+        public DeserializeSite(long callId, String hostMethodKey, String owner, String name,
+                               String descriptor, String ruleId, String bridge,
+                               boolean applicationOwned, boolean externalInput,
+                               List<String> targetTypes) {
+            this(callId, hostMethodKey, owner, name, descriptor, ruleId, bridge,
+                    applicationOwned, externalInput, targetTypes, List.of());
         }
 
         public DeserializeSite {
@@ -314,16 +330,9 @@ public final class ApplicationEntryIndex {
             descriptor = descriptor == null ? "" : descriptor;
             ruleId = ruleId == null ? "" : ruleId;
             bridge = bridge == null ? "" : bridge;
-            List<String> normalizedTargets = new ArrayList<>();
-            if (targetTypes != null) {
-                for (String target : targetTypes) {
-                    if (target != null && !target.isBlank() && target.indexOf('.') < 0
-                            && target.indexOf('[') < 0) {
-                        normalizedTargets.add(target.trim());
-                    }
-                }
-            }
-            targetTypes = normalizedTargets.stream().distinct().sorted().toList();
+            targetTypes = normalizeInternalTypeNames(targetTypes);
+            deserializationSideEffectTypes = normalizeInternalTypeNames(
+                    deserializationSideEffectTypes);
         }
     }
 
@@ -661,6 +670,8 @@ public final class ApplicationEntryIndex {
     private final List<DeserializeSite> applicationInputSites;
     private final List<DeserializeSite> typedBindingSites;
     private final Map<String, List<DeserializeSite>> typedBindingSitesByTarget;
+    private final List<DeserializeSite> deserializationSideEffectSites;
+    private final Map<String, List<DeserializeSite>> deserializationSideEffectSitesByTarget;
     private final Map<String, List<DeserializeSite>> applicationInputSitesByMember;
     private final List<ServiceEndpoint> serviceEndpoints;
     private final Map<String, List<ServiceEndpoint>> serviceEndpointsByMethod;
@@ -691,6 +702,7 @@ public final class ApplicationEntryIndex {
     private final Set<String> terminalHostMethods;
     private final List<TerminalImpact> terminalDemandImpacts;
     private final Set<String> bindingCallbackMethods;
+    private final Set<String> deserializationSideEffectCallbackMethods;
     private final Map<TerminalKey, List<TerminalImpact>> terminalImpactsBySignature;
     private final Map<TerminalKey, List<TerminalImpact>> terminalImpactsByName;
     private final String semanticDigest;
@@ -713,7 +725,8 @@ public final class ApplicationEntryIndex {
                                   List<String> entryTerminalIntersection,
                                   List<String> dependencyCandidates,
                                   List<String> completenessReasons,
-                                  Set<String> bindingCallbackMethods) {
+                                  Set<String> bindingCallbackMethods,
+                                  Set<String> deserializationSideEffectCallbackMethods) {
         this.applicationScopeKnown = applicationScopeKnown;
         this.hasDeserializeRoot = hasDeserializeRoot;
         this.applicationOwners = immutableSorted(applicationOwners);
@@ -732,6 +745,11 @@ public final class ApplicationEntryIndex {
                 .filter(site -> isTypedBindingBridge(site.bridge()))
                 .toList();
         this.typedBindingSitesByTarget = immutableBindingTargetIndex(this.typedBindingSites);
+        this.deserializationSideEffectSites = this.applicationInputSites.stream()
+                .filter(site -> !site.deserializationSideEffectTypes().isEmpty())
+                .toList();
+        this.deserializationSideEffectSitesByTarget = immutableDeserializationSideEffectIndex(
+                this.deserializationSideEffectSites);
         this.applicationInputSitesByMember = immutableSiteMemberIndex(this.applicationInputSites);
         this.serviceEndpoints = immutableServiceEndpoints(serviceEndpoints);
         this.serviceEndpointsByMethod = immutableServiceEndpointIndex(this.serviceEndpoints);
@@ -779,6 +797,8 @@ public final class ApplicationEntryIndex {
         this.terminalDemandImpacts = immutableTerminalDemandImpacts(this.terminalImpacts,
                 this.sinkReverseMethods);
         this.bindingCallbackMethods = immutableSorted(bindingCallbackMethods);
+        this.deserializationSideEffectCallbackMethods = immutableSorted(
+                deserializationSideEffectCallbackMethods);
         this.terminalImpactsBySignature = immutableTerminalIndex(this.terminalImpacts, false);
         this.terminalImpactsByName = immutableTerminalIndex(this.terminalImpacts, true);
         this.semanticDigest = digestCanonical();
@@ -825,9 +845,22 @@ public final class ApplicationEntryIndex {
     /** Build a deterministic target-owner index for typed binding sites once per scan. */
     private static Map<String, List<DeserializeSite>> immutableBindingTargetIndex(
             List<DeserializeSite> sites) {
+        return immutableDeserializeTypeIndex(sites, false);
+    }
+
+    /** Build the immutable actual-type index for deserialization side effects. */
+    private static Map<String, List<DeserializeSite>> immutableDeserializationSideEffectIndex(
+            List<DeserializeSite> sites) {
+        return immutableDeserializeTypeIndex(sites, true);
+    }
+
+    private static Map<String, List<DeserializeSite>> immutableDeserializeTypeIndex(
+            List<DeserializeSite> sites, boolean sideEffectTypes) {
         Map<String, List<DeserializeSite>> grouped = new java.util.TreeMap<>();
         for (DeserializeSite site : sites) {
-            for (String target : site.targetTypes()) {
+            List<String> types = sideEffectTypes ? site.deserializationSideEffectTypes()
+                    : site.targetTypes();
+            for (String target : types) {
                 if (target == null || target.isBlank()) {
                     continue;
                 }
@@ -840,6 +873,20 @@ public final class ApplicationEntryIndex {
         Map<String, List<DeserializeSite>> result = new java.util.TreeMap<>();
         grouped.forEach((target, values) -> result.put(target, List.copyOf(values)));
         return Map.copyOf(result);
+    }
+
+    private static List<String> normalizeInternalTypeNames(List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        List<String> normalized = new ArrayList<>();
+        for (String value : values) {
+            if (value != null && !value.isBlank() && value.indexOf('.') < 0
+                    && value.indexOf('[') < 0) {
+                normalized.add(value.trim());
+            }
+        }
+        return normalized.stream().distinct().sorted().toList();
     }
 
     /**
@@ -1874,6 +1921,8 @@ public final class ApplicationEntryIndex {
         List<String> acceptedApplicationTypes = owners.stream()
                 .filter(owner -> acceptedTypePrefixes.stream().anyMatch(owner::startsWith))
                 .sorted().toList();
+        List<String> fastJsonAcceptedApplicationTypes = fastJsonAcceptedApplicationTypes(
+                graph, owners, acceptedTypePrefixes);
         for (Node call : graph.nodesOfType(NodeType.CALL)) {
             String host = methodKey(call.methodOwner(), call.methodName(), call.methodDescriptor());
             Rule.SourceRule source = rules.matchingSource(call.owner(), call.name(), call.descriptor())
@@ -1967,7 +2016,7 @@ public final class ApplicationEntryIndex {
                     acceptedApplicationTypes, declaredBindingTypes));
             sites.add(new DeserializeSite(method.id(), host, method.owner(), method.name(),
                     method.descriptor(), FRAMEWORK_BINDING_RULE, "framework-binding", true, true,
-                    bindingTargets));
+                    bindingTargets, fastJsonAcceptedApplicationTypes));
             sourceHosts.put(host, true);
         }
 
@@ -1988,6 +2037,21 @@ public final class ApplicationEntryIndex {
                         && typedBindingTargetOwners.contains(method.owner())
                         && isPublicBeanSetter(method)) {
                     bindingCallbacks.add(methodKey(method.owner(), method.name(),
+                            method.descriptor()));
+                }
+            }
+        }
+        Set<String> deserializationSideEffectTargetOwners = sites.stream()
+                .filter(site -> site.applicationOwned() && site.externalInput())
+                .flatMap(site -> site.deserializationSideEffectTypes().stream())
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new));
+        Set<String> deserializationSideEffectCallbacks = new TreeSet<>();
+        if (!deserializationSideEffectTargetOwners.isEmpty()) {
+            for (Node method : graph.nodesOfType(NodeType.METHOD)) {
+                if (applicationScopeKnown && owners.contains(method.owner())
+                        && deserializationSideEffectTargetOwners.contains(method.owner())
+                        && isPublicBeanSetter(method)) {
+                    deserializationSideEffectCallbacks.add(methodKey(method.owner(), method.name(),
                             method.descriptor()));
                 }
             }
@@ -2058,7 +2122,7 @@ public final class ApplicationEntryIndex {
                 siteRoots,
                 impacts,
                 forward, reverse, List.copyOf(intersection), dependency, reasons,
-                bindingCallbacks);
+                bindingCallbacks, deserializationSideEffectCallbacks);
     }
 
     public boolean applicationScopeKnown() {
@@ -2274,6 +2338,41 @@ public final class ApplicationEntryIndex {
         return typedBindingSites.stream().anyMatch(site -> site.targetTypes().contains(owner));
     }
 
+    /**
+     * Whether a method owner is an actual class selected by a deserializer before the framework
+     * invokes its declared controller argument.  This is intentionally separate from typed
+     * binding: an accepted runtime class can be unrelated to the declared final parameter while
+     * its setters still execute during deserialization.
+     */
+    public boolean isApplicationDeserializationSideEffectCallback(String owner, String name,
+                                                                   String descriptor) {
+        return isApplicationOwner(owner)
+                && descriptor != null && !descriptor.isBlank()
+                && deserializationSideEffectCallbackMethods.contains(
+                        methodKey(owner, name, descriptor));
+    }
+
+    /** Whether a method belongs to an indexed deserialization actual-type side-effect target. */
+    public boolean isApplicationDeserializationSideEffectTarget(String owner, String name,
+                                                                String descriptor) {
+        if (!applicationScopeKnown || owner == null || owner.isBlank()
+                || name == null || name.isBlank() || descriptor == null || descriptor.isBlank()) {
+            return false;
+        }
+        try {
+            if (Descriptor.paramCount(descriptor) == 0) {
+                return false;
+            }
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+        if (deserializationSideEffectCallbackMethods.contains(methodKey(owner, name, descriptor))) {
+            return !deserializationSideEffectSites.isEmpty();
+        }
+        return deserializationSideEffectSites.stream()
+                .anyMatch(site -> site.deserializationSideEffectTypes().contains(owner));
+    }
+
     /** Whether a method has a concrete external-control proof at the application boundary. */
     public boolean isExternalEntryMethod(String methodKey) {
         if (methodKey == null) {
@@ -2349,6 +2448,14 @@ public final class ApplicationEntryIndex {
             return List.of();
         }
         return typedBindingSitesByTarget.getOrDefault(owner, List.of());
+    }
+
+    /** Immutable deserialization side-effect sites whose actual type is the supplied owner. */
+    public List<DeserializeSite> deserializationSideEffectSitesForTarget(String owner) {
+        if (owner == null || owner.isBlank()) {
+            return List.of();
+        }
+        return deserializationSideEffectSitesByTarget.getOrDefault(owner, List.of());
     }
 
     public List<TerminalImpact> terminalImpacts() {
@@ -2582,6 +2689,12 @@ public final class ApplicationEntryIndex {
         boolean entryForward = entryForwardMethods.contains(entryKey);
         boolean bindingCallback = isApplicationBindingCallback(owner, name, descriptor);
         boolean bindingTarget = isApplicationBindingTarget(owner, name, descriptor);
+        boolean deserializationSideEffectCallback =
+                isApplicationDeserializationSideEffectCallback(owner, name, descriptor);
+        boolean deserializationSideEffectTarget =
+                isApplicationDeserializationSideEffectTarget(owner, name, descriptor);
+        boolean bridgeCallback = bindingCallback || deserializationSideEffectCallback;
+        boolean bridgeTarget = bindingTarget || deserializationSideEffectTarget;
         TerminalDecision terminal = resolvedTerminal == null
                 ? terminalAdmission(sinkOwner, sinkName, sinkDescriptor) : resolvedTerminal;
         if (!applicationScopeKnown) {
@@ -2593,12 +2706,12 @@ public final class ApplicationEntryIndex {
                 && terminal.status() == TerminalStatus.NOT_INDEXED
                 && (!isApplicationOwner(owner)
                 || applicationEntryMethods.contains(entryKey) || entryForward
-                || bindingTarget)) {
+                || bridgeTarget)) {
             return new CandidateAdmissionDecision(
                     CandidateAdmissionStatus.DECLARED_FRAGMENT_CONTINUATION, entryKey,
                     sinkOwner, sinkName, sinkDescriptor, entryForward, false, true);
         }
-        if (!isApplicationOwner(owner) && !bindingTarget) {
+        if (!isApplicationOwner(owner) && !bridgeTarget) {
             // A dependency fragment that ends at a typed capability is not an application
             // root, but it is still a legitimate continuation participant.  Preserve the
             // intermediate classification so producerAdmission can route it to the bridge
@@ -2617,7 +2730,7 @@ public final class ApplicationEntryIndex {
                     continuationEvidence);
         }
         if (!applicationEntryMethods.contains(entryKey) && !entryForward
-                && !bindingCallback && !bindingTarget && !serializedTriggerContinuation) {
+                && !bridgeCallback && !bridgeTarget && !serializedTriggerContinuation) {
             return new CandidateAdmissionDecision(
                     CandidateAdmissionStatus.ENTRY_NOT_FORWARD_REACHABLE, entryKey,
                     sinkOwner, sinkName, sinkDescriptor, false, false,
@@ -2650,7 +2763,7 @@ public final class ApplicationEntryIndex {
         // solver from materializing globally reachable but irrelevant chains only to discard
         // them after a full join walk.
         if (!entryTerminalMethods.contains(entryKey) && !continuationEvidence
-                && !bindingCallback && !bindingTarget) {
+                && !bridgeCallback && !bridgeTarget) {
             return new CandidateAdmissionDecision(
                     CandidateAdmissionStatus.ENTRY_NOT_IN_TERMINAL_DEMAND, entryKey,
                     sinkOwner, sinkName, sinkDescriptor, entryForward, true,
@@ -2707,7 +2820,9 @@ public final class ApplicationEntryIndex {
                 && (admission.entryForward() || applicationEntryMethods.contains(
                         admission.entryMethodKey())
                 || isApplicationBindingCallback(candidate.entryOwner(), candidate.entryName(),
-                        candidate.entryDescriptor()))) {
+                        candidate.entryDescriptor())
+                || isApplicationDeserializationSideEffectCallback(candidate.entryOwner(),
+                        candidate.entryName(), candidate.entryDescriptor()))) {
             // An application-owned prefix that currently ends at a typed capability/bridge is
             // still a valid application candidate.  Keep it in the default audit product so
             // the composition phase can attach the later terminal suffix; it is not eligible
@@ -3155,21 +3270,89 @@ public final class ApplicationEntryIndex {
                 continue;
             }
             for (Object value : values) {
-                if (value == null) {
-                    continue;
+                String prefix = normalizeAcceptedTypePrefix(value);
+                if (!prefix.isBlank()) {
+                    prefixes.add(prefix);
                 }
-                String prefix = value.toString().trim().replace('.', '/');
-                if (prefix.isBlank() || prefix.length() > 256 || !prefix.endsWith("/")) {
-                    continue;
-                }
-                // A package prefix must not contain wildcards, descriptors, or path escapes.
-                if (prefix.contains("*") || prefix.contains("[") || prefix.contains("..")) {
-                    continue;
-                }
-                prefixes.add(prefix);
             }
         }
         return Set.copyOf(prefixes);
+    }
+
+    /**
+     * Return application classes that Fastjson can instantiate before a declared controller
+     * argument is checked.  The accepted-prefix fact is only promoted to this side-effect axis
+     * when the same application configuration method wires a FastJsonHttpMessageConverter with
+     * FastJsonConfig and registers it through Spring's server converter builder.  An allowlist
+     * or an unregistered converter call by itself is not evidence that the HTTP body uses it.
+     */
+    private static List<String> fastJsonAcceptedApplicationTypes(Graph graph,
+                                                                   Set<String> owners,
+                                                                   Set<String> prefixes) {
+        if (graph == null || owners == null || owners.isEmpty()
+                || prefixes == null || prefixes.isEmpty()) {
+            return List.of();
+        }
+        Set<String> acceptedHosts = new TreeSet<>();
+        Set<String> converterConfigHosts = new TreeSet<>();
+        Set<String> converterRegistrationHosts = new TreeSet<>();
+        for (Node call : graph.nodesOfType(NodeType.CALL)) {
+            if (!owners.contains(call.methodOwner())) {
+                continue;
+            }
+            String host = methodKey(call.methodOwner(), call.methodName(),
+                    call.methodDescriptor());
+            if (FASTJSON_PARSER_CONFIG_OWNER.equals(call.owner())
+                    && "addAccept".equals(call.name())
+                    && hasAcceptedTypePrefix(call, prefixes)) {
+                acceptedHosts.add(host);
+            }
+            if (FASTJSON_CONVERTER_OWNER.equals(call.owner())
+                    && "setFastJsonConfig".equals(call.name())) {
+                converterConfigHosts.add(host);
+            }
+            if (SPRING_SERVER_CONVERTER_BUILDER_OWNER.equals(call.owner())
+                    && "addCustomConverter".equals(call.name())) {
+                converterRegistrationHosts.add(host);
+            }
+        }
+        acceptedHosts.retainAll(converterConfigHosts);
+        acceptedHosts.retainAll(converterRegistrationHosts);
+        if (acceptedHosts.isEmpty()) {
+            return List.of();
+        }
+        return owners.stream()
+                .filter(owner -> prefixes.stream().anyMatch(owner::startsWith))
+                .sorted().toList();
+    }
+
+    private static boolean hasAcceptedTypePrefix(Node call, Set<String> prefixes) {
+        Object hints = call == null ? null : call.note("stringLiteralHints");
+        if (!(hints instanceof Iterable<?> values)) {
+            return false;
+        }
+        for (Object value : values) {
+            String prefix = normalizeAcceptedTypePrefix(value);
+            if (!prefix.isBlank() && prefixes.contains(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String normalizeAcceptedTypePrefix(Object value) {
+        if (value == null) {
+            return "";
+        }
+        String prefix = value.toString().trim().replace('.', '/');
+        if (prefix.isBlank() || prefix.length() > 256 || !prefix.endsWith("/")) {
+            return "";
+        }
+        // A package prefix must not contain wildcards, descriptors, or path escapes.
+        if (prefix.contains("*") || prefix.contains("[") || prefix.contains("..")) {
+            return "";
+        }
+        return prefix;
     }
 
     private static List<String> referenceParameterTypes(String descriptor) {

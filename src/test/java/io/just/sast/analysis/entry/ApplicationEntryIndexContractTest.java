@@ -956,6 +956,47 @@ class ApplicationEntryIndexContractTest {
                 "an application class outside the accepted prefix is not a target");
         assertTrue(index.typedBindingSitesForTarget(unrelated).isEmpty(),
                 "an application class outside the accepted prefix must not become a target");
+        assertTrue(index.deserializationSideEffectSitesForTarget(unrelated).isEmpty(),
+                "an allowlist without a configured Fastjson converter is not a side effect fact");
+    }
+
+    @Test
+    void acceptedAutoTypePrefixWithoutFastJsonConverterDoesNotCreateSideEffectTarget() {
+        String controller = "fixture/app/Controller";
+        String declared = "fixture/app/Note";
+        String actual = "fixture/app/Metric";
+        Graph graph = new Graph();
+        Node endpoint = graph.methodNode(controller, "put", "(Lfixture/app/Note;)V", false);
+        endpoint.propsNote("methodAccess", Modifier.PUBLIC);
+        endpoint.propsNote("classAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/RestController;"));
+        endpoint.propsNote("methodAnnotationDescriptors", List.of(
+                "Lorg/springframework/web/bind/annotation/PutMapping;"));
+        graph.methodNode(controller, "configure", "()V", false)
+                .propsNote("methodAccess", Modifier.PUBLIC);
+        Node accept = graph.addCallNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", "VIRTUAL", null, 0,
+                controller, "configure", "()V");
+        accept.propsNote("stringLiteralHints", List.of("fixture.app."));
+        Node acceptMethod = graph.methodNode("com/alibaba/fastjson/parser/ParserConfig",
+                "addAccept", "(Ljava/lang/String;)V", true);
+        graph.addEdge(accept, acceptMethod, EdgeType.INVOKES, "VIRTUAL");
+        Node setter = graph.methodNode(actual, "setValue", "(Ljava/lang/String;)V", false);
+        setter.propsNote("methodAccess", Modifier.PUBLIC);
+        graph.freeze();
+
+        ClassHierarchy hierarchy = new ClassHierarchy(Map.of(
+                declared, new ClassInfo(declared, "java/lang/Object", List.of(),
+                        Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of()),
+                actual, new ClassInfo(actual, "java/lang/Object", List.of(),
+                        Modifier.PUBLIC | Modifier.FINAL, List.of(), List.of())), null);
+        ApplicationEntryIndex index = ApplicationEntryIndex.build(graph,
+                new RuleEngine(rules(), hierarchy), Set.of(controller, declared, actual), true);
+
+        assertTrue(index.typedBindingSitesForTarget(actual).isEmpty());
+        assertTrue(index.deserializationSideEffectSitesForTarget(actual).isEmpty());
+        assertFalse(index.isApplicationDeserializationSideEffectCallback(actual, "setValue",
+                "(Ljava/lang/String;)V"));
     }
 
     @Test

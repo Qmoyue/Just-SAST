@@ -215,6 +215,7 @@ public final class ApplicationChainJoiner {
         }
         String terminalHostKey = terminalDecision.hostMethodKey();
         boolean continuationEvidence = entryMatch.typedBinding()
+                || entryMatch.deserializationSideEffect()
                 || hasSemanticContinuation(index, chain);
         if (!declaredJdbcTerminal) {
             ApplicationEntryIndex.DemandDecision demand = index.demandAdmission(entryKey,
@@ -240,6 +241,8 @@ public final class ApplicationChainJoiner {
                 Math.max(0, entryMatch.path().size() - 1)));
         entryAttributes.put("entry_join_kind", entryMatch.typedBinding()
                 ? "TYPED_BINDING_TARGET"
+                : entryMatch.deserializationSideEffect()
+                ? "DESERIALIZATION_SIDE_EFFECT"
                 : entryMatch.path().size() > 1
                 ? "CALL_GRAPH_PREFIX" : "DIRECT_APPLICATION_ENTRY");
         if (!entryMatch.path().isEmpty()) {
@@ -304,13 +307,19 @@ public final class ApplicationChainJoiner {
             entryAttributes.put("binding_target_type", chain.entryClass());
             entryAttributes.put("binding_site_call_id", Long.toString(site.callId()));
             entryAttributes.put("binding_site_host", site.hostMethodKey());
+        } else if (entryMatch.deserializationSideEffect()) {
+            entryAttributes.put("deserialization_actual_type", chain.entryClass());
+            entryAttributes.put("deserialization_site_call_id", Long.toString(site.callId()));
+            entryAttributes.put("deserialization_site_host", site.hostMethodKey());
         }
         addBridgeProfileAttributes(entryAttributes, bridgeProfile);
         EvidenceAtom entry = EvidenceAtom.of(EvidenceAtom.Kind.APPLICATION_ENTRY, "UNKNOWN",
                 ownerOf(entryKey), memberOf(entryKey), entryMatch.path().isEmpty()
                         ? (!routeBindings.isEmpty() ? "INDEX_RESOURCE_ROUTE"
                         : "INDEX_APPLICATION_ENTRY") : entryMatch.typedBinding()
-                        ? "INDEX_TYPED_BINDING_ENTRY" : "INDEX_APPLICATION_CALL_PREFIX",
+                        ? "INDEX_TYPED_BINDING_ENTRY" : entryMatch.deserializationSideEffect()
+                        ? "INDEX_DESERIALIZATION_SIDE_EFFECT_ENTRY"
+                        : "INDEX_APPLICATION_CALL_PREFIX",
                 entryAttributes);
         EvidenceAtom siteAtom = siteAtom(site, entryKey, chain, entryMatch, bridgeProfile,
                 inputFlow, reflectiveProof);
@@ -341,6 +350,7 @@ public final class ApplicationChainJoiner {
         EntryChainJoinEvidence.CallbackSemantics callback = callbackSemantics(chain, site,
                 bridgeProfile);
         EntryChainJoinEvidence.RuntimeTypeProof runtimeType = entryMatch.typedBinding()
+                || entryMatch.deserializationSideEffect()
                 ? EntryChainJoinEvidence.RuntimeTypeProof.EXACT
                 : chain.unresolvedHops() == 0
                 ? EntryChainJoinEvidence.RuntimeTypeProof.BOUNDED
@@ -425,7 +435,8 @@ public final class ApplicationChainJoiner {
                 // the value reaching the composed chain. An explicit typed binding, protocol
                 // bridge, or taint-solver argument proof can establish that relation.
                 && (site == null || !"builtin:framework-binding".equals(site.ruleId())
-                || entryMatch.typedBinding() || flow != EntryChainJoinEvidence.ValueFlow.UNKNOWN);
+                || entryMatch.typedBinding() || entryMatch.deserializationSideEffect()
+                || flow != EntryChainJoinEvidence.ValueFlow.UNKNOWN);
         if (flow == EntryChainJoinEvidence.ValueFlow.DESERIALIZED_ELEMENT
                 && !reflectiveProof.established()) {
             joinEvidenceComplete = false;
@@ -526,6 +537,11 @@ public final class ApplicationChainJoiner {
                 callTargetCache);
         if (typedBinding != null) {
             return typedBinding;
+        }
+        EntryMatch deserializationSideEffect = findDeserializationSideEffectEntry(index, graph,
+                chain, allowedMethods, callTargetCache);
+        if (deserializationSideEffect != null) {
+            return deserializationSideEffect;
         }
         Set<String> candidates = new TreeSet<>();
         String entryDescriptor = entryDescriptor(graph, chain);
@@ -649,6 +665,56 @@ public final class ApplicationChainJoiner {
                     continue;
                 }
                 EntryMatch candidate = new EntryMatch(root, chainEntryKey, path, site, true);
+                if (best == null || candidate.path().size() < best.path().size()
+                        || candidate.path().size() == best.path().size()
+                        && candidate.applicationEntryKey().compareTo(best.applicationEntryKey()) < 0) {
+                    best = candidate;
+                }
+            }
+            if (best != null) {
+                return best;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Join the actual class selected by a deserializer even when it is not assignable to the
+     * declared framework parameter.  The side effect occurs while the converter constructs the
+     * object; controller reflection is a later boundary and is not a typed callback edge.
+     */
+    private static EntryMatch findDeserializationSideEffectEntry(
+            ApplicationEntryIndex index, Graph graph, Chain chain, Set<String> allowedMethods,
+            Map<String, List<String>> callTargetCache) {
+        if (index == null || chain == null || chain.entryClass() == null
+                || chain.entryMethod() == null || !callbackAcceptsValue(graph, chain)) {
+            return null;
+        }
+        List<ApplicationEntryIndex.DeserializeSite> sites =
+                index.deserializationSideEffectSitesForTarget(chain.entryClass());
+        String chainEntryDescriptor = entryDescriptor(graph, chain);
+        if (!index.isApplicationDeserializationSideEffectCallback(chain.entryClass(),
+                chain.entryMethod(), chainEntryDescriptor)) {
+            return null;
+        }
+        String chainEntryKey = methodKey(chain.entryClass(), chain.entryMethod(),
+                chainEntryDescriptor);
+        for (ApplicationEntryIndex.DeserializeSite site : sites) {
+            String host = site.hostMethodKey();
+            if (index.isExternalEntryMethod(host) || index.isApplicationEntryMethod(host)) {
+                return new EntryMatch(host, chainEntryKey, List.of(host), site, false, true);
+            }
+            if (graph == null || !index.isEntryForwardReachable(host)) {
+                continue;
+            }
+            EntryMatch best = null;
+            for (String root : index.applicationEntryMethods()) {
+                List<String> path = boundedCallPath(graph, root, host, allowedMethods,
+                        callTargetCache);
+                if (path.isEmpty()) {
+                    continue;
+                }
+                EntryMatch candidate = new EntryMatch(root, chainEntryKey, path, site, false, true);
                 if (best == null || candidate.path().size() < best.path().size()
                         || candidate.path().size() == best.path().size()
                         && candidate.applicationEntryKey().compareTo(best.applicationEntryKey()) < 0) {
@@ -902,12 +968,14 @@ public final class ApplicationChainJoiner {
                                          OriginSupport.DeserializationInputFlow inputFlow,
                                          OriginSupport.ReflectiveDispatchProof reflectiveProof) {
         EvidenceAtom.Kind kind = site == null ? EvidenceAtom.Kind.DESERIALIZATION_SITE
-                : siteKind(site.bridge(), match != null && match.typedBinding());
+                : siteKind(site.bridge(), match != null && (match.typedBinding()
+                || match.deserializationSideEffect()));
         String owner = site == null ? ownerOf(entryKey) : site.owner();
         String member = site == null ? memberOf(entryKey) : site.name() + site.descriptor();
         String evidenceCode = site == null ? "APPLICATION_CALLBACK_ENTRY"
                 : match != null && match.typedBinding()
-                ? "INDEX_TYPED_BINDING_SITE" : "INDEX_DESERIALIZE_SITE";
+                ? "INDEX_TYPED_BINDING_SITE" : match != null && match.deserializationSideEffect()
+                ? "INDEX_DESERIALIZATION_SIDE_EFFECT_SITE" : "INDEX_DESERIALIZE_SITE";
         Map<String, String> attributes = new TreeMap<>();
         attributes.put("entry_method", entryKey);
         if (site != null) {
@@ -919,8 +987,14 @@ public final class ApplicationChainJoiner {
             if (!site.targetTypes().isEmpty()) {
                 attributes.put("target_types", String.join(",", site.targetTypes()));
             }
+            if (!site.deserializationSideEffectTypes().isEmpty()) {
+                attributes.put("deserialization_side_effect_types",
+                        String.join(",", site.deserializationSideEffectTypes()));
+            }
             if (match != null && match.typedBinding()) {
                 attributes.put("join_kind", "TYPED_BINDING_TARGET");
+            } else if (match != null && match.deserializationSideEffect()) {
+                attributes.put("join_kind", "DESERIALIZATION_SIDE_EFFECT");
             }
         }
         addBridgeProfileAttributes(attributes, bridgeProfile);
@@ -1142,7 +1216,8 @@ public final class ApplicationChainJoiner {
         if (bridgeProfile.jdbcComplete()) {
             return EntryChainJoinEvidence.ValueFlow.DERIVED_VALUE;
         }
-        if (entryMatch != null && entryMatch.typedBinding()) {
+        if (entryMatch != null && (entryMatch.typedBinding()
+                || entryMatch.deserializationSideEffect())) {
             return EntryChainJoinEvidence.ValueFlow.CALLBACK_ARGUMENT;
         }
         if (inputFlow != null && inputFlow.proven()) {
@@ -1720,8 +1795,16 @@ public final class ApplicationChainJoiner {
     private record EntryMatch(String applicationEntryKey, String chainEntryKey,
                               List<String> path,
                               ApplicationEntryIndex.DeserializeSite bindingSite,
-                              boolean typedBinding) {
-        private static final EntryMatch NOT_FOUND = new EntryMatch("", "", List.of(), null, false);
+                              boolean typedBinding,
+                              boolean deserializationSideEffect) {
+        private static final EntryMatch NOT_FOUND = new EntryMatch("", "", List.of(), null,
+                false, false);
+
+        private EntryMatch(String applicationEntryKey, String chainEntryKey, List<String> path,
+                           ApplicationEntryIndex.DeserializeSite bindingSite,
+                           boolean typedBinding) {
+            this(applicationEntryKey, chainEntryKey, path, bindingSite, typedBinding, false);
+        }
 
         private EntryMatch {
             applicationEntryKey = applicationEntryKey == null ? "" : applicationEntryKey;
