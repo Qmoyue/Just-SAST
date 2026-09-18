@@ -20,11 +20,13 @@ public record JndiLookupIdentityFlow(
 
     public enum Status {
         PROVED,
+        PARTIAL,
         UNKNOWN
     }
 
     public enum Reason {
         NONE,
+        LOOKUP_SEARCH_VALUE_FLOW_INCOMPLETE,
         LOOKUP_SEARCH_IDENTITY_MISMATCH
     }
 
@@ -64,6 +66,9 @@ public record JndiLookupIdentityFlow(
     }
 
     private static Decision decide(JndiLookupCallSite lookup, JndiLookupCallSite search) {
+        if (incomplete(lookup) || incomplete(search)) {
+            return new Decision(Status.PARTIAL, Reason.LOOKUP_SEARCH_VALUE_FLOW_INCOMPLETE);
+        }
         String lookupResult = lookup.returnValue().orElseThrow(
                 () -> new IllegalArgumentException("JNDI lookup result slot is missing"))
                 .value().token();
@@ -72,6 +77,10 @@ public record JndiLookupIdentityFlow(
             return new Decision(Status.PROVED, Reason.NONE);
         }
         return new Decision(Status.UNKNOWN, Reason.LOOKUP_SEARCH_IDENTITY_MISMATCH);
+    }
+
+    private static boolean incomplete(JndiLookupCallSite callSite) {
+        return callSite.values().stream().anyMatch(value -> value.value().producerOffset() < 0);
     }
 
     private record Decision(Status status, Reason reason) {

@@ -5,6 +5,7 @@ import io.just.sast.cpg.graph.Node;
 import io.just.sast.frontend.asm.FactsExtractor;
 import io.just.sast.model.ClassInfo;
 import io.just.sast.model.JndiLookupCallSite;
+import io.just.sast.model.JndiLookupCapability;
 import io.just.sast.model.JndiLookupIdentityFlow;
 import io.just.sast.model.LoadResult;
 import org.junit.jupiter.api.Test;
@@ -129,7 +130,66 @@ class JndiLookupIdentityContractTest {
                 lookupFact.returnValue().orElseThrow().value().state());
         assertEquals(JndiLookupCallSite.ValueState.UNKNOWN,
                 searchFact.receiver().value().state());
-        assertTrue(flows(search).isEmpty());
+        assertEquals(1, flows(search).size());
+        assertEquals(JndiLookupIdentityFlow.Status.PARTIAL, flows(search).get(0).status());
+        assertEquals(JndiLookupIdentityFlow.Reason.LOOKUP_SEARCH_VALUE_FLOW_INCOMPLETE,
+                flows(search).get(0).reason());
+    }
+
+    @Test
+    void unknownLookupNamePublishesCapabilityOnlyWithoutResolvingAProvider() {
+        Fixture fixture = fixture(chainBytes(true));
+        Node lookup = fixture.call(JndiLookupCallSite.INITIAL_CONTEXT_OWNER,
+                JndiLookupCallSite.LOOKUP_NAME, JndiLookupCallSite.LOOKUP_DESCRIPTOR);
+
+        JndiLookupCapability capability = capability(lookup);
+        assertEquals(JndiLookupCapability.Status.CAPABILITY_ONLY, capability.status());
+        assertEquals(JndiLookupCapability.Reason.LOOKUP_URL_UNKNOWN, capability.reason());
+        assertEquals(1, capability.identityFlows().size());
+        assertTrue(capability.identityFlows().get(0).proved());
+    }
+
+    @Test
+    void knownLookupNameStillStopsAtCapabilityWithoutProviderInference() {
+        Fixture fixture = fixture(chainBytes());
+        Node lookup = fixture.call(JndiLookupCallSite.INITIAL_CONTEXT_OWNER,
+                JndiLookupCallSite.LOOKUP_NAME, JndiLookupCallSite.LOOKUP_DESCRIPTOR);
+
+        JndiLookupCapability capability = capability(lookup);
+        assertEquals(JndiLookupCapability.Status.CAPABILITY_ONLY, capability.status());
+        assertEquals(JndiLookupCapability.Reason.LOOKUP_PROVIDER_NOT_RESOLVED,
+                capability.reason());
+    }
+
+    @Test
+    void incompleteLookupSearchFlowRemainsPartialAtBothCapabilityBoundaries() {
+        Fixture fixture = fixture(branchBytes());
+        Node lookup = fixture.call(JndiLookupCallSite.INITIAL_CONTEXT_OWNER,
+                JndiLookupCallSite.LOOKUP_NAME, JndiLookupCallSite.LOOKUP_DESCRIPTOR);
+        Node search = fixture.call(JndiLookupCallSite.DIR_CONTEXT_OWNER,
+                JndiLookupCallSite.SEARCH_NAME,
+                "(Ljava/lang/String;Ljavax/naming/directory/Attributes;)"
+                        + JndiLookupCallSite.SEARCH_RETURN_DESCRIPTOR);
+
+        assertEquals(JndiLookupCapability.Status.PARTIAL, capability(lookup).status());
+        assertEquals(JndiLookupCapability.Reason.VALUE_FLOW_INCOMPLETE,
+                capability(lookup).reason());
+        assertEquals(JndiLookupCapability.Status.PARTIAL, capability(search).status());
+        assertEquals(JndiLookupCapability.Reason.VALUE_FLOW_INCOMPLETE,
+                capability(search).reason());
+    }
+
+    @Test
+    void ambiguousLookupSearchIdentityRemainsUnknown() {
+        Fixture fixture = fixture(twoLookupBytes());
+        Node search = fixture.call(JndiLookupCallSite.DIR_CONTEXT_OWNER,
+                JndiLookupCallSite.SEARCH_NAME,
+                "(Ljava/lang/String;Ljavax/naming/directory/Attributes;)"
+                        + JndiLookupCallSite.SEARCH_RETURN_DESCRIPTOR);
+
+        assertEquals(JndiLookupCapability.Status.UNKNOWN, capability(search).status());
+        assertEquals(JndiLookupCapability.Reason.IDENTITY_FLOW_AMBIGUOUS,
+                capability(search).reason());
     }
 
     private static JndiLookupCallSite fact(Node node) {
@@ -137,6 +197,13 @@ class JndiLookupIdentityContractTest {
                 JndiLookupCallSite.GRAPH_NOTE_KEY);
         assertNotNull(fact);
         return fact;
+    }
+
+    private static JndiLookupCapability capability(Node node) {
+        JndiLookupCapability capability = (JndiLookupCapability) node.note(
+                JndiLookupCapability.GRAPH_NOTE_KEY);
+        assertNotNull(capability);
+        return capability;
     }
 
     @SuppressWarnings("unchecked")

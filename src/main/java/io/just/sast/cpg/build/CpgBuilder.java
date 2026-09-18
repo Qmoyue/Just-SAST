@@ -17,6 +17,7 @@ import io.just.sast.model.JaasLoginModuleFlow;
 import io.just.sast.model.JdbcConnectionCallSite;
 import io.just.sast.model.JndiReferenceFact;
 import io.just.sast.model.JndiLookupCallSite;
+import io.just.sast.model.JndiLookupCapability;
 import io.just.sast.model.JndiLookupIdentityFlow;
 import io.just.sast.model.MethodId;
 import io.just.sast.model.MethodInfo;
@@ -110,6 +111,7 @@ public final class CpgBuilder {
                 annotateJdbcConnectionFacts(graph, method);
                 annotateJaasLoginModuleFacts(graph, method);
                 annotateJndiLookupIdentityFacts(graph, method);
+                annotateJndiLookupCapabilityFacts(graph, method);
                 for (var tryCatch : method.tryCatch()) {
                     slice.accept(tryCatch);
                 }
@@ -817,6 +819,12 @@ public final class CpgBuilder {
                 }
             });
         }
+        attachJndiLookupIdentityFlows(graph, lookups, searches);
+    }
+
+    private static void attachJndiLookupIdentityFlows(Graph graph,
+                                                       List<JndiLookupCallSite> lookups,
+                                                       List<JndiLookupCallSite> searches) {
         for (JndiLookupCallSite search : searches) {
             List<JndiLookupIdentityFlow> flows = lookups.stream()
                     .map(lookup -> JndiLookupIdentityFlow.connect(lookup, search))
@@ -831,11 +839,83 @@ public final class CpgBuilder {
     private static void annotateUnknownJndiLookupFacts(Graph graph, MethodInfo method,
                                                        String hostMethodKey) {
         MethodId hostMethod = MethodId.of(method.owner(), method.name(), method.descriptor());
+        List<JndiLookupCallSite> lookups = new ArrayList<>();
+        List<JndiLookupCallSite> searches = new ArrayList<>();
         for (Node call : graph.callsOfMethod(hostMethodKey)) {
             JndiLookupCallSite.fromCall(call.id(), hostMethod, call.offset(), call.owner(),
                     call.name(), call.descriptor(), call.invokeKind())
-                    .ifPresent(fact -> call.propsNote(JndiLookupCallSite.GRAPH_NOTE_KEY, fact));
+                    .ifPresent(fact -> {
+                        call.propsNote(JndiLookupCallSite.GRAPH_NOTE_KEY, fact);
+                        if (fact.kind() == JndiLookupCallSite.Kind.INITIAL_CONTEXT_LOOKUP) {
+                            lookups.add(fact);
+                        } else {
+                            searches.add(fact);
+                        }
+                    });
         }
+        attachJndiLookupIdentityFlows(graph, lookups, searches);
+    }
+
+    /** Publish capability-only/partial/unknown status at the exact JNDI boundary. */
+    private static void annotateJndiLookupCapabilityFacts(Graph graph, MethodInfo method) {
+        String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
+        Map<String, List<JndiLookupIdentityFlow>> flowsByCallIdentity = new HashMap<>();
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            Object note = call.note(JndiLookupIdentityFlow.GRAPH_NOTE_KEY);
+            if (note == null) {
+                continue;
+            }
+            List<JndiLookupIdentityFlow> flows = jndiIdentityFlows(note);
+            for (JndiLookupIdentityFlow flow : flows) {
+                String key = flow.search().identity();
+                List<JndiLookupIdentityFlow> existing = flowsByCallIdentity
+                        .computeIfAbsent(key, ignored -> new ArrayList<>());
+                existing.add(flow);
+            }
+        }
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            Object note = call.note(JndiLookupCallSite.GRAPH_NOTE_KEY);
+            if (!(note instanceof JndiLookupCallSite fact)) {
+                continue;
+            }
+            List<JndiLookupIdentityFlow> flows = fact.kind()
+                    == JndiLookupCallSite.Kind.DIR_CONTEXT_SEARCH
+                    ? flowsByCallIdentity.getOrDefault(fact.identity(), List.of())
+                    : flowsByLookupIdentity(graph, hostMethodKey, fact);
+            call.propsNote(JndiLookupCapability.GRAPH_NOTE_KEY,
+                    JndiLookupCapability.classify(fact, flows));
+        }
+    }
+
+    private static List<JndiLookupIdentityFlow> flowsByLookupIdentity(
+            Graph graph, String hostMethodKey, JndiLookupCallSite lookup) {
+        List<JndiLookupIdentityFlow> result = new ArrayList<>();
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            Object note = call.note(JndiLookupIdentityFlow.GRAPH_NOTE_KEY);
+            if (note == null) {
+                continue;
+            }
+            for (JndiLookupIdentityFlow flow : jndiIdentityFlows(note)) {
+                if (lookup.identity().equals(flow.lookup().identity())) {
+                    result.add(flow);
+                }
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private static List<JndiLookupIdentityFlow> jndiIdentityFlows(Object value) {
+        if (!(value instanceof List<?> values)) {
+            throw new IllegalStateException("JNDI identity-flow note is not a flow list");
+        }
+        List<JndiLookupIdentityFlow> result = new ArrayList<>(values.size());
+        for (Object item : values) {
+            if (!(item instanceof JndiLookupIdentityFlow flow)) {
+                throw new IllegalStateException("JNDI identity-flow note contains an invalid fact");
+            }
+            result.add(flow);
+        }
+        return List.copyOf(result);
     }
 
     private static String jndiReceiverDescriptor(JndiLookupCallSite.Kind kind) {
