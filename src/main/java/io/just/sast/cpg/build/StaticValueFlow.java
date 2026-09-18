@@ -13,6 +13,7 @@ import io.just.sast.model.TypeRef;
 import io.just.sast.model.TypedBridgeFact;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -67,9 +68,12 @@ final class StaticValueFlow {
                 return true;
             }
             case ACONST_NULL -> stack.add(Value.nullValue(hostMethodKey, insn.offset()));
-            case ICONST_M1, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5,
-                    FCONST_0, FCONST_1, FCONST_2, BIPUSH, SIPUSH ->
-                    stack.add(Value.unknown(hostMethodKey, insn.offset(), "I", false));
+            case ICONST_M1, ICONST_0, ICONST_1, ICONST_2, ICONST_3, ICONST_4, ICONST_5 ->
+                    stack.add(Value.integer(hostMethodKey, insn.offset(), integerConstant(insn.op())));
+            case BIPUSH, SIPUSH ->
+                    stack.add(Value.integer(hostMethodKey, insn.offset(), intOperand(insn)));
+            case FCONST_0, FCONST_1, FCONST_2 ->
+                    stack.add(Value.unknown(hostMethodKey, insn.offset(), "F", false));
             case LCONST_0, LCONST_1 ->
                     stack.add(Value.unknown(hostMethodKey, insn.offset(), "J", true));
             case DCONST_0, DCONST_1 ->
@@ -79,6 +83,12 @@ final class StaticValueFlow {
                 if (constant instanceof String value) {
                     stack.add(Value.known(hostMethodKey, insn.offset(), "Ljava/lang/String;",
                             value));
+                } else if (constant instanceof TypeRef type
+                        && classLiteralInternalName(type) != null) {
+                    stack.add(Value.classLiteral(hostMethodKey, insn.offset(),
+                            classLiteralInternalName(type)));
+                } else if (constant instanceof Integer value) {
+                    stack.add(Value.integer(hostMethodKey, insn.offset(), value));
                 } else {
                     stack.add(Value.unknown(hostMethodKey, insn.offset(),
                             constant instanceof Long ? "J"
@@ -107,6 +117,43 @@ final class StaticValueFlow {
                 }
                 stack.add(Value.known(hostMethodKey, insn.offset(), "L" + owner + ";", null,
                         "allocation"));
+            }
+            case ANEWARRAY -> {
+                Value length = pop(stack);
+                String component = internalName(insn.typeRef());
+                if (length == null || component == null) {
+                    return false;
+                }
+                int size = length.integerValue() == null ? -1 : length.integerValue();
+                if (size < -1) {
+                    return false;
+                }
+                String descriptor = "[L" + component + ";";
+                stack.add(Value.array(hostMethodKey, insn.offset(), descriptor, component, size));
+            }
+            case NEWARRAY -> {
+                Value length = pop(stack);
+                if (length == null) {
+                    return false;
+                }
+                int size = length.integerValue() == null ? -1 : length.integerValue();
+                if (size < -1) {
+                    return false;
+                }
+                stack.add(Value.array(hostMethodKey, insn.offset(), "[?", null, size));
+            }
+            case MULTIANEWARRAY -> {
+                if (insn.operands().size() < 2 || !(insn.operands().get(0) instanceof TypeRef type)
+                        || !(insn.operands().get(1) instanceof Integer dimensions)
+                        || dimensions < 1) {
+                    return false;
+                }
+                for (int dimension = 0; dimension < dimensions; dimension++) {
+                    if (pop(stack) == null) {
+                        return false;
+                    }
+                }
+                stack.add(Value.array(hostMethodKey, insn.offset(), type.descriptor(), null, -1));
             }
             case CHECKCAST -> {
                 Value value = pop(stack);
@@ -172,7 +219,19 @@ final class StaticValueFlow {
                     return false;
                 }
             }
-            case IALOAD, FALOAD, AALOAD, BALOAD, CALOAD, SALOAD -> {
+            case AALOAD -> {
+                Value index = pop(stack);
+                Value array = pop(stack);
+                if (index == null || array == null) {
+                    return false;
+                }
+                Value element = array.arrayShape() == null || index.integerValue() == null
+                        ? null : array.arrayShape().element(index.integerValue());
+                stack.add(element == null
+                        ? Value.unknown(hostMethodKey, insn.offset(), "Ljava/lang/Object;", false)
+                        : element);
+            }
+            case IALOAD, FALOAD, BALOAD, CALOAD, SALOAD -> {
                 if (!popTwo(stack)) {
                     return false;
                 }
@@ -186,11 +245,37 @@ final class StaticValueFlow {
                 stack.add(Value.unknown(hostMethodKey, insn.offset(),
                         insn.op() == Op.LALOAD ? "J" : "D", true));
             }
-            case IASTORE, FASTORE, AASTORE, BASTORE, CASTORE, SASTORE,
+            case AASTORE -> {
+                Value value = pop(stack);
+                Value index = pop(stack);
+                Value array = pop(stack);
+                if (value == null || index == null || array == null) {
+                    return false;
+                }
+                if (array.arrayShape() != null) {
+                    if (index.integerValue() == null) {
+                        array.arrayShape().markUnknown();
+                    } else {
+                        array.arrayShape().put(index.integerValue(), value);
+                    }
+                }
+            }
+            case IASTORE, FASTORE, BASTORE, CASTORE, SASTORE,
                     LASTORE, DASTORE -> {
                 if (!popThree(stack)) {
                     return false;
                 }
+            }
+            case ARRAYLENGTH -> {
+                Value array = pop(stack);
+                if (array == null) {
+                    return false;
+                }
+                Integer length = array.arrayShape() == null
+                        ? null : array.arrayShape().length();
+                stack.add(length == null || length < 0
+                        ? Value.unknown(hostMethodKey, insn.offset(), "I", false)
+                        : Value.integer(hostMethodKey, insn.offset(), length));
             }
             case INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE,
                     INVOKEDYNAMIC -> {
@@ -307,6 +392,37 @@ final class StaticValueFlow {
         return descriptor != null && !descriptor.isBlank();
     }
 
+    private static int integerConstant(Op op) {
+        return switch (op) {
+            case ICONST_M1 -> -1;
+            case ICONST_0 -> 0;
+            case ICONST_1 -> 1;
+            case ICONST_2 -> 2;
+            case ICONST_3 -> 3;
+            case ICONST_4 -> 4;
+            case ICONST_5 -> 5;
+            default -> throw new IllegalArgumentException("not an integer constant opcode: " + op);
+        };
+    }
+
+    private static int intOperand(InsnFact insn) {
+        if (insn.operands().size() != 1 || !(insn.operands().get(0) instanceof Integer value)) {
+            throw new IllegalArgumentException("integer opcode has no integer operand");
+        }
+        return value;
+    }
+
+    private static String classLiteralInternalName(TypeRef type) {
+        if (type == null || type.descriptor() == null) {
+            return null;
+        }
+        String descriptor = type.descriptor();
+        if (!descriptor.startsWith("L") || !descriptor.endsWith(";")) {
+            return null;
+        }
+        return internalName(type);
+    }
+
     private static boolean isCategory2(String descriptor) {
         return "J".equals(descriptor) || "D".equals(descriptor);
     }
@@ -326,6 +442,59 @@ final class StaticValueFlow {
 
     private static String token(String hostMethodKey, int offset, String kind) {
         return "value-flow-v1:" + hostMethodKey + ":" + offset + ":" + kind;
+    }
+
+    /** Mutable only inside one local bytecode transfer; facts receive an immutable snapshot. */
+    static final class ArrayShape {
+        private final String descriptor;
+        private final String component;
+        private final int length;
+        private final Map<Integer, Value> elements = new LinkedHashMap<>();
+        private boolean valid = true;
+
+        private ArrayShape(String descriptor, String component, int length) {
+            this.descriptor = Objects.requireNonNull(descriptor, "array descriptor");
+            this.component = component;
+            this.length = length;
+        }
+
+        private void put(int index, Value value) {
+            if (value == null || index < 0 || (length >= 0 && index >= length)) {
+                valid = false;
+                return;
+            }
+            elements.put(index, value);
+        }
+
+        private void markUnknown() {
+            valid = false;
+        }
+
+        private Value element(int index) {
+            return elements.get(index);
+        }
+
+        Integer length() {
+            return length;
+        }
+
+        /** Return exact Class literals in array order, or null when any member is unresolved. */
+        List<String> interfaceTypes() {
+            if (!valid || !"[Ljava/lang/Class;".equals(descriptor)
+                    || length < 0 || component == null
+                    || !"java/lang/Class".equals(component)) {
+                return null;
+            }
+            List<String> result = new ArrayList<>(length);
+            for (int index = 0; index < length; index++) {
+                Value value = elements.get(index);
+                if (value == null || value.classLiteral() == null) {
+                    return null;
+                }
+                result.add(value.classLiteral());
+            }
+            return List.copyOf(result);
+        }
     }
 
     record Result(List<Invocation> invocations, boolean complete) {
@@ -348,7 +517,8 @@ final class StaticValueFlow {
     }
 
     record Value(ValueState state, TypedBridgeFact.FlowIdentity identity, String displayValue,
-                 String descriptor, int producerOffset, boolean category2) {
+                 String descriptor, int producerOffset, boolean category2, Integer integerValue,
+                 String classLiteral, ArrayShape arrayShape) {
         Value {
             state = Objects.requireNonNull(state, "value-flow state");
             identity = Objects.requireNonNull(identity, "value-flow identity");
@@ -363,6 +533,13 @@ final class StaticValueFlow {
                 throw new IllegalArgumentException(
                         "non-known value-flow value cannot carry display text");
             }
+            if (integerValue != null && !"I".equals(descriptor)) {
+                throw new IllegalArgumentException("integer value-flow value must have I descriptor");
+            }
+            if (classLiteral != null && !(state == ValueState.KNOWN
+                    && "Ljava/lang/Class;".equals(descriptor))) {
+                throw new IllegalArgumentException("class literal value-flow shape is invalid");
+            }
         }
 
         static Value known(String hostMethodKey, int offset, String descriptor,
@@ -374,13 +551,13 @@ final class StaticValueFlow {
                            String displayValue, String kind) {
             return new Value(ValueState.KNOWN,
                     new TypedBridgeFact.FlowIdentity(token(hostMethodKey, offset, kind)),
-                    displayValue, descriptor, offset, isCategory2(descriptor));
+                    displayValue, descriptor, offset, isCategory2(descriptor), null, null, null);
         }
 
         static Value nullValue(String hostMethodKey, int offset) {
             return new Value(ValueState.NULL,
                     new TypedBridgeFact.FlowIdentity(token(hostMethodKey, offset, "null")),
-                    null, "Ljava/lang/Object;", offset, false);
+                    null, "Ljava/lang/Object;", offset, false, null, null, null);
         }
 
         static Value unknown(String hostMethodKey, int offset, String descriptor,
@@ -392,7 +569,27 @@ final class StaticValueFlow {
                              boolean category2, String kind) {
             return new Value(ValueState.UNKNOWN,
                     new TypedBridgeFact.FlowIdentity(token(hostMethodKey, offset, kind)),
-                    null, descriptor, offset, category2);
+                    null, descriptor, offset, category2, null, null, null);
+        }
+
+        static Value integer(String hostMethodKey, int offset, int value) {
+            return new Value(ValueState.UNKNOWN,
+                    new TypedBridgeFact.FlowIdentity(token(hostMethodKey, offset, "integer")),
+                    null, "I", offset, false, value, null, null);
+        }
+
+        static Value classLiteral(String hostMethodKey, int offset, String internalName) {
+            return new Value(ValueState.KNOWN,
+                    new TypedBridgeFact.FlowIdentity(token(hostMethodKey, offset, "class-literal")),
+                    null, "Ljava/lang/Class;", offset, false, null, internalName, null);
+        }
+
+        static Value array(String hostMethodKey, int offset, String descriptor,
+                           String component, int length) {
+            return new Value(ValueState.KNOWN,
+                    new TypedBridgeFact.FlowIdentity(token(hostMethodKey, offset, "array")),
+                    null, descriptor, offset, false, null, null,
+                    new ArrayShape(descriptor, component, length));
         }
     }
 

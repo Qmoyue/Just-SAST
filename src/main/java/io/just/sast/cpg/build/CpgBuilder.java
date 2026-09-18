@@ -23,6 +23,7 @@ import io.just.sast.model.MethodId;
 import io.just.sast.model.MethodInfo;
 import io.just.sast.model.MethodRef;
 import io.just.sast.model.Op;
+import io.just.sast.model.ProxyCreationCallSite;
 import io.just.sast.model.TypeRef;
 import io.just.sast.model.TypedBridgeFact;
 
@@ -112,6 +113,7 @@ public final class CpgBuilder {
                 annotateJaasLoginModuleFacts(graph, method);
                 annotateJndiLookupIdentityFacts(graph, method);
                 annotateJndiLookupCapabilityFacts(graph, method);
+                annotateProxyCreationFacts(graph, method);
                 for (var tryCatch : method.tryCatch()) {
                     slice.accept(tryCatch);
                 }
@@ -885,6 +887,85 @@ public final class CpgBuilder {
             call.propsNote(JndiLookupCapability.GRAPH_NOTE_KEY,
                     JndiLookupCapability.classify(fact, flows));
         }
+    }
+
+    /** Publish exact Proxy.newProxyInstance slot/identity facts without resolving the runtime. */
+    private static void annotateProxyCreationFacts(Graph graph, MethodInfo method) {
+        String hostMethodKey = methodKey(method.owner(), method.name(), method.descriptor());
+        if (method.instructions().isEmpty()) {
+            return;
+        }
+        StaticValueFlow.Result flow = StaticValueFlow.analyze(graph, method);
+        if (!flow.complete()) {
+            annotateUnknownProxyCreationFacts(graph, method, hostMethodKey);
+            return;
+        }
+        for (StaticValueFlow.Invocation invocation : flow.invocations()) {
+            if (!ProxyCreationCallSite.matches(invocation.owner(), invocation.name(),
+                    invocation.descriptor(), invocation.invokeKind())) {
+                continue;
+            }
+            if (invocation.arguments().size() != 3 || invocation.result() == null
+                    || invocation.receiver() != null) {
+                throw new IllegalStateException("exact proxy factory has an invalid value-flow shape");
+            }
+            ProxyCreationCallSite fact = ProxyCreationCallSite.withValues(
+                    proxyCallSite(invocation.call(), method),
+                    proxyValue(invocation.arguments().get(0)),
+                    proxyInterfaceSet(invocation.arguments().get(1)),
+                    proxyValue(invocation.arguments().get(2)),
+                    proxyValue(invocation.result()));
+            invocation.call().propsNote(ProxyCreationCallSite.GRAPH_NOTE_KEY, fact);
+        }
+    }
+
+    private static void annotateUnknownProxyCreationFacts(Graph graph, MethodInfo method,
+                                                           String hostMethodKey) {
+        MethodId hostMethod = MethodId.of(method.owner(), method.name(), method.descriptor());
+        for (Node call : graph.callsOfMethod(hostMethodKey)) {
+            ProxyCreationCallSite.fromCall(call.id(), hostMethod, call.offset(), call.owner(),
+                    call.name(), call.descriptor(), call.invokeKind())
+                    .ifPresent(fact -> call.propsNote(ProxyCreationCallSite.GRAPH_NOTE_KEY, fact));
+        }
+    }
+
+    private static ProxyCreationCallSite.ValueIdentity proxyValue(StaticValueFlow.Value value) {
+        if (value == null) {
+            throw new IllegalArgumentException("proxy value-flow slot is missing");
+        }
+        return switch (value.state()) {
+            case KNOWN -> ProxyCreationCallSite.ValueIdentity.known(value.identity(),
+                    value.descriptor(), value.producerOffset());
+            case NULL -> ProxyCreationCallSite.ValueIdentity.nullValue(value.identity(),
+                    value.descriptor(), value.producerOffset());
+            case UNKNOWN -> ProxyCreationCallSite.ValueIdentity.unknown(value.identity(),
+                    value.descriptor(), value.producerOffset());
+        };
+    }
+
+    private static ProxyCreationCallSite.InterfaceSet proxyInterfaceSet(
+            StaticValueFlow.Value value) {
+        if (value == null) {
+            throw new IllegalArgumentException("proxy interface-set value is missing");
+        }
+        if (value.state() == StaticValueFlow.ValueState.NULL) {
+            return ProxyCreationCallSite.InterfaceSet.nullValue(value.identity(),
+                    value.producerOffset());
+        }
+        List<String> interfaceTypes = value.arrayShape() == null
+                ? null : value.arrayShape().interfaceTypes();
+        if (interfaceTypes == null) {
+            return ProxyCreationCallSite.InterfaceSet.unknown(value.identity(),
+                    value.producerOffset());
+        }
+        return ProxyCreationCallSite.InterfaceSet.known(value.identity(),
+                value.producerOffset(), interfaceTypes);
+    }
+
+    private static TypedBridgeFact.CallSite proxyCallSite(Node call, MethodInfo method) {
+        return new TypedBridgeFact.CallSite(call.id(),
+                MethodId.of(method.owner(), method.name(), method.descriptor()), call.offset(),
+                call.owner(), call.name(), call.descriptor(), bridgeInvokeKind(call.invokeKind()));
     }
 
     private static List<JndiLookupIdentityFlow> flowsByLookupIdentity(
