@@ -107,7 +107,38 @@ class JndiReferenceFactoryClassConstraintTest {
                 .isEmpty());
     }
 
+    @Test
+    void missingReferenceFactoryClassRemainsPartialWithoutGuessing() {
+        Fixture fixture = fixture();
+        JndiReferenceFact missingFactory = new JndiReferenceFact(fixture.reference().identity(),
+                fixture.reference().type(), JndiReferenceFact.FieldValue.absent(),
+                fixture.reference().factoryLocation(), fixture.reference().properties());
+
+        JndiReferenceFactoryClassConstraint constraint = connect(missingFactory, fixture,
+                new TypedBridgeFact.FlowIdentity("factory-name"),
+                new TypedBridgeFact.FlowIdentity("factory-name"),
+                TypeId.of("fixture/Factory"), TypeId.of("fixture/Factory"),
+                JndiReferenceFact.FieldValue.known("fixture.Factory"));
+
+        assertEquals(JndiReferenceFactoryClassConstraint.Status.PARTIAL, constraint.status());
+        assertEquals(JndiReferenceFactoryClassConstraint.Reason.REFERENCE_FACTORY_CLASS_UNKNOWN,
+                constraint.reason());
+        assertFalse(constraint.proved());
+    }
+
     private static JndiReferenceFactoryClassConstraint connect(
+            Fixture fixture,
+            TypedBridgeFact.FlowIdentity classNameIdentity,
+            TypedBridgeFact.FlowIdentity referenceIdentity,
+            TypeId receiverType,
+            TypeId loadedType,
+            JndiReferenceFact.FieldValue classForNameArgument) {
+        return connect(fixture.reference(), fixture, classNameIdentity, referenceIdentity,
+                receiverType, loadedType, classForNameArgument);
+    }
+
+    private static JndiReferenceFactoryClassConstraint connect(
+            JndiReferenceFact reference,
             Fixture fixture,
             TypedBridgeFact.FlowIdentity classNameIdentity,
             TypedBridgeFact.FlowIdentity referenceIdentity,
@@ -133,7 +164,7 @@ class JndiReferenceFactoryClassConstraintTest {
                 new TypedBridgeFact.FlowIdentity("factory-object"), receiverCall,
                 TypedBridgeFact.Slot.receiver(JndiObjectFactoryCallSite.RECEIVER_DESCRIPTOR),
                 receiverType, artifact);
-        return JndiReferenceFactoryClassConstraint.connect(fixture.reference(),
+        return JndiReferenceFactoryClassConstraint.connect(reference,
                 fixture.classForName(), classForNameArgument, classNameEndpoint,
                 referenceFactoryEndpoint, factoryReceiver, loadedType,
                 TypedBridgeFact.IdentityRelation.SAME,
