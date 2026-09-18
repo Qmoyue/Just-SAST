@@ -604,6 +604,8 @@ class ApplicationChainJoinerContractTest {
                         && site.targetTypes().contains("fixture/app/Note")));
         assertTrue(index.typedBindingSitesForTarget(target).isEmpty(),
                 "an unrelated final class under an accepted prefix is not a typed target");
+        assertFalse(index.isApplicationBindingCallback(target, "setValue", setterDesc),
+                "an unrelated final class must not enter the application callback projection");
 
         Chain chain = new Chain("unrelated-prefix-final", "COMMAND", "HIGH", target, "setValue",
                 "deserialize", RUNTIME, "start", List.of(

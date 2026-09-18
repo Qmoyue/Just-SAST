@@ -1972,16 +1972,20 @@ public final class ApplicationEntryIndex {
         }
 
         // A deserialize source is a typed object-binding boundary even when the frontend
-        // cannot recover a concrete target class literal.  Restrict the generic fallback to
-        // public, instance JavaBean setters and require an application-owned external
-        // deserialize site in this artifact; an arbitrary public method must not become an
+        // cannot recover a concrete target class literal.  Restrict the callback projection to
+        // public, instance JavaBean setters whose owner is an exact target of an
+        // application-owned external site; an arbitrary public method must not become an
         // attacker entry merely because a source rule exists somewhere on the class path.
-        boolean externalDeserializeSite = sites.stream().anyMatch(site -> site.applicationOwned()
-                && site.externalInput() && isTypedBindingBridge(site.bridge()));
+        Set<String> typedBindingTargetOwners = sites.stream()
+                .filter(site -> site.applicationOwned() && site.externalInput()
+                        && isTypedBindingBridge(site.bridge()))
+                .flatMap(site -> site.targetTypes().stream())
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new));
         Set<String> bindingCallbacks = new TreeSet<>();
-        if (externalDeserializeSite) {
+        if (!typedBindingTargetOwners.isEmpty()) {
             for (Node method : graph.nodesOfType(NodeType.METHOD)) {
                 if (applicationScopeKnown && owners.contains(method.owner())
+                        && typedBindingTargetOwners.contains(method.owner())
                         && isPublicBeanSetter(method)) {
                     bindingCallbacks.add(methodKey(method.owner(), method.name(),
                             method.descriptor()));
