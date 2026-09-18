@@ -529,7 +529,7 @@ public final class ScanPipeline {
                 scanChainProofCompleteness,
                 targetArtifactHash, metricCapture.status(), metricCapture.namespaces(),
                 metricCapture.namespaceStatus(), blackboard.originSupport().finiteFilterEvidence());
-        new io.just.sast.report.MultiFormatReporter().writeMetadata(reportLayout, scanStats);
+        new io.just.sast.report.ScanMetadataWriter().write(reportLayout, scanStats);
         new io.just.sast.report.ConciseReportWriter().write(reportLayout,
                 modePolicy.wireName(),
                 findingOutput, scanStats);

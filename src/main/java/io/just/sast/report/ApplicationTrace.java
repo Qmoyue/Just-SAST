@@ -2,9 +2,11 @@ package io.just.sast.report;
 
 import io.just.sast.analysis.entry.ApplicationChainEvidence;
 import io.just.sast.blackboard.ApplicationChainId;
+import io.just.sast.blackboard.ChainHop;
 import io.just.sast.blackboard.EvidenceAtom;
 import io.just.sast.blackboard.EvidenceEdge;
 import io.just.sast.blackboard.EvidenceNode;
+import io.just.sast.blackboard.HopKind;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -331,7 +333,7 @@ public record ApplicationTrace(
     /** Human-readable application-root → legacy-chain path used by all report formats. */
     public String applicationPath(io.just.sast.blackboard.Chain chain) {
         Objects.requireNonNull(chain, "chain");
-        String chainPath = CsvReporter.pathSummary(chain);
+        String chainPath = pathSummary(chain);
         if (entryPrefixPath.isBlank()) {
             return chainPath;
         }
@@ -350,6 +352,27 @@ public record ApplicationTrace(
             return prefix;
         }
         return prefix + " -> " + suffix;
+    }
+
+    /** Stable entry-to-impact path used by the canonical application trace projection. */
+    private static String pathSummary(io.just.sast.blackboard.Chain chain) {
+        StringBuilder out = new StringBuilder();
+        List<ChainHop> hops = chain.hops();
+        boolean first = true;
+        for (int hopIndex = hops.size() - 1; hopIndex >= 0; hopIndex--) {
+            ChainHop hop = hops.get(hopIndex);
+            if (first) {
+                out.append(hop.fromOwner()).append('.').append(hop.fromName());
+                first = false;
+            }
+            if (hop.kind() != HopKind.ENTRY && hop.kind() != HopKind.FIELD_FLOW) {
+                out.append(" -> ").append(hop.toOwner()).append('.').append(hop.toName());
+            } else if (hop.kind() == HopKind.FIELD_FLOW) {
+                out.append(" --[").append(hop.field()).append("]--> ")
+                        .append(hop.toOwner()).append('.').append(hop.toName());
+            }
+        }
+        return out.toString();
     }
 
     public String entryDisplay() {

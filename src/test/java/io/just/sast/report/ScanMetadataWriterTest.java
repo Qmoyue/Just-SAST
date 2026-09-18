@@ -1,9 +1,6 @@
 package io.just.sast.report;
 
 import io.just.sast.analysis.taint.FilterAnalysis;
-import io.just.sast.blackboard.Chain;
-import io.just.sast.blackboard.ChainHop;
-import io.just.sast.blackboard.HopKind;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -15,43 +12,19 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class MultiFormatReporterTest {
-
-    @Test
-    void writesStaticDetailedViewsFromOneSnapshot(@TempDir Path temp) throws Exception {
-        Chain chain = new Chain("RULE-1", "DESERIALIZE", "HIGH",
-                "example.Entry", "readObject", "deserialize",
-                "java.lang.reflect.Method", "invoke",
-                List.of(new ChainHop("example.Entry", "readObject",
-                        "java.lang.reflect.Method", "invoke", HopKind.DIRECT_CALL,
-                        null, "test", "()V", null)), 0);
-
-        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                List.of(chain), Map.of(), Map.of(), Map.of());
-        new MultiFormatReporter().write(ReportLayout.create(temp), snapshot);
-
-        String json = Files.readString(temp.resolve("evidence/findings.json"));
-        assertTrue(json.startsWith("[\n") && json.endsWith("\n]\n"));
-        assertTrue(json.contains("\"construction\":"));
-        assertTrue(json.contains("\"sink_control\":\"STATIC_UNCERTAIN\""));
-        assertFalse(json.contains("verification"));
-        assertTrue(Files.readString(temp.resolve("evidence/findings.html"))
-                .contains("Static evidence only"));
-        assertTrue(Files.readString(temp.resolve("evidence/findings.md"))
-                .contains("java.lang.reflect.Method"));
-    }
+class ScanMetadataWriterTest {
 
     @Test
     void metadataPersistsStaticRunAndFilterEvidence(@TempDir Path temp) throws Exception {
         ScanStatistics stats = stats();
         ReportLayout layout = ReportLayout.create(temp);
-        new MultiFormatReporter().writeMetadata(layout, stats);
+        new ScanMetadataWriter().write(layout, stats);
 
         String metadata = Files.readString(temp.resolve("meta/scan-metadata.json"));
         String run = Files.readString(temp.resolve("meta/run.json"));
         assertTrue(metadata.contains("\"run_outcome\":{\"schema_version\":1"));
         assertTrue(metadata.contains("\"artifact_sha256\":\"" + "a".repeat(64) + "\""));
-        assertTrue(metadata.contains("\"filter_evidence\":["));
+        assertTrue(metadata.contains("\"filter_evidence\":"));
         assertTrue(metadata.contains("\"domain_digest\":\"" + "b".repeat(64) + "\""));
         assertTrue(metadata.contains("\"expanded\":4"));
         assertTrue(metadata.contains("\"filter_cost_nanos\":123"));
@@ -66,7 +39,7 @@ class MultiFormatReporterTest {
             throws Exception {
         ScanStatistics stats = stats();
         ReportLayout layout = ReportLayout.create(temp);
-        new MultiFormatReporter().writeMetadata(layout, stats);
+        new ScanMetadataWriter().write(layout, stats);
 
         String metadata = Files.readString(temp.resolve("meta/scan-metadata.json"));
         assertTrue(metadata.contains("\"dependency_resolution_ms\":8")

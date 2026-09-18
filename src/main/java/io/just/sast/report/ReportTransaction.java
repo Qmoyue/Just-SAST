@@ -137,7 +137,7 @@ public final class ReportTransaction implements AutoCloseable {
         this.target = target;
         this.staging = staging;
         // Keep the transaction marker separate from the report metadata written by
-        // MultiFormatReporter.  Both are internal meta files; neither is a third report entry.
+        // ScanMetadataWriter.  Both are internal meta files; neither is a third report entry.
         this.runState = layout.meta().resolve("transaction.json");
         this.layout = layout;
         this.overwrite = overwrite;

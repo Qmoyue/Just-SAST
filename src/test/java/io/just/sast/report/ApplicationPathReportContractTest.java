@@ -21,11 +21,11 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Cross-renderer contract for the application-entry-to-chain path projection. */
+/** Canonical report contract for the application-entry-to-chain path projection. */
 class ApplicationPathReportContractTest {
 
     @Test
-    void everyRendererCarriesTheTypedApplicationPath(@TempDir Path tmp) throws Exception {
+    void canonicalEvidenceCarriesTheTypedApplicationPath(@TempDir Path tmp) throws Exception {
         Chain chain = new Chain("RULE-APP-PATH", "COMMAND_EXEC", "HIGH", "dep/MetricDTO",
                 "setValueByCommand", "deserialize", "java/lang/ProcessBuilder", "start",
                 List.of(new ChainHop("dep/MetricDTO", "setValueByCommand",
@@ -79,12 +79,15 @@ class ApplicationPathReportContractTest {
 
         new FindingOutputWriter().write(layout, snapshot);
         new ApplicationChainEvidenceWriter().write(layout, evidence);
-        new CsvReporter().write(layout, Map.of(), snapshot, new java.util.LinkedHashMap<>());
-        new MultiFormatReporter().write(layout, snapshot);
-        new SarifReporter().write(layout, snapshot);
 
         String expectedEntry = "app/ApiController";
         String expectedPath = "app/ApiController#putNote()Ljava/lang/Object;";
+        ApplicationTrace pathTrace = new ApplicationTrace(
+                "app/ApiController", "putNote()Ljava/lang/Object;", "app/ApiController",
+                "putNote()Ljava/lang/Object;", "BINDING_SITE", "DESERIALIZATION_SIDE_EFFECT",
+                "dep/MetricDTO#setValueByCommand()V", expectedPath, "dep/MetricDTO",
+                "java/lang/ProcessBuilder", "start");
+        assertTrue(pathTrace.applicationPath(chain).startsWith(expectedPath + " -> "));
         String findingOutput = Files.readString(layout.meta().resolve("finding-output.json"));
         String applicationEvidence = Files.readString(
                 layout.meta().resolve("application-chain-evidence.json"));
@@ -98,11 +101,5 @@ class ApplicationPathReportContractTest {
         assertTrue(applicationEvidence.contains("\"graph_digest\":\""
                 + graph.canonicalDigest() + "\""));
         assertTrue(applicationEvidence.contains(join.id()));
-        assertTrue(Files.readString(layout.evidence().resolve("chains.csv")).contains(expectedPath));
-        assertTrue(Files.readString(layout.evidence().resolve("findings.csv")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.evidence().resolve("findings.json")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.evidence().resolve("findings.html")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.evidence().resolve("findings.md")).contains(expectedEntry));
-        assertTrue(Files.readString(layout.evidence().resolve("findings.sarif")).contains(expectedEntry));
     }
 }

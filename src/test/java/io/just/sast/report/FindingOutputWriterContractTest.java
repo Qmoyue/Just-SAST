@@ -38,22 +38,4 @@ class FindingOutputWriterContractTest {
         }
     }
 
-    @Test
-    void allFormatWritersAcceptTheSameFrozenSnapshot(@TempDir Path temp) throws Exception {
-        Chain chain = new Chain("RULE-SHARED", "CODE_EXEC", "HIGH", "app/Entry",
-                "readObject", "readObject", "java/lang/Runtime", "exec", List.of(
-                new ChainHop("app/Entry", "readObject", "java/lang/Runtime", "exec",
-                        HopKind.DIRECT_CALL, null, "terminal", "()V", null)), 0);
-        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
-                List.of(chain), Map.of(), Map.of(), null);
-        ReportLayout layout = ReportLayout.create(temp);
-
-        new MultiFormatReporter().write(layout, snapshot);
-        new CsvReporter().write(layout, Map.of(), snapshot, new java.util.LinkedHashMap<>());
-        new SarifReporter().write(layout, snapshot);
-
-        assertTrue(Files.exists(layout.evidence().resolve("findings.json")));
-        assertTrue(Files.exists(layout.evidence().resolve("findings.csv")));
-        assertTrue(Files.exists(layout.evidence().resolve("findings.sarif")));
-    }
 }

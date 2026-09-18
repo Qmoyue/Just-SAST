@@ -285,15 +285,12 @@ class ConciseReportContractTest {
         Path output = temp.resolve("hostile");
         new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
                 ScanStatistics.empty());
-        new MultiFormatReporter().write(ReportLayout.flat(output.resolve("detailed")), snapshot);
 
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        String html = Files.readString(output.resolve("detailed/findings.html"));
         assertTrue(json.contains("\\u0001"), json);
         assertTrue(markdown.contains("&lt;script&gt;"), markdown);
         assertFalse(markdown.contains("<script>"), markdown);
-        assertTrue(html.contains("&lt;script&gt;"), html);
         CanonicalReportReader.Snapshot parsed = new CanonicalReportReader().read(
                 output.resolve("report.json"), io.just.sast.run.InputBudget.defaults(),
                 io.just.sast.run.InputBudget.defaults().tracker());
