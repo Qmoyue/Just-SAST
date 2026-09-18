@@ -6,12 +6,16 @@ import io.just.sast.cpg.graph.Graph;
 import io.just.sast.cpg.graph.Node;
 import io.just.sast.cpg.graph.NodeType;
 import io.just.sast.model.HandleRef;
+import io.just.sast.model.HessianProxyInvokeDispatch;
 import io.just.sast.model.LambdaMetafactoryCallSite;
 import io.just.sast.model.JndiObjectFactoryCallSite;
 import io.just.sast.model.JndiObjectFactoryDispatch;
 import io.just.sast.model.JaasLoginModuleCallSite;
 import io.just.sast.model.JaasLoginModuleDispatch;
 import io.just.sast.model.JdkSourceInfo;
+import io.just.sast.model.MethodId;
+import io.just.sast.model.MethodInfo;
+import io.just.sast.model.ProxyCreationCallSite;
 import io.just.sast.model.ProxyInterfaceCallSite;
 import io.just.sast.model.ProxyInterfaceDispatch;
 import io.just.sast.model.ClassInfo;
@@ -286,6 +290,15 @@ public final class CallGraphBuilder {
         }
         ProxyInterfaceDispatch dispatch = resolveProxyInterfaceDispatch(site);
         call.propsNote(ProxyInterfaceCallSite.DISPATCH_NOTE_KEY, dispatch);
+        HessianProxyInvokeDispatch hessian = resolveHessianProxyInvoke(dispatch);
+        call.propsNote(HessianProxyInvokeDispatch.GRAPH_NOTE_KEY, hessian);
+        if (hessian.resolved()) {
+            Node targetNode = graph.methodNode(hessian.target().owner().internalName(),
+                    hessian.target().name(), hessian.target().descriptor(),
+                    !hierarchy.isInitialClass(hessian.target().owner().internalName()));
+            graph.addEdge(call, targetNode, EdgeType.DISPATCHES, "HESSIAN_PROXY_INVOKE");
+            return 1;
+        }
         if (!dispatch.resolved()) {
             return 0;
         }
@@ -294,6 +307,32 @@ public final class CallGraphBuilder {
                 !hierarchy.isInitialClass(target.owner()));
         graph.addEdge(call, targetNode, EdgeType.DISPATCHES, "PROXY_DEFAULT");
         return 1;
+    }
+
+    /**
+     * Resolve the handler only after proxy interface dispatch has proved a real handler boundary.
+     * The target method is accepted from the initial classpath facts with its exact owner/name/
+     * descriptor; no Hessian class is loaded, initialized, constructed, reflected, or invoked.
+     */
+    private HessianProxyInvokeDispatch resolveHessianProxyInvoke(
+            ProxyInterfaceDispatch dispatch) {
+        MethodId target = null;
+        ProxyCreationCallSite.ValueIdentity handler = dispatch.callSite().creation().handler();
+        if (dispatch.status() == ProxyInterfaceDispatch.Status.HANDLER_REQUIRED
+                && handler.state() == ProxyCreationCallSite.ValueState.KNOWN
+                && handler.producerOffset() >= 0
+                && HessianProxyInvokeDispatch.HANDLER_DESCRIPTOR.equals(handler.descriptor())) {
+            ClassInfo handlerClass = hierarchy.classInfo(HessianProxyInvokeDispatch.OWNER);
+            if (handlerClass != null) {
+                MethodInfo method = handlerClass.method(HessianProxyInvokeDispatch.NAME,
+                        HessianProxyInvokeDispatch.DESCRIPTOR);
+                if (method != null && !Modifier.isStatic(method.access())
+                        && !Modifier.isAbstract(method.access())) {
+                    target = MethodId.of(method);
+                }
+            }
+        }
+        return HessianProxyInvokeDispatch.connect(dispatch, target);
     }
 
     private ProxyInterfaceDispatch resolveProxyInterfaceDispatch(ProxyInterfaceCallSite site) {
