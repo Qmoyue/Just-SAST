@@ -11,15 +11,15 @@ Just 不运行目标应用，不初始化或构造目标类，不执行反序列
 从 [GitHub Releases](https://github.com/Qmoyue/Just-SAST/releases) 下载 JAR：
 
 ```bash
-curl -L -o just-sast-0.2.1-shaded.jar \
-  https://github.com/Qmoyue/Just-SAST/releases/download/v0.2.1/just-sast-0.2.1-shaded.jar
-java -jar just-sast-0.2.1-shaded.jar --help
+curl -L -o just-sast-0.2.2-shaded.jar \
+  https://github.com/Qmoyue/Just-SAST/releases/download/v0.2.2/just-sast-0.2.2-shaded.jar
+java -jar just-sast-0.2.2-shaded.jar --help
 ```
 
 分析独立组件：
 
 ```bash
-java -jar just-sast-0.2.1-shaded.jar scan \
+java -jar just-sast-0.2.2-shaded.jar scan \
   --jar component.jar \
   --mode component \
   --jdk-home /path/to/target-jdk \
@@ -29,7 +29,7 @@ java -jar just-sast-0.2.1-shaded.jar scan \
 从真实应用入口分析，并使用 Maven POM 补齐应用依赖：
 
 ```bash
-java -jar just-sast-0.2.1-shaded.jar scan \
+java -jar just-sast-0.2.2-shaded.jar scan \
   --jar app.jar \
   --mode application \
   --pom pom.xml \
@@ -40,7 +40,7 @@ java -jar just-sast-0.2.1-shaded.jar scan \
 需要离线分析时，显式提供依赖目录并追加 `--offline`：
 
 ```bash
-java -jar just-sast-0.2.1-shaded.jar scan \
+java -jar just-sast-0.2.2-shaded.jar scan \
   --jar app.jar --mode application --pom pom.xml --deps lib \
   --offline --jdk-home /path/to/target-jdk --output just-out
 ```
