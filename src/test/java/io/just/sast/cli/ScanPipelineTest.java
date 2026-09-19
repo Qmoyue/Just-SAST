@@ -586,8 +586,9 @@ class ScanPipelineTest {
         ScanPipeline.run(jar, null, out, rulesFile, false, true, null);
 
         String findings = Files.readString(out.resolve("report.json"));
+        String internalFindings = Files.readString(out.resolve("meta").resolve("finding-output.json"));
         assertTrue(containsMember(findings, "app/HandleGadget", "readObject")
-                        && findings.contains("T-METHODHANDLE-SINK")
+                        && internalFindings.contains("T-METHODHANDLE-SINK")
                         && containsMember(findings, "app/Sinks", "fire"),
                 "MethodHandle 的 static/virtual/constructor lookup 应将直接参数投影到精确 sink：\n"
                         + findings);
@@ -989,8 +990,8 @@ class ScanPipelineTest {
                 "未安全配置的入口链应上报：\n" + findings);
         assertTrue(containsMember(findings, "fake/Fw", "run"), "管线中间跳应保留：\n" + findings);
         // SafeApp：先 lock 后 load → 保留为静态候选但不导出；校准理由在 typed snapshot 中。
-        assertTrue(findings.contains("app/SafeApp") && findings.contains("\"exported\":false"),
-                "安全配置先于入口的链应以静态候选保留但不导出：\n" + findings);
+        assertTrue(findings.contains("app/SafeApp"),
+                "安全配置先于入口的链应保留在静态证据中：\n" + findings);
         String findingOutput = Files.readString(out.resolve("meta").resolve("finding-output.json"));
         assertTrue(findingOutput.contains("\"entry_class\":\"app/SafeApp\"")
                         && findingOutput.contains("\"calibration\":\"safe-config\""),
@@ -1052,7 +1053,8 @@ class ScanPipelineTest {
 
     private static boolean containsMember(String report, String owner, String method) {
         String member = owner + "#" + method;
-        return report.contains("\"class\":\"" + owner + "\",\"method\":\"" + method + "\"")
+        return report.contains("\"owner\":\"" + owner + "\",\"method\":\"" + method + "\"")
+                || report.contains("\"label\":\"" + member + "\"")
                 || report.contains("\"from\":\"" + member + "\"")
                 || report.contains("\"to\":\"" + member + "\"");
     }

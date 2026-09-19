@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://just.invalid/schema/rules-v2.schema.json",
   "title": "Just rule catalog v2",
-  "description": "Typed rule data for capability, bridge, boundary, terminal, source, filter and callback semantics.",
+  "description": "Typed rule data for capability, bridge, boundary, terminal, source, filter and callback semantics. Rules are generic and cannot encode benchmark answers or target-specific special cases.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "rules"],

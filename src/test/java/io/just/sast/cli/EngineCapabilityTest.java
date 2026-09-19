@@ -380,7 +380,8 @@ class EngineCapabilityTest {
 
     private static boolean containsMember(String report, String owner, String method) {
         String member = owner + "#" + method;
-        return report.contains("\"class\":\"" + owner + "\",\"method\":\"" + method + "\"")
+        return report.contains("\"owner\":\"" + owner + "\",\"method\":\"" + method + "\"")
+                || report.contains("\"label\":\"" + member + "\"")
                 || report.contains("\"from\":\"" + member + "\"")
                 || report.contains("\"to\":\"" + member + "\"");
     }

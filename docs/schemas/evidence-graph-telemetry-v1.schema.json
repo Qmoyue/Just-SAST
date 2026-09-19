@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://just-sast.dev/schema/evidence-graph-telemetry-v1.json",
-  "title": "Just SAST evidence graph telemetry",
+  "title": "Just internal evidence graph telemetry",
+  "description": "Optional internal provenance telemetry. It is not part of report.json and must not be used to add report fields.",
   "type": "object",
   "additionalProperties": false,
   "required": [

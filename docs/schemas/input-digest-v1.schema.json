@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://just.invalid/schema/input-digest-v1.json",
-  "title": "Just scan input before/after digest evidence",
+  "title": "Just internal scan input digest evidence",
+  "description": "Internal input identity evidence. It is not the V3 concise report and carries no dynamic verification state.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "status", "target", "dependencies", "reasons"],

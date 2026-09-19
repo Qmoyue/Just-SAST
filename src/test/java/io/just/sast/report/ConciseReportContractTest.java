@@ -19,6 +19,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Golden contract for the small human/agent static report surface. */
@@ -40,23 +41,19 @@ class ConciseReportContractTest {
         String firstMarkdown = Files.readString(first.resolve("report.md"));
         assertEquals(firstJson, Files.readString(second.resolve("report.json")));
         assertEquals(firstMarkdown, Files.readString(second.resolve("report.md")));
-        assertTrue(firstJson.contains("\"schema_version\":\"JUST-REPORT-V1\""));
-        assertTrue(firstJson.contains("\"analysis\":{\"mode\":\"STATIC_ONLY\""));
+        assertTrue(firstJson.contains("\"schema_version\":\"JUST-REPORT-V2\""));
+        assertTrue(firstJson.contains("\"mode\":\"component\""));
         assertTrue(firstJson.contains("\"outcome\":\"FINDINGS_AVAILABLE\""));
         assertTrue(firstJson.contains("\"coverage\":\"COMPLETE\""));
-        assertTrue(firstJson.contains("\"graph\":{\"nodes\":["));
-        assertTrue(firstJson.contains("\"result_explanation\":{\"kind\":\"EXPORTED_CANDIDATES\""));
-        assertTrue(firstJson.contains("\"arg_ordinal\":0"));
-        assertTrue(firstJson.contains("\"hop_index\":1"));
-        assertTrue(firstMarkdown.contains("Finding ID:"));
-        assertTrue(firstMarkdown.contains("Gadget graph:"));
-        assertTrue(firstJson.contains("\"constraints\":{"));
+        assertTrue(firstJson.contains("\"graph\":["));
+        assertTrue(firstJson.contains("\"proof\":{"));
+        assertTrue(firstMarkdown.contains("### 1."));
+        assertTrue(firstMarkdown.contains("Graph:"));
         assertTrue(firstMarkdown.contains("[ENTRY] dep/Gadget#readObject"));
-        assertTrue(firstMarkdown.contains("[TERMINAL] java/lang/Runtime#exec"));
-        assertFalse(firstMarkdown.contains("[ENTRY] dep/Gadget#readObject\n    │ ENTRY"));
-        assertTrue(firstMarkdown.contains("DIRECT_CALL — bytecode"));
+        assertTrue(firstMarkdown.contains("[IMPACT] java/lang/Runtime#exec"));
         assertFalse(firstJson.contains("generated_bytes"));
         assertFalse(firstJson.contains("verification"));
+        assertFalse(firstJson.contains("analysis"));
     }
 
     @Test
@@ -69,21 +66,19 @@ class ConciseReportContractTest {
 
         Map<?, ?> document = assertInstanceOf(Map.class,
                 new Yaml().load(Files.readString(output.resolve("report.json"))));
-        assertEquals("JUST-REPORT-V1", document.get("schema_version"));
-        Map<?, ?> analysis = assertInstanceOf(Map.class, document.get("analysis"));
-        assertEquals("STATIC_ONLY", analysis.get("mode"));
-        Map<?, ?> run = assertInstanceOf(Map.class, document.get("run"));
-        assertEquals("FINDINGS_AVAILABLE", run.get("outcome"));
-        assertEquals("COMPLETE", run.get("coverage"));
-        List<?> chains = assertInstanceOf(List.class, document.get("chains"));
-        Map<?, ?> finding = assertInstanceOf(Map.class, chains.get(0));
-        Map<?, ?> graph = assertInstanceOf(Map.class, finding.get("graph"));
-        List<?> nodes = assertInstanceOf(List.class, graph.get("nodes"));
-        List<?> edges = assertInstanceOf(List.class, graph.get("edges"));
-        assertTrue(nodes.size() >= 2);
-        assertTrue(edges.stream().allMatch(Map.class::isInstance));
+        assertEquals("JUST-REPORT-V2", document.get("schema_version"));
+        assertEquals("component", document.get("mode"));
+        Map<?, ?> result = assertInstanceOf(Map.class, document.get("result"));
+        assertEquals("FINDINGS_AVAILABLE", result.get("outcome"));
+        assertEquals("COMPLETE", result.get("coverage"));
+        List<?> findings = assertInstanceOf(List.class, document.get("findings"));
+        Map<?, ?> finding = assertInstanceOf(Map.class, findings.get(0));
+        List<?> graph = assertInstanceOf(List.class, finding.get("graph"));
+        assertTrue(graph.size() >= 2);
+        assertTrue(graph.stream().allMatch(Map.class::isInstance));
         assertFalse(document.containsKey("target_code_executed"));
         assertFalse(document.containsKey("verification"));
+        assertFalse(document.containsKey("chains"));
     }
 
     @Test
@@ -97,8 +92,40 @@ class ConciseReportContractTest {
                 ScanStatistics.empty());
         String json = Files.readString(output.resolve("report.json"));
         assertTrue(json.contains("\"mode\":\"application\""));
-        assertTrue(json.contains("\"exported\":false"));
-        assertTrue(Files.readString(output.resolve("report.md")).contains("CANDIDATE"));
+        assertTrue(json.contains("\"findings\":[]"));
+        assertTrue(json.contains("NO_APPLICATION_ENTRY"));
+        assertTrue(json.contains("\"exported\":0"));
+        assertFalse(Files.readString(output.resolve("report.md")).contains("CANDIDATE"));
+    }
+
+    @Test
+    void applicationGraphKeepsDistinctTypedRolesWithTheSameLabel(@TempDir Path temp)
+            throws Exception {
+        Chain chain = chain();
+        FindingOutputReader.Snapshot base = new FindingOutputReader().read(
+                List.of(chain), Map.of(), Map.of(), Map.of());
+        ApplicationTrace trace = new ApplicationTrace("app/Main", "main", "app/Main", "main",
+                "HTTP_SERVER", "HTTP_SERVER", "dep/Gadget#readObject()V",
+                "app/Main#main([Ljava/lang/String;)V->app/Main#main([Ljava/lang/String;)V",
+                "dep/Gadget", "java/lang/Runtime", "exec",
+                new ApplicationTrace.JoinEvidence("graph", "artifact", "index", "join", "chain",
+                        "entry", "site", "dependency", "DIRECT_VALUE", "DERIVED_OBJECT",
+                        "DESERIALIZATION", "EXACT", "UNKNOWN", "UNKNOWN", "SAT",
+                        List.of("BRIDGE-1")));
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader.Snapshot(
+                base.schemaVersion(), base.findings(), base.byChainKey(),
+                Map.of(chain.key(), trace));
+
+        Path output = temp.resolve("application-graph");
+        new ConciseReportWriter().write(ReportLayout.flat(output), "application", snapshot,
+                ScanStatistics.empty());
+        String json = Files.readString(output.resolve("report.json"));
+
+        assertTrue(json.contains("\"role\":\"ENTRY\""), json);
+        assertTrue(json.contains("\"role\":\"SITE\""), json);
+        assertTrue(json.contains("\"role\":\"DESERIALIZE\""), json);
+        assertTrue(json.contains("\"role\":\"BRIDGE\""), json);
+        assertTrue(json.contains("\"role\":\"IMPACT\""), json);
     }
 
     @Test
@@ -115,12 +142,11 @@ class ConciseReportContractTest {
                 ScanStatistics.empty());
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        assertTrue(json.contains("\"role\":\"CAPABILITY\""));
-        assertTrue(json.contains("\"label\":\"java/lang/reflect/Method#invoke\",\"role\":\"BOUNDARY\""));
+        assertTrue(json.contains("\"role\":\"CAPABILITY_BOUNDARY\""));
+        assertTrue(json.contains("\"role\":\"BOUNDARY\",\"label\":\"java/lang/reflect/Method#invoke\""));
         assertTrue(markdown.contains("[BOUNDARY] java/lang/reflect/Method#invoke"));
-        assertTrue(markdown.contains("Capability boundary: java/lang/reflect/Method#invoke"));
-        assertTrue(markdown.contains("target unresolved, so no terminal is claimed"));
-        assertFalse(markdown.contains("Terminal: java/lang/reflect/Method#invoke"));
+        assertTrue(markdown.contains("terminal: CAPABILITY_ONLY"));
+        assertFalse(markdown.contains("[IMPACT] java/lang/reflect/Method#invoke"));
     }
 
     @Test
@@ -142,14 +168,13 @@ class ConciseReportContractTest {
         FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
                 List.of(chain), Map.of(), Map.of(), Map.of());
         Path output = temp.resolve("composed");
-        new ConciseReportWriter().write(ReportLayout.flat(output), "application", snapshot,
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
                 stats("C".repeat(64)));
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        assertTrue(json.contains("\"kind\":\"CHAIN_JOIN\""));
+        assertTrue(json.contains("java/lang/reflect/Method#invoke"));
         assertTrue(markdown.contains("[STEP] java/lang/reflect/Method#invoke"));
-        assertTrue(markdown.contains("[TERMINAL] com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl#newTransformer"));
-        assertFalse(markdown.contains("FIELD_FLOW —"));
+        assertTrue(markdown.contains("[IMPACT] com/sun/org/apache/xalan/internal/xsltc/trax/TemplatesImpl#newTransformer"));
     }
 
     @Test
@@ -161,11 +186,60 @@ class ConciseReportContractTest {
                 ScanStatistics.empty());
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        assertTrue(json.contains("\"chains\":[]"));
-        assertTrue(json.contains("\"kind\":\"EMPTY\""));
-        assertTrue(json.contains("\"NO_CANDIDATES\""));
+        assertTrue(json.contains("\"findings\":[]"));
+        assertTrue(json.contains("\"outcome\":\"NO_FINDINGS\""));
+        assertTrue(json.contains("\"NO_STATIC_FINDINGS\""));
         assertTrue(markdown.contains("not proof that the artifact is safe"));
-        assertTrue(markdown.contains("NO_CANDIDATES"));
+        assertTrue(markdown.contains("NO_STATIC_FINDINGS"));
+    }
+
+    @Test
+    void partialAndUnknownStatusesNameTheirStaticProofGaps(@TempDir Path temp) throws Exception {
+        Chain partial = new Chain("RULE-PARTIAL", "COMMAND", "HIGH", "dep/Partial",
+                "readObject", "readObject", "java/lang/Runtime", "exec",
+                List.of(new ChainHop("dep/Partial", "readObject", "java/lang/Runtime", "exec",
+                        HopKind.DIRECT_CALL, null, "bounded hop", "()V", null)), 1);
+        Chain unknown = new Chain("RULE-UNKNOWN", "COMMAND", "UNKNOWN", "unknown/Entry",
+                "unknownMethod", "UNKNOWN", "unknown/Boundary", "unknownImpact", List.of(),
+                0, "", "CAPABILITY");
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(partial, unknown), Map.of(), Map.of(), Map.of());
+        Path output = temp.resolve("status");
+
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                ScanStatistics.empty());
+
+        String json = Files.readString(output.resolve("report.json"));
+        assertTrue(json.contains("\"status\":\"PARTIAL\""), json);
+        assertTrue(json.contains("\"status\":\"UNKNOWN\""), json);
+        assertTrue(json.contains("UNRESOLVED_HOPS"), json);
+        assertTrue(json.contains("TERMINAL_IMPACT_NOT_PROVEN"), json);
+    }
+
+    @Test
+    void dependencyInputIncompleteRemainsBoundedAndFailureIsNotAnEmptyFinding(@TempDir Path temp)
+            throws Exception {
+        FindingOutputReader.Snapshot snapshot = new FindingOutputReader().read(
+                List.of(), Map.of(), Map.of(), Map.of());
+        ScanStatistics incomplete = new ScanStatistics(0, 0, 0, 0, 0, 0,
+                1, 1, 1, "PARTIAL", List.of("DEPENDENCY_INPUT_INCOMPLETE"),
+                Map.of(), Map.of(), "PARTIAL", "D".repeat(64),
+                Map.of(), Map.of(), Map.of(), List.of());
+        Path output = temp.resolve("incomplete");
+
+        new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
+                incomplete);
+
+        String json = Files.readString(output.resolve("report.json"));
+        assertTrue(json.contains("\"coverage\":\"BOUNDED\""), json);
+        assertTrue(json.contains("DEPENDENCY_INPUT_INCOMPLETE"), json);
+        assertTrue(json.contains("\"findings\":[]"), json);
+
+        Path malformed = temp.resolve("malformed-report.json");
+        Files.writeString(malformed, "{\"schema_version\":\"JUST-REPORT-V2\"}");
+        assertThrows(java.io.IOException.class, () -> new CanonicalReportReader().read(
+                malformed, io.just.sast.run.InputBudget.defaults(),
+                io.just.sast.run.InputBudget.defaults().tracker()));
     }
 
     @Test
@@ -188,9 +262,8 @@ class ConciseReportContractTest {
                 stats("B".repeat(64)));
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        assertTrue(json.contains("\"object_relations\":[{\"from\":\"app/Entry#readObject\""));
-        assertTrue(json.contains("\"field_owner\":\"app/Holder\""));
-        assertTrue(json.contains("\"arg_ordinal\":0"));
+        assertTrue(json.contains("FIELD_FLOW"));
+        assertFalse(json.contains("object_relations"));
         assertTrue(markdown.contains("[ENTRY] app/Entry#readObject"));
         assertTrue(markdown.contains("FIELD_FLOW"));
     }
@@ -226,11 +299,13 @@ class ConciseReportContractTest {
         new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
                 ScanStatistics.empty());
         String json = Files.readString(output.resolve("report.json"));
-        int chains = json.indexOf("\"chains\":[");
-        int nestedRank = json.indexOf("semantic=TYPED_NESTED_DESERIALIZATION", chains);
-        int genericRank = json.indexOf("semantic=ORDINARY_CHAIN", chains);
-        assertTrue(chains >= 0 && nestedRank > chains && genericRank > nestedRank,
-                "concise report must preserve ChainRanking semantic order");
+        int genericPosition = json.indexOf("\"label\":\"java/lang/Runtime#exec\"");
+        int nestedPosition = json.indexOf("\"label\":\"app/Terminal#run\"");
+        int expectedOrder = io.just.sast.chain.ChainRanking.compare(generic, nested,
+                Map.of(), java.util.Set.of());
+        assertTrue(genericPosition >= 0 && nestedPosition >= 0 && expectedOrder != 0,
+                json);
+        assertTrue((expectedOrder < 0) == (genericPosition < nestedPosition), json);
     }
 
     @Test
@@ -257,12 +332,12 @@ class ConciseReportContractTest {
 
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        assertEquals(13, occurrences(json, "\"chain_key\":"));
-        assertTrue(json.contains("\"display_limit\":10"));
-        assertTrue(json.contains("\"json_truncated\":false"));
-        assertTrue(markdown.contains("Candidates: 13; exported: 13"));
-        assertTrue(markdown.contains("Capability boundary: java/lang/reflect/Method#invoke"));
-        assertTrue(markdown.contains("Remaining candidate summaries"));
+        assertEquals(13, occurrences(json, "\"id\":"));
+        assertTrue(json.contains("\"candidates\":13"));
+        assertTrue(json.contains("\"exported\":13"));
+        assertTrue(markdown.contains("Candidates: 13"));
+        assertTrue(markdown.contains("[BOUNDARY] java/lang/reflect/Method#invoke"));
+        assertFalse(markdown.contains("Remaining candidate summaries"));
     }
 
     @Test
@@ -299,12 +374,12 @@ class ConciseReportContractTest {
 
     @Test
     void activeReportSchemasDescribeTheStaticV3Surface() throws Exception {
-        String concise = Files.readString(Path.of("docs/schemas/concise-report-v1.schema.json"));
+        String concise = Files.readString(Path.of("docs/schemas/concise-report-v2.schema.json"));
         String finding = Files.readString(Path.of("docs/schemas/finding-output-v1.schema.json"));
-        assertTrue(concise.contains("\"analysis\"")
-                        && concise.contains("\"display_limit\"")
-                        && concise.contains("\"filter_evidence\"")
-                        && concise.contains("\"join_evidence\"")
+        assertTrue(concise.contains("JUST-REPORT-V2")
+                        && concise.contains("\"result\"")
+                        && concise.contains("\"findings\"")
+                        && concise.contains("\"provenance\"")
                         && concise.contains("\"graph\""), concise);
         assertTrue(finding.contains("\"entry_descriptor\"")
                         && finding.contains("\"application_trace\"")
@@ -337,11 +412,9 @@ class ConciseReportContractTest {
         new ConciseReportWriter().write(ReportLayout.flat(output), "component", snapshot,
                 ScanStatistics.empty());
         String json = Files.readString(output.resolve("report.json"));
-        assertTrue(json.contains("\"status\":\"PROVEN\""), json);
-        assertTrue(json.contains("\"basis\":\"CALLSITE_EXACT\""), json);
-        assertTrue(json.contains("\"bytecode_offset\":17"), json);
-        assertTrue(json.contains("\"logical_name\":\"fixture.jar\""), json);
-        assertTrue(Files.readString(output.resolve("report.md")).contains("@17"));
+        assertTrue(json.contains("\"status\":\"COMPLETE\""), json);
+        assertTrue(json.contains("app/Entry#readObject"), json);
+        assertFalse(json.contains("bytecode_offset"), json);
     }
 
     @Test

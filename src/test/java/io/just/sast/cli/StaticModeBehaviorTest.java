@@ -54,7 +54,7 @@ class StaticModeBehaviorTest {
         ScanPipeline.run(jar, null, temp.resolve("out"), null, false, true, null);
         assertFalse(Files.exists(sentinel), "static analysis must not initialize target classes");
         String report = Files.readString(temp.resolve("out").resolve("report.json"));
-        assertTrue(report.contains("\"analysis\":{\"mode\":\"STATIC_ONLY\""));
+        assertTrue(report.contains("\"schema_version\":\"JUST-REPORT-V2\""));
         assertFalse(report.contains("target_code_executed"));
     }
 
@@ -76,7 +76,7 @@ class StaticModeBehaviorTest {
                 ModeDemandPolicy.forMode(ScanMode.COMPONENT));
         String component = Files.readString(componentOut.resolve("report.json"));
         assertTrue(component.contains("\"mode\":\"component\""));
-        assertTrue(component.contains("\"exported\":true"),
+        assertTrue(component.contains("\"findings\":[") && component.contains("dep/Gadget"),
                 "component mode must retain a dependency/kernel candidate without an app root");
 
         Path application = compileToJar(temp.resolve("application.jar"), Map.of("app.Main", """
@@ -146,9 +146,9 @@ class StaticModeBehaviorTest {
                 ModeDemandPolicy.forMode(ScanMode.COMPONENT));
         String json = Files.readString(output.resolve("report.json"));
         String markdown = Files.readString(output.resolve("report.md"));
-        assertTrue(json.contains("\"chains\":[]"), "negative fixture should have no chain rows");
-        assertTrue(json.contains("\"kind\":\"EMPTY\""));
-        assertTrue(json.contains("\"NO_CANDIDATES\""));
+        assertTrue(json.contains("\"findings\":[]"), "negative fixture should have no finding rows");
+        assertTrue(json.contains("\"outcome\":\"NO_FINDINGS\""));
+        assertTrue(json.contains("\"NO_STATIC_FINDINGS\""));
         assertTrue(markdown.contains("not proof that the artifact is safe"));
     }
 
@@ -201,7 +201,8 @@ class StaticModeBehaviorTest {
 
     private static boolean containsMember(String report, String owner, String method) {
         String member = owner + "#" + method;
-        return report.contains("\"class\":\"" + owner + "\",\"method\":\"" + method + "\"")
+        return report.contains("\"owner\":\"" + owner + "\",\"method\":\"" + method + "\"")
+                || report.contains("\"label\":\"" + member + "\"")
                 || report.contains("\"from\":\"" + member + "\"")
                 || report.contains("\"to\":\"" + member + "\"");
     }

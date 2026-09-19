@@ -31,27 +31,32 @@ class DiffCommandTest {
                                 String sinkClass, String sinkMethod, String sinkDescriptor,
                                 String marker) {
         return "{\"id\":" + json(id)
-                + ",\"exported\":true,\"rule_id\":" + json(ruleId)
-                + ",\"category\":" + json(category)
-                + ",\"severity\":" + json(severity)
-                + ",\"entry\":{\"class\":" + json(entryClass)
+                + ",\"status\":\"COMPLETE\""
+                + ",\"entry\":{\"owner\":" + json(entryClass)
                 + ",\"method\":" + json(entryMethod)
                 + ",\"descriptor\":" + json(entryDescriptor)
                 + ",\"kind\":\"readObject\"}"
-                + ",\"sink\":{\"class\":" + json(sinkClass)
+                + ",\"impact\":{\"owner\":" + json(sinkClass)
                 + ",\"method\":" + json(sinkMethod)
                 + ",\"descriptor\":" + json(sinkDescriptor)
-                + ",\"role\":\"TERMINAL\",\"risk\":\"HIGH\"}"
-                + ",\"state\":{\"feasibility\":\"UNKNOWN\"}"
-                + ",\"ranking\":{\"explanation\":" + json(marker) + "}"
-                + ",\"notes\":[" + json(marker) + "]"
-                + ",\"hops\":[],\"application_trace\":null}";
+                + ",\"role\":\"TERMINAL_IMPACT\"}"
+                + ",\"graph\":[{\"role\":\"ENTRY\",\"label\":\"entry\"},"
+                + "{\"role\":\"IMPACT\",\"label\":\"impact\"}]"
+                + ",\"proof\":{\"entry\":" + json(ruleId)
+                + ",\"site\":" + json(category)
+                + ",\"input\":" + json(marker)
+                + ",\"callback\":\"callback\",\"bridge\":\"bridge\","
+                + "\"terminal\":\"terminal\",\"feasibility\":\"SAT\"}}";
     }
 
     private static Path writeReport(Path dir, String... chains) throws Exception {
         Files.createDirectories(dir);
-        String report = "{\"schema_version\":\"JUST-REPORT-V1\",\"mode\":\"component\","
-                + "\"chains\":[" + String.join(",", chains) + "]}\n";
+        String report = "{\"schema_version\":\"JUST-REPORT-V2\",\"mode\":\"component\","
+                + "\"result\":{\"outcome\":\"FINDINGS_AVAILABLE\",\"coverage\":\"COMPLETE\","
+                + "\"candidates\":" + chains.length + ",\"exported\":" + chains.length + "},"
+                + "\"findings\":[" + String.join(",", chains) + "],"
+                + "\"provenance\":{\"artifact_sha256\":\"" + "a".repeat(64)
+                + "\",\"detail\":\"test\"}}\n";
         Path file = dir.resolve("report.json");
         Files.writeString(file, report, StandardCharsets.UTF_8);
         return file;
@@ -78,7 +83,7 @@ class DiffCommandTest {
                         "java/lang/Runtime", "exec", "(Ljava/lang/String;)V",
                         "note with, quote \"x\" and unicode \u4e2d")).getParent();
         Path newDir = writeReport(temp.resolve("new"),
-                chain("R-2", "RULE", "CATEGORY", "HIGH", "app/Entry", "read", "()V",
+                chain("R-1", "RULE", "CATEGORY", "HIGH", "app/Entry", "read", "()V",
                         "java/lang/Runtime", "exec", "(Ljava/lang/String;)V",
                         "note with, quote \"x\" and unicode \u4e2d")).getParent();
 
@@ -90,9 +95,7 @@ class DiffCommandTest {
     @Test
     void chainIdReorderingIsNotAChange(@TempDir Path temp) throws Exception {
         Path oldDir = writeReport(temp.resolve("old"), ROW_A, ROW_B).getParent();
-        String rowAPrime = ROW_A.replace("R-0001", "R-0007");
-        String rowBPrime = ROW_B.replace("R-0002", "R-0001");
-        Path newDir = writeReport(temp.resolve("new"), rowBPrime, rowAPrime).getParent();
+        Path newDir = writeReport(temp.resolve("new"), ROW_B, ROW_A).getParent();
 
         String output = captureDiff(oldDir, newDir);
         assertTrue(output.contains("新增链: 0") && output.contains("消失链: 0")
@@ -105,6 +108,7 @@ class DiffCommandTest {
         String changed = chain("R-0009", "JUST-SINK-COMMAND-EXEC-RUNTIME", "COMMAND_EXEC",
                 "HIGH", "app/Gadget", "readObject", "(Ljava/io/ObjectInputStream;)V",
                 "java/lang/Runtime", "exec", "([Ljava/lang/String;)V", "static path changed");
+        changed = changed.replace("R-0009", "R-0001");
         Path newDir = writeReport(temp.resolve("new"), changed).getParent();
 
         String output = captureDiff(oldDir, newDir);

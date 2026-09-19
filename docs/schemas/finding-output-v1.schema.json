@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://just-sast.dev/schema/finding-output-v1.json",
-  "title": "Just SAST typed finding output reader snapshot",
+  "title": "Just legacy typed finding output reader snapshot",
+  "description": "Legacy/internal reader snapshot retained only while consumers migrate to the V3 concise projection.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "findings"],

@@ -60,17 +60,16 @@ public final class BaselineSuppressionWriter {
             }
         }
         Set<String> old = baseline == null ? Set.of() : readBaseline(baseline, policy, tracker);
-        Set<String> currentSemantic = new TreeSet<>();
+        Set<String> currentReportIds = new TreeSet<>();
         for (Chain chain : current.values()) {
-            currentSemantic.add(ChainIdentity.of(chain));
+            currentReportIds.add(reportId(chain));
         }
         List<Selector> selectors = suppressions == null ? List.of()
                 : readSelectors(suppressions, policy, tracker);
         Set<String> usedSelectors = new LinkedHashSet<>();
         List<Row> rows = new ArrayList<>();
         for (Map.Entry<String, Chain> entry : current.entrySet()) {
-            boolean baselineMatch = old.contains(entry.getKey())
-                    || old.contains(ChainIdentity.of(entry.getValue()));
+            boolean baselineMatch = old.contains(reportId(entry.getValue()));
             boolean suppressionMatch = matches(entry.getKey(), entry.getValue(), selectors, usedSelectors);
             String status = suppressionMatch
                     ? baselineMatch ? "SUPPRESSED_BASELINE" : "SUPPRESSED_NEW"
@@ -78,7 +77,7 @@ public final class BaselineSuppressionWriter {
             rows.add(new Row(entry.getKey(), entry.getValue(), status));
         }
         for (String removed : new TreeSet<>(old)) {
-            if (!current.containsKey(removed) && !currentSemantic.contains(removed)) {
+            if (!currentReportIds.contains(removed)) {
                 rows.add(new Row(removed, null, "REMOVED"));
             }
         }
@@ -107,9 +106,14 @@ public final class BaselineSuppressionWriter {
                 tracker);
         Set<String> identities = new TreeSet<>();
         for (CanonicalReportReader.ChainRecord chain : snapshot.chains()) {
-            identities.add(chain.variantIdentity());
+            identities.add(chain.id());
         }
         return Set.copyOf(identities);
+    }
+
+    /** The public V2 finding id is the baseline key; it is stable across both renderers. */
+    private static String reportId(Chain chain) {
+        return io.just.sast.blackboard.FindingId.fromCanonical(chain.ruleId(), chain.key()).value();
     }
 
     private static List<Selector> readSelectors(Path file, InputBudget policy,

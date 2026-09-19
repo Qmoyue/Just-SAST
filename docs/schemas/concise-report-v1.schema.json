@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://just.invalid/schema/concise-report-v1.schema.json",
-  "title": "Just concise static report",
+  "title": "Just legacy concise static report v1",
+  "description": "Legacy migration schema. It is not the current CLI output contract; use concise-report-v2 for the V3 projection.",
   "type": "object",
   "required": ["schema_version", "mode", "analysis", "artifact_sha256", "run", "summary", "presentation", "filter_evidence", "result_explanation", "chains"],
   "properties": {
